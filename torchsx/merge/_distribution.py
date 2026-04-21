@@ -278,7 +278,15 @@ def fit_gengauss(
     mode: str = "log",
     joint_device: str = "cpu",
 ) -> HKLDistribution:
-    """Fit per-HKL generalized Gaussian distribution with adjacency smoothing.
+    """Fit per-HKL generalized Gaussian distribution in log-space with IRLS.
+
+    .. note::
+
+        This function works in log-space and uses only **positive**
+        observations.  It does not model Poisson noise or handle negative
+        reflections.  For a proper Poisson marginal likelihood approach that
+        uses all observations (including negatives), use :func:`fit_em`
+        instead.
 
     Parameters
     ----------
@@ -322,28 +330,10 @@ def fit_gengauss(
     -------
     HKLDistribution with per-HKL parameters.
     """
-    # ── Joint optimisation with Poisson noise model ──
-    # Activates when poisson_noise is provided or mode="joint"
     if mode == "joint" or poisson_noise is not None:
-        from ._em import JointConfig, fit_joint_em
-
-        if corrections is None and scale_crystals:
-            corrections = [ScaleBCorrection(scale_prior=scale_prior,
-                                            bfactor_prior=bfactor_prior)]
-        joint_config = JointConfig(
-            n_em_cycles=n_em_cycles if n_em_cycles > 0 else 5,
-            min_obs=min_obs,
-            n_shells=n_shells,
-            snr_thresh=snr_thresh,
-            free_fraction=free_fraction,
-            reg_lambda=smooth_lambda,
-            device=joint_device,
-        )
-        return fit_joint_em(
-            stream,
-            config=joint_config,
-            corrections=corrections,
-            poisson_noise=poisson_noise,
+        raise ValueError(
+            "mode='joint' and poisson_noise are no longer supported in "
+            "fit_gengauss. Use fit_em() for Poisson marginal likelihood."
         )
 
     from torchref.base.reciprocal.hkl import get_d_spacing

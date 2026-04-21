@@ -10,6 +10,28 @@ from torch import Tensor
 
 
 @dataclass
+class RefineData:
+    """Per-observation data for explained-variance orientation refinement."""
+
+    hkl_obs: Tensor       # (N, 3) int16 — Miller indices
+    crystal_id: Tensor    # (N,) int32
+    hkl_id: Tensor        # (N,) int64 — unique HKL index
+    log_resid: Tensor     # (N,) float32 — log(I / (I0 × scale)), fixed
+    weights: Tensor       # (N,) float32 — 1/Var(log_resid), Poisson-aware
+    UB: Tensor            # (C, 3, 3) float32
+    lambda_0: Tensor      # (C,) float32 — per-crystal wavelength (Å)
+    n_crystals: int
+    n_hkl: int
+
+    def to(self, device):
+        fields = {}
+        for k in ["hkl_obs", "crystal_id", "hkl_id", "log_resid", "weights",
+                   "UB", "lambda_0"]:
+            fields[k] = getattr(self, k).to(device)
+        return RefineData(**fields, n_crystals=self.n_crystals, n_hkl=self.n_hkl)
+
+
+@dataclass
 class PairData:
     """Precomputed pair data for rank concordance refinement."""
 
@@ -113,10 +135,27 @@ def fit_BG(I_obs, hkl_id, crystal_id, s_sq, n_unique, n_crystals):
 
 
 def build_pairs(I_corr, hkl_id, crystal_id, n_unique, *,
-                I_threshold, min_mult, max_pairs_per_hkl):
-    """Build (pair_i, pair_j, pair_sign, pair_weight) for all qualifying HKLs."""
+                I_threshold=0.0, min_mult=3, max_pairs_per_hkl=500,
+                sigma=None):
+    """Build (pair_i, pair_j, pair_sign, pair_weight) for all qualifying HKLs.
+
+    Parameters
+    ----------
+    I_corr : (N,) corrected intensities
+    hkl_id : (N,) unique HKL index per observation
+    crystal_id : (N,) crystal index (unused, kept for interface compat)
+    n_unique : number of unique HKLs
+    I_threshold : minimum intensity to include (default 0 = use all)
+    min_mult : minimum observations per HKL
+    max_pairs_per_hkl : cap on pairs (subsampled by weight if exceeded)
+    sigma : (N,) optional per-obs Poisson sigma. When provided, pairs are
+        weighted by the Z-score of the intensity difference:
+        w_ij = |I_i - I_j| / sqrt(σ²_i + σ²_j).  When None, falls back
+        to sqrt(min(I_i, I_j)).
+    """
     hkl_np = hkl_id.numpy()
     I_np = I_corr.numpy()
+    sigma_np = sigma.numpy() if sigma is not None else None
 
     order = np.argsort(hkl_np)
     boundaries = np.searchsorted(hkl_np[order], np.arange(n_unique + 1))
@@ -132,37 +171,50 @@ def build_pairs(I_corr, hkl_id, crystal_id, n_unique, *,
         idx = order[lo:hi]
         I_h = I_np[idx]
 
-        strong = I_h > I_threshold
-        if strong.sum() < min_mult:
-            continue
-        idx = idx[strong]
-        I_h = I_h[strong]
+        if I_threshold > 0:
+            keep = I_h > I_threshold
+            if keep.sum() < min_mult:
+                continue
+            idx = idx[keep]
+            I_h = I_h[keep]
+
         n = len(idx)
+        if n < min_mult:
+            continue
 
         ii, jj = np.triu_indices(n, k=1)
-        if len(ii) > max_pairs_per_hkl:
-            sel = rng.choice(len(ii), max_pairs_per_hkl, replace=False)
-            ii, jj = ii[sel], jj[sel]
 
-        obs_i = idx[ii]
-        obs_j = idx[jj]
+        # Compute pair weights before subsampling so we can sample by weight
         sign_ij = np.sign(I_h[ii] - I_h[jj]).astype(np.float32)
-
         nonzero = sign_ij != 0
-        obs_i = obs_i[nonzero]
-        obs_j = obs_j[nonzero]
-        sign_ij = sign_ij[nonzero]
-
-        if len(obs_i) == 0:
+        if nonzero.sum() == 0:
             continue
 
-        w = np.minimum(I_h[ii[nonzero]], I_h[jj[nonzero]])
-        w = np.sqrt(w.clip(min=1))
+        if sigma_np is not None:
+            sig_i = sigma_np[idx[ii]]
+            sig_j = sigma_np[idx[jj]]
+            # Z-score: |ΔI| / sqrt(σ²_i + σ²_j)
+            w = np.abs(I_h[ii] - I_h[jj]) / np.sqrt(
+                sig_i ** 2 + sig_j ** 2).clip(min=1.0)
+        else:
+            w = np.sqrt(np.minimum(I_h[ii], I_h[jj]).clip(min=1))
 
-        all_i.append(obs_i)
-        all_j.append(obs_j)
+        # Apply nonzero filter
+        ii = ii[nonzero]
+        jj = jj[nonzero]
+        sign_ij = sign_ij[nonzero]
+        w = w[nonzero]
+
+        # Subsample if too many pairs — weighted sampling keeps informative pairs
+        if len(ii) > max_pairs_per_hkl:
+            prob = w / w.sum()
+            sel = rng.choice(len(ii), max_pairs_per_hkl, replace=False, p=prob)
+            ii, jj, sign_ij, w = ii[sel], jj[sel], sign_ij[sel], w[sel]
+
+        all_i.append(idx[ii])
+        all_j.append(idx[jj])
         all_sign.append(sign_ij)
-        all_weight.append(w)
+        all_weight.append(w.astype(np.float32))
 
     pair_i = torch.from_numpy(np.concatenate(all_i)).long()
     pair_j = torch.from_numpy(np.concatenate(all_j)).long()

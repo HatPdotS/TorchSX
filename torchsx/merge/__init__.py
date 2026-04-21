@@ -29,16 +29,14 @@ from torchsx.merge._corrections import (
     ScaleBCorrection,
     PanelCorrection,
 )
-from torchsx.merge._noise import PoissonNoiseModel, compute_sigma2_LN
+from torchsx.merge._noise import PoissonNoiseModel
 from torchsx.merge._em import EMConfig, fit_em
 from torchsx.merge._dstep import (
     DStepResult,
     QuadratureGrid,
     build_softplus_grid,
     d_step,
-    fit_I0_log,
-    fit_I0_newton,
-    fit_I0_poisson_log,
+    fit_I0_poisson,
     fit_alpha,
 )
 from torchsx.merge._distribution import (

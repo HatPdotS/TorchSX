@@ -1,9 +1,77 @@
-"""Rank concordance loss for partiality-free orientation refinement."""
+"""Losses for partiality-free orientation refinement."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn, Tensor
+
+
+class ExplainedVarianceLoss(nn.Module):
+    """Maximize variance of log-residuals explained by |r|.
+
+    For each HKL, computes weighted Corr²(|r|, e) via scatter ops,
+    where e = log(I/(I0·scale)) is fixed and |r| is differentiable
+    through the crystal orientations.
+
+    No partiality model is assumed — only that partiality correlates
+    with |r|.  Poisson-noise-aware weighting naturally downweights
+    noise-dominated weak observations.
+    """
+
+    def forward(
+        self,
+        abs_r: Tensor,
+        hkl_id: Tensor,
+        log_resid: Tensor,
+        weights: Tensor,
+        n_hkl: int,
+    ) -> Tensor:
+        """Compute negative mean R² across HKLs (minimise to maximise R²).
+
+        Parameters
+        ----------
+        abs_r : (N,) differentiable |excitation error|
+        hkl_id : (N,) int64 — HKL index per observation
+        log_resid : (N,) fixed log-residuals log(I/(I0·scale))
+        weights : (N,) 1/Var(log_resid), Poisson+GenGauss-aware
+        n_hkl : number of unique HKLs
+        """
+        dev = abs_r.device
+
+        # Per-HKL weighted means
+        sum_wr = torch.zeros(n_hkl, device=dev).scatter_add_(0, hkl_id, abs_r * weights)
+        sum_we = torch.zeros(n_hkl, device=dev).scatter_add_(0, hkl_id, log_resid * weights)
+        sum_w = torch.zeros(n_hkl, device=dev).scatter_add_(0, hkl_id, weights).clamp(min=1e-8)
+        mean_r = sum_wr / sum_w
+        mean_e = sum_we / sum_w
+
+        # Center observations
+        dr = abs_r - mean_r[hkl_id]
+        de = log_resid - mean_e[hkl_id]
+
+        # Per-HKL weighted covariance and variances
+        cov = torch.zeros(n_hkl, device=dev).scatter_add_(0, hkl_id, dr * de * weights) / sum_w
+        var_r = torch.zeros(n_hkl, device=dev).scatter_add_(0, hkl_id, dr ** 2 * weights) / sum_w
+        var_e = torch.zeros(n_hkl, device=dev).scatter_add_(0, hkl_id, de ** 2 * weights) / sum_w
+
+        # R² = Corr² = cov² / (var_r × var_e)
+        denom = (var_r * var_e).clamp(min=1e-12)
+        r_squared = cov ** 2 / denom
+
+        # Weighted mean R² (weight by total per-HKL weight)
+        return -(r_squared * sum_w).sum() / sum_w.sum()
+
+    def mean_r_squared(
+        self,
+        abs_r: Tensor,
+        hkl_id: Tensor,
+        log_resid: Tensor,
+        weights: Tensor,
+        n_hkl: int,
+    ) -> float:
+        """Non-differentiable diagnostic: weighted mean R² across HKLs."""
+        with torch.no_grad():
+            return -self.forward(abs_r, hkl_id, log_resid, weights, n_hkl).item()
 
 
 class RankConcordanceLoss(nn.Module):

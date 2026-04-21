@@ -34,7 +34,7 @@ from ._distribution import (
     _laplacian_smooth,
 )
 from ._dstep import d_step
-from ._noise import PoissonNoiseModel, compute_sigma2_LN
+from ._noise import PoissonNoiseModel
 
 
 # ── Configuration ─────────────────────────────────────────────
@@ -56,8 +56,6 @@ class EMConfig:
     lam_start: float = 0.6
     n_newton_start: int = 3
     n_newton_final: int = 10
-    # I₀ estimation method
-    i0_method: str = "poisson_log"  # "poisson_log" | "quadrature" | "newton" | "log"
     # Alpha regularization
     alpha_prior_lambda: float = 0.0  # >0 enables shell-level alpha; 0 = Laplacian (default)
 
@@ -100,6 +98,10 @@ class PreparedObs:
     # Per-obs background (for Poisson model)
     bg_all: Tensor | None       # (N_all,) or None
 
+    # External per-obs partiality (sorted order), or None
+    partiality_all: Tensor | None
+    partiality_pos: Tensor | None
+
     # ObsInfo for corrections (positive obs only)
     obs_info_pos: ObsInfo | None
     # ObsInfo for corrections mapped to ALL obs
@@ -111,6 +113,7 @@ def prepare_observations(
     config: EMConfig,
     poisson_noise: PoissonNoiseModel,
     corrections: Sequence[Correction] | None = None,
+    partiality: Tensor | None = None,
 ) -> PreparedObs:
     """Extract and sort observation arrays, compute initial estimates.
 
@@ -324,6 +327,13 @@ def prepare_observations(
             background=_chain_all("background").float() if core.background is not None else None,
         )
 
+    # ── Reindex external partiality to sorted order ──
+    partiality_all_sorted = None
+    partiality_pos_sorted = None
+    if partiality is not None:
+        partiality_all_sorted = partiality[obs_keep_all][sort_all]
+        partiality_pos_sorted = partiality[pos_mask][obs_keep_pos][sort_pos]
+
     return PreparedObs(
         hkl_valid=hkl_valid,
         d_spacing=d_spacing_all[valid_indices],
@@ -344,6 +354,8 @@ def prepare_observations(
         edge_dst=edge_dst,
         n_neighbors=n_neighbors,
         bg_all=bg_all,
+        partiality_all=partiality_all_sorted,
+        partiality_pos=partiality_pos_sorted,
         obs_info_pos=obs_info_pos,
         obs_info_all=obs_info_all,
     )
@@ -377,6 +389,7 @@ def fit_em(
     corrections: Sequence[Correction] | None = None,
     poisson_noise: PoissonNoiseModel | None = None,
     device: str | torch.device = "cpu",
+    partiality: Tensor | None = None,
 ) -> HKLDistribution:
     """Fit per-HKL distributions via EM with Poisson+LogNormal model.
 
@@ -387,6 +400,11 @@ def fit_em(
     corrections : list of Correction instances (e.g. ScaleBCorrection)
     poisson_noise : PoissonNoiseModel (created with defaults if None)
     device : "cpu" or "cuda" — all computation runs on this device
+    partiality : (N_obs,) tensor in stream order, optional.
+        Per-observation partiality scale factor (0 < p <= 1).
+        Multiplied into the model's scale: I_obs ~ Poisson(I0 * p * scale + bg).
+        This scales the distribution, not the observations, so Poisson
+        variance remains correct.
 
     Returns
     -------
@@ -398,7 +416,8 @@ def fit_em(
         poisson_noise = PoissonNoiseModel()
 
     # ── Prepare observations (on CPU), then move to device ──
-    prep = prepare_observations(stream, config, poisson_noise, corrections)
+    prep = prepare_observations(stream, config, poisson_noise, corrections,
+                                partiality=partiality)
     if str(device) != "cpu":
         prep = _prep_to_device(prep, device)
 
@@ -451,12 +470,21 @@ def fit_em(
         # ── D-step: fit I₀ (all obs), α (pos obs) ──
         # Apply corrections: I_corrected = I_obs / exp(correction)
         scale_all = torch.exp(correction_all)
+
+        # Include external partiality in the model scale.
+        # This scales the distribution: I_obs ~ Poisson(I0 * p * scale + bg),
+        # keeping Poisson variance correct (based on expected, not amplified count).
+        if prep.partiality_all is not None:
+            scale_all = scale_all * prep.partiality_all
+
         I_all_corrected = prep.I_all_sorted / scale_all.clamp(min=1e-8)
 
         # Positive corrected observations
         scale_pos = torch.exp(
             pipeline.predict(prep.obs_info_pos) if pipeline else torch.zeros_like(prep.I_pos_sorted)
         )
+        if prep.partiality_pos is not None:
+            scale_pos = scale_pos * prep.partiality_pos
         I_pos_corrected = prep.I_pos_sorted / scale_pos.clamp(min=1e-8)
 
         # Adjust Poisson variance for correction scale
@@ -480,12 +508,9 @@ def fit_em(
             n_neighbors=prep.n_neighbors,
             n_smooth_iter=n_smooth_now,
             smooth_lambda=lam_now,
-            i0_method=config.i0_method,
-            # Raw obs + scales for log / poisson_log methods
+            # Raw obs + scales for Poisson marginal
             I_obs_all=prep.I_all_sorted,
             scale_all=scale_all,
-            I_obs_pos=prep.I_pos_sorted,
-            scale_pos=scale_pos,
             bg=prep.bg_all if prep.bg_all is not None else 0.0,
             # Resolution-dependent alpha prior
             d_spacing=prep.d_spacing,
@@ -506,6 +531,29 @@ def fit_em(
                 f"med(α)={med_alpha:.4f} I₀=0: {n_zero}/{prep.n_valid}"
             )
 
+    # ── Truncation bias correction ──
+    # The quadrature grid floor biases I0 upward for weak reflections.
+    # Correct using the inverse Mills ratio of the truncated normal:
+    #   E[log(signal) | log(signal) > log(signal_lo)] = log(I0) + α·φ(z)/Φ_c(z)
+    # so the unbiased log(I0) = log(I0_raw) - α·φ(z)/Φ_c(z).
+    if prep.bg_all is not None:
+        bg_hkl = torch.zeros(prep.n_valid, device=I0.device)
+        bg_hkl.scatter_add_(0, prep.hkl_id_all, prep.bg_all.clamp(min=0))
+        bg_hkl = (bg_hkl / prep.obs_counts_all.float().clamp(min=1)).clamp(min=1.0)
+    else:
+        bg_hkl = torch.ones(prep.n_valid, device=I0.device)
+    sigma_floor = (bg_hkl / prep.obs_counts_all.float().clamp(min=1)).sqrt()
+    sig_lo_hkl = (sigma_floor * 0.5).clamp(min=0.01)
+
+    with torch.no_grad():
+        log_I0_raw = torch.log(I0.clamp(min=1e-8))
+        eps_min = torch.log(sig_lo_hkl.clamp(min=1e-8)) - log_I0_raw
+        z_min = eps_min / alpha
+        phi = torch.exp(-0.5 * z_min ** 2) * 0.3989422804014327  # 1/√(2π)
+        Phi_c = (0.5 * torch.erfc(z_min * 0.7071067811865476)).clamp(min=1e-8)
+        bias = alpha * phi / Phi_c
+        I0 = torch.exp(log_I0_raw - bias)
+
     # ── Final σ(I₀) ──
     sigma_I0_final = result.sigma_I0 if config.n_em_cycles > 0 else I0 * 0.1
     mu_final = torch.log(I0.clamp(min=1e-8))
@@ -524,142 +572,6 @@ def fit_em(
     )
 
 
-# ══════════════════════════════════════════════════════════════
-# Joint optimisation EM (mode="joint")
-# ══════════════════════════════════════════════════════════════
 
 
-@dataclass
-class JointConfig:
-    """Configuration for joint (I₀, α) optimisation with LBFGS."""
 
-    n_em_cycles: int = 5       # outer EM iterations (for S-step corrections)
-    reg_lambda: float = 0.5    # Laplacian regularisation (tighter prior on α smoothness)
-    n_quad: int = 21           # quadrature points
-    max_iter: int = 500        # LBFGS iterations (single call, converges internally)
-    warmup_iter: int = 0       # no warmup — joint from the start
-    min_obs: int = 20          # min observations per HKL
-    n_shells: int = 20         # resolution shells for β estimation
-    snr_thresh: float = 3.0    # SNR threshold for shell pooling
-    free_fraction: float = 0.1 # hold-out fraction for monitoring
-    device: str = "cpu"        # "cpu" or "cuda"
-
-
-def fit_joint_em(
-    stream,
-    *,
-    config: JointConfig | None = None,
-    corrections: Sequence[Correction] | None = None,
-    poisson_noise: PoissonNoiseModel | None = None,
-) -> HKLDistribution:
-    """Joint optimisation of (I₀, α) per HKL via LBFGS + Laplacian.
-
-    Outer EM loop alternates:
-      S-step: fit corrections in log-space (positive obs, work set)
-      D-step: joint LBFGS on [I₀, log α] with exact quadrature NLL
-
-    Parameters
-    ----------
-    stream : SFXStream
-    config : JointConfig (defaults applied if None)
-    corrections : list of Correction objects (for S-step)
-    poisson_noise : PoissonNoiseModel (gain=1.0 for calibrated detector)
-
-    Returns
-    -------
-    HKLDistribution
-    """
-    from ._dstep import fit_joint, DStepResult
-
-    if config is None:
-        config = JointConfig()
-    if poisson_noise is None:
-        poisson_noise = PoissonNoiseModel()
-
-    # ── Prepare observations (reuse existing infrastructure) ──
-    em_config = EMConfig(
-        n_em_cycles=config.n_em_cycles,
-        n_smooth_iter=15,  # not used in joint path
-        smooth_lambda=0.3,  # not used in joint path
-        min_obs=config.min_obs,
-        n_shells=config.n_shells,
-        snr_thresh=config.snr_thresh,
-        free_fraction=config.free_fraction,
-    )
-    # Force gain=1.0 (detector calibrated)
-    poisson_noise.gain = 1.0
-    print(f"  PoissonNoiseModel: gain=1.0 (detector calibrated)")
-
-    prep = prepare_observations(stream, em_config, poisson_noise, corrections)
-
-    # ── Initial parameters from log-space MLE ──
-    I0 = torch.exp(prep.mu_init).clamp(min=1e-6)
-    alpha = prep.alpha_init.clone()
-    beta = prep.beta_perhkl
-    n_valid = prep.n_valid
-
-    # ── Correction pipeline (for S-step) ──
-    pipeline = None
-    if corrections:
-        from ._corrections import CorrectionPipeline
-        pipeline = CorrectionPipeline(corrections)
-        pipeline.free_fraction = config.free_fraction
-        pipeline.init_masks(prep.log_I_pos_sorted.shape[0])
-
-    # ── Outer EM loop ──
-    for em_iter in range(config.n_em_cycles):
-        # ── S-step: fit corrections in log-space on positive obs ──
-        total_corr_pos = torch.zeros_like(prep.log_I_pos_sorted)
-        total_corr_all = torch.zeros(prep.I_all_sorted.shape[0])
-
-        if pipeline is not None:
-            log_I0 = torch.log(I0.clamp(min=1e-8))
-            mu_expanded_pos = log_I0.repeat_interleave(prep.obs_counts_pos)
-            residuals_pos = prep.log_I_pos_sorted - mu_expanded_pos
-            total_corr_pos = pipeline.fit_and_predict(
-                residuals_pos, prep.obs_info_pos
-            )
-            total_corr_all = pipeline.predict(prep.obs_info_all)
-
-        # ── Apply corrections to ALL obs ──
-        scale_all = torch.exp(total_corr_all)
-        I_corrected = prep.I_all_sorted / scale_all.clamp(min=1e-12)
-        sigma2_poi_corrected = prep.sigma2_poi_all / (scale_all ** 2).clamp(min=1e-12)
-
-        # ── D-step: joint LBFGS on (I₀, log α) ──
-        result = fit_joint(
-            I_corrected,
-            prep.hkl_id_all,
-            sigma2_poi_corrected,
-            alpha, beta, I0,
-            prep.obs_counts_all, n_valid,
-            prep.edge_src, prep.edge_dst,
-            reg_lambda=config.reg_lambda,
-            n_quad=config.n_quad,
-            max_iter=config.max_iter,
-            warmup_iter=config.warmup_iter if em_iter == 0 else 0,
-            device=config.device if hasattr(config, 'device') else "cpu",
-        )
-
-        I0 = result.I0
-        alpha = result.alpha
-        print(f"  EM {em_iter+1}/{config.n_em_cycles}: "
-              f"med(α)={alpha.median():.4f} "
-              f"I₀=0: {int((I0 < 1).sum())}/{n_valid}")
-
-    # ── Build final output ──
-    I0 = I0.clamp(min=0.0)  # enforce non-negativity on final output only
-    mu_final = torch.log(I0.clamp(min=1e-8))
-    sigma_mu = result.sigma_I0 / I0.clamp(min=1e-8)
-
-    return HKLDistribution(
-        hkl=prep.hkl_valid,
-        I0=I0,
-        alpha=alpha,
-        beta=beta,
-        mu=mu_final,
-        d_spacing=prep.d_spacing,
-        n_obs=prep.obs_counts_all,
-        sigma_mu=sigma_mu,
-        sigma_I0=result.sigma_I0,
-    )
