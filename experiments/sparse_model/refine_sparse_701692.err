@@ -1,0 +1,3 @@
+/das/work/units/LBR-FEL/p17490/Peter/torchsx/torchsx/scaling/_inputs.py:11: UserWarning: TorchRef auto-configured 10 threads. Set TORCHREF_NUM_THREADS to override.
+  from torchref.base.reciprocal.hkl import get_d_spacing
+[2026-03-11T15:18:33.516] error: *** JOB 701692 ON ra-gpu-002 CANCELLED AT 2026-03-11T15:18:33 DUE to SIGNAL Terminated ***

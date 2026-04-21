@@ -1,0 +1,4 @@
+/das/work/units/LBR-FEL/p17490/Peter/torchsx/torchsx/scaling/_inputs.py:11: UserWarning: TorchRef auto-configured 1 threads. Set TORCHREF_NUM_THREADS to override.
+  from torchref.base.reciprocal.hkl import get_d_spacing
+/var/spool/slurmd/job701690/slurm_script: line 10: 3275549 Killed                  .venv/bin/python sparse_model/refine_sparse.py
+[2026-03-11T14:36:40.534] error: Detected 1 oom_kill event in StepId=701690.batch. Some of the step tasks have been OOM Killed.

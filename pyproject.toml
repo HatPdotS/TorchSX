@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchsx"
+version = "0.1.0"
+description = "GPU-friendly stacked tensors for unmerged serial crystallography data"
+requires-python = ">=3.10"
+dependencies = [
+    "torchref>=0.4",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=6.0", "black>=21.5", "isort>=5.9"]
+
+[tool.setuptools.packages.find]
+include = ["torchsx*"]

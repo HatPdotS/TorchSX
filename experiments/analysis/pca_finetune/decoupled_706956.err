@@ -1,0 +1,7 @@
+/das/work/units/LBR-FEL/p17490/Peter/torchsx/torchsx/scaling/_inputs.py:11: UserWarning: TorchRef auto-configured 4 threads. Set TORCHREF_NUM_THREADS to override.
+  from torchref.base.reciprocal.hkl import get_d_spacing
+Traceback (most recent call last):
+  File "/das/work/units/LBR-FEL/p17490/Peter/torchsx/analysis/pca_finetune/decoupled_refine.py", line 312, in <module>
+    hkl_bin_id = torch.bucketize(d_star, d_star_bin_edges[1:-1])  # (n_unique,) in [0, N_BINS-1]
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected all tensors to be on the same device, but got boundaries is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA_Tensor_bucketize)
