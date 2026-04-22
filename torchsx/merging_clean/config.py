@@ -28,6 +28,17 @@ class MergeConfig:
     lam_alpha_anchor: float = 0.0
     lam_beta_anchor: float = 0.0
 
+    # Weak Gaussian prior on log I₀ centred at `log_I0_floor_target`.
+    # Designed so HKLs with no signal evidence (bg-anchor dominates) get
+    # pulled toward the target value ≈ 0 intensity, while strong HKLs keep
+    # their data MLE.  The transition is governed by MAP arithmetic:
+    #   log I₀_MAP  ≈  (F_data·log I_MLE + τ·log I_target) / (F_data + τ)
+    # with τ = lam_I0_floor and F_data ~ N_h.  With the default τ=0.01 the
+    # prior loses to the data when N_h ≥ ~100; pure-bg HKLs (F_data≈0) go to
+    # the target.  Off by default — opt-in via a positive λ.
+    lam_I0_floor: float = 0.1
+    log_I0_floor_target: float = -11.5   # log(10⁻⁵): "zero" intensity
+
     # Half-Cauchy prior on the GenGauss distribution width σ = α · c(β), where
     # c(β) = √(Γ(3/β) / Γ(1/β)).  This is a proper shrinkage prior: mode at 0,
     # log-tails, invariant under α ↔ β trade-offs.  Answers the question "do
@@ -72,5 +83,10 @@ class MergeConfig:
     #   float → constant across all observations
     sig_lo_override: float | None = 1e-4
 
-    # Truncation-bias correction
-    apply_bias_correction: bool = True
+    # Truncation-bias correction (Mills ratio).  Made redundant by
+    #   (a) sig_lo_override = 1e-4 (grid captures integrand support)
+    #   (b) the bg-anchor in data_nll (genuinely-dark HKLs are handled by the
+    #       background hypothesis instead of being pulled down post-hoc).
+    # Defaults to False; flip to True to re-enable the Gaussian-tail Mills
+    # correction for datasets where those two assumptions don't hold.
+    apply_bias_correction: bool = False

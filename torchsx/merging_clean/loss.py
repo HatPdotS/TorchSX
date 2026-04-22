@@ -82,6 +82,8 @@ class UnifiedMergeLoss(nn.Module):
         # ── Non-parameter tensors (buffers) ──
         # Observation arrays (for chunked indexing)
         self.register_buffer("hkl_id", prep.hkl_id)                    # (N,)
+        self.register_buffer("I_obs", prep.I_obs)                      # (N,)  for bg-anchor
+        self.register_buffer("bg", prep.bg)                            # (N,)  for bg-anchor
         # Quadrature grid
         self.register_buffer("signal", prep.grid.signal)               # (N, K)
         self.register_buffer("log_poi_plus_jac", prep.grid.log_poi_plus_jac)  # (N, K)
@@ -182,8 +184,25 @@ class UnifiedMergeLoss(nn.Module):
             - log_alpha[:, None]
         )
 
-        log_integrand = log_gg + log_poi_plus_jac
-        log_p = torch.logsumexp(log_integrand, dim=1)  # (M,)
+        log_integrand = log_gg + log_poi_plus_jac      # (M, K)
+
+        # Background anchor: "this observation is pure bg" — appended as a
+        # (K+1)th column.  log Poisson(n_peak | bg) with n_peak = I_obs + bg.
+        # For observations that look indistinguishable from Poisson(bg), this
+        # anchor dominates the logsumexp and signal-side gradients shrink
+        # proportionally to P(H_sig | obs).
+        n_peak_slice = (self.I_obs[s:e] + self.bg[s:e]).clamp(min=0)
+        bg_slice = self.bg[s:e].clamp(min=1e-12)
+        log_p_bg = (
+            n_peak_slice * torch.log(bg_slice)
+            - bg_slice
+            - torch.lgamma(n_peak_slice + 1)
+        )
+        log_integrand_ext = torch.cat(
+            [log_integrand, log_p_bg.unsqueeze(1)], dim=1
+        )                                              # (M, K+1)
+
+        log_p = torch.logsumexp(log_integrand_ext, dim=1)  # (M,)
         return -log_p.sum()
 
     def regularizers_only(self) -> Tensor:
@@ -208,6 +227,12 @@ class UnifiedMergeLoss(nn.Module):
         if cfg.lam_beta_anchor > 0:
             db = self.log_beta - self.log_beta_init
             reg = reg + s * cfg.lam_beta_anchor * (db * db).sum()
+        # Weak "zero-intensity floor" prior on log I₀:
+        # pull HKLs with no evidence toward log I_target; data wins for
+        # well-measured HKLs because F_data >> lam_I0_floor for those.
+        if cfg.lam_I0_floor > 0:
+            di = self.log_I0 - float(cfg.log_I0_floor_target)
+            reg = reg + s * cfg.lam_I0_floor * (di * di).sum()
         # Half-Cauchy prior on GenGauss width σ = α · c(β).
         # Width-invariant under α↔β trades.
         if cfg.lam_sigma_cauchy > 0:
