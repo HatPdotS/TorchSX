@@ -20,7 +20,7 @@ from torchsx.merge._noise import PoissonNoiseModel
 from torchsx.merging_clean.adjacency import Adjacency, build_adjacency
 from torchsx.merging_clean.config import MergeConfig
 from torchsx.merging_clean.corrections import ObsInfo
-from torchsx.merging_clean.quadrature import QuadratureGrid, build_softplus_grid
+from torchsx.merging_clean.quadrature import QuadratureGrid  # noqa: F401  — re-exported
 
 
 @dataclass
@@ -44,9 +44,6 @@ class PreparedObs:
     alpha_init: Tensor       # (n_valid,)
     beta_perhkl: Tensor      # (n_valid,)
 
-    # Quadrature grid (already built)
-    grid: QuadratureGrid
-
     # Adjacency graph over valid HKLs
     adjacency: Adjacency
 
@@ -69,7 +66,6 @@ class PreparedObs:
             mu_init=self.mu_init.to(device),
             alpha_init=self.alpha_init.to(device),
             beta_perhkl=self.beta_perhkl.to(device),
-            grid=self.grid.to(device),
             adjacency=self.adjacency.to(device),
             obs_info=self.obs_info.to(device),
             partiality=None if self.partiality is None else self.partiality.to(device),
@@ -270,13 +266,11 @@ def prepare_observations(
             sig_lo_hkl = (sigma_floor * 0.5).clamp(min=0.01)
             sig_lo_per_obs = sig_lo_hkl[hkl_id]
 
-    grid = build_softplus_grid(
-        n_ph,
-        bg,
-        n_quad=config.n_quad,
-        n_sigma=config.n_sigma_quad,
-        signal_lo_override=sig_lo_per_obs,
-    )
+    # Quadrature grid is built per-chunk inside UnifiedMergeLoss.data_nll so
+    # we don't store a global (N_obs × n_quad) tensor that would otherwise
+    # dominate GPU memory at large N.  The loss uses sig_lo_per_obs, n_ph,
+    # and bg (all O(N_obs)) to rebuild grids on demand.
+    del sig_lo_per_obs  # not stored; loss recomputes sig_lo identically
 
     # ── External partiality (sorted to match) ──
     partiality_sorted = None
@@ -295,7 +289,6 @@ def prepare_observations(
         mu_init=mu_init,
         alpha_init=alpha_init,
         beta_perhkl=beta_perhkl,
-        grid=grid,
         adjacency=adjacency,
         obs_info=obs_info,
         partiality=partiality_sorted,

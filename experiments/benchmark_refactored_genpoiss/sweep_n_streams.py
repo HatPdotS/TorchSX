@@ -66,18 +66,12 @@ def fit_streams(names: list[str], max_iter: int) -> dict:
     s = SFXStream.concat(streams) if len(streams) > 1 else streams[0]
     t_load = time.perf_counter() - t0
 
-    # Memory scaling: quadrature buffers are O(N_obs · n_quad).  Drop n_quad
-    # and chunk size for large datasets so the 40 GB A100 stays within budget.
+    # Quadrature is now built per-chunk inside the loss (no persistent (N,K)
+    # buffer), so memory scales with chunk_size not N_obs.  Keep n_quad=51
+    # everywhere and scale chunk down only modestly for the biggest datasets
+    # to keep autograd intermediates within the 40 GB A100 budget.
     n_obs_est = sum(int(Path(STREAM_DIR / f"{nm}.sfx").stat().st_size / 50) for nm in names)
-    if n_obs_est > 40_000_000:
-        n_quad = 21
-        chunk = 200_000
-    elif n_obs_est > 10_000_000:
-        n_quad = 31
-        chunk = 300_000
-    else:
-        n_quad = 51
-        chunk = 1_000_000
+    chunk = 500_000 if n_obs_est > 40_000_000 else 1_000_000
 
     cfg = MergeConfig(
         min_obs=5,
@@ -87,12 +81,13 @@ def fit_streams(names: list[str], max_iter: int) -> dict:
         lam_beta_anchor=0.0,
         lam_sigma_cauchy=0.0,
         sig_lo_override=1e-4,
+        n_outer_iters=5,       # up to 5 × max_iter LBFGS iterations with early stop
         max_iter=max_iter,
         history_size=10,
         obs_chunk_size=chunk,
-        n_quad=n_quad,
+        n_quad=51,
     )
-    print(f"    (memory: n_quad={n_quad}, chunk={chunk})", flush=True)
+    print(f"    (memory: n_quad=51, chunk={chunk})", flush=True)
     t1 = time.perf_counter()
     merger = Merger(s, config=cfg, corrections=[ScaleBCorrection], device=device)
     result = merger.merge()
@@ -122,7 +117,9 @@ def fit_streams(names: list[str], max_iter: int) -> dict:
         std_logI0=log_I0.std().item(),
         # Convergence
         n_closure_calls=result.diagnostics.get("n_closure_calls"),
+        initial_max_grad=result.diagnostics.get("initial_max_grad"),
         max_grad=result.diagnostics.get("max_grad"),
+        grad_reduction=result.diagnostics.get("grad_reduction"),
         final_data_nll=result.diagnostics.get("final_data_nll"),
         final_reg=result.diagnostics.get("final_reg"),
     )
@@ -165,7 +162,8 @@ for n in N_SIZES:
     )
     print(
         f"    LBFGS: n_closure={row['n_closure_calls']}  "
-        f"max|grad|={row['max_grad']:.2e}  "
+        f"|grad|₀={row['initial_max_grad']:.2e} → |grad|={row['max_grad']:.2e}  "
+        f"(reduction ×{row['grad_reduction']:.1f})  "
         f"data_nll={row['final_data_nll']:.3e}",
         flush=True,
     )

@@ -195,6 +195,7 @@ def _run_loss_on_synth(synth, *, chunk_size=0, n_lbfgs_steps=40):
         n_crystals=synth["n_crystals"],
     )
 
+    del grid  # loss rebuilds quadrature per-chunk now
     prep = PreparedObs(
         hkl_valid=hkl_valid,
         d_spacing=torch.linspace(2.0, 10.0, n_hkl),
@@ -207,7 +208,6 @@ def _run_loss_on_synth(synth, *, chunk_size=0, n_lbfgs_steps=40):
         mu_init=torch.full((n_hkl,), math.log(50.0)),
         alpha_init=torch.full((n_hkl,), 0.5),
         beta_perhkl=torch.full((n_hkl,), 1.5),
-        grid=grid,
         adjacency=adj,
         obs_info=obs_info,
         partiality=None,

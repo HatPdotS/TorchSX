@@ -162,10 +162,47 @@ class Merger:
             n_calls["n"] += 1
             return total
 
-        final_loss = opt.step(closure)
+        # Initial gradient — baseline for "how far did LBFGS actually move".
+        # Comparing final/initial gradient is a much better convergence
+        # diagnostic than an absolute gradient norm alone.
+        opt.zero_grad(set_to_none=False)
+        for s, e in loss.obs_chunks(cfg.obs_chunk_size):
+            loss.data_nll(s, e).backward()
+        loss.regularizers_only().backward()
+        initial_max_grad = max(
+            (p.grad.detach().abs().max().item()
+             for p in loss.parameters() if p.grad is not None),
+            default=0.0,
+        )
+
+        # Outer loop: LBFGS state (history) persists across step() calls,
+        # so each call continues refining from the current parameters.
+        # Early-stop when gradient is small enough.
+        final_loss = None
+        grad_history: list[float] = []
+        for outer in range(max(1, cfg.n_outer_iters)):
+            final_loss = opt.step(closure)
+            with torch.no_grad():
+                rnd_max_grad = max(
+                    (p.grad.detach().abs().max().item()
+                     for p in loss.parameters() if p.grad is not None),
+                    default=0.0,
+                )
+            grad_history.append(rnd_max_grad)
+            if cfg.n_outer_iters > 1:
+                print(
+                    f"    LBFGS outer {outer+1}/{cfg.n_outer_iters}: "
+                    f"max|grad|={rnd_max_grad:.3e}",
+                    flush=True,
+                )
+            if rnd_max_grad < cfg.tolerance_grad:
+                break
         with torch.no_grad():
             reg_final = loss.regularizers_only()
-            data_final = loss.data_nll(0, loss.n_obs_total)
+            # Chunked data-NLL sum so we never allocate (N_obs, K) at once.
+            data_final = torch.zeros((), device=dev)
+            for s, e in loss.obs_chunks(cfg.obs_chunk_size):
+                data_final = data_final + loss.data_nll(s, e)
             # Max gradient norm across parameters — useful for convergence check
             max_grad = 0.0
             for p in loss.parameters():
@@ -178,7 +215,11 @@ class Merger:
             final_data_nll=float(data_final),
             final_reg=float(reg_final),
             n_closure_calls=n_calls["n"],
+            initial_max_grad=initial_max_grad,
             max_grad=max_grad,
+            grad_reduction=initial_max_grad / max(max_grad, 1e-30),
+            grad_history=grad_history,
+            n_outer_iters_used=len(grad_history),
             max_iter=cfg.max_iter,
             tolerance_grad=cfg.tolerance_grad,
         )

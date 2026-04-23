@@ -40,7 +40,12 @@ class MergeConfig:
     lam_sigma_cauchy: float = 0.0
     sigma_cauchy_scale: float = 1.0
 
-    # LBFGS
+    # LBFGS — outer loop runs up to `n_outer_iters` calls of `opt.step()`,
+    # each of which runs up to `max_iter` internal LBFGS iterations using
+    # persisted history.  Early-stops if max|grad| falls below
+    # `tolerance_grad` between rounds.  Use this to "do more steps" without
+    # a single giant step() call, and to get round-by-round diagnostics.
+    n_outer_iters: int = 1
     max_iter: int = 200
     history_size: int = 10
     tolerance_grad: float = 1e-6

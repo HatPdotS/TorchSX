@@ -43,7 +43,7 @@ from torchsx.merging_clean.adjacency import Adjacency, dirichlet_energy
 from torchsx.merging_clean.config import MergeConfig
 from torchsx.merging_clean.corrections import Correction, ObsInfo
 from torchsx.merging_clean.observations import PreparedObs
-from torchsx.merging_clean.quadrature import QuadratureGrid
+from torchsx.merging_clean.quadrature import QuadratureGrid, build_softplus_grid
 
 
 def _log_gg_norm(beta: Tensor) -> Tensor:
@@ -82,9 +82,26 @@ class UnifiedMergeLoss(nn.Module):
         # ── Non-parameter tensors (buffers) ──
         # Observation arrays (for chunked indexing)
         self.register_buffer("hkl_id", prep.hkl_id)                    # (N,)
-        # Quadrature grid
-        self.register_buffer("signal", prep.grid.signal)               # (N, K)
-        self.register_buffer("log_poi_plus_jac", prep.grid.log_poi_plus_jac)  # (N, K)
+        # Quadrature inputs: store the minimal info to rebuild the grid
+        # per-chunk rather than a full (N, K) tensor.  Avoids O(N·K)
+        # persistent buffers that otherwise dominate GPU memory at scale.
+        self.register_buffer("_n_ph", (prep.I_obs + prep.bg).clamp(min=0))  # (N,)
+        self.register_buffer("_bg", prep.bg)                               # (N,)
+        # Per-obs signal lower bound (rebuild same floor as observations.py)
+        with torch.no_grad():
+            if config.sig_lo_override is not None:
+                sig_lo_per_obs = torch.full_like(prep.I_obs, float(config.sig_lo_override))
+            else:
+                bg_sum = torch.zeros(prep.n_valid).scatter_add_(
+                    0, prep.hkl_id.cpu(), prep.bg.cpu().clamp(min=0))
+                bg_per_hkl = (bg_sum / prep.obs_counts.float().cpu().clamp(min=1)).clamp(min=1.0)
+                sigma_floor = (bg_per_hkl / prep.obs_counts.float().cpu().clamp(min=1)).sqrt()
+                sig_lo_hkl = (sigma_floor * 0.5).clamp(min=0.01)
+                sig_lo_per_obs = sig_lo_hkl[prep.hkl_id.cpu()]
+        self.register_buffer("_sig_lo", sig_lo_per_obs)                    # (N,)
+        # Cache scalar quadrature config
+        self._n_quad = int(config.n_quad)
+        self._n_sigma_quad = float(config.n_sigma_quad)
         # Adjacency
         self.register_buffer("edge_src", prep.adjacency.edge_src)
         self.register_buffer("edge_dst", prep.adjacency.edge_dst)
@@ -144,7 +161,7 @@ class UnifiedMergeLoss(nn.Module):
     def _total_correction(self, obs_info: ObsInfo, obs_range: tuple[int, int]) -> Tensor:
         s, e = obs_range
         if len(self.corrections) == 0:
-            return torch.zeros(e - s, device=self.signal.device, dtype=self.signal.dtype)
+            return torch.zeros(e - s, device=self._n_ph.device, dtype=self._n_ph.dtype)
         total = None
         for c in self.corrections:
             part = c(obs_info, obs_range=obs_range)
@@ -167,9 +184,17 @@ class UnifiedMergeLoss(nn.Module):
         beta = torch.exp(log_beta)
         alpha = torch.exp(log_alpha)
 
-        # ε_jk = log(signal_jk) − log(I0) − log(scale)
-        signal = self.signal[s:e]               # (M, K)
-        log_poi_plus_jac = self.log_poi_plus_jac[s:e]  # (M, K)
+        # Build the softplus quadrature grid for THIS chunk only — avoids
+        # persistent (N, K) buffers that otherwise dominate GPU memory.
+        grid = build_softplus_grid(
+            self._n_ph[s:e],
+            self._bg[s:e],
+            n_quad=self._n_quad,
+            n_sigma=self._n_sigma_quad,
+            signal_lo_override=self._sig_lo[s:e],
+        )
+        signal = grid.signal                    # (M, K)
+        log_poi_plus_jac = grid.log_poi_plus_jac  # (M, K)
         log_signal = torch.log(signal.clamp(min=1e-12))
         eps = log_signal - (log_I0[:, None] + log_scale[:, None])
 
