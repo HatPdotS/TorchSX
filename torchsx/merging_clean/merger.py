@@ -19,6 +19,34 @@ from torchsx.merging_clean.observations import PreparedObs, prepare_observations
 from torchsx.merging_clean.result import MergedResult
 
 
+def _q_moments(
+    alpha: Tensor, beta: Tensor, *, n_grid: int = 201, u_max: float = 10.0
+) -> tuple[Tensor, Tensor]:
+    """E[q] and Var[q] for q = exp(ε), ε ~ GenGauss(0, α, β), per HKL.
+
+    Evaluated by numerical integration over standardised u = ε/α with a
+    uniform grid on [-u_max, u_max].  With α ≈ 1.5, β ≈ 2, the true Var[q]
+    is roughly 5× larger than the linear approximation α²·c(β)² — so using
+    the correct moments matters quantitatively for σ(I_h) at bright HKLs.
+
+    Shapes: alpha, beta (n_HKL,).  Returns (E[q], Var[q]), both (n_HKL,).
+    """
+    device = alpha.device
+    u = torch.linspace(-u_max, u_max, n_grid, device=device)
+    du = (2.0 * u_max) / (n_grid - 1)
+    # log density (standardised GenGauss): log β − log 2 − lgamma(1/β) − |u|^β
+    log_norm = torch.log(beta) - math.log(2.0) - torch.lgamma(1.0 / beta)   # (n_HKL,)
+    abs_u_pow_beta = u.abs().unsqueeze(0).pow(beta.unsqueeze(1))            # (n_HKL, K)
+    log_p = log_norm.unsqueeze(1) - abs_u_pow_beta                          # (n_HKL, K)
+    p = log_p.exp()                                                         # density in u
+    # q = exp(ε) = exp(α·u)
+    q = torch.exp(alpha.unsqueeze(1) * u.unsqueeze(0))                      # (n_HKL, K)
+    E_q = (q * p).sum(dim=1) * du                                            # (n_HKL,)
+    E_q2 = (q * q * p).sum(dim=1) * du
+    Var_q = (E_q2 - E_q * E_q).clamp(min=0.0)
+    return E_q, Var_q
+
+
 class Merger:
     """Merge unmerged SFX observations with a single joint LBFGS minimization.
 
@@ -227,14 +255,51 @@ class Merger:
     def _package_result(self) -> MergedResult:
         loss = self.loss
         prep = self.prep
+        cfg = self.config
+
+        # ── Hessian-diagonal σ(log_I0) from data NLL + regularizers ──
+        # Data NLL's Hessian w.r.t. log_I0 is diagonal (log p_j only depends
+        # on log_I0[h_j]), so H·1 = diag(H).  Compute per chunk to keep the
+        # autograd graph small.  Regularizer Hessian on log_I0 is diagonal
+        # with entries 2·λ_floor·s (from the weak floor prior).  Dirichlet
+        # smoothing on log_I0 couples neighbours but is off by default.
+        # σ(I_h) = σ(log_I₀_h) · I_h_MAP   (delta method).
+        H_diag = torch.zeros_like(loss.log_I0)
+        for s, e in loss.obs_chunks(cfg.obs_chunk_size):
+            nll = loss.data_nll(s, e)
+            grad_logI0 = torch.autograd.grad(nll, loss.log_I0, create_graph=True)[0]
+            H_chunk = torch.autograd.grad(
+                grad_logI0, loss.log_I0,
+                grad_outputs=torch.ones_like(loss.log_I0),
+                retain_graph=False,
+            )[0]
+            H_diag = H_diag + H_chunk.detach()
+
+        # Regularizer diagonal contribution (only floor prior touches log_I0
+        # with a diagonal term; smoothing on log_I0 would add off-diagonal
+        # but is disabled by default).
+        reg_scale = float(prep.n_obs_total) / float(cfg.reg_scale_ref_obs)
+        if cfg.lam_I0_floor > 0:
+            H_diag = H_diag + 2.0 * cfg.lam_I0_floor * reg_scale
+        if cfg.lam_I0_smooth > 0:
+            # Dirichlet on log_I0 contributes 2·λ_smooth·(deg + 1) approx
+            # to each diagonal (deg = neighbour count).  Coarse; off by default.
+            H_diag = (
+                H_diag
+                + 2.0 * cfg.lam_I0_smooth * reg_scale
+                * loss.edge_src.bincount(minlength=loss.n_valid).float().clamp(min=0)
+            )
 
         with torch.no_grad():
             I0 = torch.exp(loss.log_I0)
             alpha = torch.exp(loss.log_alpha)
             beta = torch.exp(loss.log_beta)
 
-            # ── Empirical σ(I0) from residuals of (I_obs − I0·scale) ──
-            # Rebuild log_scale on all observations
+            sigma_logI0 = (1.0 / H_diag.clamp(min=1e-6)).sqrt()
+            sigma_I0 = sigma_logI0 * I0
+
+            # Rebuild log_scale on all observations (used for diagnostics below
+            # and for bias correction if enabled).
             log_scale = torch.zeros(prep.n_obs_total, device=self.device)
             for c in loss.corrections:
                 log_scale = log_scale + c(loss._obs_info_slice(0, prep.n_obs_total),
@@ -242,14 +307,6 @@ class Merger:
             if loss.has_partiality:
                 log_scale = log_scale + torch.log(loss.partiality.clamp(min=1e-12))
             scale = torch.exp(log_scale)
-
-            I0_po = I0[loss.hkl_id]
-            resid_sq = (prep.I_obs - I0_po * scale) ** 2
-            sum_resid_sq = torch.zeros(prep.n_valid, device=self.device).scatter_add_(
-                0, loss.hkl_id, resid_sq
-            )
-            n = prep.obs_counts.float()
-            sigma_I0 = (sum_resid_sq / (n * (n - 1).clamp(min=1))).clamp(min=1e-12).sqrt()
 
             # ── Truncation-bias correction (port from fit_em) ──
             if self.config.apply_bias_correction:
