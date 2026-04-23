@@ -31,7 +31,7 @@ from torchsx.merging_clean import Merger, MergeConfig, ScaleBCorrection as NewSc
 # ── Configuration ────────────────────────────────────────────
 STREAM_DIR = Path("/das/work/units/LBR-FEL/p17490/Peter/torchsx/experiments/sfx_scan/streams")
 PART_DIR = Path("/das/work/units/LBR-FEL/p17490/Peter/torchsx/experiments/sfx_scan/partialator")
-OUTDIR = Path("/das/work/units/LBR-FEL/p17490/Peter/torchsx/experiments/benchmark_refactored_genpoiss")
+OUTDIR = Path(__file__).parent
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 # Same 3 streams the user asked for
@@ -73,6 +73,8 @@ def save_result(result, path: Path) -> None:
             "beta": result.beta,
             "d_spacing": result.d_spacing,
             "n_obs": result.n_obs,
+            "sigma_I0": result.sigma_I0,
+            "sigma_mu": result.sigma_mu,
         }, path)
     else:
         torch.save(result, path)
