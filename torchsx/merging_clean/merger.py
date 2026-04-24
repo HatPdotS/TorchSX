@@ -328,6 +328,12 @@ class Merger:
             mu = torch.log(I0.clamp(min=1e-8))
             sigma_mu = sigma_I0 / I0.clamp(min=1e-8)
 
+        # Learned per-HKL bg probability (diagnostic).  In non-per_hkl modes
+        # this is a buffer of zeros and σ(0) = 0.5 is returned for reference.
+        pi_bg = torch.sigmoid(loss.pi_logit).detach().cpu()
+        diag = dict(self.diagnostics)
+        diag["pi_bg"] = pi_bg
+        diag["bg_mode"] = loss.bg_mode
         return MergedResult(
             hkl=prep.hkl_valid.cpu(),
             I0=I0.cpu(),
@@ -338,5 +344,5 @@ class Merger:
             n_obs=prep.obs_counts.cpu(),
             sigma_I0=sigma_I0.cpu(),
             sigma_mu=sigma_mu.cpu(),
-            diagnostics=dict(self.diagnostics),
+            diagnostics=diag,
         )

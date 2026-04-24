@@ -98,24 +98,47 @@ class PoissonNoiseModel:
         return self.gain ** 2 * self.sigma2_raw(I_obs, background)
 
     def calibrate_gain(self, I_obs: Tensor, background: Tensor) -> float:
-        """Calibrate gain from negative observations.
+        """Mandel gain calibration from background-limited (negative) peaks.
 
-        For negative I_obs, the signal is zero and I_obs ≈ η (pure noise).
-        So <I_neg²> ≈ g² · <σ²_poisson_pred> → g = √(<I²>/<σ²_pred>).
+        Derivation for a peak window where the true signal is zero (bg-only):
+
+          n_photon_peak_sum ~ Poisson(n_peak · λ_bg_photon)
+          bg_hat_photon     = (1/n_bg) Σ_bg n_j  → Var = λ_bg_photon / n_bg
+          I_obs_photon      = n_photon_peak_sum − n_peak · bg_hat_photon
+          Var[I_obs_photon] = n_peak · λ_bg_photon · (1 + n_peak/n_bg)
+
+        Convert to ADU (with gain g ≡ ADU/photon):
+
+          I_obs_ADU         = g · I_obs_photon       (so E[I_obs_ADU] ≈ 0)
+          Var[I_obs_ADU]    = g² · Var[I_obs_photon]
+                            = g · n_peak · bg_ADU_per_px · (1 + n_peak/n_bg)
+
+        (the last step uses bg_ADU_per_px = g · λ_bg_photon, by definition of g).
+        Conditioning on I_obs < 0 (symmetric noise around 0) gives
+        ⟨I²_neg⟩ = Var[I_obs_ADU], so
+
+          g = ⟨I²_neg⟩ / ⟨n_peak · bg_ADU_per_px · (1 + n_peak/n_bg)⟩.
+
+        Unlike the old implementation this (1) returns `g` not `√g`, and
+        (2) does not include the signal term in the denominator — signal is
+        zero for the bg-only observations we're fitting to.
         """
         neg = I_obs < 0
-        n_neg = neg.sum().item()
+        n_neg = int(neg.sum().item())
         if n_neg < 100:
             print(f"  PoissonNoiseModel: only {n_neg} negative obs, "
                   f"keeping gain={self.gain:.3f}")
             return self.gain
 
-        sigma2_pred = self.sigma2_raw(I_obs[neg], background[neg])
-        sigma2_obs = (I_obs[neg] ** 2).mean()
-        g = (sigma2_obs / sigma2_pred.mean()).sqrt().item()
+        bg_neg = background[neg].clamp(min=0)
+        sigma2_pred_ADU = bg_neg * self.n_peak * (1.0 + self.n_peak / self.n_bg)
+        var_ADU = (I_obs[neg] ** 2).mean()
+        denom = sigma2_pred_ADU.mean().clamp(min=1e-12)
+        g = (var_ADU / denom).item()
         self.gain = g
-        print(f"  PoissonNoiseModel: gain={g:.4f} (g²={g**2:.4f}) "
-              f"from {n_neg} negatives")
+        print(f"  PoissonNoiseModel: gain={g:.4f} ADU/photon "
+              f"[n_peak={self.n_peak:.2f}, n_bg={self.n_bg:.2f}, "
+              f"{n_neg} negatives]")
         return g
 
 

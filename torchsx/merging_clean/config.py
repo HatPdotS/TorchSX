@@ -95,3 +95,59 @@ class MergeConfig:
     # Defaults to False; flip to True to re-enable the Gaussian-tail Mills
     # correction for datasets where those two assumptions don't hold.
     apply_bias_correction: bool = False
+
+    # Background-hypothesis mixing.  Three modes:
+    #   "off"     — no bg term; pure GenGauss+Poisson signal likelihood.
+    #   "global"  — append log Poisson(n|bg) as a (K+1)th logsumexp term;
+    #               implicit 50/50 mixture per observation (fixed).
+    #   "per_hkl" — learn a per-HKL Bernoulli weight π_h ∈ [0, 1]:
+    #               p(obs) = (1−π_h)·p_sig_marginal + π_h·p_bg.
+    #               Dark HKLs commit π_h → 1 and their data gradient on I₀
+    #               vanishes, so the floor prior (or just gradient-zero) can
+    #               place I₀ at 0 cleanly.  Bright HKLs commit π_h → 0 and
+    #               the GenGauss scatter model is unperturbed.
+    bg_mode: str = "global"
+
+    # Beta(a, b) prior on π_h when bg_mode = "per_hkl".  Choose a < b to bias
+    # toward signal (most HKLs really do have signal); a > b biases toward
+    # dark.  Strength scales with lam_pi_beta (set to 0 for uniform prior).
+    pi_beta_a: float = 1.0
+    pi_beta_b: float = 2.0
+    lam_pi_beta: float = 1.0
+
+    # French–Wilson log-prior on I₀ (per-shell, gradient-flowing ⟨I⟩).
+    #   acentric:  -log p = I/Σ + log Σ
+    #   centric:   -log p = I/(2Σ) + 0.5·log(I/Σ) + 0.5·log Σ
+    # Σ = ⟨I⟩_shell is recomputed each forward pass from exp(log_I0) via
+    # scatter_add over `shell_id_fw` (no detach — with O(n_HKL_per_shell)
+    # ≫ 1 the self-coupling is negligible and the prior behaves as EM).
+    # Shell-calibrated shrinkage replaces the coarse `lam_I0_floor`
+    # Gaussian pull. Off by default; opt-in via a positive λ.
+    lam_frac_wilson: float = 0.0
+    fw_n_shells: int = 20
+    fw_eps: float = 1e-6
+
+    # Wilson **distribution-match** prior — KL between the empirical Gaussian
+    # fit of log(I/Σ) and the Wilson-target (mean, var), per shell × centricity
+    # group. Preserves the *shape* of the Wilson distribution (wide spread,
+    # exponential decay) rather than shrinking all HKLs toward the mode.
+    #   lam_wilson_match = 0      → disabled (default)
+    #   lam_wilson_match ~ 1e-3   → soft shape-matching (recommended starting point)
+    #   lam_wilson_match ~ 1e-1   → stronger; comparable to per-HKL MAP prior
+    # Groups with fewer than `wilson_match_min_count` HKLs are skipped (bad
+    # empirical-moment estimates).
+    lam_wilson_match: float = 0.0
+    wilson_match_min_count: int = 20
+
+    # Detector gain (ADU per photon).  The Poisson likelihood assumes the
+    # intensities fed to the loss are photon counts, not ADU; with an
+    # integrating detector at protein wavelengths this is ~30–400 ADU/photon.
+    # Treating ADU as photons underestimates shot noise by a factor of `gain`,
+    # which biases α/β and I₀.
+    #   "stream"  → read `adu_per_eV` from the geometry header and multiply
+    #               by each image's `photon_energy_eV`.  Most robust default.
+    #   "empirical" → empirical Mandel calibration on the negatives
+    #               (`PoissonNoiseModel.calibrate_gain`).  Requires enough
+    #               negative background-subtracted observations.
+    #   float    → explicit gain value (ADU/photon), e.g. 330.0.
+    gain: str | float = "stream"

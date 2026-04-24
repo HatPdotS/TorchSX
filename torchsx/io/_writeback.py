@@ -97,6 +97,34 @@ def write_stream_reconstruct(
         for i in range(max_pid)
     ]
 
+    # Crystallographic constants (parsed from the unit-cell section of the
+    # original stream, if present).  Partialator's xsphere model crashes
+    # (assertion `kmax > kmin` in do_integral) when these are missing, so we
+    # inject them into every reconstructed crystal record.
+    lattice_type = None
+    centering = None
+    unique_axis = None
+    if original_stream and Path(str(original_stream)).exists():
+        with open(str(original_stream), "r") as orig:
+            in_cell = False
+            for line in orig:
+                if line.startswith("----- Begin unit cell"):
+                    in_cell = True
+                    continue
+                if not in_cell:
+                    continue
+                if line.startswith("----- End unit cell"):
+                    break
+                if line.startswith("lattice_type"):
+                    lattice_type = line.split("=", 1)[1].strip()
+                elif line.startswith("centering"):
+                    centering = line.split("=", 1)[1].strip()
+                elif line.startswith("unique_axis"):
+                    unique_axis = line.split("=", 1)[1].strip()
+
+    det_shift_x_np = core.det_shift_x.cpu().numpy()
+    det_shift_y_np = core.det_shift_y.cpu().numpy()
+
     with open(path, "w") as f:
         # Header
         f.write("CrystFEL stream format 2.3\n")
@@ -120,12 +148,20 @@ def write_stream_reconstruct(
             f.write(f"Event: {event}\n")
             f.write(f"Image serial number: {iid}\n")
 
+            f.write(f"hit = 1\n")
+            f.write(f"indexed_by = {'xgandalf' if image_to_crystals.get(iid) else 'none'}\n")
+            f.write(f"n_indexing_tries = 1\n")
             f.write(f"photon_energy_eV = {beam_energy_np[iid]:.6f}\n")
+            # Defaults — partialator's xsphere integrator needs nonzero
+            # bandwidth (else kmax == kmin in do_integral and it asserts).
+            f.write("beam_divergence = 0.00e+00 rad\n")
+            f.write("beam_bandwidth = 1.00e-08 (fraction)\n")
+            # average_camera_length in metres
+            clen_m = float(core.camera_length[iid].item()) if core.camera_length.numel() > iid else 0.0
+            f.write(f"average_camera_length = {clen_m:.6f} m\n")
             f.write(f"num_peaks = {n_peaks_np[iid]}\n")
 
             crystal_ids = image_to_crystals.get(iid, [])
-            indexed_by = "xgandalf" if crystal_ids else "none"
-            f.write(f"indexed_by = {indexed_by}\n")
 
             # Empty peak list (we don't store raw peaks)
             f.write("Peaks from peak search\n")
@@ -149,7 +185,27 @@ def write_stream_reconstruct(
                 f.write(f"bstar = {bstar_np[cid,0]:+.7f} {bstar_np[cid,1]:+.7f} {bstar_np[cid,2]:+.7f} nm^-1\n")
                 f.write(f"cstar = {cstar_np[cid,0]:+.7f} {cstar_np[cid,1]:+.7f} {cstar_np[cid,2]:+.7f} nm^-1\n")
 
+                if lattice_type is not None:
+                    f.write(f"lattice_type = {lattice_type}\n")
+                if centering is not None:
+                    f.write(f"centering = {centering}\n")
+                if unique_axis is not None:
+                    f.write(f"unique_axis = {unique_axis}\n")
+
                 f.write(f"profile_radius = {profile_rad_np[cid]:.5f} nm^-1\n")
+                # Placeholder refine residuals — partialator xsphere's
+                # do_integral crashes without these fields, but the exact
+                # values are overwritten during scaling.  Zeros are safe.
+                f.write("predict_refine/initial_residual = 0.000000 "
+                        "(0.000000 0.000000 0.000000)\n")
+                f.write("predict_refine/final_residual = 0.000000 "
+                        "(0.000000 0.000000 0.000000)\n")
+                f.write("predict_refine/total_shifts = 0.000000e+00 "
+                        "0.000000e+00 0.000000e+00\n")
+                f.write(
+                    f"predict_refine/det_shift x = {det_shift_x_np[iid]:.3f} "
+                    f"y = {det_shift_y_np[iid]:.3f} mm\n"
+                )
 
                 res_A = float(resolution_np[cid])
                 res_nm = 10.0 / res_A if res_A > 0 else 0.0

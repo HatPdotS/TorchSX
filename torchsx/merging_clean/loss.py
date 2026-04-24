@@ -37,12 +37,14 @@ from typing import Iterator
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from torchsx.merging_clean.adjacency import Adjacency, dirichlet_energy
 from torchsx.merging_clean.config import MergeConfig
 from torchsx.merging_clean.corrections import Correction, ObsInfo
 from torchsx.merging_clean.observations import PreparedObs
+from torchsx.merging_clean.priors import FrenchWilsonPrior, WilsonMatchPrior
 from torchsx.merging_clean.quadrature import QuadratureGrid, build_softplus_grid
 
 
@@ -71,6 +73,19 @@ class UnifiedMergeLoss(nn.Module):
         self.log_I0 = nn.Parameter(log_I0_init.clone())
         self.log_alpha = nn.Parameter(log_alpha_init.clone())
         self.log_beta = nn.Parameter(log_beta_init.clone())
+
+        # Per-HKL background-hypothesis logit.  Only optimised when
+        # bg_mode = "per_hkl".  Initialised at −2.2 so σ(π) = 0.1 (bright by
+        # default); data can pull it up for genuinely dark HKLs.
+        self.bg_mode = getattr(config, "bg_mode", "global")
+        if self.bg_mode == "per_hkl":
+            self.pi_logit = nn.Parameter(
+                torch.full((prep.n_valid,), -2.2, dtype=log_I0_init.dtype)
+            )
+        else:
+            self.register_buffer(
+                "pi_logit", torch.zeros(prep.n_valid, dtype=log_I0_init.dtype)
+            )
 
         # Anchor targets for Gaussian priors (prevent collective drift that
         # Laplacian smoothing cannot catch).
@@ -107,6 +122,11 @@ class UnifiedMergeLoss(nn.Module):
         # Adjacency
         self.register_buffer("edge_src", prep.adjacency.edge_src)
         self.register_buffer("edge_dst", prep.adjacency.edge_dst)
+        # French–Wilson MAP log-prior on I₀ (shrinks each HKL toward I = Σ).
+        self.fw_prior = FrenchWilsonPrior.from_prep(prep, config)
+        # Wilson distribution-match prior (KL of empirical log(I/Σ) to Wilson
+        # targets per shell × centricity group; preserves distribution shape).
+        self.wm_prior = WilsonMatchPrior.from_prep(prep, config)
         # Partiality (optional)
         if prep.partiality is not None:
             self.register_buffer("partiality", prep.partiality)
@@ -211,24 +231,36 @@ class UnifiedMergeLoss(nn.Module):
 
         log_integrand = log_gg + log_poi_plus_jac      # (M, K)
 
-        # Background anchor: "this observation is pure bg" — appended as a
-        # (K+1)th column.  log Poisson(n_peak | bg) with n_peak = I_obs + bg.
-        # For observations that look indistinguishable from Poisson(bg), this
-        # anchor dominates the logsumexp and signal-side gradients shrink
-        # proportionally to P(H_sig | obs).  Uses the already-registered
-        # `_n_ph` (n_peak) and `_bg` buffers — no duplication.
+        if self.bg_mode == "off":
+            log_p = torch.logsumexp(log_integrand, dim=1)
+            return -log_p.sum()
+
+        # Background hypothesis: log Poisson(n_peak | bg) with n_peak = I_obs
+        # + bg (pre-computed and cached as `_n_ph`).
         n_peak_slice = self._n_ph[s:e]
         bg_slice = self._bg[s:e].clamp(min=1e-12)
         log_p_bg = (
             n_peak_slice * torch.log(bg_slice)
             - bg_slice
             - torch.lgamma(n_peak_slice + 1)
-        )
-        log_integrand_ext = torch.cat(
-            [log_integrand, log_p_bg.unsqueeze(1)], dim=1
-        )                                              # (M, K+1)
+        )                                              # (M,)
 
-        log_p = torch.logsumexp(log_integrand_ext, dim=1)  # (M,)
+        log_p_sig_marginal = torch.logsumexp(log_integrand, dim=1)  # (M,)
+
+        if self.bg_mode == "global":
+            # Fixed 50/50 mixture (implicit weight 1 on each via logsumexp).
+            log_p = torch.logaddexp(log_p_sig_marginal, log_p_bg)
+            return -log_p.sum()
+
+        # bg_mode == "per_hkl" — learned per-HKL Bernoulli weight.
+        pi_logit_slice = self.pi_logit[h]              # (M,)
+        # Numerically stable log σ and log(1−σ) via softplus.
+        log_pi = F.logsigmoid(pi_logit_slice)          # log π_h
+        log_1mpi = F.logsigmoid(-pi_logit_slice)       # log(1 − π_h)
+        log_p = torch.logaddexp(
+            log_1mpi + log_p_sig_marginal,
+            log_pi + log_p_bg,
+        )
         return -log_p.sum()
 
     def regularizers_only(self) -> Tensor:
@@ -259,6 +291,14 @@ class UnifiedMergeLoss(nn.Module):
         if cfg.lam_I0_floor > 0:
             di = self.log_I0 - float(cfg.log_I0_floor_target)
             reg = reg + s * cfg.lam_I0_floor * (di * di).sum()
+        # French–Wilson MAP log-prior on I₀ (per-HKL mode-pulling).
+        if cfg.lam_frac_wilson > 0:
+            reg = reg + s * cfg.lam_frac_wilson * self.fw_prior(self.log_I0).sum()
+        # Wilson distribution-match prior (per-shell KL on the empirical
+        # spread of log(I/Σ)).  Complementary to the MAP prior: preserves
+        # distribution *shape* rather than concentrating toward the mode.
+        if cfg.lam_wilson_match > 0:
+            reg = reg + s * cfg.lam_wilson_match * self.wm_prior(self.log_I0)
         # Half-Cauchy prior on GenGauss width σ = α · c(β).
         # Width-invariant under α↔β trades.
         if cfg.lam_sigma_cauchy > 0:
@@ -268,6 +308,16 @@ class UnifiedMergeLoss(nn.Module):
             sigma2 = torch.exp(2.0 * log_sigma)
             tau2 = float(cfg.sigma_cauchy_scale) ** 2
             reg = reg + s * cfg.lam_sigma_cauchy * torch.log(tau2 + sigma2).sum()
+        # Beta(a, b) prior on learned π_h.  Only active in per-HKL bg mode.
+        #   -log p = -(a-1)·log π - (b-1)·log(1-π)  [ignoring Beta-function
+        #   constant; gradient wrt π_logit is well-defined via softplus].
+        if self.bg_mode == "per_hkl" and cfg.lam_pi_beta > 0:
+            log_pi = F.logsigmoid(self.pi_logit)
+            log_1mpi = F.logsigmoid(-self.pi_logit)
+            a_m1 = float(cfg.pi_beta_a) - 1.0
+            b_m1 = float(cfg.pi_beta_b) - 1.0
+            # Subtract because this is a *negative* log-likelihood (add to loss)
+            reg = reg + cfg.lam_pi_beta * (-a_m1 * log_pi - b_m1 * log_1mpi).sum()
         # Correction-specific regularizers (ridge on log_G, B, panel gain, ...)
         for c in self.corrections:
             reg = reg + c.regularizer()

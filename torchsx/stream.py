@@ -40,6 +40,8 @@ class SFXStream:
         cache: str | Path | None = None,
         n_workers: int = 1,
         merge_friedel: bool = True,
+        max_crystals: int | None = None,
+        seed: int = 0,
     ) -> SFXStream:
         """Parse a CrystFEL .stream file.
 
@@ -50,6 +52,11 @@ class SFXStream:
         cache : if provided, save/load .sfx cache at this path
         n_workers : parallel workers (default 1 for login node safety)
         merge_friedel : if True, canonicalize HKL to merge Friedel mates
+        max_crystals : if set, parse a random subset of chunks whose total
+            crystal count is ≥ this value.  Uses a streaming two-pass strategy
+            that never holds the whole file in memory — required for 50+ GB
+            streams on memory-constrained nodes.
+        seed : RNG seed for subsampling (ignored unless max_crystals is set).
         """
         from torchsx.io._parser import parse_stream
         from torchsx.io._safetensors import load_sfx, save_sfx
@@ -64,7 +71,10 @@ class SFXStream:
                     stream = stream.symmetrize()
                 return stream
 
-        core = parse_stream(path, spacegroup=spacegroup, n_workers=n_workers)
+        core = parse_stream(
+            path, spacegroup=spacegroup, n_workers=n_workers,
+            max_crystals=max_crystals, seed=seed,
+        )
 
         if cache is not None:
             save_sfx(core, cache)

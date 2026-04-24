@@ -148,15 +148,31 @@ class Geometry:
                 elif prop in ("corner_x", "corner_y", "coffset"):
                     panel_data[panel_name][prop] = float(value)
             else:
-                # Global property
+                # Global property — values may be HDF5 paths (e.g.
+                # "/LCLS/photon_energy_eV"), in which case we skip and let the
+                # per-chunk value override.
+                def _maybe_float(v):
+                    try:
+                        return float(v.split()[0])
+                    except ValueError:
+                        return None
+
                 if key == "photon_energy":
-                    global_params["photon_energy_eV"] = float(value.split()[0])
+                    f = _maybe_float(value)
+                    if f is not None:
+                        global_params["photon_energy_eV"] = f
                 elif key == "clen":
-                    global_params["clen"] = float(value.split()[0])
+                    f = _maybe_float(value)
+                    if f is not None:
+                        global_params["clen"] = f
                 elif key == "res":
-                    global_params["res"] = float(value.split()[0])
+                    f = _maybe_float(value)
+                    if f is not None:
+                        global_params["res"] = f
                 elif key == "adu_per_eV":
-                    global_params["adu_per_eV"] = float(value.split()[0])
+                    f = _maybe_float(value)
+                    if f is not None:
+                        global_params["adu_per_eV"] = f
                 elif key == "data":
                     global_params["data_path"] = value
                 elif key.startswith("mask") and key.endswith("_file"):

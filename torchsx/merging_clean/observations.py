@@ -53,6 +53,10 @@ class PreparedObs:
     # External partiality (sorted), or None
     partiality: Tensor | None
 
+    # French–Wilson prior inputs (per valid HKL)
+    shell_id_fw: Tensor      # (n_valid,) long — rank-binned on d_spacing
+    is_centric: Tensor       # (n_valid,) bool — from torchref is_centric_from_hkl
+
     def to(self, device) -> "PreparedObs":
         return PreparedObs(
             hkl_valid=self.hkl_valid.to(device),
@@ -69,6 +73,8 @@ class PreparedObs:
             adjacency=self.adjacency.to(device),
             obs_info=self.obs_info.to(device),
             partiality=None if self.partiality is None else self.partiality.to(device),
+            shell_id_fw=self.shell_id_fw.to(device),
+            is_centric=self.is_centric.to(device),
         )
 
 
@@ -84,14 +90,44 @@ def prepare_observations(
 
     if poisson_noise is None:
         poisson_noise = PoissonNoiseModel()
-    poisson_noise.gain = 1.0  # detector calibrated: 1 ADU = 1 photon
 
     core = stream._core
+    core_I = core.I
+    core_background = core.background
+
+    # ── Detector gain (ADU / photon) ──
+    # The Poisson likelihood treats I_obs + bg as photon counts, so we need to
+    # divide ADU by gain before feeding them to the loss.
+    gain_cfg = config.gain
+    if isinstance(gain_cfg, (int, float)):
+        gain = float(gain_cfg)
+        gain_src = "explicit"
+    elif gain_cfg == "stream":
+        adu_per_eV = 1.0
+        if core.geometry is not None:
+            adu_per_eV = float(getattr(core.geometry, "adu_per_eV", 1.0) or 1.0)
+        mean_eV = float(core.beam_energy.float().mean().item())
+        gain = adu_per_eV * mean_eV
+        if gain <= 0:
+            gain = 1.0
+        gain_src = f"stream (adu_per_eV={adu_per_eV:.6g} × {mean_eV:.1f} eV)"
+    elif gain_cfg == "empirical":
+        g = poisson_noise.calibrate_gain(core_I, core_background)
+        gain = float(g) if g and g > 0 else 1.0
+        gain_src = "empirical (negatives-Mandel)"
+    else:
+        raise ValueError(f"Unknown config.gain: {gain_cfg!r}")
+    print(f"  gain = {gain:.4g} ADU/photon  [{gain_src}]", flush=True)
+    poisson_noise.gain = gain
+
+    # Convert ADU → photon-equivalent counts for the Poisson model.
+    core_I = core_I / gain
+    core_background = core_background / gain
     hkl_idx = compute_hkl_index(core.hkl)
     hkl_id_raw = hkl_idx.hkl_id
     unique_hkl = hkl_idx.unique_hkl
     n_unique = hkl_idx.n_unique
-    I_obs_stream = core.I
+    I_obs_stream = core_I
     median_cell = core.cell.median(dim=0).values
 
     # ── Per-HKL statistics (for shell β fit / SNR) ──
@@ -181,7 +217,7 @@ def prepare_observations(
     n_obs_total = int(I_obs.shape[0])
 
     # Total background in peak region (bg_per_pixel * n_peak)
-    bg_per_pixel = core.background[keep_all][sort_all]
+    bg_per_pixel = core_background[keep_all][sort_all]
     bg = bg_per_pixel * poisson_noise.n_peak
 
     # ── Initial log-space MLE for μ and α (positive obs per HKL) ──
@@ -225,6 +261,24 @@ def prepare_observations(
 
     hkl_valid = unique_hkl[valid_indices]
     d_valid = d_spacing_all[valid_indices]
+
+    # ── French–Wilson prior metadata (per valid HKL) ──
+    # Shell binning on d_spacing (rank-based, same recipe as hkl_shell above
+    # but sized by config.fw_n_shells).
+    rank_valid = d_valid.argsort().argsort()
+    shell_id_fw = (
+        rank_valid.float() / max(n_valid, 1) * config.fw_n_shells
+    ).long().clamp(max=config.fw_n_shells - 1)
+    # Centric classification via torchref symmetry ops.  Falls back to all-
+    # acentric if space group is P1 or torchref cannot parse it (still
+    # correct — P1 has no centric reflections).
+    from torchref.base.french_wilson import is_centric_from_hkl
+    try:
+        sg = getattr(stream, "spacegroup", None) or "P 1"
+        is_centric = is_centric_from_hkl(hkl_valid.long(), space_group=sg)
+    except Exception as exc:  # noqa: BLE001 — surface the fallback for the user
+        print(f"  [FW] centric detection failed ({exc!r}); treating all as acentric")
+        is_centric = torch.zeros(n_valid, dtype=torch.bool)
 
     # ── Adjacency graph (±1 Miller) ──
     adjacency = build_adjacency(hkl_valid)
@@ -292,4 +346,6 @@ def prepare_observations(
         adjacency=adjacency,
         obs_info=obs_info,
         partiality=partiality_sorted,
+        shell_id_fw=shell_id_fw,
+        is_centric=is_centric,
     )
