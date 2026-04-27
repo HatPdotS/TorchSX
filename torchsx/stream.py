@@ -430,7 +430,7 @@ class SFXStream:
 
         Returns (n_bins,) tensor.
         """
-        from torchsx.merge._stats import completeness
+        from torchsx.merging.indexing import completeness
         return completeness(self._core, n_bins)
 
     def multiplicity(self, n_bins: int = 20) -> torch.Tensor:
@@ -438,7 +438,7 @@ class SFXStream:
 
         Returns (n_bins,) tensor.
         """
-        from torchsx.merge._stats import multiplicity
+        from torchsx.merging.indexing import multiplicity
         return multiplicity(self._core, n_bins)
 
     def cell_distribution(self) -> torch.Tensor:
@@ -452,7 +452,7 @@ class SFXStream:
         -------
         HKLIndex with unique_hkl (N_unique, 3), hkl_id (N_obs,), n_unique
         """
-        from torchsx.merge._hkl import compute_hkl_index
+        from torchsx.merging.indexing import compute_hkl_index
         return compute_hkl_index(self._core.hkl)
 
     def merge(self):
@@ -466,7 +466,7 @@ class SFXStream:
             sigma : (N_unique,) float32 — merged sigma
             multiplicity : (N_unique,) int32 — observations per reflection
         """
-        from torchsx.merge._hkl import compute_hkl_index, merge_intensities
+        from torchsx.merging.indexing import compute_hkl_index, merge_intensities
         idx = compute_hkl_index(self._core.hkl)
         I_m, sig_m, mult = merge_intensities(
             idx.hkl_id, self._core.I, self._core.sigma, idx.n_unique,
@@ -486,7 +486,7 @@ class SFXStream:
         dict mapping (h, k, l) tuples to (N_i,) float32 tensors of intensities
         for that reflection.
         """
-        from torchsx.merge._hkl import compute_hkl_index
+        from torchsx.merging.indexing import compute_hkl_index
 
         idx = compute_hkl_index(self._core.hkl)
         # Sort by hkl_id for efficient splitting
@@ -510,27 +510,27 @@ class SFXStream:
 
     def filter_resolution(self, d_min: float = 0.0, d_max: float = 999.0) -> SFXStream:
         """Keep only observations within resolution range."""
-        from torchsx.merge._filter import filter_resolution
+        from torchsx.merging.indexing import filter_resolution
         return SFXStream(filter_resolution(self._core, d_min, d_max))
 
     def filter_crystals(self, mask: torch.Tensor) -> SFXStream:
         """Keep crystals where mask is True."""
-        from torchsx.merge._filter import filter_crystals
+        from torchsx.merging.indexing import filter_crystals
         return SFXStream(filter_crystals(self._core, mask))
 
     def filter_images(self, mask: torch.Tensor) -> SFXStream:
         """Keep images where mask is True."""
-        from torchsx.merge._filter import filter_images
+        from torchsx.merging.indexing import filter_images
         return SFXStream(filter_images(self._core, mask))
 
     def filter_outliers(self, n_sigma: float = 4.0) -> SFXStream:
         """Remove per-hkl outlier observations."""
-        from torchsx.merge._filter import filter_outliers
+        from torchsx.merging.indexing import filter_outliers
         return SFXStream(filter_outliers(self._core, n_sigma))
 
     def filter_cell(self, tolerance: float = 0.1) -> SFXStream:
         """Remove crystals with unit cell deviating from median by > tolerance."""
-        from torchsx.merge._filter import filter_cell
+        from torchsx.merging.indexing import filter_cell
         return SFXStream(filter_cell(self._core, tolerance))
 
     # --- Patch extraction ---
@@ -702,6 +702,11 @@ class SFXStream:
             f"n_images={self.n_images})"
         )
 
+    def merge(self):
+        """Merge intensities using the likelihood-random scale assumed model. Returns merged intensities and sigmas by unique HKL."""
+        from torchsx.merging import Merger
+        M = Merger(self)
+        return M.merge()
 
 def _is_numeric_list(lst: list) -> bool:
     """Check if all existing elements in a list are numeric."""
