@@ -28,6 +28,16 @@ class Quadrature(nn.Module):
     this result via ``DetectionLikelihood.combine_with_marginal``.
     """
 
+    # Quadratures whose grid positions depend on ``log_mean`` (i.e. shift
+    # with each μ candidate during posterior moment computation) must set
+    # this to ``True`` so the merger uses ``compute_posterior_moments_per_call``
+    # — which calls ``marginalize_signal`` once per offset, keeping the
+    # MAP marginal and the posterior moment integration on the *same* grid.
+    # The default cached-backbone path uses ``_sig_lo_slice`` / ``_build_grid``
+    # to set up the per-obs μ-coarse scan and is only valid for grids whose
+    # node positions are independent of ``log_mean``.
+    requires_per_call_posterior: bool = False
+
     @abstractmethod
     def marginalize_signal(
         self,

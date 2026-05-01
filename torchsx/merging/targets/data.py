@@ -50,15 +50,22 @@ class _ChunkedDataNLL(torch.autograd.Function):
         target = ctx.target
         params = list(target._param_tuple())
         grads = [torch.zeros_like(p) for p in params]
-        for s, e in target._iter_chunks():
-            with torch.enable_grad():
-                loss_c = target._chunk_loss(s, e)
-            partials = torch.autograd.grad(
-                loss_c, params, retain_graph=False, allow_unused=True,
-            )
-            for i, p in enumerate(partials):
-                if p is not None:
-                    grads[i].add_(p)
+        # Frozen params (requires_grad=False) cannot be passed to
+        # autograd.grad — filter them out and accumulate zero into their
+        # grad slots.  Frozen params occur when callers pin α, β (or any
+        # other parameter) to a known value before optimisation.
+        live_idx = [i for i, p in enumerate(params) if p.requires_grad]
+        if live_idx:
+            live_params = [params[i] for i in live_idx]
+            for s, e in target._iter_chunks():
+                with torch.enable_grad():
+                    loss_c = target._chunk_loss(s, e)
+                partials = torch.autograd.grad(
+                    loss_c, live_params, retain_graph=False, allow_unused=True,
+                )
+                for slot, p in zip(live_idx, partials):
+                    if p is not None:
+                        grads[slot].add_(p)
         scaled = tuple(grad_output * g for g in grads)
         # None for the non-tensor ``target`` argument.
         return (None,) + scaled

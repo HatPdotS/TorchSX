@@ -22,6 +22,19 @@ negative for dark-HKL obs (bg hypothesis wins).  A ~zero BF with no
 clear separation means the per-obs evidence isn't pinning down which
 regime the obs belongs to — indicates a noisy/borderline observation.
 
+The full per-obs marginal log-likelihood and the post-mixture log p (i.e.
+the per-obs contribution to the data NLL the LBFGS minimised) are saved
+alongside the residuals so downstream plots don't have to reconstruct
+them from the Bayes factor + bg-Poisson formula:
+
+* ``log_p_sig_marginal`` = ``log ∫ p(n|S,bg) p_GG(log_S − log_mean) dlog_S``
+  — the signal-hypothesis marginal; recoverable as ``log_bf + log_p_bg``
+  but cached here for convenience.
+* ``log_p`` = post bg-mixture combine.  Equals ``log_p_sig_marginal``
+  for ``bg_mode="off"``; for the bg-mixture modes it's
+  ``logaddexp(log(1−π) + log_p_sig, log(π) + log_p_bg)``.  Sum over obs
+  reproduces ``final_data_nll`` up to fp32 jitter.
+
 These quantities are aggregated per resolution shell and per intensity
 decile so a plot can spot bias versus those covariates.
 """
@@ -48,6 +61,12 @@ class Residuals:
     log_scatter: Tensor          # log((n − bg) / (K · I))  (NaN if n ≤ bg)
     z_scatter: Tensor            # log_scatter / α_h         (NaN if undefined)
     log_bf: Tensor               # log p(signal+bg) − log p(bg-only)
+    log_p_sig_marginal: Tensor   # log ∫ p(n|S,bg) · p_GG(log S − log_mean) dlog S
+    log_p: Tensor                # post bg-mixture combine; per-obs contribution
+                                 # to the data NLL.  For bg_mode="off" this
+                                 # equals ``log_p_sig_marginal``; for the
+                                 # bg-mixture modes it is
+                                 # ``log_p_sig_marginal``-vs-``log_p_bg`` mixed.
     # ── Per-obs context (for grouping in plots) ──
     obs_hkl_id: Tensor           # which HKL each obs belongs to (n_obs,)
     obs_d_spacing: Tensor        # (n_obs,)
@@ -109,17 +128,26 @@ def compute_residuals(merger: "Merger", result: "MergedResult") -> Residuals:
     )
     # Proper marginal log p(n | signal+bg) — integrate over the scatter
     # latent S using the same quadrature LBFGS used.  Chunked to keep
-    # memory bounded.
+    # memory bounded.  We also fold the bg-mixture combine pass through
+    # ``likelihood.combine_with_marginal`` so we get the full per-obs
+    # NLL contribution (= -log_p) the LBFGS objective minimised, not
+    # just the signal-only marginal.
     log_p_sig_marginal = torch.empty_like(n)
+    log_p_total = torch.empty_like(n)
     chunk = 1_000_000
     for s_lo in range(0, n_obs, chunk):
         s_hi = min(s_lo + chunk, n_obs)
-        log_p_sig_marginal[s_lo:s_hi] = merger.quadrature.marginalize_signal(
+        oi_slice = prep.obs_info.slice(s_lo, s_hi)
+        log_p_sig_chunk = merger.quadrature.marginalize_signal(
             merger.scatter, likelihood,
             log_mu_sig[s_lo:s_hi],
             n[s_lo:s_hi], bg[s_lo:s_hi],
-            params, prep.obs_info.slice(s_lo, s_hi),
+            params, oi_slice,
             obs_range=(s_lo, s_hi),
+        )
+        log_p_sig_marginal[s_lo:s_hi] = log_p_sig_chunk
+        log_p_total[s_lo:s_hi] = likelihood.combine_with_marginal(
+            n[s_lo:s_hi], bg[s_lo:s_hi], log_p_sig_chunk, params, oi_slice,
         )
     log_bf = log_p_sig_marginal - log_p_bg
 
@@ -162,6 +190,8 @@ def compute_residuals(merger: "Merger", result: "MergedResult") -> Residuals:
         log_scatter=log_scatter.cpu(),
         z_scatter=z_scatter.cpu(),
         log_bf=log_bf.cpu(),
+        log_p_sig_marginal=log_p_sig_marginal.cpu(),
+        log_p=log_p_total.cpu(),
         obs_hkl_id=h.cpu(),
         obs_d_spacing=prep.d_spacing[h].cpu(),
         obs_log_I_predicted=log_mu_sig.cpu(),
@@ -182,6 +212,8 @@ def save_residuals(res: Residuals, path) -> None:
     out = {
         "pearson": res.pearson, "log_scatter": res.log_scatter,
         "z_scatter": res.z_scatter, "log_bf": res.log_bf,
+        "log_p_sig_marginal": res.log_p_sig_marginal,
+        "log_p": res.log_p,
         "obs_hkl_id": res.obs_hkl_id, "obs_d_spacing": res.obs_d_spacing,
         "obs_log_I_predicted": res.obs_log_I_predicted,
         "obs_n": res.obs_n, "obs_bg": res.obs_bg, "obs_mu_tot": res.obs_mu_tot,

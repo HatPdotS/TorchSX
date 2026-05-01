@@ -14,7 +14,7 @@ from dataclasses import dataclass
 @dataclass
 class MergeConfig:
     # ── Observation filtering / shell setup ────────────────────────────
-    min_obs: int = 5
+    min_obs: int = 0
     n_shells: int = 20
     snr_thresh: float = 3.0
 
@@ -88,10 +88,29 @@ class MergeConfig:
     lam_frac_wilson: float = 0.0
     fw_n_shells: int = 20
     fw_eps: float = 1e-6
+    # Shell-mean estimator for Σ in WilsonPrior:
+    # "arithmetic" — Σ = mean(I0) (linear; insensitive to collapsed HKLs).
+    # "geometric"  — Σ = exp(mean(log I0) + γ) (sensitive on equal log
+    #                footing; collapsed HKLs perturb Σ and feed back through
+    #                the per-shell coupling).
+    wilson_mean_kind: str = "arithmetic"
 
     # ── Wilson distribution-match prior (KL per shell × centricity) ───
     lam_wilson_match: float = 0.0
     wilson_match_min_count: int = 20
+
+    # ── Wilson anisotropic prior on log_I0 (alternative to lam_frac_wilson) ──
+    # Replaces the per-shell discrete Σ with a single global log_I_mean and a
+    # 6-parameter anisotropic ADP-like decay U so log_Σ_h = log_I_mean
+    # − 2π² · sᵀ U s. Convention matches torchref.scaling.scaler_base. The
+    # population mean of per-crystal B is pulled toward zero by a soft
+    # regularizer (lam_wilson_aniso_b_center) so the global resolution decay
+    # flows into U rather than being absorbed by the per-crystal scale.
+    # Mutually exclusive with lam_frac_wilson at runtime.
+    lam_wilson_aniso: float = 0.0
+    lam_wilson_aniso_U_ridge: float = 1.0
+    lam_wilson_aniso_b_center: float = 1.0
+    wilson_aniso_init_from_data: bool = True
 
     # ── Detector gain ─────────────────────────────────────────────────
     #   "stream"    → ``adu_per_eV × photon_energy_eV`` from the stream
@@ -125,3 +144,21 @@ class MergeConfig:
     # Which posterior to use as the primary ``I0`` / ``sigma_I0`` column.
     # Both named variants are still stored in diagnostics.
     posterior_primary: str = "wilson"
+    # How to summarise the per-HKL posterior in linear-I space.
+    #   "linear_mean"  — I0 = E[I | data]   (default; legacy behaviour)
+    #   "log_mean"     — I0 = exp(E[log I | data]); sigma via delta method.
+    # Linear-mean is biased upward by ~exp(σ²_logI / 2) for broad posteriors
+    # (weak HKLs); log-mean is unbiased w.r.t. log_I_truth.  See
+    # experiments/synthetic_gengauss/integrand_diag/fix_bias for the derivation.
+    posterior_summary: str = "linear_mean"
+    # How to lay out the dlog_I integration grid for the posterior moments.
+    #   "laplace" — MAP-centered, ±n_sigma·σ_laplace per HKL  (default)
+    #   "global"  — single fixed log_I grid, identical for every HKL.
+    # ``"global"`` removes the Laplace approx and any MAP-centering bias.
+    # When the quadrature exposes ``log_S_grid`` (e.g. ``FixedLogGrid``),
+    # those nodes are used directly; otherwise the explicit range below
+    # parameterises a fresh grid.
+    posterior_grid_mode: str = "laplace"
+    posterior_global_log_I_min: float = -6.907755     # log(1e-3)
+    posterior_global_log_I_max: float = 13.815511     # log(1e6)
+    posterior_global_n_points: int = 1025

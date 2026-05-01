@@ -187,28 +187,51 @@ def _moments_from_log_post(
     delta_map: Tensor,          # (n_valid,)
     sigma_clamped: Tensor,      # (n_valid,)
     map_fallback_log_I0: Tensor | None,
+    summary: str = "linear_mean",
 ) -> PosteriorMoments:
-    """Trapezoidal integration in Δ for ⟨I₀⟩ and Var[I₀].
+    """Trapezoidal integration in Δ for the posterior summary.
 
-    Emits diagnostics per HKL:
+    Two summaries (selected by ``summary``):
 
-    * ``fallback_mask`` — True where the computed mean/variance was non-finite
-      and ``map_fallback_log_I0`` (if supplied) was substituted.
-    * ``grid_mass_frac`` — fraction of total probability mass captured by the
-      centre ``±3σ`` portion of the grid (informal "is the grid well-centred").
-    * ``mode_shift`` — offset from MAP to argmax(log_post) in units of σ.
+    * ``"linear_mean"`` (default, legacy)
+        ``I0 = E[I | data]``, ``σ_I0 = sqrt(Var[I | data])``.  Integrates
+        in linear-I space — biased upward by ``exp(σ²_logI / 2)`` for
+        broad posteriors (Jensen).
+
+    * ``"log_mean"``
+        ``μ = E[log I | data]``, ``σ_μ = sqrt(Var[log I | data])``,
+        ``I0 = exp(μ)`` and ``σ_I0 = σ_μ · I0`` (delta method).
+        Unbiased w.r.t. log_I_truth; the natural choice when the
+        downstream consumer (refinement, F-obs propagation) treats the
+        per-HKL uncertainty as Gaussian on log_I.
+
+    Emits the same diagnostics either way.
     """
     log_dD = torch.log(ddelta)                                # (n_valid,)
-    # log ∫ e^{log_post} dΔ
-    log_Z = log_dD + torch.logsumexp(log_post, dim=1)
-    # log ∫ e^{Δ + log_post} dΔ
-    log_EI = log_dD + torch.logsumexp(delta_fine + log_post, dim=1) - log_Z
-    # log ∫ e^{2Δ + log_post} dΔ
-    log_EI2 = log_dD + torch.logsumexp(2.0 * delta_fine + log_post, dim=1) - log_Z
-    I0 = log_EI.exp()
-    I0_sq_mean = log_EI2.exp()
-    var_I0 = (I0_sq_mean - I0.pow(2)).clamp(min=0.0)
-    sigma_I0 = var_I0.sqrt()
+    log_Z = log_dD + torch.logsumexp(log_post, dim=1)         # log ∫ e^{log_post} dΔ
+
+    if summary == "log_mean":
+        # Stable softmax-weighted moments of Δ.
+        log_max = log_post.max(dim=1, keepdim=True).values
+        w = (log_post - log_max).exp()
+        Z_local = w.sum(dim=1, keepdim=True).clamp(min=1e-30)
+        p = w / Z_local                                        # (n_valid, M_fine)
+        mu = (delta_fine * p).sum(dim=1)                       # (n_valid,)
+        mu2 = (delta_fine.pow(2) * p).sum(dim=1)
+        sigma_mu = (mu2 - mu.pow(2)).clamp(min=0.0).sqrt()
+        I0 = mu.exp()
+        sigma_I0 = sigma_mu * I0
+    elif summary == "linear_mean":
+        log_EI = log_dD + torch.logsumexp(delta_fine + log_post, dim=1) - log_Z
+        log_EI2 = log_dD + torch.logsumexp(2.0 * delta_fine + log_post, dim=1) - log_Z
+        I0 = log_EI.exp()
+        I0_sq_mean = log_EI2.exp()
+        var_I0 = (I0_sq_mean - I0.pow(2)).clamp(min=0.0)
+        sigma_I0 = var_I0.sqrt()
+        mu = I0.clamp(min=1e-12).log()
+        sigma_mu = sigma_I0 / I0.clamp(min=1e-12)
+    else:
+        raise ValueError(f"Unknown posterior summary: {summary!r}")
 
     # ── Diagnostics ──────────────────────────────────────────────
     # Posterior mode (argmax index) → shift from MAP in σ-units.
@@ -218,8 +241,6 @@ def _moments_from_log_post(
 
     # Mass fraction inside the central ±3σ of the (±n_sigma·σ) grid.
     M_fine = delta_fine.shape[1]
-    # The grid is centred at Δ_MAP with linear offsets; central ±50% of
-    # grid indices corresponds to ±n_sigma/2 · σ (= ±3σ for default n_sigma=6).
     lo = M_fine // 4
     hi = M_fine - lo
     log_max = log_post.max(dim=1, keepdim=True).values
@@ -231,15 +252,14 @@ def _moments_from_log_post(
     bad = ~(torch.isfinite(I0) & torch.isfinite(sigma_I0))
     fallback_mask = bad.clone()
     if map_fallback_log_I0 is not None and bad.any():
-        I0_fallback = map_fallback_log_I0.exp()
-        # For σ on fallback we use σ_laplace·I0 (delta-method); caller
-        # passes the clamped σ already, which is a conservative width.
-        sigma_fallback = sigma_clamped * I0_fallback
+        mu_fallback = map_fallback_log_I0
+        I0_fallback = mu_fallback.exp()
+        sigma_fallback = sigma_clamped * I0_fallback           # delta-method
+        mu = torch.where(bad, mu_fallback, mu)
+        sigma_mu = torch.where(bad, sigma_clamped, sigma_mu)
         I0 = torch.where(bad, I0_fallback, I0)
         sigma_I0 = torch.where(bad, sigma_fallback, sigma_I0)
 
-    mu = I0.clamp(min=1e-12).log()
-    sigma_mu = sigma_I0 / I0.clamp(min=1e-12)
     return PosteriorMoments(
         I0=I0, sigma_I0=sigma_I0, log_evidence=log_Z, mu=mu, sigma_mu=sigma_mu,
         fallback_mask=fallback_mask,
@@ -333,6 +353,7 @@ def compute_posterior_moments(
     obs_chunk_size: int = 500_000,
     sigma_max: float = 2.0,
     map_fallback_log_I0: Tensor | None = None,
+    summary: str = "linear_mean",
 ) -> dict[str, PosteriorMoments]:
     """Per-HKL posterior mean / std of ``I₀`` under each named prior.
 
@@ -412,5 +433,221 @@ def compute_posterior_moments(
             delta_map=delta_map,
             sigma_clamped=sigma,
             map_fallback_log_I0=map_fallback_log_I0,
+            summary=summary,
+        )
+    return results
+
+
+@torch.no_grad()
+def _fill_f_coarse_per_call(
+    *,
+    prep: PreparedObs,
+    params: Parameters,
+    scale: ScaleModel,
+    scatter: ScatterModel,
+    quadrature,                 # any Quadrature with marginalize_signal
+    likelihood: DetectionLikelihood,
+    delta_map: Tensor,          # (n_valid,)
+    sigma_laplace: Tensor,      # (n_valid,)
+    offsets_coarse: Tensor,     # (K_coarse,)
+    chunk_size: int,
+) -> Tensor:
+    """Fill ``f_j(μ)`` by calling ``quadrature.marginalize_signal`` per offset.
+
+    Drop-in alternative to :func:`_fill_f_coarse` for quadratures where the
+    inner-grid node positions depend on trial μ (i.e. on log_mean) and the
+    cached-backbone optimisation does not apply.  ``LaplaceSaddleGrid``
+    relocates its nodes around the joint saddle every call, so each μ
+    offset needs a fresh ``marginalize_signal`` evaluation.
+
+    Cost: ``K_coarse × ceil(n_obs / chunk_size)`` quadrature calls (vs the
+    cached version's 1 backbone build + ``K_coarse`` scatter evaluations).
+    Typical 2–3× slower but works with any Quadrature.
+    """
+    n_obs = prep.n_obs_total
+    K_coarse = offsets_coarse.numel()
+    device, dtype = delta_map.device, delta_map.dtype
+    f_coarse = torch.empty((n_obs, K_coarse), device=device, dtype=dtype)
+
+    hkl_id = prep.hkl_id
+    bg = prep.bg
+    n_ph = (prep.I_obs + bg).clamp(min=0)
+
+    C = chunk_size if chunk_size and chunk_size > 0 else n_obs
+    for s in range(0, n_obs, C):
+        e = min(s + C, n_obs)
+        oi_chunk = prep.obs_info.slice(s, e)
+        h_chunk = hkl_id[s:e]
+        delta_map_chunk = delta_map[h_chunk]                              # (Nc,)
+        sigma_chunk = sigma_laplace[h_chunk]                              # (Nc,)
+        n_ph_chunk = n_ph[s:e]
+        bg_chunk = bg[s:e]
+
+        log_scale_chunk = scale.log_k(params, oi_chunk, obs_range=(s, e))  # (Nc,)
+        mu_map = delta_map_chunk + log_scale_chunk                         # (Nc,)
+
+        for i in range(K_coarse):
+            mu_i = mu_map + offsets_coarse[i] * sigma_chunk                # (Nc,)
+            log_p_sig = quadrature.marginalize_signal(
+                scatter, likelihood, mu_i, n_ph_chunk, bg_chunk,
+                params, oi_chunk, obs_range=(s, e),
+            )                                                              # (Nc,)
+            log_p = likelihood.combine_with_marginal(
+                n_ph_chunk, bg_chunk, log_p_sig, params, oi_chunk
+            )
+            f_coarse[s:e, i] = log_p
+
+    return f_coarse
+
+
+@torch.no_grad()
+def compute_posterior_moments_per_call(
+    *,
+    prep: PreparedObs,
+    params: Parameters,
+    scale: ScaleModel,
+    scatter: ScatterModel,
+    quadrature,
+    likelihood: DetectionLikelihood,
+    sigma_laplace: Tensor,
+    priors: Mapping[str, PriorEvaluator],
+    n_grid_coarse: int = 31,
+    n_grid_fine: int = 101,
+    n_sigma: float = 6.0,
+    obs_chunk_size: int = 500_000,
+    sigma_max: float = 2.0,
+    map_fallback_log_I0: Tensor | None = None,
+    summary: str = "linear_mean",
+) -> dict[str, PosteriorMoments]:
+    """Posterior moments for a quadrature whose grid is trial-μ-dependent.
+
+    Same outer machinery as :func:`compute_posterior_moments` (coarse-fine
+    Δ grid, prior evaluators, trapezoidal integration) but with the
+    cached-backbone ``_fill_f_coarse`` replaced by per-offset
+    ``marginalize_signal`` calls.  Use this with ``LaplaceSaddleGrid`` (or
+    any Quadrature where node positions depend on log_mean).
+    """
+    device = params.log_I0.device
+    dtype = params.log_I0.dtype
+    n_valid = prep.n_valid
+
+    delta_map = params.log_I0.detach()
+    sigma = sigma_laplace.detach().clamp(min=1e-3, max=float(sigma_max))
+
+    offsets_coarse, offsets_fine, i_lo, w_hi = _interp_weights(
+        n_grid_coarse, n_grid_fine, n_sigma, device=device, dtype=dtype
+    )
+
+    f_coarse = _fill_f_coarse_per_call(
+        prep=prep, params=params, scale=scale, scatter=scatter,
+        quadrature=quadrature, likelihood=likelihood,
+        delta_map=delta_map, sigma_laplace=sigma,
+        offsets_coarse=offsets_coarse, chunk_size=obs_chunk_size,
+    )
+
+    L = _reduce_to_hkl_curves(f_coarse, prep.hkl_id, n_valid, i_lo, w_hi)
+
+    delta_fine = delta_map[:, None] + offsets_fine[None, :] * sigma[:, None]
+    ddelta = (2.0 * n_sigma) * sigma / (n_grid_fine - 1)
+
+    results: dict[str, PosteriorMoments] = {}
+    for name, prior_fn in priors.items():
+        log_prior = prior_fn(delta_fine) if prior_fn is not None else torch.zeros_like(L)
+        log_post = L + log_prior
+        results[name] = _moments_from_log_post(
+            delta_fine, log_post, ddelta,
+            delta_map=delta_map,
+            sigma_clamped=sigma,
+            map_fallback_log_I0=map_fallback_log_I0,
+            summary=summary,
+        )
+    return results
+
+
+@torch.no_grad()
+def compute_posterior_moments_global_grid(
+    *,
+    prep: PreparedObs,
+    params: Parameters,
+    scale: ScaleModel,
+    scatter: ScatterModel,
+    quadrature,
+    likelihood: DetectionLikelihood,
+    sigma_laplace: Tensor,
+    priors: Mapping[str, PriorEvaluator],
+    log_I_grid: Tensor,                # (K_post,) — fixed candidate log_I0 grid
+    obs_chunk_size: int = 500_000,
+    sigma_max: float = 2.0,            # only used for the mode_shift diagnostic
+    map_fallback_log_I0: Tensor | None = None,
+    summary: str = "linear_mean",
+) -> dict[str, PosteriorMoments]:
+    """Posterior moments on a fixed global log_I grid.
+
+    Replaces the MAP-centered ``delta_map ± n_sigma·σ_laplace`` window
+    used by :func:`compute_posterior_moments_per_call` with a single
+    fixed grid (``log_I_grid``) shared across every HKL — no Laplace
+    approximation in the posterior path, no per-HKL window adaptation.
+    The quadrature decides the grid; the data decides the posterior
+    shape.
+
+    Cost: ``K_post × ⌈n_obs / chunk⌉`` ``marginalize_signal`` calls
+    (vs the per-call version's ``K_coarse = 31``).  Use when σ_laplace
+    is unreliable for weak HKLs (flat marginal NLL → curvature ≈ 0) or
+    when you want the dlog_I integration on the same grid as the inner
+    likelihood marginal — e.g. ``log_I_grid = quadrature.log_S_grid``
+    for ``FixedLogGrid``.
+    """
+    device = params.log_I0.device
+    dtype = params.log_I0.dtype
+    n_valid = prep.n_valid
+    n_obs = prep.n_obs_total
+    K_post = log_I_grid.shape[0]
+
+    log_I_grid = log_I_grid.to(device=device, dtype=dtype)
+    delta_map = params.log_I0.detach()
+    sigma_clamped = sigma_laplace.detach().clamp(min=1e-3, max=float(sigma_max))
+
+    # Per-HKL log marginal data likelihood at every grid node.
+    L = torch.zeros((n_valid, K_post), device=device, dtype=dtype)
+
+    hkl_id = prep.hkl_id
+    bg = prep.bg
+    n_ph = (prep.I_obs + bg).clamp(min=0)
+
+    C = obs_chunk_size if obs_chunk_size and obs_chunk_size > 0 else n_obs
+    for s in range(0, n_obs, C):
+        e = min(s + C, n_obs)
+        oi_chunk = prep.obs_info.slice(s, e)
+        h_chunk = hkl_id[s:e]
+        n_ph_chunk = n_ph[s:e]
+        bg_chunk = bg[s:e]
+        log_scale_chunk = scale.log_k(params, oi_chunk, obs_range=(s, e))   # (Nc,)
+
+        for k in range(K_post):
+            mu_k = log_I_grid[k] + log_scale_chunk                          # (Nc,)
+            log_p_sig = quadrature.marginalize_signal(
+                scatter, likelihood, mu_k, n_ph_chunk, bg_chunk,
+                params, oi_chunk, obs_range=(s, e),
+            )                                                                # (Nc,)
+            log_p = likelihood.combine_with_marginal(
+                n_ph_chunk, bg_chunk, log_p_sig, params, oi_chunk
+            )                                                                # (Nc,)
+            L[:, k].scatter_add_(0, h_chunk, log_p)
+
+    # Posterior moments on the global grid (uniform step, identical for all HKLs).
+    delta_fine = log_I_grid[None, :].expand(n_valid, -1).contiguous()        # (n_valid, K_post)
+    step = float((log_I_grid[-1] - log_I_grid[0]) / (K_post - 1))
+    ddelta = torch.full((n_valid,), step, device=device, dtype=dtype)
+
+    results: dict[str, PosteriorMoments] = {}
+    for name, prior_fn in priors.items():
+        log_prior = prior_fn(delta_fine) if prior_fn is not None else torch.zeros_like(L)
+        log_post = L + log_prior
+        results[name] = _moments_from_log_post(
+            delta_fine, log_post, ddelta,
+            delta_map=delta_map,
+            sigma_clamped=sigma_clamped,
+            map_fallback_log_I0=map_fallback_log_I0,
+            summary=summary,
         )
     return results

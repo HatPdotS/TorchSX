@@ -88,6 +88,7 @@ class PreparedObs:
     hkl_valid: Tensor
     d_spacing: Tensor
     n_valid: int
+    median_cell: Tensor
 
     # Sorted observations (all obs, positive + negative)
     I_obs: Tensor
@@ -119,6 +120,7 @@ class PreparedObs:
             hkl_valid=self.hkl_valid.to(device),
             d_spacing=self.d_spacing.to(device),
             n_valid=self.n_valid,
+            median_cell=self.median_cell.to(device),
             I_obs=self.I_obs.to(device),
             hkl_id=self.hkl_id.to(device),
             bg=self.bg.to(device),
@@ -366,6 +368,7 @@ def prepare_observations(
         hkl_valid=hkl_valid,
         d_spacing=d_valid,
         n_valid=n_valid,
+        median_cell=median_cell,
         I_obs=I_obs,
         hkl_id=hkl_id,
         bg=bg,

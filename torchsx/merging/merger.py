@@ -25,16 +25,24 @@ from torchsx.merging.likelihood import (
 from torchsx.merging.likelihood.poisson_bg_mix import PiBetaPrior
 from torchsx.merging.observations import PreparedObs, prepare_observations
 from torchsx.merging.parameters import Parameters
-from torchsx.merging.priors import FlatPrior, WilsonMatchPrior, WilsonPrior
+from torchsx.merging.priors import (
+    FlatPrior,
+    WilsonAnisoPrior,
+    WilsonMatchPrior,
+    WilsonPrior,
+)
 from torchsx.merging.quadrature import TrapezoidalLogGrid
 from torchsx.merging.regularizers import (
     GaussianAnchor,
     MillerGraphSmoothness,
+    ScaleBMeanRegularizer,
     SigmaCauchy,
 )
 from torchsx.merging.posterior import (
     PosteriorMoments,
     compute_posterior_moments,
+    compute_posterior_moments_global_grid,
+    compute_posterior_moments_per_call,
     make_flat_prior,
     make_wilson_prior,
     shell_mean_from_log_I0,
@@ -70,6 +78,17 @@ def _q_moments(
     E_q2 = (q * q * p).sum(dim=1) * du
     Var_q = (E_q2 - E_q * E_q).clamp(min=0.0)
     return E_q, Var_q
+
+
+def _find_scale_b_per_crystal(scale: ScaleModel) -> ScaleBPerCrystal | None:
+    """Locate the ScaleBPerCrystal inside a (possibly composite) scale module."""
+    if isinstance(scale, ScaleBPerCrystal):
+        return scale
+    if isinstance(scale, CompositeScale):
+        for sub in scale.submodules_list:
+            if isinstance(sub, ScaleBPerCrystal):
+                return sub
+    return None
 
 
 class Merger:
@@ -362,7 +381,13 @@ class Merger:
             )
             state.set_weight("merging/reg/sigma_cauchy", s * cfg.lam_sigma_cauchy)
 
-        # Wilson MAP prior.
+        # Wilson MAP prior — shell and anisotropic forms are alternative
+        # parameterizations of the same prior; require at most one.
+        if cfg.lam_frac_wilson > 0 and cfg.lam_wilson_aniso > 0:
+            raise ValueError(
+                "lam_frac_wilson and lam_wilson_aniso are alternative "
+                "parameterizations of the Wilson prior; set at most one > 0."
+            )
         if cfg.lam_frac_wilson > 0:
             wilson = WilsonPrior.from_prep(prep, cfg).to(device)
             state.register_target(
@@ -370,6 +395,27 @@ class Merger:
                 IntensityPriorTarget(params, wilson).to(device),
             )
             state.set_weight("merging/prior/wilson", s * cfg.lam_frac_wilson)
+
+        # Wilson anisotropic prior (continuous log_I_mean + ADP-like U).
+        if cfg.lam_wilson_aniso > 0:
+            wilson_aniso = WilsonAnisoPrior.from_prep(prep, cfg).to(device)
+            state.register_target(
+                "merging/prior/wilson_aniso",
+                IntensityPriorTarget(params, wilson_aniso).to(device),
+            )
+            state.set_weight("merging/prior/wilson_aniso", s * cfg.lam_wilson_aniso)
+
+            # Pin mean(per-crystal B) → 0 so the global decay flows into U.
+            scale_b = _find_scale_b_per_crystal(scale)
+            if scale_b is not None and cfg.lam_wilson_aniso_b_center > 0:
+                state.register_target(
+                    "merging/reg/scale_b_center",
+                    RegularizerTarget(params, ScaleBMeanRegularizer(scale_b)).to(device),
+                )
+                state.set_weight(
+                    "merging/reg/scale_b_center",
+                    s * cfg.lam_wilson_aniso_b_center,
+                )
 
         # Wilson distribution-match prior.
         if cfg.lam_wilson_match > 0:
@@ -516,15 +562,23 @@ class Merger:
         # data target's autograd into chunks.
         for s, e in data_target._iter_chunks():
             nll_chunk = data_target._chunk_loss(s, e)
+            # ``allow_unused=True`` covers piecewise-affine quadratures
+            # (e.g. PrecomputedGridQuadrature) whose 2nd derivative wrt
+            # log_I0 is identically zero; the data Hessian is then 0 and
+            # σ comes from priors + posterior moments.
             grad_logI0 = torch.autograd.grad(
-                nll_chunk, params.log_I0, create_graph=True
+                nll_chunk, params.log_I0,
+                create_graph=True, allow_unused=True,
             )[0]
+            if grad_logI0 is None:
+                continue
             H_chunk = torch.autograd.grad(
                 grad_logI0, params.log_I0,
                 grad_outputs=torch.ones_like(params.log_I0),
-                retain_graph=False,
+                retain_graph=False, allow_unused=True,
             )[0]
-            H_diag = H_diag + H_chunk.detach()
+            if H_chunk is not None:
+                H_diag = H_diag + H_chunk.detach()
 
         # All non-data targets, in one shot.  The state's losses dict was
         # populated by the last LBFGS step; we need fresh values with grad
@@ -608,22 +662,63 @@ class Merger:
                     is_centric=prep.is_centric.to(self.device),
                 ),
             }
-            posteriors = compute_posterior_moments(
-                prep=prep,
-                params=params,
-                scale=self.scale,
-                scatter=self.scatter,
-                quadrature=self.quadrature,
-                likelihood=self.likelihood,
-                sigma_laplace=sigma_logI0,
-                priors=prior_specs,
-                n_grid_coarse=cfg.posterior_n_grid_coarse,
-                n_grid_fine=cfg.posterior_n_grid_fine,
-                n_sigma=cfg.posterior_n_sigma,
-                obs_chunk_size=cfg.posterior_obs_chunk_size,
-                sigma_max=cfg.posterior_sigma_max,
-                map_fallback_log_I0=params.log_I0.detach(),
+            # Quadratures whose grid moves with log_mean (e.g. WideLogGrid,
+            # LaplaceSaddleGrid, HierarchicalImportanceQuadrature) need the
+            # per-call posterior path so the µ-coarse scan and the MAP
+            # marginal use the *same* grid; otherwise the scan silently
+            # falls back to the softplus inner grid (via _sig_lo_slice /
+            # _build_grid) and the posterior MAP inflates.
+            _per_call = getattr(
+                self.quadrature, "requires_per_call_posterior", False
             )
+            _grid_mode = getattr(cfg, "posterior_grid_mode", "laplace")
+            if _grid_mode == "global":
+                # Use the inner quadrature's log_S grid as the candidate
+                # log_I0 grid when available (FixedLogGrid); otherwise
+                # build one from config knobs.
+                qgrid = getattr(self.quadrature, "log_S_grid", None)
+                if qgrid is not None:
+                    log_I_grid = qgrid.detach().to(self.device)
+                else:
+                    log_I_grid = torch.linspace(
+                        cfg.posterior_global_log_I_min,
+                        cfg.posterior_global_log_I_max,
+                        int(cfg.posterior_global_n_points),
+                        device=self.device,
+                    )
+                posteriors = compute_posterior_moments_global_grid(
+                    prep=prep, params=params,
+                    scale=self.scale, scatter=self.scatter,
+                    quadrature=self.quadrature, likelihood=self.likelihood,
+                    sigma_laplace=sigma_logI0, priors=prior_specs,
+                    log_I_grid=log_I_grid,
+                    obs_chunk_size=cfg.posterior_obs_chunk_size,
+                    sigma_max=cfg.posterior_sigma_max,
+                    map_fallback_log_I0=params.log_I0.detach(),
+                    summary=getattr(cfg, "posterior_summary", "linear_mean"),
+                )
+            else:
+                _post_fn = (
+                    compute_posterior_moments_per_call
+                    if _per_call else compute_posterior_moments
+                )
+                posteriors = _post_fn(
+                    prep=prep,
+                    params=params,
+                    scale=self.scale,
+                    scatter=self.scatter,
+                    quadrature=self.quadrature,
+                    likelihood=self.likelihood,
+                    sigma_laplace=sigma_logI0,
+                    priors=prior_specs,
+                    n_grid_coarse=cfg.posterior_n_grid_coarse,
+                    n_grid_fine=cfg.posterior_n_grid_fine,
+                    n_sigma=cfg.posterior_n_sigma,
+                    obs_chunk_size=cfg.posterior_obs_chunk_size,
+                    sigma_max=cfg.posterior_sigma_max,
+                    map_fallback_log_I0=params.log_I0.detach(),
+                    summary=getattr(cfg, "posterior_summary", "linear_mean"),
+                )
 
         diag = dict(self.diagnostics)
         diag["pi_bg"] = pi_bg
