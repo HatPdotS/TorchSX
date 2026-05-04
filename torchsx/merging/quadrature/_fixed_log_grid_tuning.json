@@ -1,0 +1,44 @@
+{
+  "NVIDIA A100-PCIE-40GB": {
+    "K<=1024": {
+      "BLOCK_M": 64,
+      "BLOCK_K": 16,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "K>1024": {
+      "BLOCK_M": 64,
+      "BLOCK_K": 16,
+      "num_warps": 4,
+      "num_stages": 2
+    }
+  },
+  "NVIDIA A100-SXM4-40GB": {
+    "K<=1024": {
+      "BLOCK_M": 64,
+      "BLOCK_K": 16,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "K>1024": {
+      "BLOCK_M": 64,
+      "BLOCK_K": 16,
+      "num_warps": 4,
+      "num_stages": 2
+    }
+  },
+  "NVIDIA A100-SXM4-80GB": {
+    "K<=1024": {
+      "BLOCK_M": 64,
+      "BLOCK_K": 16,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "K>1024": {
+      "BLOCK_M": 64,
+      "BLOCK_K": 16,
+      "num_warps": 4,
+      "num_stages": 2
+    }
+  }
+}

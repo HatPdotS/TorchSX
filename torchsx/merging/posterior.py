@@ -191,7 +191,7 @@ def _moments_from_log_post(
 ) -> PosteriorMoments:
     """Trapezoidal integration in Δ for the posterior summary.
 
-    Two summaries (selected by ``summary``):
+    Three summaries (selected by ``summary``):
 
     * ``"linear_mean"`` (default, legacy)
         ``I0 = E[I | data]``, ``σ_I0 = sqrt(Var[I | data])``.  Integrates
@@ -201,9 +201,16 @@ def _moments_from_log_post(
     * ``"log_mean"``
         ``μ = E[log I | data]``, ``σ_μ = sqrt(Var[log I | data])``,
         ``I0 = exp(μ)`` and ``σ_I0 = σ_μ · I0`` (delta method).
-        Unbiased w.r.t. log_I_truth; the natural choice when the
-        downstream consumer (refinement, F-obs propagation) treats the
-        per-HKL uncertainty as Gaussian on log_I.
+        Unbiased w.r.t. log_I_truth on a window-matched grid; on a wide
+        global grid it can be biased downward by mass leaking into the
+        flat-likelihood tail.
+
+    * ``"mode"``
+        ``μ = argmax_Δ log_post(Δ)`` parabolic-refined to sub-grid
+        precision, ``σ_μ = 1/√curvature_at_mode`` (with geometric-
+        variance fallback at the boundary).  Robust to long flat tails
+        that drag the mean — picks the data-favoured peak even when the
+        log_I grid extends far past the informative region.
 
     Emits the same diagnostics either way.
     """
@@ -230,8 +237,59 @@ def _moments_from_log_post(
         sigma_I0 = var_I0.sqrt()
         mu = I0.clamp(min=1e-12).log()
         sigma_mu = sigma_I0 / I0.clamp(min=1e-12)
+    elif summary == "mode":
+        # Per-HKL posterior mode = argmax(log_post), parabolic-refined to
+        # sub-grid precision using the two grid neighbours.  Robust to long
+        # flat tails that drag the mean (linear or geometric) — picks the
+        # data-favoured peak even when the global log_I grid extends far
+        # past the informative region.  σ_logI from the local parabolic
+        # curvature; geometric-variance fallback at the boundary.
+        argmax_m = log_post.argmax(dim=1)                          # (n_valid,)
+        M_fine = log_post.shape[1]
+        interior = (argmax_m > 0) & (argmax_m < M_fine - 1)
+        k_int = argmax_m.clamp(min=1, max=M_fine - 2)
+        y_lo = log_post.gather(1, (k_int - 1)[:, None]).squeeze(1)
+        y_md = log_post.gather(1, k_int[:, None]).squeeze(1)
+        y_hi = log_post.gather(1, (k_int + 1)[:, None]).squeeze(1)
+        # log_post is concave at its argmax → curvature > 0 inside the support.
+        curvature = 2.0 * y_md - y_lo - y_hi
+        use_para = interior & (curvature > 1e-12)
+        refine = 0.5 * (y_hi - y_lo) / curvature.clamp(min=1e-12)
+        refine = torch.where(
+            use_para, refine.clamp(min=-0.5, max=0.5), torch.zeros_like(refine)
+        )
+        delta_mode_int = delta_fine.gather(1, k_int[:, None]).squeeze(1)
+        mu = delta_mode_int + refine * ddelta
+
+        # σ_logI: parabolic 1/√curvature where well-defined, else the
+        # softmax-weighted standard deviation (always finite, bounded by
+        # the grid extent).
+        log_max = log_post.max(dim=1, keepdim=True).values
+        w = (log_post - log_max).exp()
+        Z_local = w.sum(dim=1, keepdim=True).clamp(min=1e-30)
+        p = w / Z_local
+        mu_geo = (delta_fine * p).sum(dim=1)
+        mu2_geo = (delta_fine.pow(2) * p).sum(dim=1)
+        sigma_geo = (mu2_geo - mu_geo.pow(2)).clamp(min=0.0).sqrt()
+        sigma_para = (ddelta.pow(2) / curvature.clamp(min=1e-12)).sqrt()
+        sigma_mu = torch.where(use_para, sigma_para, sigma_geo)
+        I0 = mu.exp()
+        sigma_I0 = sigma_mu * I0
     else:
         raise ValueError(f"Unknown posterior summary: {summary!r}")
+
+    # ── Sub-grid σ floor ─────────────────────────────────────────
+    # When the actual posterior is sharper than the integration grid step
+    # (typical for strong, well-measured HKLs whose Laplace σ has been
+    # clamped at ``sigma_max``), the linear-mean variance can underflow to
+    # exactly zero (E[I²] - E[I]² ≈ 0 with all mass on one node) and the
+    # parabolic-curvature σ in the mode branch can become arbitrarily
+    # small.  Floor σ_μ at half a grid step in log_I — below that the
+    # discretisation makes the reported σ meaningless, and at zero the
+    # downstream consumer (phenix.iotbx) silently drops the reflection.
+    sigma_mu_floor = ddelta * 0.5
+    sigma_mu = torch.maximum(sigma_mu, sigma_mu_floor)
+    sigma_I0 = torch.maximum(sigma_I0, sigma_mu_floor * I0)
 
     # ── Diagnostics ──────────────────────────────────────────────
     # Posterior mode (argmax index) → shift from MAP in σ-units.

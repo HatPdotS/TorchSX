@@ -405,9 +405,14 @@ class Merger:
             )
             state.set_weight("merging/prior/wilson_aniso", s * cfg.lam_wilson_aniso)
 
-            # Pin mean(per-crystal B) → 0 so the global decay flows into U.
+        # Pin mean(per-crystal B) → 0 (independent of Wilson aniso prior).
+        # When lam_wilson_aniso > 0, the global decay flows into the prior's U
+        # so B-mean must be centred; otherwise centring B-mean prevents the
+        # per-crystal B from absorbing the global resolution decay and
+        # collapsing per-HKL dynamic range at high resolution.
+        if cfg.lam_wilson_aniso_b_center > 0:
             scale_b = _find_scale_b_per_crystal(scale)
-            if scale_b is not None and cfg.lam_wilson_aniso_b_center > 0:
+            if scale_b is not None:
                 state.register_target(
                     "merging/reg/scale_b_center",
                     RegularizerTarget(params, ScaleBMeanRegularizer(scale_b)).to(device),

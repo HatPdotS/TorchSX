@@ -19,12 +19,14 @@ centering choice in the other grids biases the merged intensities.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from torch import Tensor
 
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood.base import DetectionLikelihood
+from torchsx.merging.likelihood.poisson import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
 from torchsx.merging.quadrature.base import Quadrature
@@ -32,6 +34,21 @@ from torchsx.merging.quadrature.trapezoidal import (
     TrapezoidalLogGrid, _compute_sig_lo_per_obs,
 )
 from torchsx.merging.scatter.base import ScatterModel
+from torchsx.merging.scatter.gengauss import GenGaussLogScatter
+
+# Triton fast path is optional — falls back to eager when unavailable.
+try:
+    from torchsx.merging.quadrature._fixed_log_grid_triton import (
+        HAVE_TRITON, marginalize_signal_triton,
+    )
+except ImportError:
+    HAVE_TRITON = False
+    marginalize_signal_triton = None  # type: ignore[assignment]
+
+
+# Set ``TORCHSX_FIXEDLOGGRID_NO_TRITON=1`` to force the eager fallback
+# (e.g. for debugging numerical drift between paths).
+_DISABLE_TRITON = os.environ.get("TORCHSX_FIXEDLOGGRID_NO_TRITON", "") == "1"
 
 
 class FixedLogGrid(Quadrature):
@@ -104,6 +121,29 @@ class FixedLogGrid(Quadrature):
     def _build_grid(self, n_ph, bg, sig_lo_per_obs):
         return self.s_grid._build_grid(n_ph, bg, sig_lo_per_obs)
 
+    def _trap_log_w(self, ref: Tensor, K: int) -> Tensor:
+        """Trapezoidal log-weights with half-weight endpoints."""
+        log_w = ref.new_full((K,), math.log(self.dlog_S))
+        log_w[0] = log_w[0] - math.log(2.0)
+        log_w[-1] = log_w[-1] - math.log(2.0)
+        return log_w
+
+    def _can_use_triton(
+        self,
+        scatter: ScatterModel,
+        likelihood: DetectionLikelihood,
+        log_mean: Tensor,
+    ) -> bool:
+        """Triton path is valid only for the (GenGauss × Poisson) workload
+        on a CUDA tensor with Triton installed."""
+        return (
+            HAVE_TRITON
+            and not _DISABLE_TRITON
+            and log_mean.is_cuda
+            and isinstance(scatter, GenGaussLogScatter)
+            and isinstance(likelihood, Poisson)
+        )
+
     def marginalize_signal(
         self,
         scatter: ScatterModel,
@@ -115,9 +155,19 @@ class FixedLogGrid(Quadrature):
         meta: ObsInfo,
         obs_range: tuple[int, int] | None = None,
     ) -> Tensor:                  # (M,)
-        M = log_mean.shape[0]
         K = self.n_points
 
+        if self._can_use_triton(scatter, likelihood, log_mean):
+            log_alpha_obs = params.log_alpha[meta.hkl_idx]
+            log_beta_obs = params.log_beta[meta.hkl_idx]
+            log_w = self._trap_log_w(self.log_S_grid, K)
+            return marginalize_signal_triton(
+                log_mean, n_ph, bg, log_alpha_obs, log_beta_obs,
+                self.log_S_grid, log_w,
+            )
+
+        # Eager fallback — bit-exact w.r.t. the original implementation.
+        M = log_mean.shape[0]
         log_S = self.log_S_grid[None, :].expand(M, K)        # (M, K)
         S     = self.S_grid[None, :].expand(M, K)            # (M, K)
         eps   = log_S - log_mean[:, None]                    # (M, K)
@@ -125,8 +175,5 @@ class FixedLogGrid(Quadrature):
         log_scatter = scatter.log_prob(eps, params, meta)            # (M, K)
         log_lik = likelihood.log_prob_given_signal(n_ph, S, bg)      # (M, K)
 
-        log_w = log_scatter.new_full((K,), math.log(self.dlog_S))
-        log_w[0]  = log_w[0]  - math.log(2.0)
-        log_w[-1] = log_w[-1] - math.log(2.0)
-
+        log_w = self._trap_log_w(log_scatter, K)
         return torch.logsumexp(log_scatter + log_lik + log_w[None, :], dim=1)
