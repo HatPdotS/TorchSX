@@ -42,6 +42,7 @@ class SFXStream:
         merge_friedel: bool = True,
         max_crystals: int | None = None,
         seed: int = 0,
+        sequential: bool = False,
     ) -> SFXStream:
         """Parse a CrystFEL .stream file.
 
@@ -52,11 +53,16 @@ class SFXStream:
         cache : if provided, save/load .sfx cache at this path
         n_workers : parallel workers (default 1 for login node safety)
         merge_friedel : if True, canonicalize HKL to merge Friedel mates
-        max_crystals : if set, parse a random subset of chunks whose total
-            crystal count is ≥ this value.  Uses a streaming two-pass strategy
-            that never holds the whole file in memory — required for 50+ GB
-            streams on memory-constrained nodes.
-        seed : RNG seed for subsampling (ignored unless max_crystals is set).
+        max_crystals : if set, parse a subset of chunks whose total crystal
+            count is ≥ this value.  Uses a streaming two-pass strategy that
+            never holds the whole file in memory — required for 50+ GB streams
+            on memory-constrained nodes.
+        seed : RNG seed for random subsampling (ignored if ``sequential`` or
+            ``max_crystals`` is None).
+        sequential : if True (and ``max_crystals`` is set), take the first
+            chunks in file order instead of a random subset.  Stops scanning
+            the file as soon as enough crystals are collected — no full-file
+            indexing pass.  Use for fast testing on large streams.
         """
         from torchsx.io._parser import parse_stream
         from torchsx.io._safetensors import load_sfx, save_sfx
@@ -73,7 +79,7 @@ class SFXStream:
 
         core = parse_stream(
             path, spacegroup=spacegroup, n_workers=n_workers,
-            max_crystals=max_crystals, seed=seed,
+            max_crystals=max_crystals, seed=seed, sequential=sequential,
         )
 
         if cache is not None:
@@ -626,35 +632,26 @@ class SFXStream:
 
     # --- Write-back ---
 
-    def write_stream(
-        self,
-        path: str | Path,
-        mode: str = "reconstruct",
-        original_stream: str | Path | None = None,
-    ):
-        """Write to CrystFEL .stream format.
+    def write_stream(self, path: str | Path, n_threads: int = 1):
+        """Write to CrystFEL .stream format (reconstructed from tensors).
+
+        The geometry / unit-cell sections are copied verbatim from
+        ``core.source_path`` if it still exists, otherwise synthesized from
+        ``core.geometry``.
 
         Parameters
         ----------
-        path : output file path
-        mode : "reconstruct" (generate from tensors) or "patch" (update I/sigma in original)
-        original_stream : required for "patch" mode, optional for "reconstruct"
+        path : output .stream file path
+        n_threads : ≥1. Parallel-format / sequential-drain pipeline; memory
+            peak stays bounded regardless of total output size. Effective
+            only when the native writer is loaded.
         """
-        if mode == "reconstruct":
-            from torchsx.io._writeback import write_stream_reconstruct
-            write_stream_reconstruct(
-                self._core, path,
-                original_stream=original_stream or self._core.source_path or None,
-            )
-        elif mode == "patch":
-            if original_stream is None:
-                original_stream = self._core.source_path
-            if not original_stream:
-                raise ValueError("patch mode requires original_stream path")
-            from torchsx.io._writeback import write_stream_patch
-            write_stream_patch(self._core, original_stream, path)
-        else:
-            raise ValueError(f"Unknown mode: {mode!r}. Use 'reconstruct' or 'patch'.")
+        from torchsx.io._writeback import write_stream_reconstruct
+        write_stream_reconstruct(
+            self._core, path,
+            original_stream=self._core.source_path or None,
+            n_threads=n_threads,
+        )
 
     # --- Symmetry ---
 
@@ -707,6 +704,60 @@ class SFXStream:
         from torchsx.merging import Merger
         M = Merger(self)
         return M.merge()
+
+    # --- Streamlined merging chain ---
+
+    def make_loss(
+        self,
+        *,
+        n_points: int = 513,
+        S_min: float = 1e-3,
+        S_max: float = 1e6,
+        gain: float | str = "auto",
+        min_obs: int = 5,
+        scale: str = "b_per_crystal",
+        smooth: float = 500.0,
+        wilson_aniso: float = 0.0,
+        wilson_aniso_U_ridge: float = 1.0,
+        wilson_aniso_b_center: float = 1.0,
+        obs_chunk_size: int = 0,
+        device: str | torch.device = "cpu",
+    ):
+        """Build a :class:`LogSpaceLoss` from this stream.
+
+        The returned object is the entry point of the streamlined chain:
+        ``stream.make_loss(...).refine(...).posterior(...).integrate()``.
+        See :class:`torchsx.merging.loss.LogSpaceLoss` for details.
+
+        Parameters
+        ----------
+        n_points :
+            Log-S quadrature grid size (default 513).
+        S_min, S_max :
+            Log-S grid bounds in absolute coordinates.
+        gain :
+            ADU/photon. ``"auto"`` (default) runs the bg-normalised
+            truncated-Gaussian fit on negatives. Pass a float to pin.
+        min_obs :
+            Drop HKLs with fewer than this many positive observations.
+        scale :
+            Scale model name (``"b_per_crystal"`` or ``"panel"``).
+        obs_chunk_size :
+            Memory budget for the per-obs data target. ``0`` = no chunking.
+        device :
+            ``"cpu"`` or ``"cuda"``.
+        """
+        from torchsx.merging.loss import LogSpaceLoss
+        return LogSpaceLoss.from_stream(
+            self,
+            n_points=n_points, S_min=S_min, S_max=S_max,
+            gain=gain, min_obs=min_obs, scale=scale,
+            smooth=smooth,
+            wilson_aniso=wilson_aniso,
+            wilson_aniso_U_ridge=wilson_aniso_U_ridge,
+            wilson_aniso_b_center=wilson_aniso_b_center,
+            obs_chunk_size=obs_chunk_size, device=device,
+        )
 
 def _is_numeric_list(lst: list) -> bool:
     """Check if all existing elements in a list are numeric."""

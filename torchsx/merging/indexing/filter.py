@@ -2,9 +2,41 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import torch
 
 from torchsx._core import _SFXStreamCore
+
+
+def _subset_metadata(
+    metadata,
+    image_mask: torch.Tensor,
+    crystal_mask: torch.Tensor,
+):
+    """Subset per-image / per-crystal entries in ``metadata`` to match the new core.
+
+    Each entry under ``metadata["image"]`` / ``metadata["crystal"]`` is subset only
+    when its length equals the original axis size, so axis-agnostic globals
+    (e.g. ``metadata["crystal"]["panel_names"]`` — actually per-panel) are left
+    untouched. Non-list / non-tensor values pass through unchanged.
+    """
+    if not metadata:
+        return metadata
+
+    new_meta = deepcopy(metadata)
+    for axis_key, mask in (("image", image_mask), ("crystal", crystal_mask)):
+        sub = new_meta.get(axis_key)
+        if not isinstance(sub, dict):
+            continue
+        n_old = int(mask.shape[0])
+        idx = mask.nonzero(as_tuple=True)[0].tolist()
+        for k, v in list(sub.items()):
+            if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] == n_old:
+                sub[k] = v[mask]
+            elif isinstance(v, list) and len(v) == n_old:
+                sub[k] = [v[i] for i in idx]
+    return new_meta
 
 
 def _reindex(
@@ -53,7 +85,7 @@ def _reindex(
         det_shift_y=core.det_shift_y[image_mask],
         n_peaks=core.n_peaks[image_mask],
         geometry=core.geometry,
-        metadata=core.metadata,
+        metadata=_subset_metadata(core.metadata, image_mask, crystal_mask),
         spacegroup=core.spacegroup,
         source_path=core.source_path,
     )

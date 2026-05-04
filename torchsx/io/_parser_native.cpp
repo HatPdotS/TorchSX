@@ -14,12 +14,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -294,6 +299,185 @@ int64_t find_chunk_at_or_after(const std::string& path, int64_t target) {
             return line_start;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-chunk indexing: emit (start, end, n_crys, n_obs) tuples.
+//
+// Single-threaded scan over a byte range, with optional early-exit when
+// cumulative crystals reach `max_crystals`. The multi-threaded entry
+// point splits the file into chunk-aligned ranges and merges results.
+// ---------------------------------------------------------------------------
+
+struct RangeResult {
+    std::vector<std::array<int64_t, 4>> chunks;  // (start, end, n_crys, n_obs)
+    bool has_pending = false;
+    int64_t pending_start = 0;
+    int64_t pending_n_crys = 0;
+    int64_t pending_n_obs = 0;
+};
+
+// Scan [start, end) of `path`, populating `res`.
+//
+// Each completed chunk gets its end set to the byte offset of the next
+// '----- Begin chunk -----'. The last chunk in the range — whose end lies
+// outside [start, end) — is returned as `pending` (no end set); the caller
+// stitches it to either the next worker's first chunk start or EOF.
+//
+// If `max_crystals > 0`, stops as soon as cumulative crystals reach the
+// threshold; in that case `has_pending` is false because the threshold-
+// crossing chunk was already finalized.
+void scan_range_into(const std::string& path, int64_t start, int64_t end,
+                     int64_t max_crystals, RangeResult& res) {
+    BufferedReader r(path, start, end);
+    int64_t current_start = -1;
+    int64_t current_crys = 0;
+    int64_t current_obs = 0;
+    int64_t cum_crys = 0;
+    bool in_refl = false;
+    std::string_view line;
+
+    while (true) {
+        int64_t pos = r.tell();
+        if (!r.read_line(line)) break;
+
+        if (in_refl) {
+            if (starts_with(line, "End of reflections")) {
+                in_refl = false;
+            } else {
+                int words = 0;
+                const char* q = line.data();
+                const char* qe = q + line.size();
+                while (q < qe) {
+                    while (q < qe && (*q == ' ' || *q == '\t')) ++q;
+                    if (q >= qe) break;
+                    ++words;
+                    if (words >= 10) break;
+                    while (q < qe && *q != ' ' && *q != '\t') ++q;
+                }
+                if (words >= 10) ++current_obs;
+            }
+            continue;
+        }
+
+        if (starts_with(line, "----- Begin chunk -----")) {
+            if (current_start >= 0) {
+                res.chunks.push_back({current_start, pos, current_crys, current_obs});
+                cum_crys += current_crys;
+                if (max_crystals > 0 && cum_crys >= max_crystals) {
+                    res.has_pending = false;
+                    return;
+                }
+            }
+            current_start = pos;
+            current_crys = 0;
+            current_obs = 0;
+        } else if (starts_with(line, "--- Begin crystal")) {
+            ++current_crys;
+        } else if (starts_with(line, "Reflections measured after indexing")) {
+            in_refl = true;
+            r.read_line(line);  // skip header
+        }
+    }
+
+    if (current_start >= 0) {
+        res.has_pending = true;
+        res.pending_start = current_start;
+        res.pending_n_crys = current_crys;
+        res.pending_n_obs = current_obs;
+    }
+}
+
+py::list index_chunks(const std::string& path, int n_threads, int64_t max_crystals) {
+    // file size
+    struct stat st;
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error("open failed: " + path + ": " + std::strerror(errno));
+    }
+    if (::fstat(fd, &st) != 0) {
+        ::close(fd);
+        throw std::runtime_error("fstat failed");
+    }
+    int64_t file_size = static_cast<int64_t>(st.st_size);
+    ::close(fd);
+
+    int64_t header_end = find_chunk_at_or_after(path, 0);
+    if (header_end >= file_size) {
+        return py::list();
+    }
+
+    if (n_threads < 1) n_threads = 1;
+
+    // Single-threaded path: also used for early-exit head mode, where
+    // threading would just race past the threshold.
+    if (n_threads == 1 || max_crystals > 0) {
+        RangeResult res;
+        {
+            py::gil_scoped_release nogil;
+            scan_range_into(path, header_end, file_size, max_crystals, res);
+        }
+        py::list out;
+        for (auto& c : res.chunks) {
+            out.append(py::make_tuple(c[0], c[1], c[2], c[3]));
+        }
+        if (res.has_pending) {
+            out.append(py::make_tuple(res.pending_start, file_size,
+                                      res.pending_n_crys, res.pending_n_obs));
+        }
+        return out;
+    }
+
+    // Multi-threaded: chunk-aligned byte-range split, one std::thread per range.
+    std::vector<int64_t> starts;
+    starts.push_back(header_end);
+    for (int i = 1; i < n_threads; ++i) {
+        int64_t target = header_end + (file_size - header_end) * i / n_threads;
+        int64_t s = find_chunk_at_or_after(path, target);
+        if (s > starts.back() && s < file_size) {
+            starts.push_back(s);
+        }
+    }
+    int actual_n = static_cast<int>(starts.size());
+    std::vector<int64_t> ends(actual_n);
+    for (int i = 0; i < actual_n - 1; ++i) ends[i] = starts[i + 1];
+    ends[actual_n - 1] = file_size;
+
+    std::vector<RangeResult> results(actual_n);
+    std::vector<std::exception_ptr> errors(actual_n, nullptr);
+    {
+        py::gil_scoped_release nogil;
+        std::vector<std::thread> threads;
+        threads.reserve(actual_n);
+        for (int i = 0; i < actual_n; ++i) {
+            threads.emplace_back([&, i]() {
+                try {
+                    scan_range_into(path, starts[i], ends[i], -1, results[i]);
+                } catch (...) {
+                    errors[i] = std::current_exception();
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+    }
+    for (auto& e : errors) {
+        if (e) std::rethrow_exception(e);
+    }
+
+    // Stitch pending-tuple ends to the next worker's first chunk start
+    // (or file_size for the trailing worker), preserving file order.
+    py::list out;
+    for (int i = 0; i < actual_n; ++i) {
+        for (auto& c : results[i].chunks) {
+            out.append(py::make_tuple(c[0], c[1], c[2], c[3]));
+        }
+        if (results[i].has_pending) {
+            int64_t pend_end = (i + 1 < actual_n) ? starts[i + 1] : file_size;
+            out.append(py::make_tuple(results[i].pending_start, pend_end,
+                                      results[i].pending_n_crys, results[i].pending_n_obs));
+        }
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +813,394 @@ py::tuple parse_into_shared(
     );
 }
 
+// ============================================================================
+// Native CrystFEL stream writer.
+//
+// Mirrors write_stream_reconstruct in torchsx/io/_writeback.py byte-for-byte.
+// Numeric formatting uses C99 printf, which on glibc applies the same
+// round-half-to-even rule as CPython's float __format__, so round-tripping
+// (write → re-parse) recovers identical float32 bit patterns.
+//
+// Throughput is snprintf-bound at ~35 MB/s single-threaded. To scale beyond
+// that we use a parallel-format / sequential-drain pipeline:
+//
+//   for batch of B images:
+//     parallel: each of N threads formats B/N images into its per-thread
+//               std::string (no I/O, no shared state)
+//     serial:   main thread fwrites the per-thread buffers in image order
+//
+// Memory peak ≈ B × avg_image_bytes (a few MB) regardless of total output
+// size — safe for arbitrarily large streams.
+// ============================================================================
+
+// Thin sink that appends formatted bytes to a std::string. Mirrors
+// FileWriter's interface so format_chunk can be templated over the sink type.
+struct StringSink {
+    std::string* out;
+
+    explicit StringSink(std::string& s) : out(&s) {}
+
+    void write(const char* data, size_t n) { out->append(data, n); }
+    void write(std::string_view s) { out->append(s.data(), s.size()); }
+    void write(const std::string& s) { out->append(s); }
+    void write(const char* s) { out->append(s); }
+
+    void writef(const char* fmt, ...) __attribute__((format(printf, 2, 3))) {
+        char buf[512];
+        va_list ap;
+        va_start(ap, fmt);
+        int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        if (n < 0) throw std::runtime_error("vsnprintf failed");
+        if (static_cast<size_t>(n) < sizeof(buf)) {
+            out->append(buf, static_cast<size_t>(n));
+            return;
+        }
+        std::vector<char> big(static_cast<size_t>(n) + 1);
+        va_start(ap, fmt);
+        std::vsnprintf(big.data(), big.size(), fmt, ap);
+        va_end(ap);
+        out->append(big.data(), static_cast<size_t>(n));
+    }
+};
+
+// Bundle of all the data format_chunk needs. Pointers; no ownership.
+struct WriteCtx {
+    // per-observation
+    const int16_t* hkl;
+    const float*   I;
+    const float*   sigma;
+    const float*   peak;
+    const float*   background;
+    const float*   fs;
+    const float*   ss;
+    const int16_t* panel_id;
+    // per-crystal
+    const float*   cell;
+    const float*   astar;
+    const float*   bstar;
+    const float*   cstar;
+    const float*   profile_rad;
+    const float*   resolution;
+    const int32_t* n_refl;
+    const int32_t* image_id;
+    // per-image
+    const float*   beam_energy;
+    const int32_t* n_peaks;
+    const float*   det_shift_x;
+    const float*   det_shift_y;
+    const float*   camera_length;  // may be null
+    int64_t        n_cam;
+    // strings
+    const std::vector<std::string>* filenames;
+    const std::vector<std::string>* events;
+    const std::vector<std::string>* panel_names;
+    const std::string* lattice_type;
+    const std::string* centering;
+    const std::string* unique_axis;
+    // structure
+    const std::vector<int64_t>*              obs_off;
+    const std::vector<std::vector<int32_t>>* image_to_crys;
+    int64_t n_panels;
+};
+
+// Format one chunk (Image filename header through "----- End chunk -----")
+// by appending bytes to `s`. Templated so the same code emits to either a
+// FILE-backed sink (single-threaded direct write) or a string-backed sink
+// (multi-threaded format-then-drain).
+template <typename Sink>
+void format_chunk(Sink& s, int64_t iid, const WriteCtx& c) {
+    s.write("----- Begin chunk -----\n");
+
+    if (iid < static_cast<int64_t>(c.filenames->size())) {
+        s.writef("Image filename: %s\n", (*c.filenames)[iid].c_str());
+    } else {
+        s.writef("Image filename: image_%lld\n", static_cast<long long>(iid));
+    }
+    if (iid < static_cast<int64_t>(c.events->size())) {
+        s.writef("Event: %s\n", (*c.events)[iid].c_str());
+    } else {
+        s.writef("Event: //%lld\n", static_cast<long long>(iid));
+    }
+    s.writef("Image serial number: %lld\n", static_cast<long long>(iid));
+    s.write("hit = 1\n");
+    const auto& crys_list = (*c.image_to_crys)[iid];
+    s.writef("indexed_by = %s\n", crys_list.empty() ? "none" : "xgandalf");
+    s.write("n_indexing_tries = 1\n");
+    s.writef("photon_energy_eV = %.6f\n", static_cast<double>(c.beam_energy[iid]));
+    s.write("beam_divergence = 0.00e+00 rad\n");
+    s.write("beam_bandwidth = 1.00e-08 (fraction)\n");
+    double clen_m = (c.camera_length && iid < c.n_cam)
+        ? static_cast<double>(c.camera_length[iid]) : 0.0;
+    s.writef("average_camera_length = %.6f m\n", clen_m);
+    s.writef("num_peaks = %d\n", static_cast<int>(c.n_peaks[iid]));
+
+    s.write("Peaks from peak search\n");
+    s.write("  fs/px   ss/px (1/d)/nm^-1   Intensity  Panel\n");
+    s.write("End of peak list\n");
+
+    for (int32_t cid : crys_list) {
+        s.write("--- Begin crystal\n");
+
+        const float* cp = c.cell + 6 * cid;
+        // Cell: a/b/c stored in Å, output in nm (÷10). α/β/γ unchanged.
+        // Critical: divide in float32 (matching numpy's weak-scalar promotion
+        // for `np.float32_arr / 10.0`), THEN promote to double for snprintf.
+        // Doing the divide in double would lose the float32 rounding step
+        // that the Python writer applies and produce 1-ULP diffs at .5f.
+        double a  = static_cast<double>(cp[0] / 10.0f);
+        double b  = static_cast<double>(cp[1] / 10.0f);
+        double cc = static_cast<double>(cp[2] / 10.0f);
+        double al = static_cast<double>(cp[3]);
+        double be = static_cast<double>(cp[4]);
+        double ga = static_cast<double>(cp[5]);
+        s.writef("Cell parameters %.5f %.5f %.5f nm, %.5f %.5f %.5f deg\n",
+                 a, b, cc, al, be, ga);
+
+        const float* ap   = c.astar + 3 * cid;
+        const float* bp   = c.bstar + 3 * cid;
+        const float* cstp = c.cstar + 3 * cid;
+        s.writef("astar = %+.7f %+.7f %+.7f nm^-1\n",
+                 static_cast<double>(ap[0] * 10.0f),
+                 static_cast<double>(ap[1] * 10.0f),
+                 static_cast<double>(ap[2] * 10.0f));
+        s.writef("bstar = %+.7f %+.7f %+.7f nm^-1\n",
+                 static_cast<double>(bp[0] * 10.0f),
+                 static_cast<double>(bp[1] * 10.0f),
+                 static_cast<double>(bp[2] * 10.0f));
+        s.writef("cstar = %+.7f %+.7f %+.7f nm^-1\n",
+                 static_cast<double>(cstp[0] * 10.0f),
+                 static_cast<double>(cstp[1] * 10.0f),
+                 static_cast<double>(cstp[2] * 10.0f));
+
+        if (!c.lattice_type->empty()) s.writef("lattice_type = %s\n", c.lattice_type->c_str());
+        if (!c.centering->empty())    s.writef("centering = %s\n", c.centering->c_str());
+        if (!c.unique_axis->empty())  s.writef("unique_axis = %s\n", c.unique_axis->c_str());
+
+        s.writef("profile_radius = %.5f nm^-1\n",
+                 static_cast<double>(c.profile_rad[cid] * 10.0f));
+        s.write("predict_refine/initial_residual = 0.000000 (0.000000 0.000000 0.000000)\n");
+        s.write("predict_refine/final_residual = 0.000000 (0.000000 0.000000 0.000000)\n");
+        s.write("predict_refine/total_shifts = 0.000000e+00 0.000000e+00 0.000000e+00\n");
+        s.writef("predict_refine/det_shift x = %.3f y = %.3f mm\n",
+                 static_cast<double>(c.det_shift_x[iid]),
+                 static_cast<double>(c.det_shift_y[iid]));
+
+        double res_A  = static_cast<double>(c.resolution[cid]);
+        double res_nm = res_A > 0.0 ? 10.0 / res_A : 0.0;
+        s.writef("diffraction_resolution_limit = %.2f nm^-1 or %.2f A\n", res_nm, res_A);
+
+        s.writef("num_reflections = %d\n", static_cast<int>(c.n_refl[cid]));
+        s.write("num_saturated_reflections = 0\n");
+        s.write("num_implausible_reflections = 0\n");
+
+        s.write("Reflections measured after indexing\n");
+        s.write("   h    k    l          I   sigma(I)       peak background  fs/px  ss/px panel\n");
+
+        int64_t lo = (*c.obs_off)[cid];
+        int64_t hi = (*c.obs_off)[cid + 1];
+        for (int64_t j = lo; j < hi; ++j) {
+            int16_t pid = c.panel_id[j];
+            const char* pname = (pid >= 0 && pid < c.n_panels)
+                ? (*c.panel_names)[pid].c_str()
+                : "";
+            // Matches Python f-string concat exactly. NO space between bg's
+            // 10-wide field and fs's 7-wide field.
+            s.writef("%4d %4d %4d %10.2f %10.2f %10.2f %10.2f%7.1f %6.1f %s\n",
+                     static_cast<int>(c.hkl[3 * j + 0]),
+                     static_cast<int>(c.hkl[3 * j + 1]),
+                     static_cast<int>(c.hkl[3 * j + 2]),
+                     static_cast<double>(c.I[j]),
+                     static_cast<double>(c.sigma[j]),
+                     static_cast<double>(c.peak[j]),
+                     static_cast<double>(c.background[j]),
+                     static_cast<double>(c.fs[j]),
+                     static_cast<double>(c.ss[j]),
+                     pname);
+        }
+
+        s.write("End of reflections\n");
+        s.write("--- End crystal\n");
+    }
+
+    s.write("----- End chunk -----\n");
+}
+
+void write_stream_reconstruct(
+    const std::string& path,
+    // per-observation arrays — caller must sort by crystal_id
+    torch::Tensor hkl,           // (N_obs, 3) int16
+    torch::Tensor I,             // (N_obs,)   float32
+    torch::Tensor sigma,         // (N_obs,)   float32
+    torch::Tensor peak,          // (N_obs,)   float32
+    torch::Tensor background,    // (N_obs,)   float32
+    torch::Tensor fs,            // (N_obs,)   float32
+    torch::Tensor ss,            // (N_obs,)   float32
+    torch::Tensor panel_id,      // (N_obs,)   int16
+    // per-crystal arrays
+    torch::Tensor cell,          // (N_crys, 6) float32, in Å + degrees
+    torch::Tensor astar,         // (N_crys, 3) float32, in Å^-1 (×10 in C++)
+    torch::Tensor bstar,         // (N_crys, 3) float32, in Å^-1 (×10 in C++)
+    torch::Tensor cstar,         // (N_crys, 3) float32, in Å^-1 (×10 in C++)
+    torch::Tensor profile_rad,   // (N_crys,)   float32, in Å^-1 (×10 in C++)
+    torch::Tensor resolution,    // (N_crys,)   float32, in Å
+    torch::Tensor n_refl,        // (N_crys,)   int32 — implies obs slicing
+    torch::Tensor image_id,      // (N_crys,)   int32
+    // per-image arrays
+    torch::Tensor beam_energy,   // (N_img,)    float32, in eV
+    torch::Tensor n_peaks,       // (N_img,)    int32
+    torch::Tensor det_shift_x,   // (N_img,)    float32, in mm
+    torch::Tensor det_shift_y,   // (N_img,)    float32, in mm
+    torch::Tensor camera_length, // (N_img,) or empty, float32, in m
+    // per-image string metadata (length N_img each)
+    const std::vector<std::string>& filenames,
+    const std::vector<std::string>& events,
+    // panel name lookup (length n_panels), pre-padded with "m{i}" fallbacks
+    const std::vector<std::string>& panel_names,
+    // optional unit-cell section fields — empty string = absent
+    const std::string& lattice_type,
+    const std::string& centering,
+    const std::string& unique_axis,
+    // pre-built header bytes (magic line(s) + geometry + unit cell sections)
+    const std::string& header_blob,
+    int n_threads,
+    int images_per_batch
+) {
+    const int64_t n_crystals  = n_refl.size(0);
+    const int64_t n_images    = beam_energy.size(0);
+    const int64_t n_panels    = static_cast<int64_t>(panel_names.size());
+    const int64_t n_cam       = camera_length.numel();
+
+    WriteCtx ctx;
+    ctx.hkl          = hkl.data_ptr<int16_t>();
+    ctx.I            = I.data_ptr<float>();
+    ctx.sigma        = sigma.data_ptr<float>();
+    ctx.peak         = peak.data_ptr<float>();
+    ctx.background   = background.data_ptr<float>();
+    ctx.fs           = fs.data_ptr<float>();
+    ctx.ss           = ss.data_ptr<float>();
+    ctx.panel_id     = panel_id.data_ptr<int16_t>();
+    ctx.cell         = cell.data_ptr<float>();
+    ctx.astar        = astar.data_ptr<float>();
+    ctx.bstar        = bstar.data_ptr<float>();
+    ctx.cstar        = cstar.data_ptr<float>();
+    ctx.profile_rad  = profile_rad.data_ptr<float>();
+    ctx.resolution   = resolution.data_ptr<float>();
+    ctx.n_refl       = n_refl.data_ptr<int32_t>();
+    ctx.image_id     = image_id.data_ptr<int32_t>();
+    ctx.beam_energy  = beam_energy.data_ptr<float>();
+    ctx.n_peaks      = n_peaks.data_ptr<int32_t>();
+    ctx.det_shift_x  = det_shift_x.data_ptr<float>();
+    ctx.det_shift_y  = det_shift_y.data_ptr<float>();
+    ctx.camera_length = (n_cam > 0) ? camera_length.data_ptr<float>() : nullptr;
+    ctx.n_cam        = n_cam;
+    ctx.filenames    = &filenames;
+    ctx.events       = &events;
+    ctx.panel_names  = &panel_names;
+    ctx.lattice_type = &lattice_type;
+    ctx.centering    = &centering;
+    ctx.unique_axis  = &unique_axis;
+    ctx.n_panels     = n_panels;
+
+    // Cumulative observation offsets per crystal.
+    std::vector<int64_t> obs_off(static_cast<size_t>(n_crystals) + 1, 0);
+    for (int64_t c = 0; c < n_crystals; ++c) {
+        obs_off[c + 1] = obs_off[c] + ctx.n_refl[c];
+    }
+    ctx.obs_off = &obs_off;
+
+    // image_id → ordered list of crystal_ids in that image.
+    std::vector<std::vector<int32_t>> image_to_crys(static_cast<size_t>(n_images));
+    for (int32_t c = 0; c < n_crystals; ++c) {
+        int32_t iid = ctx.image_id[c];
+        if (iid >= 0 && iid < n_images) {
+            image_to_crys[iid].push_back(c);
+        }
+    }
+    ctx.image_to_crys = &image_to_crys;
+
+    if (n_threads < 1) n_threads = 1;
+    if (images_per_batch < 1) images_per_batch = 1024;
+
+    py::gil_scoped_release nogil;
+
+    // Open output with a 1 MiB userspace fwrite buffer.
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        throw std::runtime_error("fopen failed: " + path + ": " + std::strerror(errno));
+    }
+    std::vector<char> userbuf(1 << 20);
+    std::setvbuf(f, userbuf.data(), _IOFBF, userbuf.size());
+
+    auto fwrite_all = [&](const char* data, size_t n) {
+        if (n && std::fwrite(data, 1, n, f) != n) {
+            std::fclose(f);
+            throw std::runtime_error("fwrite failed");
+        }
+    };
+
+    try {
+        fwrite_all(header_blob.data(), header_blob.size());
+
+        // Reusable per-thread format buffers — capacity grows naturally to
+        // the largest batch size, then is retained across batches.
+        std::vector<std::string> bufs(static_cast<size_t>(n_threads));
+        for (auto& b : bufs) b.reserve(1 << 20);
+
+        for (int64_t batch_start = 0; batch_start < n_images; batch_start += images_per_batch) {
+            const int64_t batch_end = std::min(
+                batch_start + static_cast<int64_t>(images_per_batch), n_images);
+            const int64_t batch_n = batch_end - batch_start;
+
+            // Per-thread image ranges within the batch (image-aligned split).
+            std::vector<int64_t> tstarts(static_cast<size_t>(n_threads) + 1);
+            for (int t = 0; t <= n_threads; ++t) {
+                tstarts[t] = batch_start + (batch_n * t) / n_threads;
+            }
+
+            if (n_threads == 1) {
+                bufs[0].clear();
+                StringSink s(bufs[0]);
+                for (int64_t iid = batch_start; iid < batch_end; ++iid) {
+                    format_chunk(s, iid, ctx);
+                }
+                fwrite_all(bufs[0].data(), bufs[0].size());
+                continue;
+            }
+
+            std::vector<std::thread> threads;
+            std::vector<std::exception_ptr> errors(static_cast<size_t>(n_threads), nullptr);
+            threads.reserve(static_cast<size_t>(n_threads));
+            for (int t = 0; t < n_threads; ++t) {
+                threads.emplace_back([&, t]() {
+                    try {
+                        bufs[t].clear();
+                        StringSink s(bufs[t]);
+                        for (int64_t iid = tstarts[t]; iid < tstarts[t + 1]; ++iid) {
+                            format_chunk(s, iid, ctx);
+                        }
+                    } catch (...) {
+                        errors[t] = std::current_exception();
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+            for (auto& e : errors) {
+                if (e) { std::fclose(f); std::rethrow_exception(e); }
+            }
+
+            // Drain in image order — bufs[0] precedes bufs[1] precedes …
+            for (int t = 0; t < n_threads; ++t) {
+                fwrite_all(bufs[t].data(), bufs[t].size());
+            }
+        }
+    } catch (...) {
+        std::fclose(f);
+        throw;
+    }
+    std::fclose(f);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -636,6 +1208,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Count (n_obs, n_crystals, n_images) in a byte range (mmap).");
     m.def("find_chunk_at_or_after", &find_chunk_at_or_after,
           "Find byte offset of first '----- Begin chunk -----' at or after target.");
+    m.def("index_chunks", &index_chunks,
+          py::arg("path"), py::arg("n_threads") = 1, py::arg("max_crystals") = -1,
+          "Index per-chunk byte offsets and counts. Returns list of "
+          "(start, end, n_crys, n_obs) int64 4-tuples in file order. "
+          "n_threads>1 splits the file into chunk-aligned byte ranges. "
+          "max_crystals>0 enables early-exit head mode (forces single-threaded).");
     m.def("parse_into_shared", &parse_into_shared,
           "Parse a byte range, writing into pre-allocated shared tensors at the given offsets.");
+    m.def("write_stream_reconstruct", &write_stream_reconstruct,
+          py::arg("path"),
+          py::arg("hkl"), py::arg("I"), py::arg("sigma"), py::arg("peak"), py::arg("background"),
+          py::arg("fs"), py::arg("ss"), py::arg("panel_id"),
+          py::arg("cell"), py::arg("astar"), py::arg("bstar"), py::arg("cstar"),
+          py::arg("profile_rad"), py::arg("resolution"), py::arg("n_refl"), py::arg("image_id"),
+          py::arg("beam_energy"), py::arg("n_peaks"),
+          py::arg("det_shift_x"), py::arg("det_shift_y"), py::arg("camera_length"),
+          py::arg("filenames"), py::arg("events"), py::arg("panel_names"),
+          py::arg("lattice_type"), py::arg("centering"), py::arg("unique_axis"),
+          py::arg("header_blob"),
+          py::arg("n_threads") = 1,
+          py::arg("images_per_batch") = 1024,
+          "Write a CrystFEL .stream file from per-observation/crystal/image tensors. "
+          "Caller must sort observations by crystal_id; header_blob is written verbatim "
+          "as the file preamble (magic line + geometry + unit-cell sections). "
+          "n_threads>1 enables parallel-format / sequential-drain pipeline; memory "
+          "peak ≈ images_per_batch × avg_image_bytes, independent of total output size.");
 }

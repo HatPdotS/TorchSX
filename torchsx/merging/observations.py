@@ -174,7 +174,13 @@ def prepare_observations(
     elif gain_cfg == "empirical":
         g = poisson_noise.calibrate_gain(core_I, core_background)
         gain = float(g) if g and g > 0 else 1.0
-        gain_src = "empirical (negatives-Mandel)"
+        gain_src = "empirical (negatives-Mandel; biased high)"
+    elif gain_cfg == "auto":
+        g, mu_bias = poisson_noise.calibrate_gain_truncnorm(
+            core_I, core_background,
+        )
+        gain = float(g) if g and g > 0 else 1.0
+        gain_src = f"auto (truncnorm, μ_z={mu_bias:+.3f}σ)"
     else:
         raise ValueError(f"Unknown config.gain: {gain_cfg!r}")
     print(f"  gain = {gain:.4g} ADU/photon  [{gain_src}]", flush=True)

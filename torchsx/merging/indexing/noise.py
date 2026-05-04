@@ -64,6 +64,10 @@ class PoissonNoiseModel:
             Var[I_obs_ADU] = g · n_peak · bg_ADU_per_px · (1 + n_peak/n_bg)
         Conditioned on I_obs<0 (zero mean),
             ⟨I²_neg⟩ = Var[I_obs_ADU]  ⇒  g = ⟨I²_neg⟩ / denom.
+
+        Note: assumes the negatives are zero-centred. Real data has a
+        positive μ-bias (signal contamination + centroiding), so this
+        estimator runs high. Prefer ``calibrate_gain_truncnorm``.
         """
         neg = I_obs < 0
         n_neg = int(neg.sum().item())
@@ -82,3 +86,91 @@ class PoissonNoiseModel:
               f"[n_peak={self.n_peak:.2f}, n_bg={self.n_bg:.2f}, "
               f"{n_neg} negatives]")
         return g
+
+    def calibrate_gain_truncnorm(
+        self,
+        I_obs: Tensor,
+        background: Tensor,
+        *,
+        bg_min: float = 0.1,
+        z_min: float = -20.0,
+        max_pool: int = 1_000_000,
+        max_iter: int = 200,
+        seed: int = 0,
+    ) -> tuple[float, float]:
+        """Bias-aware gain from bg-normalised truncated-Gaussian fit on negatives.
+
+        Each negative ``I_j`` is whitened by its predicted σ at g=1,
+        ``z_j = I_j / sqrt(bg_j · n_peak · (1 + n_peak/n_bg))``. The pool of
+        ``z`` values truncated to (-∞, 0) is fit by MLE to a Normal(μ, σ);
+        the gain is ``g = σ²``. The bias is absorbed into μ instead of
+        inflating σ as in the naive Mandel estimator.
+
+        Returns
+        -------
+        (gain, mu_bias_in_sigma_units)
+            ``mu_bias_in_sigma_units`` is the fitted μ in units of the
+            predicted σ at g=1 — diagnostic only.
+        """
+        device = I_obs.device
+        dtype = torch.float64
+
+        neg = (I_obs < 0) & (background > bg_min)
+        n_neg = int(neg.sum().item())
+        if n_neg < 100:
+            print(f"  PoissonNoiseModel.truncnorm: only {n_neg} valid negatives, "
+                  f"keeping gain={self.gain:.3f}")
+            return self.gain, 0.0
+
+        I_neg = I_obs[neg].to(dtype=dtype)
+        bg_neg = background[neg].to(dtype=dtype)
+        sigma_pred_g1 = (bg_neg * self.n_peak * (1.0 + self.n_peak / self.n_bg)).sqrt()
+        z = I_neg / sigma_pred_g1.clamp(min=1e-12)
+        z = z[(z > z_min) & (z < 0.0)]
+
+        if z.numel() > max_pool:
+            gen = torch.Generator(device=device).manual_seed(seed)
+            idx = torch.randperm(z.numel(), generator=gen, device=device)[:max_pool]
+            z = z[idx]
+
+        sigma0 = (z.std(unbiased=False) / math.sqrt(1.0 - 2.0 / math.pi)).clamp(min=1e-3)
+        mu = torch.zeros((), device=device, dtype=dtype, requires_grad=True)
+        log_sigma = torch.tensor(
+            float(sigma0.log()), device=device, dtype=dtype, requires_grad=True,
+        )
+
+        opt = torch.optim.LBFGS(
+            [mu, log_sigma], max_iter=max_iter, history_size=10,
+            tolerance_grad=1e-8, tolerance_change=1e-12,
+            line_search_fn="strong_wolfe",
+        )
+
+        # log Φ(x) via the standard normal CDF, computed stably as
+        # log(0.5 · erfc(-x / √2)).
+        def _log_phi_cdf(x: Tensor) -> Tensor:
+            return torch.log(0.5 * torch.erfc(-x / math.sqrt(2.0)).clamp(min=1e-300))
+
+        def closure() -> Tensor:
+            opt.zero_grad(set_to_none=False)
+            sigma = log_sigma.exp()
+            zc = (z - mu) / sigma
+            ll_point = -0.5 * zc.pow(2) - 0.5 * math.log(2.0 * math.pi) - log_sigma
+            log_trunc = _log_phi_cdf(-mu / sigma)  # Φ(-μ/σ)
+            nll = -(ll_point.sum() - z.numel() * log_trunc)
+            nll.backward()
+            return nll
+
+        opt.step(closure)
+
+        sigma_hat = float(log_sigma.detach().exp().item())
+        mu_hat = float(mu.detach().item())
+        gain = sigma_hat ** 2
+        self.gain = gain
+        print(
+            f"  PoissonNoiseModel.truncnorm: gain={gain:.4f} ADU/photon  "
+            f"σ_z={sigma_hat:.3f}  μ_z={mu_hat:+.3f}σ  "
+            f"[n_peak={self.n_peak:.2f}, n_bg={self.n_bg:.2f}, "
+            f"{int(z.numel())}/{n_neg} negatives]",
+            flush=True,
+        )
+        return gain, mu_hat

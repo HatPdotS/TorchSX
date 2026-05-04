@@ -709,6 +709,7 @@ def parse_stream(
     n_workers: int = 1,
     max_crystals: int | None = None,
     seed: int = 0,
+    sequential: bool = False,
 ) -> _SFXStreamCore:
     """Parse a CrystFEL .stream file into stacked tensors.
 
@@ -716,15 +717,25 @@ def parse_stream(
     ----------
     path : path to .stream file
     spacegroup : space group string (stored as metadata)
-    n_workers : number of parallel worker processes. ``1`` parses serially.
-    max_crystals : if set, parse a random subset containing at most this many
-        crystals. Serial parse; ``n_workers`` ignored.
-    seed : RNG seed for chunk sampling (only used when ``max_crystals`` is set).
+    n_workers : number of parallel worker processes for full-file parse;
+        also the number of native indexer threads in sampled mode.  Sequential
+        head mode forces single-threaded indexing.
+    max_crystals : if set, parse a subset containing at most this many
+        crystals. Parse phase is serial (``n_workers`` only affects indexing).
+    seed : RNG seed for random chunk sampling (only used when
+        ``max_crystals`` is set and ``sequential`` is False).
+    sequential : if True with ``max_crystals``, take chunks from the file
+        start in order and stop scanning as soon as enough crystals are
+        collected. Avoids the full-file indexing pass.
     """
     path = str(path)
 
     if max_crystals is not None:
-        return _parse_stream_sampled(path, spacegroup, int(max_crystals), int(seed))
+        if sequential:
+            return _parse_stream_head(path, spacegroup, int(max_crystals))
+        return _parse_stream_sampled(
+            path, spacegroup, int(max_crystals), int(seed), n_workers=int(n_workers),
+        )
 
     geometry = Geometry.from_stream(path)
     panel_name_to_id = geometry.panel_name_to_id
@@ -908,15 +919,164 @@ def _finalize_shared(
     )
 
 
+def _index_chunks_until(
+    path: str, max_crystals: int
+) -> list[tuple[int, int, int, int]]:
+    """Walk the stream from the start, indexing chunks until cumulative
+    crystals ≥ ``max_crystals``. Returns the selected chunks as
+    ``(start, end, n_crys, n_obs)`` — same shape as :func:`_index_chunks`.
+
+    Stops early; never reads past the last needed chunk.
+    """
+    B_BEGIN_CHUNK = b"----- Begin chunk -----"
+    B_BEGIN_CRY = b"--- Begin crystal"
+    B_REFL_BEGIN = b"Reflections measured after indexing"
+    B_REFL_END = b"End of reflections"
+
+    selected: list[tuple[int, int, int, int]] = []
+    current_start: int | None = None
+    current_crystals = 0
+    current_obs = 0
+    n_crys_cum = 0
+    in_refl = False
+
+    with open(path, "rb", buffering=1 << 20) as f:
+        while True:
+            pos = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            if in_refl:
+                if line.startswith(B_REFL_END):
+                    in_refl = False
+                elif len(line.split()) >= 10:
+                    current_obs += 1
+                continue
+            c0 = line[:1]
+            if c0 == b"-":
+                if line.startswith(B_BEGIN_CHUNK):
+                    if current_start is not None:
+                        selected.append(
+                            (current_start, pos, current_crystals, current_obs)
+                        )
+                        n_crys_cum += current_crystals
+                        if n_crys_cum >= max_crystals:
+                            current_start = None  # already flushed
+                            break
+                    current_start = pos
+                    current_crystals = 0
+                    current_obs = 0
+                elif line.startswith(B_BEGIN_CRY):
+                    current_crystals += 1
+            elif c0 == b"R" and line.startswith(B_REFL_BEGIN):
+                in_refl = True
+                f.readline()  # skip reflection-table header
+        if current_start is not None:
+            # Reached EOF — flush the last partially-indexed chunk.
+            end_pos = f.tell()
+            selected.append(
+                (current_start, end_pos, current_crystals, current_obs)
+            )
+
+    return selected
+
+
+def _index_chunks_native_or_python(
+    path: str,
+    n_workers: int = 1,
+    max_crystals: int | None = None,
+) -> list[tuple[int, int, int, int]]:
+    """Return per-chunk ``(start, end, n_crys, n_obs)`` tuples.
+
+    Routes through the C++ extension when available (single call, GIL
+    released, multi-threaded for ``n_workers > 1``). Falls back to the
+    pure-Python serial walk otherwise.
+
+    ``max_crystals``, if set, enables early-exit head mode (forces
+    single-threaded — racing past the threshold wastes I/O).
+    """
+    from torchsx.io import _native
+    native_mod = _native.load()
+    if native_mod is not None:
+        mc = -1 if max_crystals is None else int(max_crystals)
+        nt = 1 if mc > 0 else max(1, int(n_workers))
+        return [tuple(t) for t in native_mod.index_chunks(path, nt, mc)]
+    if max_crystals is not None:
+        return _index_chunks_until(path, int(max_crystals))
+    _, chunks = _index_chunks(path)
+    return chunks
+
+
+def _parse_stream_head(
+    path: str,
+    spacegroup: str,
+    max_crystals: int,
+) -> _SFXStreamCore:
+    """Parse the first chunks of a stream until ``max_crystals`` is reached.
+
+    Single-pass index (early-exit) + targeted parse. Avoids scanning the
+    whole file just to know its total chunk count.
+    """
+    print(
+        f"  [head] indexing chunks of {path} until ≥{max_crystals} crystals ...",
+        flush=True,
+    )
+    selected = _index_chunks_native_or_python(path, max_crystals=max_crystals)
+    if not selected:
+        raise ValueError(f"No chunks found in {path}")
+
+    n_obs_alloc = sum(c[3] for c in selected)
+    n_crys_total = sum(c[2] for c in selected)
+    n_imgs_total = len(selected)  # one image per chunk
+    print(
+        f"  [head] selected {n_imgs_total} chunks → {n_crys_total} crystals",
+        flush=True,
+    )
+
+    geometry = Geometry.from_stream(path)
+    panel_name_to_id = geometry.panel_name_to_id
+
+    tensors = _allocate_tensors(n_obs_alloc, n_crys_total, n_imgs_total)
+    views = {k: t.numpy() for k, t in tensors.items()}
+    filenames: list[str] = []
+    events: list[str] = []
+    crystal_idx = image_idx = n_obs_got = 0
+
+    with open(path, "rb", buffering=1 << 20) as f:
+        for start, end, _, _ in selected:
+            f.seek(start)
+            it = _line_iter(f, end)
+            crystal_idx, image_idx, n_obs_got = _parse_into_views(
+                it, panel_name_to_id, views, filenames, events,
+                crystal_idx, image_idx, n_obs_got,
+            )
+
+    result = _finalize(
+        tensors, n_obs_got, n_obs_alloc,
+        crystal_idx, n_crys_total,
+        image_idx, n_imgs_total,
+        filenames, events,
+    )
+    return _assemble_core([result], path, spacegroup, geometry)
+
+
 def _parse_stream_sampled(
     path: str,
     spacegroup: str,
     max_crystals: int,
     seed: int,
+    n_workers: int = 1,
 ) -> _SFXStreamCore:
-    """Parse a random subset of chunks totalling ``max_crystals`` crystals."""
-    print(f"  [sampled] indexing chunks in {path} ...", flush=True)
-    _, chunks = _index_chunks(path)  # now (start, end, n_crys, n_obs) per chunk
+    """Parse a random subset of chunks totalling ``max_crystals`` crystals.
+
+    Indexing is parallelised via the native C++ extension when ``n_workers > 1``;
+    parse phase is serial.
+    """
+    print(
+        f"  [sampled] indexing chunks in {path} (n_workers={n_workers}) ...",
+        flush=True,
+    )
+    chunks = _index_chunks_native_or_python(path, n_workers=n_workers)
     total_crystals = sum(c[2] for c in chunks)
     print(
         f"  [sampled] {len(chunks)} chunks, {total_crystals} crystals total; "

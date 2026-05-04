@@ -11,9 +11,9 @@ def __getattr__(name):
     if name in ("load_sfx", "save_sfx"):
         from torchsx.io import _safetensors
         return getattr(_safetensors, name)
-    if name in ("write_stream_reconstruct", "write_stream_patch"):
+    if name == "write_stream_reconstruct":
         from torchsx.io import _writeback
-        return getattr(_writeback, name)
+        return _writeback.write_stream_reconstruct
     if name == "FrameStore":
         from torchsx.io._frame_store import FrameStore
         return FrameStore

@@ -20,6 +20,10 @@ from torchsx.merging.observations import PreparedObs, ObsInfo, prepare_observati
 from torchsx.merging.merger import Merger
 from torchsx.merging.result import MergedResult
 
+# Streamlined chain: stream → loss → posterior → ReflectionData.
+from torchsx.merging.loss import LogSpaceLoss
+from torchsx.merging.posterior import Posterior
+
 # Re-export the scale models most experiment scripts need.
 from torchsx.merging.scale import (
     ScaleModel,
@@ -37,6 +41,8 @@ __all__ = [
     "prepare_observations",
     "Merger",
     "MergedResult",
+    "LogSpaceLoss",
+    "Posterior",
     "ScaleModel",
     "ScaleBPerCrystal",
     "PanelScale",

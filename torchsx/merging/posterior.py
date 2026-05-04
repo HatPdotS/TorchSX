@@ -66,6 +66,9 @@ class PosteriorMoments:
     # posterior mode vs. MAP (Laplace) diagnostic — offset in σ units
     mode_shift: Tensor      # (n_valid,) — (Δ*_post − Δ_MAP) / σ_Laplace
     sigma_laplace_clamped: Tensor  # (n_valid,) — σ after the sigma_max cap
+    # Structure-factor moments under the same posterior — bypasses French–Wilson.
+    F: Tensor | None = None        # (n_valid,) E[√I0 | data]
+    F_sigma: Tensor | None = None  # (n_valid,) sqrt(Var[√I0 | data]) = sqrt(I0 - F²)
 
 
 def _interp_weights(n_coarse: int, n_fine: int, n_sigma: float, device, dtype):
@@ -237,6 +240,20 @@ def _moments_from_log_post(
         sigma_I0 = var_I0.sqrt()
         mu = I0.clamp(min=1e-12).log()
         sigma_mu = sigma_I0 / I0.clamp(min=1e-12)
+        # Structure-factor moments F = √I₀ — softmax-weighted mean over the
+        # same grid as I0, but computed in linear F space so that the variance
+        # never has to subtract two overflowed inf's (which is what kills the
+        # naive logsumexp-based formulation when the global log_I grid spans
+        # ~9 decades).  E[F] = ∫ exp(½Δ) p(Δ) dΔ and Var[F] = E[F²] − E[F]².
+        log_max_p = log_post.max(dim=1, keepdim=True).values
+        p_norm_F = (log_post - log_max_p).exp()
+        Zp = p_norm_F.sum(dim=1, keepdim=True).clamp(min=1e-30)
+        p_norm_F = p_norm_F / Zp                       # (n_valid, K)
+        F_grid = (0.5 * delta_fine).exp()              # √I_grid (bounded by √S_max)
+        F_mean = (F_grid * p_norm_F).sum(dim=1)
+        F2_mean = (F_grid.pow(2) * p_norm_F).sum(dim=1)
+        F_var = (F2_mean - F_mean.pow(2)).clamp(min=0.0)
+        F_sigma_val = F_var.sqrt()
     elif summary == "mode":
         # Per-HKL posterior mode = argmax(log_post), parabolic-refined to
         # sub-grid precision using the two grid neighbours.  Robust to long
@@ -318,12 +335,25 @@ def _moments_from_log_post(
         I0 = torch.where(bad, I0_fallback, I0)
         sigma_I0 = torch.where(bad, sigma_fallback, sigma_I0)
 
+    F_out = None
+    F_sigma_out = None
+    if summary == "linear_mean":
+        F_out = F_mean
+        F_sigma_out = F_sigma_val
+        if map_fallback_log_I0 is not None and bad.any():
+            F_fallback = (0.5 * map_fallback_log_I0).exp()
+            F_out = torch.where(bad, F_fallback, F_out)
+            F_sigma_out = torch.where(
+                bad, sigma_clamped * 0.5 * F_fallback, F_sigma_out,
+            )
+
     return PosteriorMoments(
         I0=I0, sigma_I0=sigma_I0, log_evidence=log_Z, mu=mu, sigma_mu=sigma_mu,
         fallback_mask=fallback_mask,
         grid_mass_frac=grid_mass_frac,
         mode_shift=mode_shift,
         sigma_laplace_clamped=sigma_clamped,
+        F=F_out, F_sigma=F_sigma_out,
     )
 
 
@@ -673,6 +703,8 @@ def compute_posterior_moments_global_grid(
     n_ph = (prep.I_obs + bg).clamp(min=0)
 
     C = obs_chunk_size if obs_chunk_size and obs_chunk_size > 0 else n_obs
+    n_obs_nan = 0
+    n_obs_posinf = 0
     for s in range(0, n_obs, C):
         e = min(s + C, n_obs)
         oi_chunk = prep.obs_info.slice(s, e)
@@ -690,7 +722,27 @@ def compute_posterior_moments_global_grid(
             log_p = likelihood.combine_with_marginal(
                 n_ph_chunk, bg_chunk, log_p_sig, params, oi_chunk
             )                                                                # (Nc,)
+            # Sanitise per-obs log_p before scatter_add: NaN or +inf would
+            # contaminate the per-HKL sum and turn every downstream logsumexp
+            # into NaN.  Replace with -inf (no support at that grid point).
+            bad_lp = ~torch.isfinite(log_p) | (log_p > 0)
+            if bad_lp.any():
+                n_obs_nan += int(torch.isnan(log_p).sum().item())
+                n_obs_posinf += int((log_p > 0).sum().item())
+                log_p = torch.where(
+                    bad_lp,
+                    torch.full_like(log_p, float("-inf")),
+                    log_p,
+                )
             L[:, k].scatter_add_(0, h_chunk, log_p)
+
+    if n_obs_nan or n_obs_posinf:
+        print(
+            f"  [posterior/global_grid] sanitised log_p: "
+            f"{n_obs_nan} NaN, {n_obs_posinf} positive (out of "
+            f"{n_obs * K_post} total chunked log_p evaluations)",
+            flush=True,
+        )
 
     # Posterior moments on the global grid (uniform step, identical for all HKLs).
     delta_fine = log_I_grid[None, :].expand(n_valid, -1).contiguous()        # (n_valid, K_post)
@@ -701,6 +753,17 @@ def compute_posterior_moments_global_grid(
     for name, prior_fn in priors.items():
         log_prior = prior_fn(delta_fine) if prior_fn is not None else torch.zeros_like(L)
         log_post = L + log_prior
+        n_lp_nan = int(torch.isnan(log_post).sum().item())
+        n_lp_posinf = int((log_post == float("inf")).sum().item())
+        n_blank = int(((log_post == float("-inf")) | torch.isnan(log_post))
+                      .all(dim=1).sum().item())
+        if n_lp_nan or n_lp_posinf or n_blank:
+            print(
+                f"  [posterior/{name}] log_post: "
+                f"{n_lp_nan} NaN, {n_lp_posinf} +inf entries; "
+                f"{n_blank}/{n_valid} HKLs are entirely -inf/NaN",
+                flush=True,
+            )
         results[name] = _moments_from_log_post(
             delta_fine, log_post, ddelta,
             delta_map=delta_map,
@@ -709,3 +772,241 @@ def compute_posterior_moments_global_grid(
             summary=summary,
         )
     return results
+
+
+# ── Streamlined Posterior object ───────────────────────────────────────
+
+
+def _fit_wilson_aniso_posthoc(
+    prep: PreparedObs, log_I0_map: Tensor, *, n_steps: int = 80,
+):
+    """Fit (log_I_mean, U) on MAP log_I0 with log_I0 frozen.
+
+    Used when ``prior='wilson_aniso'`` is requested but no active prior
+    was registered during LBFGS.  Cheap: 7 params, no data targets — just
+    the prior NLP at the converged MAP.
+    """
+    from dataclasses import replace
+    from torchsx.merging.priors import WilsonAnisoPrior
+    from torchsx.merging.config import MergeConfig
+
+    cfg = MergeConfig()
+    prep_seeded = replace(prep, mu_init=log_I0_map.detach().cpu())
+    prior = WilsonAnisoPrior.from_prep(prep_seeded, cfg).to(log_I0_map.device)
+    opt = torch.optim.LBFGS(
+        [prior.log_I_mean, prior.U],
+        max_iter=n_steps, line_search_fn="strong_wolfe",
+    )
+
+    def closure():
+        opt.zero_grad(set_to_none=False)
+        loss = prior(log_I0_map.detach()).sum()
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return prior
+
+
+class Posterior:
+    """Per-HKL posterior moments on a MAP-centered Δ-window per HKL.
+
+    Build via :meth:`LogSpaceLoss.posterior` (or directly with
+    :meth:`from_loss`).  Wraps the per-call MAP-centered integration path
+    (:func:`compute_posterior_moments_per_call`): each HKL's Δ-grid spans
+    ``delta_map ± n_sigma · sigma_laplace`` so the integration tracks the
+    data peak — same approach the n513 reference fit used.  Returns a
+    :class:`torchref.ReflectionData` from :meth:`integrate`.
+
+    Both ``I/I_sigma`` and ``F/F_sigma`` are populated, so loading the
+    written MTZ back into ``ReflectionData.load_mtz`` will not auto-trigger
+    French–Wilson — F/σ_F come directly from posterior moments.
+    """
+
+    def __init__(
+        self, loss, prior: str, moments: PosteriorMoments,
+        wilson_aniso_prior=None,
+    ) -> None:
+        self._loss = loss
+        self._prior = prior
+        self._moments = moments
+        self._wilson_aniso_prior = wilson_aniso_prior
+
+    @classmethod
+    def from_loss(cls, loss, prior: str = "flat") -> "Posterior":
+        """Build a Posterior from a refined LogSpaceLoss."""
+        device = loss._params.log_I0.device
+
+        prior_fn: PriorEvaluator
+        wp = None
+        if prior == "flat":
+            prior_fn = make_flat_prior()
+        elif prior == "wilson":
+            prep = loss._prep
+            Sigma_shell = shell_mean_from_log_I0(
+                loss._params.log_I0.detach(),
+                prep.shell_id_fw.to(device),
+                n_shells=int(prep.shell_id_fw.max().item()) + 1
+                if prep.n_valid > 0 else 1,
+                eps=1e-6,
+            )
+            prior_fn = make_wilson_prior(
+                Sigma_shell=Sigma_shell,
+                is_centric=prep.is_centric.to(device),
+            )
+        elif prior == "wilson_aniso":
+            prep = loss._prep
+            wp = getattr(loss, "_wilson_aniso_prior", None)
+            if wp is None:
+                wp = _fit_wilson_aniso_posthoc(prep, loss._params.log_I0)
+            Sigma_h = wp.log_sigma().detach().exp().clamp(min=1e-6)
+            prior_fn = make_wilson_prior(
+                Sigma_shell=Sigma_h,                       # per-HKL anisotropic
+                is_centric=prep.is_centric.to(device),
+            )
+        else:
+            raise ValueError(
+                f"Unknown prior {prior!r}; expected 'flat', 'wilson', or 'wilson_aniso'"
+            )
+
+        sigma_laplace = loss._hessian_diag_log_I0()  # (n_valid,)
+
+        # MAP-centered Δ-grid: for each HKL the integration spans
+        # ``delta_map ± n_sigma · sigma_laplace`` (clamped to sigma_max),
+        # giving a tight log-space trapezoidal integral over the data
+        # peak.  Inner signal marginal still uses FixedLogGrid (Triton).
+        results = compute_posterior_moments_per_call(
+            prep=loss._prep,
+            params=loss._params,
+            scale=loss._scale,
+            scatter=loss._scatter,
+            quadrature=loss._quadrature,
+            likelihood=loss._likelihood,
+            sigma_laplace=sigma_laplace,
+            priors={prior: prior_fn},
+            n_grid_coarse=31,
+            n_grid_fine=101,
+            n_sigma=6.0,
+            obs_chunk_size=loss._obs_chunk_size,
+            sigma_max=2.0,
+            map_fallback_log_I0=loss._params.log_I0.detach(),
+            summary="linear_mean",
+        )
+        return cls(loss, prior, results[prior], wilson_aniso_prior=wp)
+
+    # ── moment accessors ──
+    @property
+    def I0(self) -> Tensor:
+        return self._moments.I0
+
+    @property
+    def sigma_I0(self) -> Tensor:
+        return self._moments.sigma_I0
+
+    @property
+    def F(self) -> Tensor:
+        if self._moments.F is None:
+            raise RuntimeError(
+                "Posterior was built with a non-linear-mean summary; "
+                "F/F_sigma are only available for summary='linear_mean'."
+            )
+        return self._moments.F
+
+    @property
+    def F_sigma(self) -> Tensor:
+        if self._moments.F_sigma is None:
+            raise RuntimeError(
+                "Posterior was built with a non-linear-mean summary; "
+                "F/F_sigma are only available for summary='linear_mean'."
+            )
+        return self._moments.F_sigma
+
+    @property
+    def prior(self) -> str:
+        return self._prior
+
+    @property
+    def moments(self) -> PosteriorMoments:
+        return self._moments
+
+    @property
+    def log_I_mean(self) -> float | None:
+        """Fitted Wilson plot intercept (only meaningful for ``prior='wilson_aniso'``)."""
+        if self._wilson_aniso_prior is None:
+            return None
+        return float(self._wilson_aniso_prior.log_I_mean.detach().item())
+
+    @property
+    def U(self) -> Tensor | None:
+        """Fitted anisotropic decay 6-vector (only meaningful for ``prior='wilson_aniso'``)."""
+        if self._wilson_aniso_prior is None:
+            return None
+        return self._wilson_aniso_prior.U.detach().clone()
+
+    def integrate(self):
+        """Build a :class:`torchref.ReflectionData` from this posterior.
+
+        Both ``I/I_sigma`` (intensity moments) and ``F/F_sigma`` (square-root
+        moments) are populated — no French–Wilson is needed downstream.
+        """
+        from torchref import ReflectionData
+        from torchref.symmetry import Cell, SpaceGroup
+
+        prep = self._loss._prep
+        m = self._moments
+
+        median_cell = prep.median_cell.detach().cpu().tolist()
+        sg = self._loss._stream._core.spacegroup or "P 1"
+
+        cell = Cell(median_cell)
+        spacegroup = SpaceGroup(sg)
+
+        # Skip torchref's resolution-binned R-free auto-generator; it
+        # requires a populated `masks()` we do not pre-build here.
+        # Downstream phenix uses an external r_free.mtz anyway, so the
+        # column written here is informational only.
+        rfree_flags = torch.zeros(prep.n_valid, dtype=torch.bool)
+
+        # Final safety net: substitute MAP-square-root for any HKL whose
+        # posterior moments came back non-finite or non-positive.  Tells
+        # the user how many fell through so they can inspect upstream.
+        F_cpu = m.F.detach().cpu().float()
+        F_sigma_cpu = m.F_sigma.detach().cpu().float()
+        I0_cpu = m.I0.detach().cpu().float()
+        I0_sigma_cpu = m.sigma_I0.detach().cpu().float()
+
+        log_I0_map = self._loss._params.log_I0.detach().cpu().float()
+        F_map = (0.5 * log_I0_map).exp().clamp(min=1e-6)
+        I0_map = log_I0_map.exp().clamp(min=1e-12)
+        # σ_F ≈ ½ · I0 · σ_logI ≈ ½ · F · σ_logI; σ_I ≈ I0 · σ_logI.
+        # Use a flat 0.1 σ_logI floor when no posterior σ is available.
+        sigma_logI_floor = torch.full_like(F_map, 0.1)
+
+        bad_F = ~torch.isfinite(F_cpu) | (F_cpu <= 0)
+        bad_Fs = ~torch.isfinite(F_sigma_cpu) | (F_sigma_cpu < 0)
+        bad_I = ~torch.isfinite(I0_cpu) | (I0_cpu <= 0)
+        bad_Is = ~torch.isfinite(I0_sigma_cpu) | (I0_sigma_cpu < 0)
+        n_bad = int((bad_F | bad_Fs | bad_I | bad_Is).sum().item())
+        if n_bad:
+            print(
+                f"  [posterior/{self._prior}] {n_bad}/{prep.n_valid} HKLs "
+                "with non-finite/non-positive posterior moments; "
+                "substituting MAP-square-root.",
+                flush=True,
+            )
+        F_cpu = torch.where(bad_F, F_map, F_cpu)
+        F_sigma_cpu = torch.where(bad_Fs, 0.5 * F_map * sigma_logI_floor, F_sigma_cpu)
+        I0_cpu = torch.where(bad_I, I0_map, I0_cpu)
+        I0_sigma_cpu = torch.where(bad_Is, I0_map * sigma_logI_floor, I0_sigma_cpu)
+
+        data = ReflectionData.from_tensors(
+            hkl=prep.hkl_valid.detach().cpu().int(),
+            F=F_cpu,
+            F_sigma=F_sigma_cpu,
+            cell=cell,
+            spacegroup=spacegroup,
+            rfree_flags=rfree_flags,
+        )
+        data.I = I0_cpu
+        data.I_sigma = I0_sigma_cpu
+        return data
