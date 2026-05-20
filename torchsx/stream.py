@@ -36,7 +36,7 @@ class SFXStream:
     def from_stream(
         cls,
         path: str | Path,
-        spacegroup: str = "P 1",
+        spacegroup: str | None = None,
         cache: str | Path | None = None,
         n_workers: int = 1,
         merge_friedel: bool = True,
@@ -64,8 +64,19 @@ class SFXStream:
             the file as soon as enough crystals are collected — no full-file
             indexing pass.  Use for fast testing on large streams.
         """
+        import warnings
         from torchsx.io._parser import parse_stream
         from torchsx.io._safetensors import load_sfx, save_sfx
+
+        if spacegroup is None:
+            warnings.warn(
+                f"SFXStream.from_stream({path!s}): spacegroup not set, "
+                f"falling back to 'P 1'. Centric detection and symmetry "
+                f"equivalents will be incorrect for any non-triclinic "
+                f"crystal. Pass spacegroup='P 63' (or similar) explicitly.",
+                stacklevel=2,
+            )
+            spacegroup = "P 1"
 
         if cache is not None:
             cache = Path(cache)
@@ -99,9 +110,20 @@ class SFXStream:
         path : .sfx file path
         merge_friedel : if True, canonicalize HKL to merge Friedel mates
         """
+        import warnings
         from torchsx.io._safetensors import load_sfx
 
         stream = cls(load_sfx(path))
+        sg = stream._core.spacegroup
+        if not sg or sg == "P 1":
+            warnings.warn(
+                f"SFXStream.load({path!s}): spacegroup is {sg!r}. "
+                f"Centric detection and symmetry equivalents will be "
+                f"incorrect for any non-triclinic crystal. Re-parse the "
+                f"original .stream with an explicit spacegroup, or set "
+                f"the 'spacegroup' field in the sidecar JSON.",
+                stacklevel=2,
+            )
         if merge_friedel:
             stream = stream.symmetrize()
         return stream
@@ -268,6 +290,10 @@ class SFXStream:
         return self._core.geometry
 
     @property
+    def spacegroup(self) -> str:
+        return self._core.spacegroup
+
+    @property
     def metadata(self) -> StreamMetadata:
         return self._core.metadata
 
@@ -319,6 +345,35 @@ class SFXStream:
         if self._core.metadata and "image" in self._core.metadata:
             return self._core.metadata["image"].get("event", [])
         return []
+
+    @property
+    def image_timepoints(self) -> list[float]:
+        """Per-image timepoints (NaN where unlabelled).
+
+        Populated by :meth:`assign_timepoints`; empty list when the
+        stream has never been labelled.
+        """
+        if self._core.metadata and "image" in self._core.metadata:
+            return self._core.metadata["image"].get("timepoint", [])
+        return []
+
+    def crystal_timepoints(self) -> torch.Tensor:
+        """Per-crystal timepoints (NaN where the image is unlabelled).
+
+        Returns
+        -------
+        torch.Tensor of shape ``(n_crystals,)``, dtype float64.
+        """
+        tp = self.image_timepoints
+        if not tp:
+            return torch.full((self.n_crystals,), float("nan"), dtype=torch.float64)
+        tp_t = torch.tensor(tp, dtype=torch.float64)
+        return tp_t[self._core.image_id.long()]
+
+    def unique_timepoints(self) -> list[float]:
+        """Sorted unique non-NaN timepoints (handy for kinetic-model grids)."""
+        from torchsx.io.times import unique_finite_timepoints
+        return unique_finite_timepoints(self.image_timepoints)
 
     def remap_filenames(self, pattern: str, replacement: str) -> SFXStream:
         """Return a new SFXStream with image filenames transformed by string substitution.
@@ -428,6 +483,94 @@ class SFXStream:
         import dataclasses
         new_core = dataclasses.replace(self._core, metadata=new_meta)
         return SFXStream(new_core)
+
+    def assign_timepoints(
+        self,
+        path: str | Path,
+        *,
+        on_missing: str = "nan",
+        verbose: bool = True,
+    ) -> SFXStream:
+        """Attach per-image timepoints from a 3-column whitespace times file.
+
+        File format: ``filename event timepoint`` (one per line; ``#``
+        comments and blanks skipped).  Times-file rows and stream images
+        do not need to match exactly — unmatched images get ``NaN`` (or
+        are dropped, see ``on_missing``).
+
+        Stores the assignment as ``metadata["image"]["timepoint"]`` (a
+        per-image list of floats).  After this call you can filter to a
+        single timepoint with ``stream.filter_images(mask)`` or run the
+        kinetic-ensemble pipeline.
+
+        Parameters
+        ----------
+        path : path to the times file.
+        on_missing :
+            ``"nan"`` — keep unmatched images, mark timepoint NaN (default).
+            ``"drop"`` — filter out unmatched images via ``filter_images``.
+            ``"error"`` — raise if any image is unmatched.
+        verbose : print the assignment report.
+
+        Returns
+        -------
+        New ``SFXStream`` with ``metadata["image"]["timepoint"]`` populated.
+        """
+        import dataclasses
+        from copy import deepcopy
+
+        import torch
+
+        from torchsx.io.times import (
+            assign_timepoints_to_images,
+            load_times_file,
+        )
+
+        lookup = load_times_file(path)
+        fnames = self.filenames
+        evts = self.events
+        if not fnames or not evts:
+            raise ValueError(
+                "Stream has no image filename/event metadata; "
+                "cannot assign timepoints. Re-parse from .stream."
+            )
+
+        timepoints, report = assign_timepoints_to_images(fnames, evts, lookup)
+        if verbose:
+            print(report.format(path=path))
+
+        if on_missing == "error" and report.n_unmatched_images > 0:
+            raise ValueError(
+                f"{report.n_unmatched_images} images had no entry in "
+                f"{path!s} (on_missing='error')"
+            )
+
+        new_meta = deepcopy(self._core.metadata)
+        if "image" not in new_meta:
+            new_meta["image"] = {}
+        new_meta["image"]["timepoint"] = timepoints
+
+        new_core = dataclasses.replace(self._core, metadata=new_meta)
+        stream = SFXStream(new_core)
+
+        if on_missing == "drop" and report.n_unmatched_images > 0:
+            import math
+            tp_t = torch.tensor(
+                [0.0 if math.isnan(t) else t for t in timepoints],
+                dtype=torch.float64,
+            )
+            valid = torch.tensor(
+                [not math.isnan(t) for t in timepoints], dtype=torch.bool,
+            )
+            stream = stream.filter_images(valid)
+            if verbose:
+                print(
+                    f"  on_missing='drop': filtered to "
+                    f"{int(valid.sum())} / {len(timepoints)} images"
+                )
+            del tp_t  # the filtered metadata already carries the surviving list
+
+        return stream
 
     # --- Inspection ---
 
@@ -716,12 +859,30 @@ class SFXStream:
         gain: float | str = "auto",
         min_obs: int = 5,
         scale: str = "b_per_crystal",
+        scale_reg_weight: float = 1.0,
+        scatter_shape="free",
         smooth: float = 500.0,
         wilson_aniso: float = 0.0,
         wilson_aniso_U_ridge: float = 1.0,
         wilson_aniso_b_center: float = 1.0,
+        poisson_null_shrinkage: float = 0.0,
+        poisson_null_tau: float | None = None,
+        reml: bool = False,
         obs_chunk_size: int = 0,
         device: str | torch.device = "cpu",
+        r_peak: float = 7.0,
+        r_gap: float = 9.0,
+        r_bg: float = 11.0,
+        likelihood: str = "poisson_excess_noise",
+        excess_noise_n_gh: int = 5,
+        read_var_photons: float = 0.0,
+        gain_switch_var_frac: float = 0.0,
+        trainable_excess: bool = False,
+        gaussian_gamma: float = 1.0,
+        var_const: float = 0.0,
+        var_linear: float = 1.0,
+        var_quadratic: float = 0.0,
+        trainable_polynomial_var: bool = False,
     ):
         """Build a :class:`LogSpaceLoss` from this stream.
 
@@ -752,11 +913,27 @@ class SFXStream:
             self,
             n_points=n_points, S_min=S_min, S_max=S_max,
             gain=gain, min_obs=min_obs, scale=scale,
+            scale_reg_weight=scale_reg_weight,
+            scatter_shape=scatter_shape,
             smooth=smooth,
             wilson_aniso=wilson_aniso,
             wilson_aniso_U_ridge=wilson_aniso_U_ridge,
             wilson_aniso_b_center=wilson_aniso_b_center,
+            poisson_null_shrinkage=poisson_null_shrinkage,
+            poisson_null_tau=poisson_null_tau,
+            reml=reml,
             obs_chunk_size=obs_chunk_size, device=device,
+            r_peak=r_peak, r_gap=r_gap, r_bg=r_bg,
+            likelihood=likelihood,
+            excess_noise_n_gh=excess_noise_n_gh,
+            read_var_photons=read_var_photons,
+            gain_switch_var_frac=gain_switch_var_frac,
+            trainable_excess=trainable_excess,
+            gaussian_gamma=gaussian_gamma,
+            var_const=var_const,
+            var_linear=var_linear,
+            var_quadratic=var_quadratic,
+            trainable_polynomial_var=trainable_polynomial_var,
         )
 
 def _is_numeric_list(lst: list) -> bool:

@@ -17,6 +17,27 @@ def _log_gg_norm(beta: Tensor) -> Tensor:
     return torch.log(beta) - math.log(2.0) - torch.lgamma(1.0 / beta)
 
 
+def gengauss_log_prob_from_obs(
+    eps: Tensor,              # (M, K)
+    log_alpha_obs: Tensor,    # (M,) per-observation (already indexed by hkl_idx)
+    log_beta_obs: Tensor,     # (M,) per-observation
+) -> Tensor:                  # (M, K)
+    """GenGauss log-density evaluated from per-observation (log α, log β).
+
+    Bypasses the (Parameters, ObsInfo) indirection so callers that need
+    elementwise gradient gating on (α, β) — e.g. the bg-gate weak/strong
+    split — can pass `torch.where(mask, x, x.detach())` directly.
+    """
+    beta = log_beta_obs.exp()
+    alpha = log_alpha_obs.exp()
+    z = eps.abs() / alpha[:, None].clamp(min=1e-8)
+    return (
+        -z.clamp(min=1e-12).pow(beta[:, None])
+        + _log_gg_norm(beta)[:, None]
+        - log_alpha_obs[:, None]
+    )
+
+
 class GenGaussLogScatter(ScatterModel):
     """Generalised-Gaussian density on ``eps = log S − log_mean``.
 
@@ -36,14 +57,4 @@ class GenGaussLogScatter(ScatterModel):
         meta: ObsInfo,
     ) -> Tensor:
         h = meta.hkl_idx
-        log_alpha = params.log_alpha[h]           # (M,)
-        log_beta = params.log_beta[h]             # (M,)
-        beta = log_beta.exp()
-        alpha = log_alpha.exp()
-
-        z = eps.abs() / alpha[:, None].clamp(min=1e-8)
-        return (
-            -z.clamp(min=1e-12).pow(beta[:, None])
-            + _log_gg_norm(beta)[:, None]
-            - log_alpha[:, None]
-        )
+        return gengauss_log_prob_from_obs(eps, params.log_alpha[h], params.log_beta[h])

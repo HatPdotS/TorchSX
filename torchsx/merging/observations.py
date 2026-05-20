@@ -35,6 +35,11 @@ class ObsInfo:
     ScaleModel subclasses index into this to compute their per-observation
     log-correction without having to stash extra tensors.  Optional fields
     stay ``None`` when the stream doesn't carry the corresponding channel.
+
+    Kinetic-ensemble fields (``delay_bin_idx``, ``unique_timepoints``) are
+    populated by :func:`prepare_observations` when the stream carries
+    image-level ``timepoint`` metadata (see
+    :meth:`SFXStream.assign_timepoints`); otherwise they stay ``None``.
     """
 
     crystal_id: Tensor
@@ -46,6 +51,10 @@ class ObsInfo:
     ss: Tensor | None = None
     peak: Tensor | None = None
     background: Tensor | None = None
+    ewald_offset: Tensor | None = None
+    # Kinetic-ensemble plumbing — both populated together or both ``None``.
+    delay_bin_idx: Tensor | None = None     # (n_crystals,) int64, indexes unique_timepoints
+    unique_timepoints: Tensor | None = None  # (n_timepoints,) float64, sorted
 
     def slice(self, s: int, e: int) -> "ObsInfo":
         """Restrict to ``obs[s:e]`` (for chunked closures)."""
@@ -59,6 +68,9 @@ class ObsInfo:
             ss=None if self.ss is None else self.ss[s:e],
             peak=None if self.peak is None else self.peak[s:e],
             background=None if self.background is None else self.background[s:e],
+            ewald_offset=None if self.ewald_offset is None else self.ewald_offset[s:e],
+            delay_bin_idx=self.delay_bin_idx,            # per-crystal — full table kept
+            unique_timepoints=self.unique_timepoints,
         )
 
     def to(self, device) -> "ObsInfo":
@@ -74,7 +86,81 @@ class ObsInfo:
             ss=_m(self.ss),
             peak=_m(self.peak),
             background=_m(self.background),
+            ewald_offset=_m(self.ewald_offset),
+            delay_bin_idx=_m(self.delay_bin_idx),
+            unique_timepoints=_m(self.unique_timepoints),
         )
+
+
+def _build_delay_bins(stream, n_crystals: int) -> tuple[Tensor | None, Tensor | None]:
+    """Build per-crystal ``delay_bin_idx`` + the unique-timepoint table.
+
+    Returns ``(None, None)`` if the stream has no image-level
+    ``timepoint`` metadata (i.e. :meth:`SFXStream.assign_timepoints`
+    was never called).  Otherwise returns
+
+      * ``delay_bin_idx`` — ``(n_crystals,) int64`` index into
+        ``unique_timepoints`` for each crystal.
+      * ``unique_timepoints`` — ``(n_t,) float64`` sorted unique
+        non-NaN timepoints observed across labelled images.
+
+    Crystals whose image has a NaN timepoint get bin index ``-1``
+    (sentinel — callers must mask before indexing).
+    """
+    image_tp = []
+    meta = stream._core.metadata if hasattr(stream, "_core") else None
+    if meta and "image" in meta:
+        image_tp = meta["image"].get("timepoint", []) or []
+    if not image_tp:
+        return None, None
+
+    image_tp_t = torch.tensor(image_tp, dtype=torch.float64)
+    if image_tp_t.numel() != stream._core.n_images:
+        # Mismatched length: refuse to silently mis-align.
+        raise ValueError(
+            f"metadata['image']['timepoint'] has {image_tp_t.numel()} entries "
+            f"but stream has {stream._core.n_images} images"
+        )
+
+    per_crystal_tp = image_tp_t[stream._core.image_id.long()]    # (n_crystals,)
+    finite = ~torch.isnan(per_crystal_tp)
+    if not finite.any():
+        return None, None
+
+    uniq_vals = torch.unique(per_crystal_tp[finite])             # already sorted
+    uniq_vals = torch.sort(uniq_vals).values                     # explicit, safe
+
+    # searchsorted gives the bin index for finite timepoints; NaNs get -1.
+    bin_idx = torch.full((n_crystals,), -1, dtype=torch.int64)
+    if finite.any():
+        bin_idx[finite] = torch.searchsorted(uniq_vals, per_crystal_tp[finite])
+    return bin_idx, uniq_vals
+
+
+def _ewald_offset(core) -> Tensor:
+    """Per-observation signed Ewald sphere offset ``‖q+s₀‖ − 1/λ`` (Å⁻¹).
+
+    Physically-motivated proxy for predicted partiality: large ``|r|`` →
+    predicted off-Bragg → signal ≈ 0.  Used by the σ²(bg) calibration to
+    select a clean noise-dominated sample.  Pure-tensor port of
+    ``compute_excitation_error`` from
+    ``torchsx/deprecated/merge/_neural_model.py``.
+
+    Wavelength is taken as the stream-median (per-image variation at
+    LCLS/EuXFEL is < 0.01 %, well below the |r| binning resolution).
+    """
+    wavelength = 12398.4 / float(core.beam_energy.float().median().item())
+    h = core.hkl[:, 0].float()
+    k = core.hkl[:, 1].float()
+    l = core.hkl[:, 2].float()
+    cid = core.crystal_id.long()
+    q_lab = (h.unsqueeze(1) * core.astar[cid]
+             + k.unsqueeze(1) * core.bstar[cid]
+             + l.unsqueeze(1) * core.cstar[cid])
+    k0 = 1.0 / wavelength
+    s0 = torch.zeros_like(q_lab)
+    s0[:, 2] = k0
+    return (q_lab + s0).norm(dim=1) - k0
 
 
 # ── Prepared-observation bundle ────────────────────────────────────────
@@ -157,6 +243,11 @@ def prepare_observations(
     core_I = core.I
     core_background = core.background
 
+    # Per-observation signed Ewald sphere offset (Å⁻¹). Used by the σ²(bg)
+    # gain calibration to gate to off-Bragg (predicted-zero-signal) obs,
+    # and propagated to ObsInfo for downstream use.
+    ewald_offset_core = _ewald_offset(core)
+
     # ── Detector gain (ADU / photon) ──
     gain_cfg = config.gain
     if isinstance(gain_cfg, (int, float)):
@@ -176,11 +267,14 @@ def prepare_observations(
         gain = float(g) if g and g > 0 else 1.0
         gain_src = "empirical (negatives-Mandel; biased high)"
     elif gain_cfg == "auto":
-        g, mu_bias = poisson_noise.calibrate_gain_truncnorm(
-            core_I, core_background,
+        g, mu_bias, read_var_adu_sq = poisson_noise.calibrate_sigma2_of_bg(
+            core_I, core_background, ewald_offset_core,
         )
         gain = float(g) if g and g > 0 else 1.0
-        gain_src = f"auto (truncnorm, μ_z={mu_bias:+.3f}σ)"
+        gain_src = (
+            f"auto (σ²(bg) off-Bragg, μ_z={mu_bias:+.3f}σ, "
+            f"read_var_ADU²={read_var_adu_sq:.4g})"
+        )
     else:
         raise ValueError(f"Unknown config.gain: {gain_cfg!r}")
     print(f"  gain = {gain:.4g} ADU/photon  [{gain_src}]", flush=True)
@@ -331,13 +425,23 @@ def prepare_observations(
     shell_id_fw = (
         rank_valid.float() / max(n_valid, 1) * config.fw_n_shells
     ).long().clamp(max=config.fw_n_shells - 1)
+    import warnings
     from torchref.base.french_wilson import is_centric_from_hkl
-    try:
-        sg = getattr(stream, "spacegroup", None) or "P 1"
-        is_centric = is_centric_from_hkl(hkl_valid.long(), space_group=sg)
-    except Exception as exc:  # noqa: BLE001 — surface the fallback
-        print(f"  [FW] centric detection failed ({exc!r}); treating all as acentric")
+    sg = getattr(stream, "spacegroup", None)
+    if not sg or sg == "P 1":
+        warnings.warn(
+            f"prepare_observations: stream.spacegroup={sg!r}; centric "
+            f"detection will be no-op (all reflections marked acentric). "
+            f"Set the spacegroup on the stream before merging.",
+            stacklevel=2,
+        )
         is_centric = torch.zeros(n_valid, dtype=torch.bool)
+    else:
+        try:
+            is_centric = is_centric_from_hkl(hkl_valid.long(), space_group=sg)
+        except Exception as exc:  # noqa: BLE001 — surface the fallback
+            print(f"  [FW] centric detection failed ({exc!r}); treating all as acentric")
+            is_centric = torch.zeros(n_valid, dtype=torch.bool)
 
     # ── Adjacency graph (±1 Miller) ──
     adjacency = build_adjacency(hkl_valid)
@@ -353,6 +457,10 @@ def prepare_observations(
 
     cid = core.crystal_id[keep_all][sort_all].long()
     n_crystals = int(core.crystal_id.max().item()) + 1
+
+    # ── Kinetic-ensemble metadata (only when the stream is labelled) ──
+    delay_bin_idx, unique_t_tensor = _build_delay_bins(stream, n_crystals)
+
     obs_info = ObsInfo(
         crystal_id=cid,
         s_sq=s_sq_per_obs[keep_all][sort_all],
@@ -363,6 +471,9 @@ def prepare_observations(
         ss=_chain("ss").float() if core.ss is not None else None,
         peak=_chain("peak").float() if core.peak is not None else None,
         background=_chain("background").float() if core.background is not None else None,
+        ewald_offset=ewald_offset_core[keep_all][sort_all].float(),
+        delay_bin_idx=delay_bin_idx,
+        unique_timepoints=unique_t_tensor,
     )
 
     # ── External partiality (sorted to match) ──

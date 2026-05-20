@@ -40,9 +40,20 @@ from torchsx.merging.scale import (
     ScaleBPerCrystal,
     ScaleModel,
 )
-from torchsx.merging.regularizers import MillerGraphSmoothness, ScaleBMeanRegularizer
+from torchsx.merging.regularizers import (
+    MillerGraphSmoothness,
+    PoissonNullShrinkage,
+    ScaleBMeanRegularizer,
+    compute_poisson_null_score,
+)
 from torchsx.merging.scale.per_crystal import ScaleBPerCrystal
 from torchsx.merging.scatter import GenGaussLogScatter
+from torchsx.merging.scatter_shape import (
+    AnisoQuadShape,
+    FreePerHKLShape,
+    GlobalShape,
+    ScatterShape,
+)
 from torchsx.merging.targets import (
     DataNLLTarget,
     IntensityPriorTarget,
@@ -51,9 +62,13 @@ from torchsx.merging.targets import (
 )
 
 
-# Reference observation count used to scale the Miller-graph smoothing
-# weight so the (reg / data) ratio is invariant across dataset sizes.
-# Matches the legacy ``MergeConfig.reg_scale_ref_obs`` default.
+# DEPRECATED: ``s = n_obs / _REG_SCALE_REF_OBS`` regularizer scaling
+# kept the (reg / data) ratio invariant to dataset size but broke
+# standard Bayesian asymptotics (it tied the *absolute* prior weight to
+# N_obs, so the prior never relinquished relative influence as data
+# grew).  ``s`` is now hardcoded to 1.0 below; ``cfg.lam_*`` weights are
+# used as absolute losses.  This constant is retained only to keep
+# import-by-name compatibility for old call sites.
 _REG_SCALE_REF_OBS = 2_200_000
 
 
@@ -66,6 +81,43 @@ def _find_scale_b_per_crystal(scale: ScaleModel) -> ScaleBPerCrystal | None:
             if isinstance(sub, ScaleBPerCrystal):
                 return sub
     return None
+
+
+def _resolve_scatter_shape(
+    spec: str | ScatterShape,
+    prep: PreparedObs,
+) -> ScatterShape:
+    """Materialize a scatter-shape spec into a :class:`ScatterShape`.
+
+    String specs read seeds from ``prep.alpha_init`` / ``prep.beta_perhkl``
+    (the same MoM seeds used by the legacy ``Parameters.from_prep``).
+    """
+    if isinstance(spec, ScatterShape):
+        return spec
+    log_alpha_init = torch.log(prep.alpha_init.clamp(min=1e-3))
+    log_beta_init = torch.log(prep.beta_perhkl.clamp(min=1e-3))
+    if spec == "free":
+        return FreePerHKLShape(log_alpha_init, log_beta_init)
+    if spec == "global":
+        return GlobalShape(
+            n_hkl=int(prep.n_valid),
+            log_alpha_init=float(log_alpha_init.median()),
+            log_beta_init=float(log_beta_init.median()),
+        )
+    if spec == "aniso_quad":
+        from torchref.base.reciprocal.basis import reciprocal_basis_matrix
+        median_cell = prep.median_cell.detach().cpu().float()
+        B_orth = reciprocal_basis_matrix(median_cell).float()
+        s_vec = prep.hkl_valid.float().cpu() @ B_orth
+        return AnisoQuadShape(
+            s_vec=s_vec,
+            log_alpha_init=float(log_alpha_init.median()),
+            log_beta_init=float(log_beta_init.median()),
+        )
+    raise ValueError(
+        f"Unknown scatter_shape {spec!r}; expected 'free', 'global', "
+        "'aniso_quad', or a ScatterShape instance"
+    )
 
 
 def _resolve_scale(
@@ -163,14 +215,41 @@ class LogSpaceLoss:
         gain: float | str = "auto",
         min_obs: int = 5,
         scale: str | type[ScaleModel] | ScaleModel | Iterable = "b_per_crystal",
+        scale_reg_weight: float = 1.0,
+        scatter_shape: str | ScatterShape = "free",
         smooth: float = 500.0,
-        wilson_aniso: float = 0.0,
+        wilson_aniso: float = 4.0,
         wilson_aniso_U_ridge: float = 1.0,
         wilson_aniso_b_center: float = 1.0,
+        poisson_null_shrinkage: float = 0.0,
+        poisson_null_tau: float | None = None,
+        reml: bool = False,
         obs_chunk_size: int = 0,
         device: str | torch.device = "cpu",
+        r_peak: float = 7.0,
+        r_gap: float = 9.0,
+        r_bg: float = 11.0,
+        likelihood: str = "poisson_excess_noise",
+        excess_noise_n_gh: int = 5,
+        read_var_photons: float = 0.0,
+        gain_switch_var_frac: float = 0.0,
+        trainable_excess: bool = False,
+        gaussian_gamma: float = 1.0,
+        var_const: float = 0.0,
+        var_linear: float = 1.0,
+        var_quadratic: float = 0.0,
+        trainable_polynomial_var: bool = False,
     ) -> "LogSpaceLoss":
-        """Construct from a stream.  See :meth:`SFXStream.make_loss`."""
+        """Construct from a stream.  See :meth:`SFXStream.make_loss`.
+
+        ``r_peak / r_gap / r_bg`` are the CrystFEL integration ring radii
+        in pixels.  They feed ``n_peak = π·r_peak²`` and
+        ``n_bg = π·(r_bg² − r_gap²)`` into both the truncnorm gain
+        calibration and the bg-in-peak-ring computation; the right values
+        must match the radii used by the indexamajig run that produced
+        the stream (otherwise gain comes out badly biased on
+        non-default-radii datasets — Rhodopsin uses 2/4/6, tubulin 2/3/6).
+        """
         device = torch.device(device)
 
         # The legacy MergeConfig is the single source of defaults consumed by
@@ -186,29 +265,98 @@ class LogSpaceLoss:
             lam_wilson_aniso_U_ridge=wilson_aniso_U_ridge,
         )
 
-        poisson_noise = PoissonNoiseModel()
+        poisson_noise = PoissonNoiseModel(r_peak=r_peak, r_gap=r_gap, r_bg=r_bg)
         prep = prepare_observations(stream, cfg, poisson_noise=poisson_noise)
         gain_value = float(poisson_noise.gain)
         if device.type != "cpu":
             prep = prep.to(device)
 
-        params = Parameters.from_prep(prep).to(device)
+        shape_module = _resolve_scatter_shape(scatter_shape, prep)
+        params = Parameters.from_prep(prep, scatter_shape=shape_module).to(device)
 
         scale_module = _resolve_scale(scale, prep, device)
         scatter = GenGaussLogScatter().to(device)
         quadrature = FixedLogGrid(
             S_min=S_min, S_max=S_max, n_points=n_points,
         ).to(device)
-        likelihood = Poisson().to(device)
+        if likelihood == "poisson":
+            likelihood_mod = Poisson().to(device)
+        elif likelihood == "poisson_excess_noise":
+            from torchsx.merging.likelihood.poisson_excess_noise import (
+                PoissonWithExcessNoise,
+            )
+            # Geometric bg-estimate-variance prefactor (always present).
+            bg_var_factor = poisson_noise.n_peak / poisson_noise.n_bg
+            # Calibrated additive read-noise floor.  ``read_var_adu_sq``
+            # is set by ``calibrate_sigma2_of_bg`` from the off-Bragg
+            # σ²_z(x) = g + c/x fit (c = ADU² per peak-ring observation).
+            # In photon space this becomes c / g².  An explicit CLI
+            # ``read_var_photons`` override wins if non-zero.
+            read_var_cal = (
+                poisson_noise.read_var_adu_sq / (poisson_noise.gain ** 2)
+                if poisson_noise.gain and poisson_noise.gain > 0
+                else 0.0
+            )
+            read_var_eff = (
+                read_var_photons if read_var_photons > 0 else read_var_cal
+            )
+            likelihood_mod = PoissonWithExcessNoise(
+                bg_var_factor=bg_var_factor,
+                read_var_photons=read_var_eff,
+                gain_switch_var_frac=gain_switch_var_frac,
+                trainable_excess=trainable_excess,
+                n_gh=excess_noise_n_gh,
+            ).to(device)
+            print(
+                f"  [likelihood] poisson_excess_noise  "
+                f"bg_var_factor={bg_var_factor:.4f} (geom)  "
+                f"read_var_photons={read_var_eff:.4g} "
+                f"({'calibrated' if read_var_photons == 0 else 'CLI override'})  "
+                f"gain_switch_var_frac={gain_switch_var_frac:.4g}  "
+                f"trainable_excess={trainable_excess}  "
+                f"n_gh={excess_noise_n_gh}",
+                flush=True,
+            )
+        elif likelihood == "gaussian_proportional":
+            from torchsx.merging.likelihood import GaussianProportional
+            likelihood_mod = GaussianProportional(
+                gamma=gaussian_gamma,
+            ).to(device)
+            print(
+                f"  [likelihood] gaussian_proportional  "
+                f"γ={gaussian_gamma:.4g}  "
+                f"var = γ·(S + bg)  (symmetric Gaussian, no GH axis)",
+                flush=True,
+            )
+        elif likelihood == "gaussian_polynomial":
+            from torchsx.merging.likelihood import GaussianPolynomialVariance
+            bg_var_factor = poisson_noise.n_peak / poisson_noise.n_bg
+            likelihood_mod = GaussianPolynomialVariance(
+                var_const=var_const,
+                var_linear=var_linear,
+                var_quadratic=var_quadratic,
+                bg_var_factor=bg_var_factor,
+                trainable=trainable_polynomial_var,
+            ).to(device)
+            print(
+                f"  [likelihood] gaussian_polynomial  "
+                f"α={var_const:.4g}  β={var_linear:.4g}  γ={var_quadratic:.4g}  "
+                f"bg_var_factor={bg_var_factor:.4f} (geom)  "
+                f"trainable={trainable_polynomial_var}",
+                flush=True,
+            )
+        else:
+            raise ValueError(f"Unknown likelihood: {likelihood!r}")
 
         data_target = DataNLLTarget(
             params=params,
             scale=scale_module,
             scatter=scatter,
             quadrature=quadrature,
-            likelihood=likelihood,
+            likelihood=likelihood_mod,
             prep=prep,
             chunk_size=obs_chunk_size,
+            reml=reml,
         ).to(device)
         scale_reg_target = ScaleRegTarget(params, scale_module).to(device)
 
@@ -216,10 +364,11 @@ class LogSpaceLoss:
         state.register_target("merging/data", data_target)
         state.set_weight("merging/data", 1.0)
         state.register_target("merging/scale_reg", scale_reg_target)
-        state.set_weight("merging/scale_reg", 1.0)
+        state.set_weight("merging/scale_reg", scale_reg_weight)
 
-        # Dataset-size-invariant scaling factor for all reg/prior terms.
-        s = float(prep.n_obs_total) / float(_REG_SCALE_REF_OBS)
+        # DEPRECATED data-size scaling — fixed at 1.0; see module-level
+        # ``_REG_SCALE_REF_OBS`` deprecation note.
+        s = 1.0
 
         # Miller-graph Dirichlet smoothing on per-HKL log_α and log_β.
         # Without it, weak HKLs can drive α or β to NaN under LBFGS in
@@ -265,6 +414,39 @@ class LogSpaceLoss:
                         s * wilson_aniso_b_center,
                     )
 
+        # Per-HKL Poisson-null shrinkage on (log α, log β).  Pulls weak
+        # HKLs (those well-explained by pure Poisson noise) toward
+        # population values while leaving strongly-identified HKLs free.
+        if poisson_null_shrinkage > 0:
+            log_alpha_pop = float(params.log_alpha.detach().median().item())
+            log_beta_pop = float(params.log_beta.detach().median().item())
+            w_h, tau_used = compute_poisson_null_score(
+                data_target,
+                n_hkl=int(params.log_I0.shape[0]),
+                log_alpha_pop=log_alpha_pop,
+                log_beta_pop=log_beta_pop,
+                tau=poisson_null_tau,
+            )
+            print(
+                f"[poisson_null_shrinkage] τ={tau_used:.4g}  "
+                f"w mean={float(w_h.mean()):.4f}  "
+                f"w median={float(w_h.median()):.4f}  "
+                f"frac(w>0.5)={float((w_h > 0.5).float().mean()):.4f}  "
+                f"log_α_pop={log_alpha_pop:.4f}  "
+                f"log_β_pop={log_beta_pop:.4f}",
+                flush=True,
+            )
+            pn_module = PoissonNullShrinkage(
+                w_h, log_alpha_pop, log_beta_pop,
+            ).to(device)
+            state.register_target(
+                "merging/reg/poisson_null",
+                RegularizerTarget(params, pn_module).to(device),
+            )
+            state.set_weight(
+                "merging/reg/poisson_null", s * poisson_null_shrinkage,
+            )
+
         return cls(
             stream=stream,
             prep=prep,
@@ -272,7 +454,7 @@ class LogSpaceLoss:
             scale=scale_module,
             scatter=scatter,
             quadrature=quadrature,
-            likelihood=likelihood,
+            likelihood=likelihood_mod,
             data_target=data_target,
             scale_reg_target=scale_reg_target,
             state=state,
@@ -282,6 +464,40 @@ class LogSpaceLoss:
             obs_chunk_size=obs_chunk_size,
             wilson_aniso_prior=wilson_aniso_module,
         )
+
+    # ── parametrization swap ──────────────────────────────────────
+
+    def swap_scatter_shape(self, spec: "str | ScatterShape") -> "LogSpaceLoss":
+        """Replace the (α, β) parametrization in place, projecting the current
+        per-HKL ``log_α``, ``log_β`` onto the new basis.
+
+        Designed for two-pass workflows: do a free per-HKL fit to get the
+        gold-standard log_I0 / scale / per-HKL α, β; then swap to a
+        lower-rank parametrization (e.g. ``"aniso_quad"``) and refine
+        further.  ``log_I0``, scale, ``pi_logit`` are untouched — only the
+        ``scatter_shape`` submodule is rebound.  Existing regularizers
+        (Miller-graph smoothness, etc.) automatically follow the new
+        parametrization on the next ``refine()`` because they read
+        ``params.log_alpha`` via the property.
+
+        ``self.final_nll`` is invalidated; call ``refine()`` again to
+        re-establish.
+        """
+        from torchsx.merging.scatter_shape import project_to_shape
+
+        old_log_alpha = self._params.log_alpha.detach().clone()
+        old_log_beta = self._params.log_beta.detach().clone()
+
+        if isinstance(spec, ScatterShape):
+            new_shape = spec.to(self._device)
+        else:
+            new_shape = _resolve_scatter_shape(spec, self._prep).to(self._device)
+
+        project_to_shape(new_shape, old_log_alpha, old_log_beta)
+
+        self._params.scatter_shape = new_shape
+        self._final_nll = None
+        return self
 
     # ── refinement ────────────────────────────────────────────────
 
@@ -357,10 +573,20 @@ class LogSpaceLoss:
 
     # ── posterior ─────────────────────────────────────────────────
 
-    def posterior(self, prior: str = "flat"):
-        """Build a :class:`Posterior` on the loss's fixed log-S grid."""
+    def posterior(
+        self,
+        prior: str = "flat",
+        *,
+        hessian_filter: str | None = None,
+    ):
+        """Build a :class:`Posterior` on the loss's fixed log-S grid.
+
+        See :meth:`Posterior.from_loss` for the ``hessian_filter`` argument.
+        """
         from torchsx.merging.posterior import Posterior
-        return Posterior.from_loss(self, prior=prior)
+        return Posterior.from_loss(
+            self, prior=prior, hessian_filter=hessian_filter,
+        )
 
     # ── diagnostics ───────────────────────────────────────────────
 
@@ -428,36 +654,68 @@ class LogSpaceLoss:
 
     # ── internals reused by Posterior ──────────────────────────────
 
-    def _hessian_diag_log_I0(self) -> Tensor:
-        """Hessian-diagonal σ on log_I0 from the full LBFGS objective.
+    def _hessian_diag_log_I0(
+        self,
+        *,
+        targets_filter: str | None = None,
+        as_hessian: bool = False,
+    ) -> Tensor:
+        """Hessian-diagonal σ on log_I0 from the LBFGS objective.
 
         Mirrors the legacy `Merger._package_result` curvature pass: data
         target is chunked (allow_unused=True so piecewise-affine quadratures
         contribute 0), all other targets are evaluated in one shot.  Used
         for the posterior's ``mode_shift`` diagnostic.
+
+        Parameters
+        ----------
+        targets_filter
+            If set, include only registered targets whose name starts
+            with this prefix (e.g. ``"merging/data"`` for the data-only
+            Hessian, ``"merging/prior"`` for prior-only).  Default
+            ``None`` walks every target — preserves σ_Laplace behaviour.
+        as_hessian
+            If True, return the raw H_diag tensor (Fisher info per HKL).
+            Default False preserves the legacy σ form
+            ``1/sqrt(H.clamp(min=1e-6))``.
         """
+        from torchsx.merging.quadrature.fixed_log_grid import eager_only
+
         params = self._params
         data_target = self._data_target
+        data_name = data_target.name
         H_diag = torch.zeros_like(params.log_I0)
 
-        for s, e in data_target._iter_chunks():
-            nll_chunk = data_target._chunk_loss(s, e)
-            grad_logI0 = torch.autograd.grad(
-                nll_chunk, params.log_I0,
-                create_graph=True, allow_unused=True,
-            )[0]
-            if grad_logI0 is None:
-                continue
-            H_chunk = torch.autograd.grad(
-                grad_logI0, params.log_I0,
-                grad_outputs=torch.ones_like(params.log_I0),
-                retain_graph=False, allow_unused=True,
-            )[0]
-            if H_chunk is not None:
-                H_diag = H_diag + H_chunk.detach()
+        include_data = (
+            targets_filter is None or data_name.startswith(targets_filter)
+        )
+        if include_data:
+            # Triton kernel only emits first-order gradients (its saved S1-S4
+            # are detached); route the data target through the eager
+            # PyTorch path so create_graph=True yields a real second-back.
+            with torch.enable_grad(), eager_only():
+                for s, e in data_target._iter_chunks():
+                    nll_chunk = data_target._chunk_loss(s, e)
+                    if not nll_chunk.requires_grad:
+                        continue
+                    grad_logI0 = torch.autograd.grad(
+                        nll_chunk, params.log_I0,
+                        create_graph=True, allow_unused=True,
+                    )[0]
+                    if grad_logI0 is None:
+                        continue
+                    H_chunk = torch.autograd.grad(
+                        grad_logI0, params.log_I0,
+                        grad_outputs=torch.ones_like(params.log_I0),
+                        retain_graph=False, allow_unused=True,
+                    )[0]
+                    if H_chunk is not None:
+                        H_diag = H_diag + H_chunk.detach()
 
         for name, target in self._state.targets.items():
-            if name == data_target.name:
+            if name == data_name:
+                continue
+            if targets_filter is not None and not name.startswith(targets_filter):
                 continue
             with torch.enable_grad():
                 w = float(self._state.get_effective_weight(name))
@@ -479,6 +737,8 @@ class LogSpaceLoss:
                 if H_chunk is not None:
                     H_diag = H_diag + H_chunk.detach()
 
+        if as_hessian:
+            return H_diag
         return (1.0 / H_diag.clamp(min=1e-6)).sqrt()
 
     def __repr__(self) -> str:

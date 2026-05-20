@@ -8,6 +8,10 @@ from torchsx.merging.regularizers.miller_graph import MillerGraphSmoothness
 from torchsx.merging.regularizers.anchor import GaussianAnchor
 from torchsx.merging.regularizers.sigma_cauchy import SigmaCauchy
 from torchsx.merging.regularizers.scale_b_center import ScaleBMeanRegularizer
+from torchsx.merging.regularizers.poisson_null_shrinkage import (
+    PoissonNullShrinkage,
+    compute_poisson_null_score,
+)
 
 __all__ = [
     "Regularizer",
@@ -15,4 +19,6 @@ __all__ = [
     "GaussianAnchor",
     "SigmaCauchy",
     "ScaleBMeanRegularizer",
+    "PoissonNullShrinkage",
+    "compute_poisson_null_score",
 ]

@@ -49,8 +49,10 @@ class MergeConfig:
     tolerance_change: float = 1e-9
     lr: float = 1.0
 
-    # Regularisation scales by N_obs / reg_scale_ref_obs so (reg ÷ data)
-    # ratio is invariant to dataset size.
+    # DEPRECATED: regulariser scaling is disabled in :mod:`merger` —
+    # ``s`` is hardcoded to 1.0 and ``cfg.lam_*`` weights are used as
+    # absolute losses.  This field is retained for backwards compatibility
+    # with config files / pickles but is no longer consulted.
     reg_scale_ref_obs: int = 2_200_000
 
     # ── Chunking / quadrature ─────────────────────────────────────────
@@ -107,7 +109,7 @@ class MergeConfig:
     # regularizer (lam_wilson_aniso_b_center) so the global resolution decay
     # flows into U rather than being absorbed by the per-crystal scale.
     # Mutually exclusive with lam_frac_wilson at runtime.
-    lam_wilson_aniso: float = 0.0
+    lam_wilson_aniso: float = 4.0
     lam_wilson_aniso_U_ridge: float = 1.0
     lam_wilson_aniso_b_center: float = 1.0
     wilson_aniso_init_from_data: bool = True

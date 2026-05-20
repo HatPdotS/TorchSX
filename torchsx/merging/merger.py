@@ -290,10 +290,16 @@ class Merger:
         state.register_target("merging/data", data_target)
         state.set_weight("merging/data", 1.0)
 
-        # Data-size scaling factor — applied as a multiplier on every
-        # regulariser's weight (matches the legacy ``s =
-        # n_obs / reg_scale_ref_obs`` convention).
-        s = float(prep.n_obs_total) / float(cfg.reg_scale_ref_obs)
+        # Data-size scaling factor — DEPRECATED.  The historical
+        # ``s = n_obs / reg_scale_ref_obs`` multiplier kept the
+        # regulariser/data NLL ratio invariant to dataset size, but as a
+        # side-effect tied the *absolute* prior weight to N_obs and broke
+        # standard Bayesian asymptotics (prior should shrink in relative
+        # influence as data grows).  Fixed at 1.0; absolute weights are
+        # now taken straight from ``cfg.lam_*``.  ``reg_scale_ref_obs``
+        # is retained on ``MergeConfig`` only for backwards compatibility
+        # and is no longer consulted.
+        s = 1.0
 
         def _reg_target(key: str, module, weight: float) -> None:
             if weight <= 0:

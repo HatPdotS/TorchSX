@@ -833,8 +833,24 @@ class Posterior:
         self._wilson_aniso_prior = wilson_aniso_prior
 
     @classmethod
-    def from_loss(cls, loss, prior: str = "flat") -> "Posterior":
-        """Build a Posterior from a refined LogSpaceLoss."""
+    def from_loss(
+        cls,
+        loss,
+        prior: str = "flat",
+        *,
+        hessian_filter: str | None = None,
+    ) -> "Posterior":
+        """Build a Posterior from a refined LogSpaceLoss.
+
+        ``hessian_filter`` selects which targets contribute to the Laplace
+        σ that sets the integration grid extent.  Default (``None``) uses
+        the full LBFGS objective — same Hessian as ``LossState.refine``.
+        Pass ``"merging/data"`` to size the grid by the data-only
+        likelihood curvature, so the posterior σ reflects what the data
+        alone could constrain (the MAP still benefits from prior shrinkage
+        but the reported uncertainty is no longer dominated by the
+        prior's curvature at prior-driven HKLs).
+        """
         device = loss._params.log_I0.device
 
         prior_fn: PriorEvaluator
@@ -869,7 +885,9 @@ class Posterior:
                 f"Unknown prior {prior!r}; expected 'flat', 'wilson', or 'wilson_aniso'"
             )
 
-        sigma_laplace = loss._hessian_diag_log_I0()  # (n_valid,)
+        sigma_laplace = loss._hessian_diag_log_I0(
+            targets_filter=hessian_filter,
+        )  # (n_valid,)
 
         # MAP-centered Δ-grid: for each HKL the integration spans
         # ``delta_map ± n_sigma · sigma_laplace`` (clamped to sigma_max),
@@ -983,7 +1001,12 @@ class Posterior:
         sigma_logI_floor = torch.full_like(F_map, 0.1)
 
         bad_F = ~torch.isfinite(F_cpu) | (F_cpu <= 0)
-        bad_Fs = ~torch.isfinite(F_sigma_cpu) | (F_sigma_cpu < 0)
+        # Also treat F_sigma == 0 as "bad": the linear-mean F_var = E[F²] − E[F]²
+        # is subject to fp32 catastrophic cancellation when the posterior is
+        # narrow (e.g. low-count Poisson at correct gain on Rhodopsin/tubulin
+        # — see experiments/integration_importance/RESULTS.md).  A literal zero
+        # makes phenix treat the reflection as infinitely precise.
+        bad_Fs = ~torch.isfinite(F_sigma_cpu) | (F_sigma_cpu <= 0)
         bad_I = ~torch.isfinite(I0_cpu) | (I0_cpu <= 0)
         bad_Is = ~torch.isfinite(I0_sigma_cpu) | (I0_sigma_cpu < 0)
         n_bad = int((bad_F | bad_Fs | bad_I | bad_Is).sum().item())
@@ -995,9 +1018,13 @@ class Posterior:
                 flush=True,
             )
         F_cpu = torch.where(bad_F, F_map, F_cpu)
-        F_sigma_cpu = torch.where(bad_Fs, 0.5 * F_map * sigma_logI_floor, F_sigma_cpu)
         I0_cpu = torch.where(bad_I, I0_map, I0_cpu)
         I0_sigma_cpu = torch.where(bad_Is, I0_map * sigma_logI_floor, I0_sigma_cpu)
+        # Prefer the delta-method fallback (F_σ ≈ σ_I / 2F) over the flat
+        # σ_logI floor, since I0_sigma_cpu has already been clamped to its
+        # own sub-grid floor and carries the actual posterior width.
+        F_fallback = 0.5 * I0_sigma_cpu / F_cpu.clamp(min=1e-6)
+        F_sigma_cpu = torch.where(bad_Fs, F_fallback, F_sigma_cpu)
 
         data = ReflectionData.from_tensors(
             hkl=prep.hkl_valid.detach().cpu().int(),
@@ -1010,3 +1037,47 @@ class Posterior:
         data.I = I0_cpu
         data.I_sigma = I0_sigma_cpu
         return data
+
+
+def build_map_only_data(loss, *, hessian_filter: str = "merging/data"):
+    """Write the MTZ directly from MAP I0 + Laplace σ — skip integration.
+
+    I0      = exp(log_I0_MAP)                       — MAP estimate
+    σ_log_I = loss._hessian_diag_log_I0(filter)     — Laplace σ in log-space
+    σ_I0    = σ_log_I · I0                          — delta method
+    F       = sqrt(I0) = exp(0.5 · log_I0_MAP)
+    σ_F     = σ_I0 / (2·F) = ½ · σ_log_I · F
+
+    Default ``hessian_filter='merging/data'`` gives σ from the likelihood
+    curvature alone (no prior shrinkage).  The MAP estimate itself is the
+    loss argmin, so it still reflects whatever priors are in the loss.
+    """
+    from torchref import ReflectionData
+    from torchref.symmetry import Cell, SpaceGroup
+
+    prep = loss._prep
+    median_cell = prep.median_cell.detach().cpu().tolist()
+    sg = loss._stream._core.spacegroup or "P 1"
+    cell = Cell(median_cell)
+    spacegroup = SpaceGroup(sg)
+
+    log_I0 = loss._params.log_I0.detach()
+    sigma_log_I0 = loss._hessian_diag_log_I0(targets_filter=hessian_filter)
+
+    I0 = log_I0.exp()
+    sigma_I0 = (sigma_log_I0 * I0).clamp(min=0.0)
+    F = (0.5 * log_I0).exp().clamp(min=1e-6)
+    sigma_F = 0.5 * sigma_log_I0 * F
+
+    rfree_flags = torch.zeros(prep.n_valid, dtype=torch.bool)
+    data = ReflectionData.from_tensors(
+        hkl=prep.hkl_valid.detach().cpu().int(),
+        F=F.detach().cpu().float(),
+        F_sigma=sigma_F.detach().cpu().float(),
+        cell=cell,
+        spacegroup=spacegroup,
+        rfree_flags=rfree_flags,
+    )
+    data.I = I0.detach().cpu().float()
+    data.I_sigma = sigma_I0.detach().cpu().float()
+    return data
