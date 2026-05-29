@@ -201,6 +201,13 @@ class PreparedObs:
     shell_id_fw: Tensor
     is_centric: Tensor
 
+    # Per-observation likelihood weight (sorted), or None.
+    # Multiplies ``log p`` per observation in the data NLL; the default
+    # ``None`` recovers the unweighted ``-Σ log p`` sum (bit-for-bit).
+    # Used by the time-binned merge to apply a Gaussian-over-crystal-rank
+    # weighting (see :mod:`torchsx.merging.time_binned`).
+    obs_weights: Tensor | None = None
+
     def to(self, device) -> "PreparedObs":
         return PreparedObs(
             hkl_valid=self.hkl_valid.to(device),
@@ -220,6 +227,7 @@ class PreparedObs:
             partiality=None if self.partiality is None else self.partiality.to(device),
             shell_id_fw=self.shell_id_fw.to(device),
             is_centric=self.is_centric.to(device),
+            obs_weights=None if self.obs_weights is None else self.obs_weights.to(device),
         )
 
 
@@ -232,8 +240,17 @@ def prepare_observations(
     *,
     partiality: Tensor | None = None,
     poisson_noise: PoissonNoiseModel | None = None,
+    crystal_weights: Tensor | None = None,
 ) -> PreparedObs:
-    """Stream → PreparedObs (CPU).  Call ``.to(device)`` afterwards."""
+    """Stream → PreparedObs (CPU).  Call ``.to(device)`` afterwards.
+
+    ``crystal_weights`` is an optional ``(n_crystals,)`` float tensor that
+    will be broadcast to per-observation weights via
+    ``crystal_weights[obs_info.crystal_id]`` and stored on
+    :attr:`PreparedObs.obs_weights`.  Multiplies ``log p`` per
+    observation in the data NLL.  Default ``None`` → no weighting,
+    bit-for-bit identical to the unweighted pipeline.
+    """
     from torchref.base.reciprocal.hkl import get_d_spacing
 
     if poisson_noise is None:
@@ -481,6 +498,20 @@ def prepare_observations(
     if partiality is not None:
         partiality_sorted = partiality[keep_all][sort_all]
 
+    # ── Per-observation weights (broadcast from per-crystal, then sorted) ──
+    obs_weights_sorted = None
+    if crystal_weights is not None:
+        if crystal_weights.ndim != 1 or crystal_weights.shape[0] != n_crystals:
+            raise ValueError(
+                f"crystal_weights must be 1-D with length n_crystals={n_crystals}, "
+                f"got shape {tuple(crystal_weights.shape)}"
+            )
+        # Broadcast per-crystal weight to all (pre-filter) observations via
+        # the stream's crystal_id, then apply the same keep/sort permutation
+        # used above to align with ``I_obs`` / ``hkl_id`` / ``obs_info``.
+        per_obs_w = crystal_weights[core.crystal_id.long()].to(torch.float32)
+        obs_weights_sorted = per_obs_w[keep_all][sort_all]
+
     return PreparedObs(
         hkl_valid=hkl_valid,
         d_spacing=d_valid,
@@ -499,4 +530,5 @@ def prepare_observations(
         partiality=partiality_sorted,
         shell_id_fw=shell_id_fw,
         is_centric=is_centric,
+        obs_weights=obs_weights_sorted,
     )

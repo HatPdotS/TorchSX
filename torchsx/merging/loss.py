@@ -229,16 +229,12 @@ class LogSpaceLoss:
         r_peak: float = 7.0,
         r_gap: float = 9.0,
         r_bg: float = 11.0,
-        likelihood: str = "poisson_excess_noise",
-        excess_noise_n_gh: int = 5,
-        read_var_photons: float = 0.0,
-        gain_switch_var_frac: float = 0.0,
-        trainable_excess: bool = False,
-        gaussian_gamma: float = 1.0,
+        likelihood: str = "gaussian_polynomial",
         var_const: float = 0.0,
         var_linear: float = 1.0,
         var_quadratic: float = 0.0,
         trainable_polynomial_var: bool = False,
+        crystal_weights: torch.Tensor | None = None,
     ) -> "LogSpaceLoss":
         """Construct from a stream.  See :meth:`SFXStream.make_loss`.
 
@@ -266,7 +262,10 @@ class LogSpaceLoss:
         )
 
         poisson_noise = PoissonNoiseModel(r_peak=r_peak, r_gap=r_gap, r_bg=r_bg)
-        prep = prepare_observations(stream, cfg, poisson_noise=poisson_noise)
+        prep = prepare_observations(
+            stream, cfg, poisson_noise=poisson_noise,
+            crystal_weights=crystal_weights,
+        )
         gain_value = float(poisson_noise.gain)
         if device.type != "cpu":
             prep = prep.to(device)
@@ -281,53 +280,7 @@ class LogSpaceLoss:
         ).to(device)
         if likelihood == "poisson":
             likelihood_mod = Poisson().to(device)
-        elif likelihood == "poisson_excess_noise":
-            from torchsx.merging.likelihood.poisson_excess_noise import (
-                PoissonWithExcessNoise,
-            )
-            # Geometric bg-estimate-variance prefactor (always present).
-            bg_var_factor = poisson_noise.n_peak / poisson_noise.n_bg
-            # Calibrated additive read-noise floor.  ``read_var_adu_sq``
-            # is set by ``calibrate_sigma2_of_bg`` from the off-Bragg
-            # σ²_z(x) = g + c/x fit (c = ADU² per peak-ring observation).
-            # In photon space this becomes c / g².  An explicit CLI
-            # ``read_var_photons`` override wins if non-zero.
-            read_var_cal = (
-                poisson_noise.read_var_adu_sq / (poisson_noise.gain ** 2)
-                if poisson_noise.gain and poisson_noise.gain > 0
-                else 0.0
-            )
-            read_var_eff = (
-                read_var_photons if read_var_photons > 0 else read_var_cal
-            )
-            likelihood_mod = PoissonWithExcessNoise(
-                bg_var_factor=bg_var_factor,
-                read_var_photons=read_var_eff,
-                gain_switch_var_frac=gain_switch_var_frac,
-                trainable_excess=trainable_excess,
-                n_gh=excess_noise_n_gh,
-            ).to(device)
-            print(
-                f"  [likelihood] poisson_excess_noise  "
-                f"bg_var_factor={bg_var_factor:.4f} (geom)  "
-                f"read_var_photons={read_var_eff:.4g} "
-                f"({'calibrated' if read_var_photons == 0 else 'CLI override'})  "
-                f"gain_switch_var_frac={gain_switch_var_frac:.4g}  "
-                f"trainable_excess={trainable_excess}  "
-                f"n_gh={excess_noise_n_gh}",
-                flush=True,
-            )
-        elif likelihood == "gaussian_proportional":
-            from torchsx.merging.likelihood import GaussianProportional
-            likelihood_mod = GaussianProportional(
-                gamma=gaussian_gamma,
-            ).to(device)
-            print(
-                f"  [likelihood] gaussian_proportional  "
-                f"γ={gaussian_gamma:.4g}  "
-                f"var = γ·(S + bg)  (symmetric Gaussian, no GH axis)",
-                flush=True,
-            )
+            print("  [likelihood] poisson", flush=True)
         elif likelihood == "gaussian_polynomial":
             from torchsx.merging.likelihood import GaussianPolynomialVariance
             bg_var_factor = poisson_noise.n_peak / poisson_noise.n_bg
@@ -340,13 +293,34 @@ class LogSpaceLoss:
             ).to(device)
             print(
                 f"  [likelihood] gaussian_polynomial  "
-                f"α={var_const:.4g}  β={var_linear:.4g}  γ={var_quadratic:.4g}  "
+                f"g0={var_const:.4g}  g1={var_linear:.4g}  g2={var_quadratic:.4g}  "
                 f"bg_var_factor={bg_var_factor:.4f} (geom)  "
                 f"trainable={trainable_polynomial_var}",
                 flush=True,
             )
+        elif likelihood == "gaussian_polynomial_bg_mixture":
+            from torchsx.merging.likelihood import GaussianPolynomialWithBgMixture
+            bg_var_factor = poisson_noise.n_peak / poisson_noise.n_bg
+            likelihood_mod = GaussianPolynomialWithBgMixture(
+                var_const=var_const,
+                var_linear=var_linear,
+                var_quadratic=var_quadratic,
+                bg_var_factor=bg_var_factor,
+                trainable=trainable_polynomial_var,
+            ).to(device)
+            print(
+                f"  [likelihood] gaussian_polynomial_bg_mixture  "
+                f"g0={var_const:.4g}  g1={var_linear:.4g}  g2={var_quadratic:.4g}  "
+                f"bg_var_factor={bg_var_factor:.4f} (geom)  "
+                f"trainable_var={trainable_polynomial_var}  "
+                f"q_a_init={params.q_a.item():.3f}  q_b_init={params.q_b.item():.3f}",
+                flush=True,
+            )
         else:
-            raise ValueError(f"Unknown likelihood: {likelihood!r}")
+            raise ValueError(
+                f"Unknown likelihood: {likelihood!r}; expected one of "
+                "'gaussian_polynomial', 'gaussian_polynomial_bg_mixture', 'poisson'"
+            )
 
         data_target = DataNLLTarget(
             params=params,

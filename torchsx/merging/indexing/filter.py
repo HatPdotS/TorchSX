@@ -113,6 +113,50 @@ def filter_resolution(
     return _reindex(core, obs_mask, crystal_mask, image_mask)
 
 
+def filter_ewald(
+    core: _SFXStreamCore,
+    max_offset: float | None = None,
+    invert: bool = False,
+    *,
+    max_offset_rel: float | None = None,
+) -> _SFXStreamCore:
+    """Keep observations close to the Ewald sphere.
+
+    Exactly one threshold mode must be supplied:
+
+    * ``max_offset`` (Å⁻¹) — uniform absolute cutoff, ``|r| ≤ max_offset``.
+    * ``max_offset_rel`` (dimensionless) — per-crystal cutoff scaled by the
+      crystal's CrystFEL integration radius, ``|r| ≤ max_offset_rel ·
+      profile_rad[crystal]``.  Adapts to per-crystal mosaicity / divergence.
+
+    ``invert=True`` flips the predicate (keep the off-Bragg tail), useful for
+    building a background-only sample for σ²(bg) calibration.
+    """
+    from torchsx.merging.observations import _ewald_offset
+
+    if (max_offset is None) == (max_offset_rel is None):
+        raise ValueError(
+            "filter_ewald: supply exactly one of max_offset or max_offset_rel"
+        )
+
+    r = _ewald_offset(core).abs()
+    if max_offset_rel is not None:
+        thr_per_obs = max_offset_rel * core.profile_rad[core.crystal_id.long()]
+        obs_mask = (r > thr_per_obs) if invert else (r <= thr_per_obs)
+    else:
+        obs_mask = (r > max_offset) if invert else (r <= max_offset)
+
+    kept_crystal_ids = core.crystal_id[obs_mask].unique()
+    crystal_mask = torch.zeros(core.n_crystals, dtype=torch.bool)
+    crystal_mask[kept_crystal_ids.long()] = True
+
+    kept_image_ids = core.image_id[crystal_mask].unique()
+    image_mask = torch.zeros(core.n_images, dtype=torch.bool)
+    image_mask[kept_image_ids.long()] = True
+
+    return _reindex(core, obs_mask, crystal_mask, image_mask)
+
+
 def filter_crystals(core: _SFXStreamCore, mask: torch.Tensor) -> _SFXStreamCore:
     """Keep crystals where mask is True.  Boolean (N_crystals,) tensor."""
     assert mask.shape[0] == core.n_crystals

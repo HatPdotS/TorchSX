@@ -29,7 +29,6 @@ from torch import Tensor
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood.base import DetectionLikelihood
 from torchsx.merging.likelihood.poisson import Poisson
-from torchsx.merging.likelihood.poisson_excess_noise import PoissonWithExcessNoise
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
 from torchsx.merging.quadrature.base import Quadrature
@@ -44,16 +43,12 @@ try:
     from torchsx.merging.quadrature._fixed_log_grid_triton import (
         HAVE_TRITON, marginalize_signal_triton,
     )
-    from torchsx.merging.quadrature._fixed_log_grid_triton_excess import (
-        marginalize_signal_triton_excess,
-    )
     from torchsx.merging.quadrature._fixed_log_grid_triton_gaussian import (
         marginalize_signal_triton_gaussian,
     )
 except ImportError:
     HAVE_TRITON = False
     marginalize_signal_triton = None  # type: ignore[assignment]
-    marginalize_signal_triton_excess = None  # type: ignore[assignment]
     marginalize_signal_triton_gaussian = None  # type: ignore[assignment]
 
 # Set ``TORCHSX_FIXEDLOGGRID_NO_TRITON=1`` to force the eager fallback
@@ -168,37 +163,23 @@ class FixedLogGrid(Quadrature):
         likelihood: DetectionLikelihood,
         log_mean: Tensor,
     ) -> bool:
-        """Triton path is valid for (GenGauss × {Poisson, PoissonWithExcessNoise,
-        GaussianLikelihood}) on a CUDA tensor with Triton installed.
+        """Triton path is valid for (GenGauss × {Poisson, GaussianLikelihood})
+        on a CUDA tensor with Triton installed.
 
-        For ``GaussianLikelihood`` subclasses the kernel takes ``g1`` and
-        ``g2`` (noise polynomial coefficients) as ``constexpr`` scalars,
-        so trainable-coefficient variants (where those become 0-d
-        tensors) fall back to the eager path.
+        ``GaussianLikelihood`` subclasses pass σ² as a per-observation
+        ``(M,)`` tensor; autograd handles chain rule through whatever
+        graph produced it (including trainable coefficients), so no
+        special probing is needed.
         """
         from torchsx.merging.likelihood import GaussianLikelihood
-        if not (
+        return (
             HAVE_TRITON
             and not _DISABLE_TRITON
             and not _eager_only.get()
             and log_mean.is_cuda
             and isinstance(scatter, GenGaussLogScatter)
-        ):
-            return False
-        if isinstance(likelihood, (Poisson, PoissonWithExcessNoise)):
-            return True
-        if isinstance(likelihood, GaussianLikelihood):
-            # Probe the coefficients to ensure g1, g2 are plain floats —
-            # we can't pass tensor scalars as Triton constexpr.
-            try:
-                _, g1, g2 = likelihood.coefficients(log_mean.new_zeros(1))
-            except Exception:
-                return False
-            return not (
-                isinstance(g1, Tensor) and g1.requires_grad
-                or isinstance(g2, Tensor) and g2.requires_grad
-            )
-        return False
+            and isinstance(likelihood, (Poisson, GaussianLikelihood))
+        )
 
     def marginalize_signal(
         self,
@@ -221,28 +202,13 @@ class FixedLogGrid(Quadrature):
             log_w = self._trap_log_w(self.log_S_grid, K)
             from torchsx.merging.likelihood import GaussianLikelihood
             if isinstance(likelihood, GaussianLikelihood):
-                g0_obs, g1, g2 = likelihood.coefficients(bg)
-                # g0_obs may be a 0-d or (M,) tensor; expand to (M,).
-                if g0_obs.dim() == 0:
-                    g0_obs = g0_obs.expand_as(bg)
-                return marginalize_signal_triton_gaussian(
-                    log_mean, n_ph, bg, g0_obs.contiguous(),
-                    log_alpha_obs, log_beta_obs,
-                    self.log_S_grid, log_w,
-                    float(g1), float(g2),
-                    var_floor=getattr(likelihood, "var_floor", 1e-12),
+                var = likelihood.sigma_squared_obs(n_ph, bg).clamp(
+                    min=likelihood.var_floor,
                 )
-            if isinstance(likelihood, PoissonWithExcessNoise):
-                sigma_excess = (
-                    likelihood.bg_var_factor * bg + likelihood.read_var_photons
-                ).clamp(min=1e-12).sqrt()
-                return marginalize_signal_triton_excess(
-                    log_mean, n_ph, bg, sigma_excess,
+                return marginalize_signal_triton_gaussian(
+                    log_mean, n_ph, bg, var.contiguous(),
                     log_alpha_obs, log_beta_obs,
                     self.log_S_grid, log_w,
-                    likelihood.gh_z.to(log_mean.device),
-                    likelihood.gh_logw.to(log_mean.device),
-                    likelihood.bg_var_factor,
                 )
             return marginalize_signal_triton(
                 log_mean, n_ph, bg, log_alpha_obs, log_beta_obs,

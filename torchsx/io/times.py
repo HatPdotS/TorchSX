@@ -1,7 +1,15 @@
-"""Times-file loader: assign per-image timepoints from a 3-column whitespace file.
+"""Times-file loader and filename-derived timepoint helpers.
 
-Format
-------
+Two ways to attach per-image timepoints to a stream:
+
+1. **Times file** (3-col whitespace, ``filename event timepoint``) —
+   see :func:`load_times_file` + :func:`assign_timepoints_to_images`.
+2. **Filename-derived** — one ``.sfx`` file per timepoint, with the
+   timepoint embedded in the filename.  See
+   :func:`load_streams_with_filename_timepoints`.
+
+Times-file format
+-----------------
 Three whitespace-separated columns: ``filename event timepoint``.
 Comment lines (``#``-prefixed) and blank lines are skipped.  No header.
 
@@ -16,16 +24,19 @@ Public entry points
 -------------------
 ``load_times_file(path)`` → ``dict[(filename, event), float]``
 ``assign_timepoints_to_images(filenames, events, lookup)`` →
-    ``(timepoints, report)`` with permissive matching and a printable
-    summary report.
+    ``(timepoints, report)``.
+``load_streams_with_filename_timepoints(paths, pattern=...)`` →
+    one labelled :class:`SFXStream` with each image carrying the
+    timepoint parsed from its source filename.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 
 @dataclass
@@ -168,3 +179,151 @@ def unique_finite_timepoints(timepoints: Iterable[float]) -> list[float]:
             continue
         out.add(float(t))
     return sorted(out)
+
+
+# ── Filename-derived timepoints ──────────────────────────────────────────
+
+
+_DEFAULT_TIMEPOINT_PATTERN = r"(?P<t>[+-]?\d+(?:\.\d+)?)"
+
+
+def parse_timepoint_from_filename(
+    name: str,
+    pattern: str = _DEFAULT_TIMEPOINT_PATTERN,
+) -> float:
+    """Parse a float timepoint out of ``name`` using a regex.
+
+    Parameters
+    ----------
+    name :
+        Filename (or full path — only ``Path(name).name`` is searched).
+    pattern :
+        Regex with a named group ``(?P<t>...)`` capturing the timepoint.
+        The default matches the **first** signed decimal in the
+        filename, which works for names like ``delay-45.sfx``,
+        ``run_t100.sfx``, ``run-001_+1.5ps.sfx``.  Override when the
+        first number is something else (run number, event id, etc.).
+
+    Returns
+    -------
+    float
+
+    Raises
+    ------
+    ValueError if the pattern matches no number in the filename.
+    """
+    stem = Path(name).name
+    m = re.search(pattern, stem)
+    if m is None:
+        raise ValueError(
+            f"timepoint pattern {pattern!r} did not match in filename {stem!r}"
+        )
+    try:
+        # Prefer the named group if present, else group(0) / group(1).
+        gd = m.groupdict()
+        if "t" in gd and gd["t"] is not None:
+            raw = gd["t"]
+        else:
+            raw = m.group(1) if m.groups() else m.group(0)
+        return float(raw)
+    except (ValueError, IndexError) as exc:
+        raise ValueError(
+            f"failed to parse float from regex match {m.group(0)!r} "
+            f"in filename {stem!r}: {exc}"
+        ) from exc
+
+
+def load_streams_with_filename_timepoints(
+    paths: Sequence[str | Path],
+    *,
+    pattern: str = _DEFAULT_TIMEPOINT_PATTERN,
+    merge_friedel: bool = True,
+    spacegroup: str | None = None,
+    verbose: bool = True,
+):
+    """Load multiple ``.sfx`` files, label each by a filename-derived timepoint, concatenate.
+
+    Each input file is assumed to represent one timepoint of a
+    time-resolved experiment.  The timepoint is parsed out of the
+    filename via the regex ``pattern`` (see
+    :func:`parse_timepoint_from_filename`).  After loading, every image
+    in the source stream receives that timepoint as its
+    ``metadata['image']['timepoint']`` entry, and all streams are
+    concatenated via :meth:`SFXStream.concat` to a single labelled
+    stream.
+
+    Parameters
+    ----------
+    paths :
+        Iterable of ``.sfx`` paths.  Order is irrelevant — the parsed
+        timepoint determines the temporal ordering of the resulting
+        stream's metadata.
+    pattern :
+        Regex matched against ``Path(p).name`` for each entry.  Must
+        capture a float-parseable string (named group ``t`` or group 1
+        or group 0).  Default: first signed decimal in the filename.
+    merge_friedel :
+        Forwarded to :meth:`SFXStream.load`.
+    verbose :
+        Print a per-file summary line and the unique timepoints found.
+
+    Returns
+    -------
+    SFXStream
+        A single concatenated stream with every image carrying a
+        finite ``timepoint`` metadata entry.
+    """
+    from torchsx.stream import SFXStream
+    import dataclasses
+    from copy import deepcopy
+
+    if len(paths) == 0:
+        raise ValueError("paths must contain at least one .sfx file")
+
+    parsed: list[tuple[float, Path]] = []
+    for p in paths:
+        p = Path(p)
+        t = parse_timepoint_from_filename(p.name, pattern)
+        parsed.append((t, p))
+    # Sort by parsed timepoint so the concatenated stream is naturally ordered.
+    parsed.sort(key=lambda pt: pt[0])
+
+    if verbose:
+        print(
+            f"[filename-timepoints] {len(parsed)} files, "
+            f"pattern={pattern!r}",
+            flush=True,
+        )
+
+    labelled_streams = []
+    for t, p in parsed:
+        # If the caller overrides the spacegroup, load with the requested
+        # merge-Friedel setting; for P1 / centrosymmetric P-1 / etc. the
+        # appropriate Friedel behaviour is the caller's call.
+        s = SFXStream.load(p, merge_friedel=merge_friedel)
+        n_images = s.n_images
+        new_meta = deepcopy(s._core.metadata) if s._core.metadata else {}
+        if "image" not in new_meta:
+            new_meta["image"] = {}
+        new_meta["image"]["timepoint"] = [float(t)] * n_images
+        replace_kwargs: dict[str, object] = {"metadata": new_meta}
+        if spacegroup is not None:
+            replace_kwargs["spacegroup"] = spacegroup
+        new_core = dataclasses.replace(s._core, **replace_kwargs)
+        labelled_streams.append(SFXStream(new_core))
+        if verbose:
+            print(
+                f"  t={t:+.4g}  ←  {p.name}  "
+                f"(n_images={n_images}, n_crystals={s.n_crystals})",
+                flush=True,
+            )
+
+    combined = SFXStream.concat(labelled_streams)
+    if verbose:
+        uniq = unique_finite_timepoints(combined.image_timepoints)
+        print(
+            f"[filename-timepoints] combined: n_images={combined.n_images}, "
+            f"n_crystals={combined.n_crystals}, unique timepoints={uniq}",
+            flush=True,
+        )
+    return combined

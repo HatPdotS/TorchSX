@@ -1,13 +1,12 @@
-"""Symmetric Gaussian likelihood with polynomial variance.
+"""Symmetric Gaussian likelihood with polynomial variance — per-observation σ².
 
 Unified noise model
 -------------------
 
-This likelihood collapses the three noise contributions we've identified
-on Jungfrau/CSPAD detectors into a single three-parameter polynomial in
-the predicted mean ``μ = S + bg``::
+We model the *per-observation* detector noise as a polynomial in the
+data-side mean estimate ``μ_obs = max(n, bg)``::
 
-    Var(n | μ) = g₀  +  g₁ · μ  +  g₂ · μ²
+    σ²_obs = g₀  +  g₁ · μ_obs  +  g₂ · μ_obs²
 
 with the physical interpretation (all three are detector gain-chain
 artefacts — hence "g"):
@@ -20,45 +19,39 @@ artefacts — hence "g"):
                                      fraction (g₂ = γ_g², where γ_g is
                                      the RMS relative gain uncertainty)
 
-Note: ``g₀, g₁, g₂`` are the *noise* polynomial coefficients and are
-distinct from the per-HKL GenGauss-prior shape parameters ``log_alpha``,
-``log_beta`` (which live in :class:`~torchsx.merging.scatter.gengauss.GenGaussLogScatter`
-and parameterise the latent-signal distribution).
-
-Equivalence with the other Gaussian-shape likelihoods:
-
-    * g₀=0, g₁=1, g₂=0          → :class:`GaussianPoisson`
-    * g₀=read_var + bg_var·bg   → :class:`GaussianPoissonExcess`
-    * g₀=0, g₁=user, g₂=0       → :class:`GaussianProportional` (gamma=g₁)
+Note: σ² is evaluated *at the data*, not per-(M, K) on the
+S-integration grid. σ is a property of the observation (set by the
+detector), not of the latent-signal hypothesis space. See
+:mod:`gaussian_base` for the conceptual rationale.
 
 The bg-estimate variance term ``(n_peak/n_bg)·bg`` from
-``PoissonNoiseModel`` is folded into the *per-observation* g₀ via
-``bg_var_factor·bg`` — it's bg-dependent but signal-independent, so it
-naturally lives in the g₀ slot.
+``PoissonNoiseModel`` is folded into ``g₀`` per observation via
+``bg_var_factor·bg`` — it's bg-dependent but signal-independent.
+
+This is the only ``GaussianLikelihood`` subclass in the public surface;
+its three coefficients subsume what used to be separate classes:
+
+    * g₀=0, g₁=1, g₂=0          — pure Poisson moment-match in σ²
+                                  (the production T7 default; ``--variance stream``)
+    * g₀=read_var + bg_var·bg   — Poisson + signal-independent excess noise
+    * g₀=0, g₁=γ, g₂=0          — symmetric Gaussian with γ-scaled variance
 
 Trainable mode (``trainable=True``) wraps each of (g₀, g₁, g₂) in a
 log-space ``nn.Parameter`` so LBFGS can co-optimise them with the rest
-of the model.  Note: earlier experiments (T5/T6/T9 in
-``experiments/weak_reflections/``) showed these are *not* identifiable
-from the data NLL alone — they end up frozen at their init in the
-cold-start case and converge to noise-inflating values in the
-warm-start case that degrade R-free.  Keep ``trainable=False`` for
-production and calibrate externally (off-Bragg σ²(bg) fit + detector
-characterisation).
+of the model. Autograd chains through ``sigma_squared_obs → var →
+log_p`` via the Triton kernel's ``S2_var`` sufficient stat.
 
-Closed-form note
-----------------
-
-The marginal ``∫ N(n; μ, σ²(μ)) · GenGauss(μ; μ_HKL, α_g, β_g) dμ`` is
-NOT analytical for either non-quadratic σ² or non-Gaussian GenGauss
-(β_g ≠ 2).  We rely on the existing ``FixedLogGrid`` quadrature on the
-signal axis, which evaluates this likelihood at each (M, K) grid point
-and handles heteroscedastic σ²(μ) without any extra machinery.
+EXPERIMENTAL — the trainable branch is preserved as an opt-in research
+knob (``--refine-detector-noise`` on the CLI). At production scale
+(50k tubulin) it converges to a non-physical ``g₁ ≈ 14`` mode and is
+NaN-prone in single precision; the data NLL alone does not pin the
+detector-noise coefficients. **Keep ``trainable=False`` for production.**
+The T9 run set in ``experiments/weak_reflections/README.md`` documents
+the failure mode.
 """
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -68,7 +61,7 @@ from torchsx.merging.likelihood.gaussian_base import GaussianLikelihood
 
 
 class GaussianPolynomialVariance(GaussianLikelihood):
-    """``n ~ Normal(μ, g₀ + g₁·μ + g₂·μ²)`` with ``μ = S + bg``.
+    """``n ~ Normal(S + bg, σ²_obs)`` with ``σ²_obs = g₀ + g₁·μ_obs + g₂·μ_obs²``.
 
     Any subset of (g₀, g₁, g₂) can be made trainable via ``trainable``.
     Log-space parameterisation keeps them positive.
@@ -82,7 +75,7 @@ class GaussianPolynomialVariance(GaussianLikelihood):
     var_const :
         g₀_const (constant part) — read-noise floor in photons².  The
         bg-dependent part ``bg_var_factor·bg`` is added automatically to
-        form the per-observation ``g₀_obs``.
+        form the per-observation g₀.
     var_linear :
         g₁ — linear coefficient.  Default 1.0 (pure Poisson moment-match
         when the gain is correct).
@@ -90,14 +83,16 @@ class GaussianPolynomialVariance(GaussianLikelihood):
         g₂ — quadratic coefficient (γ_g², dimensionless).
     bg_var_factor :
         ``n_peak / n_bg``.  Adds ``bg_var_factor·bg`` to g₀ per observation
-        — the bg-estimate finite-sample variance.  Default 0
-        (caller responsible for absorbing it into ``var_const`` if desired).
+        — the bg-estimate finite-sample variance.
     trainable :
         If True, all three coefficients become log-space ``nn.Parameter``s
         that LBFGS can optimise.  Floors at 1e-10 to avoid log(0).
+        **EXPERIMENTAL** — at production scale (50k tubulin) this branch
+        converges to a non-physical ``g₁ ≈ 14`` mode and is NaN-prone in
+        single precision. Keep ``trainable=False`` for production; see the
+        T9 run set in ``experiments/weak_reflections/README.md``.
     var_floor :
-        Hard minimum on the predicted variance.  Overrides the base class
-        default of 1e-12 if specified.
+        Hard minimum on σ².  Overrides the base class default of 1e-12.
     """
 
     def __init__(
@@ -151,15 +146,20 @@ class GaussianPolynomialVariance(GaussianLikelihood):
             out.append(float(v.item()) if isinstance(v, Tensor) else float(v))
         return tuple(out)  # type: ignore[return-value]
 
-    def coefficients(self, bg: Tensor) -> Tuple[Tensor, Tensor | float, Tensor | float]:
-        """Return ``(g0_obs, g1, g2)`` for the unified Gaussian likelihood.
+    def sigma_squared_obs(self, n: Tensor, bg: Tensor) -> Tensor:
+        """``σ²_obs = (g₀_const + bg_var·bg₊) + g₁·μ_obs + g₂·μ_obs²``.
 
-        g₀ is folded into a per-observation tensor that includes the
-        bg-estimate variance contribution ``bg_var_factor·bg``.  g₁ and
-        g₂ are returned as scalars (or 0-d tensors when trainable).
+        ``μ_obs = max(n, bg, 0)`` — Poisson MLE for μ, floored at 0.
+        ``bg₊ = max(bg, 0)`` — bg-variance contribution uses only the
+        non-negative part of bg (the (n_peak/n_bg)·bg variance estimator
+        is only meaningful for non-negative bg).
+
+        Without these floors, observations with strongly negative
+        background-subtracted ``n`` or noise-dominated negative ``bg``
+        can drive σ² below zero, and the var_floor clamp downstream
+        blocks the gradient pull-back.
         """
-        g0_const = self._g0_const()
-        # g0_const may be a scalar tensor (trainable) or Python float
-        # (fixed).  The expression must broadcast against (M,) ``bg``.
-        g0_obs = g0_const + self.bg_var_factor * bg                # (M,)
-        return g0_obs, self._g1(), self._g2()
+        mu_obs = torch.maximum(n, bg).clamp(min=0.0)
+        bg_pos = bg.clamp(min=0.0)
+        g0_obs = self._g0_const() + self.bg_var_factor * bg_pos
+        return g0_obs + self._g1() * mu_obs + self._g2() * mu_obs * mu_obs

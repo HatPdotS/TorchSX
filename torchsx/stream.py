@@ -662,6 +662,23 @@ class SFXStream:
         from torchsx.merging.indexing import filter_resolution
         return SFXStream(filter_resolution(self._core, d_min, d_max))
 
+    def filter_ewald(
+        self,
+        max_offset: float | None = None,
+        invert: bool = False,
+        *,
+        max_offset_rel: float | None = None,
+    ) -> SFXStream:
+        """Drop observations far from the Ewald sphere.
+
+        Supply exactly one of ``max_offset`` (absolute Å⁻¹) or
+        ``max_offset_rel`` (fraction of per-crystal ``profile_rad``).
+        """
+        from torchsx.merging.indexing import filter_ewald
+        return SFXStream(filter_ewald(
+            self._core, max_offset, invert, max_offset_rel=max_offset_rel,
+        ))
+
     def filter_crystals(self, mask: torch.Tensor) -> SFXStream:
         """Keep crystals where mask is True."""
         from torchsx.merging.indexing import filter_crystals
@@ -873,16 +890,12 @@ class SFXStream:
         r_peak: float = 7.0,
         r_gap: float = 9.0,
         r_bg: float = 11.0,
-        likelihood: str = "poisson_excess_noise",
-        excess_noise_n_gh: int = 5,
-        read_var_photons: float = 0.0,
-        gain_switch_var_frac: float = 0.0,
-        trainable_excess: bool = False,
-        gaussian_gamma: float = 1.0,
+        likelihood: str = "gaussian_polynomial",
         var_const: float = 0.0,
         var_linear: float = 1.0,
         var_quadratic: float = 0.0,
         trainable_polynomial_var: bool = False,
+        crystal_weights: torch.Tensor | None = None,
     ):
         """Build a :class:`LogSpaceLoss` from this stream.
 
@@ -925,15 +938,11 @@ class SFXStream:
             obs_chunk_size=obs_chunk_size, device=device,
             r_peak=r_peak, r_gap=r_gap, r_bg=r_bg,
             likelihood=likelihood,
-            excess_noise_n_gh=excess_noise_n_gh,
-            read_var_photons=read_var_photons,
-            gain_switch_var_frac=gain_switch_var_frac,
-            trainable_excess=trainable_excess,
-            gaussian_gamma=gaussian_gamma,
             var_const=var_const,
             var_linear=var_linear,
             var_quadratic=var_quadratic,
             trainable_polynomial_var=trainable_polynomial_var,
+            crystal_weights=crystal_weights,
         )
 
 def _is_numeric_list(lst: list) -> bool:

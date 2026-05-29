@@ -32,6 +32,11 @@ class Parameters(nn.Module):
     pi_logit        (n_hkl,) — logit of the per-HKL background mixture weight
                     π_h ∈ (0, 1); only active when the likelihood subclass
                     reads it.
+    q_a, q_b        scalars defining the per-obs background-mixture weight
+                    ``q(|r|) = sigmoid(q_a + q_b · |r| · 1e3)`` (|r| scaled to
+                    ×10⁻³ Å⁻¹ units so q_b is order-unity). Only read by the
+                    ``GaussianPolynomialWithBgMixture`` likelihood; no-ops for
+                    the plain GP / Poisson paths.
     """
 
     def __init__(
@@ -39,6 +44,8 @@ class Parameters(nn.Module):
         log_I0_init: Tensor,
         scatter_shape: ScatterShape,
         pi_logit_init: Tensor | None = None,
+        q_a_init: float = -2.197,
+        q_b_init: float = 0.514,
     ) -> None:
         super().__init__()
         self.log_I0 = nn.Parameter(log_I0_init.clone())
@@ -46,6 +53,8 @@ class Parameters(nn.Module):
         if pi_logit_init is None:
             pi_logit_init = torch.zeros_like(log_I0_init)
         self.pi_logit = nn.Parameter(pi_logit_init.clone())
+        self.q_a = nn.Parameter(torch.tensor(float(q_a_init), dtype=torch.float32))
+        self.q_b = nn.Parameter(torch.tensor(float(q_b_init), dtype=torch.float32))
 
     @classmethod
     def from_prep(

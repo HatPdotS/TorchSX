@@ -14,6 +14,7 @@ from torchsx.merging.indexing.hkl import (
 )
 from torchsx.merging.indexing.filter import (
     filter_resolution,
+    filter_ewald,
     filter_crystals,
     filter_images,
     filter_outliers,
@@ -47,6 +48,7 @@ __all__ = [
     "merge_intensities",
     "merge_median",
     "filter_resolution",
+    "filter_ewald",
     "filter_crystals",
     "filter_images",
     "filter_outliers",

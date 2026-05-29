@@ -103,6 +103,10 @@ class Merger:
         - class → built from ``obs_info`` via ``from_obs_info``
         - instance → used as-is
     partiality : (N_obs,) tensor in stream order, optional.
+    crystal_weights : (n_crystals,) tensor, optional.
+        Per-crystal likelihood weight, broadcast to per-observation and
+        threaded into the data NLL as ``-Σ w_i · log p_i``.  ``None``
+        (default) recovers the unweighted pipeline bit-for-bit.
     device : 'cpu' or 'cuda'.
     poisson_noise : PoissonNoiseModel, optional.
     init_from : optional ``MergedResult`` to seed log_I0 / α / β.
@@ -115,6 +119,7 @@ class Merger:
         config: MergeConfig | None = None,
         scale_models: Sequence[ScaleModel] | None = None,
         partiality: Tensor | None = None,
+        crystal_weights: Tensor | None = None,
         device: str | torch.device = "cpu",
         poisson_noise: PoissonNoiseModel | None = None,
         init_from: MergedResult | None = None,
@@ -123,6 +128,7 @@ class Merger:
         self.config = config or MergeConfig()
         self.device = torch.device(device)
         self.partiality = partiality
+        self.crystal_weights = crystal_weights
         self.poisson_noise = poisson_noise or PoissonNoiseModel()
         self._user_scale_models = scale_models
         self.init_from = init_from
@@ -154,6 +160,7 @@ class Merger:
             self.config,
             partiality=self.partiality,
             poisson_noise=self.poisson_noise,
+            crystal_weights=self.crystal_weights,
         )
         if self.init_from is not None:
             self._seed_init_from(prep, self.init_from)

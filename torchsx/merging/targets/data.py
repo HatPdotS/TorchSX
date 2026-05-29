@@ -121,8 +121,13 @@ class _ChunkedDataNLL_REML(torch.autograd.Function):
         with torch.no_grad():
             for s, e in target._iter_chunks():
                 log_p, A, B, C, hkl_idx = target._chunk_log_p_and_aux(s, e)
-                L_data = L_data - log_p.sum()
-                term = C - B + A * A                                # (M_chunk,)
+                if target.has_obs_weights:
+                    w = target.obs_weights[s:e]
+                    L_data = L_data - (w * log_p).sum()
+                    term = w * (C - B + A * A)                      # (M_chunk,)
+                else:
+                    L_data = L_data - log_p.sum()
+                    term = C - B + A * A                            # (M_chunk,)
                 J.scatter_add_(0, hkl_idx, term)
 
         # HKLs with no observations have J_h = 0; drop them from the sum.
@@ -155,12 +160,22 @@ class _ChunkedDataNLL_REML(torch.autograd.Function):
             with torch.enable_grad():
                 log_p, A, B, C, hkl_idx = target._chunk_log_p_and_aux(s, e)
                 term = C - B + A * A
-                # Chunk surrogate: gradient wrt params equals this chunk's
-                # contribution to ∂(L_data + L_REML)/∂params.
-                L_chunk = (
-                    -log_p.sum()
-                    + (dL_reml_dJ[hkl_idx] * term).sum()
-                )
+                if target.has_obs_weights:
+                    w = target.obs_weights[s:e]
+                    # Weighted data + weighted Fisher accumulator.  Matches
+                    # the forward pass's per-obs weighting of both L_data
+                    # and J so the gradient is consistent.
+                    L_chunk = (
+                        -(w * log_p).sum()
+                        + (dL_reml_dJ[hkl_idx] * w * term).sum()
+                    )
+                else:
+                    # Chunk surrogate: gradient wrt params equals this chunk's
+                    # contribution to ∂(L_data + L_REML)/∂params.
+                    L_chunk = (
+                        -log_p.sum()
+                        + (dL_reml_dJ[hkl_idx] * term).sum()
+                    )
             partials = torch.autograd.grad(
                 L_chunk, live_params, retain_graph=False, allow_unused=True,
             )
@@ -213,7 +228,7 @@ class DataNLLTarget(MergingTarget):
         self.register_buffer("_oi_s_sq", oi.s_sq)
         self.register_buffer("_oi_hkl_idx", oi.hkl_idx)
         self._oi_n_crystals = oi.n_crystals
-        for name in ("panel_id", "fs", "ss", "peak", "background"):
+        for name in ("panel_id", "fs", "ss", "peak", "background", "ewald_offset"):
             t = getattr(oi, name)
             if t is not None:
                 self.register_buffer(f"_oi_{name}", t)
@@ -225,6 +240,16 @@ class DataNLLTarget(MergingTarget):
         else:
             self.register_buffer("partiality", torch.empty(0))
             self.has_partiality = False
+
+        # Optional per-observation likelihood weights (sorted).  When set,
+        # the data NLL is ``-Σ w_i · log p_i`` instead of ``-Σ log p_i``.
+        # Default-off path is bit-for-bit identical to the unweighted sum.
+        if prep.obs_weights is not None:
+            self.register_buffer("obs_weights", prep.obs_weights)
+            self.has_obs_weights = True
+        else:
+            self.register_buffer("obs_weights", torch.empty(0))
+            self.has_obs_weights = False
 
         self.n_obs_total = int(prep.n_obs_total)
         self.chunk_size = chunk_size
@@ -246,6 +271,7 @@ class DataNLLTarget(MergingTarget):
             ss=self._slice_opt("_oi_ss", s, e),
             peak=self._slice_opt("_oi_peak", s, e),
             background=self._slice_opt("_oi_background", s, e),
+            ewald_offset=self._slice_opt("_oi_ewald_offset", s, e),
         )
 
     def _iter_chunks(self) -> Iterator[tuple[int, int]]:
@@ -293,6 +319,8 @@ class DataNLLTarget(MergingTarget):
         log_p = self.likelihood.combine_with_marginal(
             n_ph_slice, bg_slice, log_p_sig, self.params, meta,
         )
+        if self.has_obs_weights:
+            return -(log_p * self.obs_weights[s:e]).sum()
         return -log_p.sum()
 
     def _chunk_log_p_and_aux(
