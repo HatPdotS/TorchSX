@@ -287,6 +287,21 @@ class Geometry:
             pid_map[p.min_ss : p.max_ss + 1, p.min_fs : p.max_fs + 1] = i
         return pid_map
 
+    # ── Beam / wavelength ─────────────────────────────────────────────────
+
+    @property
+    def wavelength_A(self) -> float:
+        """X-ray wavelength in Angstrom, from the photon energy.
+
+        ``λ[Å] = hc / E`` with ``hc = 12398.419843320026 eV·Å``.
+        """
+        if self.photon_energy_eV <= 0:
+            raise ValueError(
+                "photon_energy_eV must be > 0 to compute a wavelength "
+                f"(got {self.photon_energy_eV})"
+            )
+        return 12398.419843320026 / self.photon_energy_eV
+
     # ── Coordinate transforms ────────────────────────────────────────────
 
     def to_lab(
@@ -394,6 +409,44 @@ class Geometry:
         y_mm = xyz[:, 1].numpy() * 1000
         return x_mm, y_mm
 
+    def to_reciprocal(
+        self,
+        ss: torch.Tensor,
+        fs: torch.Tensor,
+        panel_id: torch.Tensor | None = None,
+        wavelength: float | None = None,
+    ) -> torch.Tensor:
+        """Convert detector (ss, fs) to reciprocal-space scattering vectors.
+
+        Builds the Ewald-sphere q-vector for each pixel, ready to feed an
+        indexer.  Uses the crystallographic convention (no ``2π`` factor),
+        so ``|q| = 2 sin θ / λ`` and ``q`` is expressed in the same inverse
+        length as a reciprocal cell ``a* = 1/d`` — i.e. **Å⁻¹** when the
+        wavelength is in Å.
+
+        With incident beam ``ŝ₀ = (0, 0, 1)`` (the .geom convention places the
+        detector downstream at ``+z = clen``) and scattered unit vector
+        ``ŝ = p / |p|`` for lab position ``p`` (from :meth:`to_lab`)::
+
+            q = (ŝ − ŝ₀) / λ
+
+        Parameters
+        ----------
+        ss, fs : (N,) float tensors — detector pixel coordinates.
+        panel_id : (N,) int tensor, optional — skip the panel lookup.
+        wavelength : float, optional — wavelength in Å; defaults to
+            :attr:`wavelength_A` (from the geometry's photon energy).
+
+        Returns
+        -------
+        q : (N, 3) float tensor — scattering vectors in Å⁻¹.
+        """
+        lam = self.wavelength_A if wavelength is None else float(wavelength)
+        p = self.to_lab(ss, fs, panel_id=panel_id)  # (N, 3) meters
+        s_hat = p / p.norm(dim=1, keepdim=True)
+        s0 = torch.tensor([0.0, 0.0, 1.0], device=p.device, dtype=p.dtype)
+        return (s_hat - s0) / lam
+
     # ── Radial distance map ──────────────────────────────────────────────
 
     def radial_map(self) -> np.ndarray:
@@ -415,6 +468,16 @@ class Geometry:
             r_map[ss0 : ss1 + 1, p.min_fs : p.max_fs + 1] = np.sqrt(x**2 + y**2)
 
         return r_map
+
+    @cached_property
+    def pixel_radius_px(self) -> torch.Tensor:
+        """Per-pixel radial distance from the beam center, in **pixels**.
+
+        Cached ``(total_ss, total_fs)`` float32 tensor.  This is what
+        peakfinder8 expects for its ``pix_r`` argument (it bins the local
+        background by radius); a thin torch view over :meth:`radial_map`.
+        """
+        return torch.from_numpy(self.radial_map())
 
     # ── Panel map ────────────────────────────────────────────────────────
 

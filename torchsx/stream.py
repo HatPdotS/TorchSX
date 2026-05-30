@@ -155,94 +155,12 @@ class SFXStream:
         if len(streams) == 1:
             return streams[0]
 
-        cores = [s._core for s in streams]
+        from torchsx._core import BaseStream
 
-        # Compute offsets for remapping join keys
-        crystal_offsets = []
-        image_offsets = []
-        cum_crystals = 0
-        cum_images = 0
-        for c in cores:
-            crystal_offsets.append(cum_crystals)
-            image_offsets.append(cum_images)
-            cum_crystals += c.n_crystals
-            cum_images += c.n_images
-
-        # --- Observation-level tensors (concat + remap crystal_id) ---
-        hkl = torch.cat([c.hkl for c in cores], dim=0)
-        I = torch.cat([c.I for c in cores])
-        sigma = torch.cat([c.sigma for c in cores])
-        background = torch.cat([c.background for c in cores])
-        peak = torch.cat([c.peak for c in cores])
-        fs = torch.cat([c.fs for c in cores])
-        ss = torch.cat([c.ss for c in cores])
-        panel_id = torch.cat([c.panel_id for c in cores])
-        crystal_id = torch.cat([
-            c.crystal_id + off for c, off in zip(cores, crystal_offsets)
-        ])
-
-        # --- Crystal-level tensors (concat + remap image_id) ---
-        astar = torch.cat([c.astar for c in cores], dim=0)
-        bstar = torch.cat([c.bstar for c in cores], dim=0)
-        cstar = torch.cat([c.cstar for c in cores], dim=0)
-        cell = torch.cat([c.cell for c in cores], dim=0)
-        profile_rad = torch.cat([c.profile_rad for c in cores])
-        resolution = torch.cat([c.resolution for c in cores])
-        n_refl = torch.cat([c.n_refl for c in cores])
-        image_id = torch.cat([
-            c.image_id + off for c, off in zip(cores, image_offsets)
-        ])
-        crystal_in_image = torch.cat([c.crystal_in_image for c in cores])
-
-        # --- Image-level tensors (simple concat) ---
-        beam_energy = torch.cat([c.beam_energy for c in cores])
-        det_shift_x = torch.cat([c.det_shift_x for c in cores])
-        det_shift_y = torch.cat([c.det_shift_y for c in cores])
-        n_peaks = torch.cat([c.n_peaks for c in cores])
-
-        # --- Metadata: merge by concatenating per-level lists ---
-        merged_meta = StreamMetadata()
-        for c in cores:
-            if not c.metadata:
-                continue
-            for top_key, sub_dict in c.metadata.items():
-                if not isinstance(sub_dict, dict):
-                    continue
-                if top_key not in merged_meta:
-                    merged_meta[top_key] = {}
-                for field, values in sub_dict.items():
-                    if field not in merged_meta[top_key]:
-                        merged_meta[top_key][field] = []
-                    if isinstance(values, list):
-                        merged_meta[top_key][field].extend(values)
-                    elif isinstance(values, torch.Tensor):
-                        merged_meta[top_key][field].append(values)
-
-        # Convert any accumulated tensor lists to single tensors
-        for top_key, sub_dict in merged_meta.items():
-            if isinstance(sub_dict, dict):
-                for field, values in sub_dict.items():
-                    if isinstance(values, list) and values and isinstance(values[0], torch.Tensor):
-                        sub_dict[field] = torch.cat(values)
-
-        # Geometry + spacegroup from first stream
-        geometry = cores[0].geometry
-        spacegroup = cores[0].spacegroup
-
-        new_core = _SFXStreamCore(
-            hkl=hkl, I=I, sigma=sigma, background=background,
-            peak=peak, fs=fs, ss=ss, panel_id=panel_id,
-            crystal_id=crystal_id,
-            astar=astar, bstar=bstar, cstar=cstar, cell=cell,
-            profile_rad=profile_rad, resolution=resolution,
-            n_refl=n_refl, image_id=image_id,
-            crystal_in_image=crystal_in_image,
-            beam_energy=beam_energy, det_shift_x=det_shift_x,
-            det_shift_y=det_shift_y, n_peaks=n_peaks,
-            geometry=geometry, metadata=merged_meta,
-            spacegroup=spacegroup,
-        )
-        return cls(new_core)
+        # Columnar concat: offsets every join key, carries arbitrary columns
+        # (e.g. a shoebox), and merges per-level metadata.
+        merged = BaseStream.concat([s._core for s in streams])
+        return cls(merged)
 
     def split_random(self, n_parts: int = 2, seed: int | None = None) -> list[SFXStream]:
         """Randomly split crystals into *n_parts* disjoint groups.
@@ -400,7 +318,7 @@ class SFXStream:
 
         new_meta = deepcopy(self._core.metadata)
         new_meta["image"]["filename"] = new_fnames
-        new_core = dataclasses.replace(self._core, metadata=new_meta)
+        new_core = self._core.replace(metadata=new_meta)
         return SFXStream(new_core)
 
     # --- External metadata ---
@@ -481,7 +399,7 @@ class SFXStream:
 
         # Build new core with updated metadata
         import dataclasses
-        new_core = dataclasses.replace(self._core, metadata=new_meta)
+        new_core = self._core.replace(metadata=new_meta)
         return SFXStream(new_core)
 
     def assign_timepoints(
@@ -550,7 +468,7 @@ class SFXStream:
             new_meta["image"] = {}
         new_meta["image"]["timepoint"] = timepoints
 
-        new_core = dataclasses.replace(self._core, metadata=new_meta)
+        new_core = self._core.replace(metadata=new_meta)
         stream = SFXStream(new_core)
 
         if on_missing == "drop" and report.n_unmatched_images > 0:
@@ -839,8 +757,7 @@ class SFXStream:
         inv[sort_indices] = torch.arange(len(sort_indices))
         canonical_hkl = canonical_hkl[inv]
 
-        new_core = dataclasses.replace(
-            self._core,
+        new_core = self._core.replace(
             hkl=canonical_hkl.to(torch.int16),
             spacegroup=sg,
         )

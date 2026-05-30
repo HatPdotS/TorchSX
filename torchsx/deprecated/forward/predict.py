@@ -518,7 +518,7 @@ def update_observations(
         new_ss[ci] = predicted.ss[pi]
 
     if mode == "position_only":
-        updated_core = dataclasses.replace(core, fs=new_fs, ss=new_ss)
+        updated_core = core.replace(fs=new_fs, ss=new_ss)
         updated_roi = roi_store
         if roi_store is not None:
             updated_roi = roi_store.update(
@@ -603,8 +603,7 @@ def update_observations(
         torch.ones(final_cid.shape[0], dtype=core.n_refl.dtype),
     )
 
-    updated_core = dataclasses.replace(
-        core,
+    updated_core = core.replace(
         hkl=final_hkl,
         I=final_I,
         sigma=final_sigma,

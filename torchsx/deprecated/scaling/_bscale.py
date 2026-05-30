@@ -37,7 +37,7 @@ class BScale(nn.Module):
         """
         correction = torch.exp(2.0 * self.B[core.crystal_id.long()] * s_sq)
         I_scaled = core.I * correction
-        return dataclasses.replace(core, I=I_scaled)
+        return core.replace(I=I_scaled)
 
     def log_scale_per_obs(
         self, crystal_id: torch.Tensor, s_sq: torch.Tensor,

@@ -1,4 +1,12 @@
-""".sfx (safetensors) I/O for SFX data."""
+""".sfx (safetensors) I/O for SFX data — column-driven, multi-level.
+
+Layout (format ``columnar-v2``): each level column is one safetensors entry
+keyed ``"<level>/<column>"`` (``obs/hkl``, ``crystal/cell``, ``image/beam_energy``,
+``obs/shoebox``, …). The JSON sidecar carries the per-level column schema, the
+join registry, spacegroup/source_path, geometry, and (transitionally) the
+StreamMetadata schema. Older flat-key ``.sfx`` files are still read via a legacy
+fallback so existing caches keep loading.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +15,14 @@ from pathlib import Path
 
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import BaseStream, JoinSpec, _SFXStreamCore
 from torchsx.geometry import Geometry
 from torchsx.io._metadata import StreamMetadata
+from torchsx.levels import Level
 
 
-_TENSOR_FIELDS = [
+# Legacy flat-field layout (for reading pre-columnar .sfx files).
+_LEGACY_TENSOR_FIELDS = [
     "hkl", "I", "sigma", "background", "peak", "fs", "ss",
     "panel_id", "crystal_id",
     "astar", "bstar", "cstar", "cell", "profile_rad", "resolution",
@@ -21,25 +31,20 @@ _TENSOR_FIELDS = [
 ]
 
 
-def save_sfx(core: _SFXStreamCore, path: str | Path):
-    """Save _SFXStreamCore as .sfx (safetensors + JSON sidecar)."""
+def save_sfx(core: BaseStream, path: str | Path):
+    """Save a stream core as .sfx (safetensors + JSON sidecar), columnar v2."""
     from safetensors.torch import save_file
 
     path = Path(path)
 
-    # Collect tensors
-    tensors = {}
-    for fname in _TENSOR_FIELDS:
-        t = getattr(core, fname)
-        if t is None:
-            continue  # optional field
-        # safetensors doesn't support int16 — upcast
-        if t.dtype == torch.int16:
-            t = t.to(torch.int32)
-        tensors[fname] = t.contiguous().cpu()
+    tensors: dict[str, torch.Tensor] = {}
+    level_schema: dict[str, dict] = {}
+    for name, level in core.levels.items():
+        lv_tensors, lv_schema = level.state_dict(prefix=name)
+        tensors.update(lv_tensors)
+        level_schema[name] = lv_schema
 
-    # Save metadata tensors if any
-    meta_tensors = {}
+    # Transitional: per-level metadata still lives in StreamMetadata.
     meta_schema = {}
     if core.metadata:
         meta_tensors, meta_schema = core.metadata.to_tensors()
@@ -50,8 +55,10 @@ def save_sfx(core: _SFXStreamCore, path: str | Path):
 
     save_file(tensors, str(path))
 
-    # JSON sidecar
     sidecar = {
+        "format": "columnar-v2",
+        "levels": level_schema,
+        "joins": [[j.child_level, j.key_column, j.parent_level] for j in core.joins],
         "spacegroup": core.spacegroup,
         "source_path": core.source_path,
         "metadata_schema": meta_schema,
@@ -64,8 +71,8 @@ def save_sfx(core: _SFXStreamCore, path: str | Path):
         json.dump(sidecar, f, indent=2)
 
 
-def load_sfx(path: str | Path) -> _SFXStreamCore:
-    """Load _SFXStreamCore from .sfx file."""
+def load_sfx(path: str | Path) -> BaseStream:
+    """Load a stream core from .sfx (columnar v2, or legacy flat-key fallback)."""
     from safetensors.torch import load_file
 
     path = Path(path)
@@ -75,28 +82,48 @@ def load_sfx(path: str | Path) -> _SFXStreamCore:
     with open(json_path) as f:
         sidecar = json.load(f)
 
-    # Extract core tensors
+    geometry = Geometry.from_dict(sidecar["geometry"]) if "geometry" in sidecar else None
+
+    meta_tensors = {k[6:]: v for k, v in all_tensors.items() if k.startswith("_meta/")}
+    meta_schema = sidecar.get("metadata_schema", {})
+    metadata = (
+        StreamMetadata.from_tensors(meta_tensors, meta_schema)
+        if meta_schema else StreamMetadata()
+    )
+
+    if sidecar.get("format") == "columnar-v2":
+        levels = {
+            name: Level.from_state(name, all_tensors, lv_schema)
+            for name, lv_schema in sidecar["levels"].items()
+        }
+        joins = [JoinSpec(*j) for j in sidecar["joins"]]
+        return BaseStream._make(
+            levels, joins, geometry, metadata,
+            sidecar.get("spacegroup", "P 1"), sidecar.get("source_path", ""),
+        )
+
+    return _load_legacy(all_tensors, sidecar, geometry, metadata)
+
+
+def _load_legacy(all_tensors, sidecar, geometry, metadata) -> _SFXStreamCore:
+    """Read a pre-columnar flat-key .sfx file into an SFXStreamCore."""
     kwargs = {}
-    for fname in _TENSOR_FIELDS:
+    for fname in _LEGACY_TENSOR_FIELDS:
         if fname not in all_tensors:
-            continue  # optional field not present in older .sfx files
+            continue
         t = all_tensors[fname]
-        # Restore original dtypes
         if fname in ("hkl", "panel_id"):
             t = t.to(torch.int16)
         elif fname in ("crystal_id", "n_refl", "image_id", "crystal_in_image", "n_peaks"):
             t = t.to(torch.int32)
         kwargs[fname] = t
 
-    # Synthesize camera_length if missing (older .sfx files) — default to 0.0
     if "camera_length" not in kwargs and "beam_energy" in kwargs:
         kwargs["camera_length"] = torch.zeros_like(kwargs["beam_energy"])
 
-    # Synthesize crystal_in_image if missing (older .sfx files)
     if "crystal_in_image" not in kwargs and "image_id" in kwargs:
         image_id = kwargs["image_id"]
         cii = torch.zeros_like(image_id)
-        # Count crystals per image_id in order
         seen: dict[int, int] = {}
         for i in range(len(image_id)):
             iid = image_id[i].item()
@@ -104,23 +131,8 @@ def load_sfx(path: str | Path) -> _SFXStreamCore:
             seen[iid] = seen.get(iid, 0) + 1
         kwargs["crystal_in_image"] = cii
 
-    # Reconstruct metadata
-    meta_tensors = {}
-    for k, v in all_tensors.items():
-        if k.startswith("_meta/"):
-            meta_tensors[k[6:]] = v  # strip "_meta/" prefix
-
-    meta_schema = sidecar.get("metadata_schema", {})
-    metadata = StreamMetadata.from_tensors(meta_tensors, meta_schema) if meta_schema else StreamMetadata()
-
-    # Reconstruct geometry
-    geometry = None
-    if "geometry" in sidecar:
-        geometry = Geometry.from_dict(sidecar["geometry"])
-
     kwargs["geometry"] = geometry
     kwargs["metadata"] = metadata
     kwargs["spacegroup"] = sidecar.get("spacegroup", "P 1")
     kwargs["source_path"] = sidecar.get("source_path", "")
-
     return _SFXStreamCore(**kwargs)

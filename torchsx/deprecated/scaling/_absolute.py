@@ -29,7 +29,7 @@ class AbsoluteScale(nn.Module):
         """Return new core with I_scaled = I / exp(log_G[crystal_id])."""
         scale = torch.exp(self.log_G[core.crystal_id.long()])
         I_scaled = core.I / scale
-        return dataclasses.replace(core, I=I_scaled)
+        return core.replace(I=I_scaled)
 
     def log_scale_per_obs(self, crystal_id: torch.Tensor) -> torch.Tensor:
         """Return log(G_i) per observation for loss computation."""

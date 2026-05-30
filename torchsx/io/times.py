@@ -309,7 +309,7 @@ def load_streams_with_filename_timepoints(
         replace_kwargs: dict[str, object] = {"metadata": new_meta}
         if spacegroup is not None:
             replace_kwargs["spacegroup"] = spacegroup
-        new_core = dataclasses.replace(s._core, **replace_kwargs)
+        new_core = s._core.replace(**replace_kwargs)
         labelled_streams.append(SFXStream(new_core))
         if verbose:
             print(

@@ -199,7 +199,7 @@ def _override_spacegroup(stream: SFXStream, requested: str) -> SFXStream:
         )
     if have == want:
         return stream
-    stream._core = replace(core, spacegroup=want)
+    stream._core = core.replace(spacegroup=want)
     return stream
 
 

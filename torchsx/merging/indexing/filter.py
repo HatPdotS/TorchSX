@@ -2,41 +2,9 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-
 import torch
 
 from torchsx._core import _SFXStreamCore
-
-
-def _subset_metadata(
-    metadata,
-    image_mask: torch.Tensor,
-    crystal_mask: torch.Tensor,
-):
-    """Subset per-image / per-crystal entries in ``metadata`` to match the new core.
-
-    Each entry under ``metadata["image"]`` / ``metadata["crystal"]`` is subset only
-    when its length equals the original axis size, so axis-agnostic globals
-    (e.g. ``metadata["crystal"]["panel_names"]`` — actually per-panel) are left
-    untouched. Non-list / non-tensor values pass through unchanged.
-    """
-    if not metadata:
-        return metadata
-
-    new_meta = deepcopy(metadata)
-    for axis_key, mask in (("image", image_mask), ("crystal", crystal_mask)):
-        sub = new_meta.get(axis_key)
-        if not isinstance(sub, dict):
-            continue
-        n_old = int(mask.shape[0])
-        idx = mask.nonzero(as_tuple=True)[0].tolist()
-        for k, v in list(sub.items()):
-            if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] == n_old:
-                sub[k] = v[mask]
-            elif isinstance(v, list) and len(v) == n_old:
-                sub[k] = [v[i] for i in idx]
-    return new_meta
 
 
 def _reindex(
@@ -45,49 +13,15 @@ def _reindex(
     crystal_mask: torch.Tensor,
     image_mask: torch.Tensor,
 ) -> _SFXStreamCore:
-    """Apply boolean masks to all three levels and rebuild contiguous IDs."""
-    crystal_remap = torch.full((core.n_crystals,), -1, dtype=torch.int32)
-    kept_crystal_ids = crystal_mask.nonzero(as_tuple=True)[0]
-    crystal_remap[kept_crystal_ids] = torch.arange(
-        len(kept_crystal_ids), dtype=torch.int32
-    )
+    """Apply boolean masks to all three levels and rebuild contiguous IDs.
 
-    image_remap = torch.full((core.n_images,), -1, dtype=torch.int32)
-    kept_image_ids = image_mask.nonzero(as_tuple=True)[0]
-    image_remap[kept_image_ids] = torch.arange(
-        len(kept_image_ids), dtype=torch.int32
-    )
-
-    new_crystal_id = crystal_remap[core.crystal_id[obs_mask].long()]
-    new_image_id = image_remap[core.image_id[crystal_mask].long()]
-
-    return _SFXStreamCore(
-        hkl=core.hkl[obs_mask],
-        I=core.I[obs_mask],
-        sigma=core.sigma[obs_mask],
-        background=core.background[obs_mask],
-        peak=core.peak[obs_mask],
-        fs=core.fs[obs_mask],
-        ss=core.ss[obs_mask],
-        panel_id=core.panel_id[obs_mask],
-        crystal_id=new_crystal_id,
-        astar=core.astar[crystal_mask],
-        bstar=core.bstar[crystal_mask],
-        cstar=core.cstar[crystal_mask],
-        cell=core.cell[crystal_mask],
-        profile_rad=core.profile_rad[crystal_mask],
-        resolution=core.resolution[crystal_mask],
-        n_refl=core.n_refl[crystal_mask],
-        image_id=new_image_id,
-        crystal_in_image=core.crystal_in_image[crystal_mask],
-        beam_energy=core.beam_energy[image_mask],
-        det_shift_x=core.det_shift_x[image_mask],
-        det_shift_y=core.det_shift_y[image_mask],
-        n_peaks=core.n_peaks[image_mask],
-        geometry=core.geometry,
-        metadata=_subset_metadata(core.metadata, image_mask, crystal_mask),
-        spacegroup=core.spacegroup,
-        source_path=core.source_path,
+    Thin wrapper over the generic columnar cascade
+    (:meth:`BaseStream.select_cascade`), which subsets every column in one loop
+    and remaps each join key onto the surviving parent rows — so any new column
+    (e.g. a shoebox) rides along automatically.
+    """
+    return core.select_cascade(
+        {"obs": obs_mask, "crystal": crystal_mask, "image": image_mask}
     )
 
 
