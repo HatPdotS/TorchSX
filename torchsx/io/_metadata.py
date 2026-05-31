@@ -7,6 +7,8 @@ from pathlib import Path
 
 import torch
 
+from torchsx._categorical import decode_categorical, encode_categorical
+
 
 class StreamMetadata(dict):
     """Nested dict-like metadata container with tensor conversion.
@@ -120,9 +122,7 @@ def _encode_value(value, flat_key: str, tensor_dict: dict) -> dict:
 
         if isinstance(first, str):
             # String table encoding
-            unique_strings = list(dict.fromkeys(value))  # preserve order, deduplicate
-            str_to_idx = {s: i for i, s in enumerate(unique_strings)}
-            indices = torch.tensor([str_to_idx[s] for s in value], dtype=torch.int32)
+            unique_strings, indices = encode_categorical(value)
             tensor_dict[flat_key] = indices
             return {
                 "type": "string_table",
@@ -168,9 +168,7 @@ def _decode_value(entry: dict, flat_key: str, tensors: dict):
     elif vtype == "empty_list":
         return []
     elif vtype == "string_table":
-        indices = tensors[flat_key]
-        strings = entry["strings"]
-        return [strings[i] for i in indices.tolist()]
+        return decode_categorical(entry["strings"], tensors[flat_key])
     elif vtype == "tensor":
         t = tensors[flat_key]
         dtype = entry["dtype"]

@@ -61,8 +61,9 @@ class PeakFinder8Params:
     max_num_peaks: int = 5000
 
 
-# columns of the returned peak table
-PANEL, SS, FS, INTENSITY = 0, 1, 2, 3
+# columns of the returned peak table — canonical schema lives in ._schema;
+# re-exported here so the historical ``from .spotfinding import PANEL, ...`` works.
+from ._schema import FS, INTENSITY, PANEL, SS  # noqa: E402,F401
 
 
 def find_spots(
@@ -71,7 +72,11 @@ def find_spots(
     pix_r_panels: torch.Tensor,
     params: PeakFinder8Params | None = None,
 ) -> torch.Tensor:
-    """Run peakfinder8 over a module stack.
+    """Run peakfinder8 over a module stack (low-level).
+
+    This is the raw pf8 wrapper. Prefer :func:`find_spots_on_frame`, which reads
+    a frame, selects a backend (pf8 / torch / probabilistic), and returns the
+    same spot table — it is the intended entry point.
 
     Parameters
     ----------

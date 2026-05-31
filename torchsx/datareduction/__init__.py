@@ -4,6 +4,20 @@ The pipeline foundation that turns SwissFEL serial-crystallography frames into
 indexed observations, built around the cloned ``peakfinder8`` (spot finding) and
 the SDSC PyTorch ``TORO`` indexer.
 
+The common currency is the **spot table**, a ``(M, C)`` float tensor whose
+columns are defined once in :mod:`._schema`::
+
+    0 PANEL   1 SS   2 FS   3 INTENSITY   [4 PROB]
+
+Two finder families emit this same table:
+
+* :mod:`.spotfinding` — the compiled pf8 / threshold backends (and the
+  ``find_spots_on_frame`` dispatcher + reciprocal mapping). Emits ``(M, 4)``.
+* :mod:`.peakfinder` — the native-torch reimplementation and the thresholdless
+  *probabilistic* finder (``find_peaks_prob``), which adds the ``PROB`` column → ``(M, 5)``.
+
+Use ``find_spots_on_frame`` as the entry point; it selects a backend.
+
 Typical flow::
 
     from torchsx.geometry import Geometry
@@ -21,7 +35,7 @@ Typical flow::
 from .frames import JungfrauReader, list_run
 from .spotfinding import (
     PeakFinder8Params,
-    find_spots,
+    find_spots,  # low-level pf8 wrapper; importable for back-compat, not in __all__
     find_spots_on_frame,
     spots_to_q,
 )
@@ -47,7 +61,6 @@ __all__ = [
     "JungfrauReader",
     "list_run",
     "PeakFinder8Params",
-    "find_spots",
     "find_spots_on_frame",
     "find_spots_torch",
     "find_peaks_prob",

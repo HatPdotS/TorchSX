@@ -18,6 +18,12 @@ from dataclasses import dataclass, field, replace as _dc_replace
 
 import torch
 
+from torchsx._categorical import (
+    decode_categorical,
+    encode_categorical,
+    remap_to_unified_table,
+)
+
 
 # dtype <-> short string, for JSON-serialisable schema and canonical-dtype restore.
 _DTYPE_TO_STR = {
@@ -169,9 +175,7 @@ class Level:
             raise ValueError(
                 f"categorical {key!r} has {len(values)} entries; level has {self._n}"
             )
-        table = list(dict.fromkeys(values))  # unique, order-preserving
-        lookup = {s: i for i, s in enumerate(table)}
-        idx = torch.tensor([lookup[s] for s in values], dtype=torch.int32)
+        table, idx = encode_categorical(values)
         self.__setitem__(
             key, idx, ColumnSpec(dtype=torch.int32, role="categorical", string_table=table)
         )
@@ -181,8 +185,7 @@ class Level:
         spec = self.schema[key]
         if spec.role != "categorical" or spec.string_table is None:
             raise ValueError(f"column {key!r} is not categorical")
-        table = spec.string_table
-        return [table[i] for i in self.columns[key].tolist()]
+        return decode_categorical(spec.string_table, self.columns[key])
 
     # ---- immutable transforms -----------------------------------------
 
@@ -254,20 +257,10 @@ class Level:
                     )
 
             if spec.role == "categorical":
-                table: list[str] = []
-                lookup: dict[str, int] = {}
-                remapped = []
-                for lv in levels:
-                    ltable = lv.schema[name].string_table or []
-                    for s in ltable:
-                        if s not in lookup:
-                            lookup[s] = len(table)
-                            table.append(s)
-                    old = lv.columns[name]
-                    remap = torch.tensor(
-                        [lookup[s] for s in ltable], dtype=torch.int32, device=old.device
-                    )
-                    remapped.append(remap[old.long()].to(torch.int32))
+                table, remapped = remap_to_unified_table(
+                    [lv.schema[name].string_table or [] for lv in levels],
+                    [lv.columns[name] for lv in levels],
+                )
                 out.__setitem__(
                     name,
                     torch.cat(remapped, dim=0),

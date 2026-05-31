@@ -32,10 +32,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .spotfinding import FS, INTENSITY, PANEL, SS
-
-# probabilistic finder adds a 5th column: per-peak probability ∈ [0,1]
-PROB = 4
+# column schema (incl. PROB, the 5th probabilistic-finder column) — see ._schema
+from ._schema import FS, INTENSITY, PANEL, PROB, SS  # noqa: F401
 
 
 @dataclass

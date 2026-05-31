@@ -16,9 +16,9 @@ import torch
 from ..geometry import Geometry
 from ..io._stream_builder import StreamBuilder, StreamChunk
 from ..stream import SFXStream
+from ._schema import FS, INTENSITY, PANEL, PROB, SS
 from .indexing import HEWL_CELL, IndexResult, index_spots
-from .peakfinder import PROB
-from .spotfinding import FS, INTENSITY, PANEL, SS, PeakFinder8Params, find_spots_on_frame, spots_to_q
+from .spotfinding import PeakFinder8Params, find_spots_on_frame, spots_to_q
 
 
 def reciprocal_vectors(basis: torch.Tensor) -> torch.Tensor:
@@ -107,6 +107,63 @@ def crystal_to_chunk(
                        key=frame_key)
 
 
+def _resolve_params(backend: str, params):
+    """Pick a default finder-params object for ``backend`` when none is given."""
+    if params is not None:
+        return params
+    if backend.startswith("torch"):
+        from .peakfinder import TorchPeakFinderParams
+        return TorchPeakFinderParams()
+    return PeakFinder8Params()
+
+
+def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
+               verbose: bool = False):
+    """Per-run calibration pass: fit the noise model ``σ²(μ)`` + empirical null.
+
+    Samples ``n_calib`` frames evenly across ``reader.n_frames``. Returns
+    ``(noise_model, null, calib_dbg)``.
+    """
+    from .noise_model import calibrate_noise, calibrate_null
+    n = reader.n_frames
+    step = max(1, n // max(1, n_calib))
+    calib_idx = list(range(0, n, step))[:n_calib]
+    noise_model, calib_dbg = calibrate_noise(reader, geom, calib_idx, device=device)
+    null = calibrate_null(reader, geom, noise_model, calib_idx,
+                          peak_min_distance=params.peak_min_distance, device=device)
+    if verbose:
+        print(f"[calib] noise σ²(μ) coef a0..a3="
+              f"{[round(c, 4) for c in calib_dbg['coef']]}  "
+              f"null n_lmax/frame={null.n_lmax_per_frame:.0f}")
+    return noise_model, null, calib_dbg
+
+
+def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
+                 noise_model, null, initial_cell: torch.Tensor, device: str,
+                 min_num_spots: int):
+    """Find spots on one frame and index them.
+
+    Returns ``(chunk, n_obs, n_spots)`` for a successfully-indexed frame, or
+    ``None`` if the frame has too few spots or fails to index.
+    """
+    spots = find_spots_on_frame(reader, i, geom, params, backend=backend,
+                                noise_model=noise_model, null=null)
+    if spots.shape[0] < min_num_spots:
+        return None
+    q = spots_to_q(spots, geom)
+    # probabilistic finder appends a PROB column → use it to weight indexing
+    weights = spots[:, PROB] if spots.shape[1] > PROB else None
+    res = index_spots(q, initial_cell, weights=weights, device=device,
+                      min_num_spots=min_num_spots)
+    if not res.success or res.n_indexed < min_num_spots:
+        return None
+    chunk = crystal_to_chunk(
+        spots, res, geom, frame_key=(reader.path, int(i)),
+        n_peaks_frame=int(spots.shape[0]),
+    )
+    return chunk, int(res.n_indexed), int(spots.shape[0]), res
+
+
 def build_stream(
     reader,
     geom: Geometry,
@@ -125,35 +182,21 @@ def build_stream(
 ) -> tuple[SFXStream, dict]:
     """Index a list of frames and assemble them into one :class:`SFXStream`.
 
-    Returns ``(stream, summary)``. Frames that don't index (or yield too few
-    indexed spots) are skipped; ``summary`` reports how many crystals made it in.
+    Thin orchestrator over :func:`_resolve_params`, :func:`_calibrate`, and
+    :func:`_index_frame`. Returns ``(stream, summary)``. Frames that don't index
+    (or yield too few indexed spots) are skipped; ``summary`` reports how many
+    crystals made it in.
 
     For ``backend="torch"`` with ``calibrate=True`` a one-time per-run calibration
     pass fits the noise model ``σ²(μ)`` and the empirical null on ``n_calib`` sampled
     frames, so the per-peak probabilities are calibrated and multiplicity-corrected.
     """
-    if params is None:
-        if backend.startswith("torch"):
-            from .peakfinder import TorchPeakFinderParams
-            params = TorchPeakFinderParams()
-        else:
-            params = PeakFinder8Params()
+    params = _resolve_params(backend, params)
 
     noise_model = null = None
-    calib_dbg = None
     if backend == "torch" and calibrate:
-        from .noise_model import calibrate_noise, calibrate_null
-        frames = list(frames)
-        n = reader.n_frames
-        step = max(1, n // max(1, n_calib))
-        calib_idx = list(range(0, n, step))[:n_calib]
-        noise_model, calib_dbg = calibrate_noise(reader, geom, calib_idx, device=device)
-        null = calibrate_null(reader, geom, noise_model, calib_idx,
-                              peak_min_distance=params.peak_min_distance, device=device)
-        if verbose:
-            print(f"[calib] noise σ²(μ) coef a0..a3="
-                  f"{[round(c, 4) for c in calib_dbg['coef']]}  "
-                  f"null n_lmax/frame={null.n_lmax_per_frame:.0f}")
+        noise_model, null, _ = _calibrate(reader, geom, params, n_calib=n_calib,
+                                          device=device, verbose=verbose)
 
     builder = StreamBuilder.initialize(
         geometry=geom, spacegroup=spacegroup, source_path=source_path
@@ -162,26 +205,18 @@ def build_stream(
     n_tried = n_indexed = total_obs = 0
     for i in frames:
         n_tried += 1
-        spots = find_spots_on_frame(reader, i, geom, params, backend=backend,
-                                    noise_model=noise_model, null=null)
-        if spots.shape[0] < min_num_spots:
+        out = _index_frame(reader, geom, i, params, backend=backend,
+                           noise_model=noise_model, null=null,
+                           initial_cell=initial_cell, device=device,
+                           min_num_spots=min_num_spots)
+        if out is None:
             continue
-        q = spots_to_q(spots, geom)
-        # probabilistic finder appends a PROB column → use it to weight indexing
-        weights = spots[:, PROB] if spots.shape[1] > PROB else None
-        res = index_spots(q, initial_cell, weights=weights, device=device,
-                          min_num_spots=min_num_spots)
-        if not res.success or res.n_indexed < min_num_spots:
-            continue
-        chunk = crystal_to_chunk(
-            spots, res, geom, frame_key=(reader.path, int(i)),
-            n_peaks_frame=int(spots.shape[0]),
-        )
+        chunk, n_obs, n_spots, res = out
         builder.add(chunk)
         n_indexed += 1
-        total_obs += res.n_indexed
+        total_obs += n_obs
         if verbose:
-            print(f"  frame {i}: indexed {res.n_indexed}/{spots.shape[0]} "
+            print(f"  frame {i}: indexed {n_obs}/{n_spots} "
                   f"cell={[round(float(x),1) for x in res.cell_lengths]}")
 
     core = builder.finalize()
