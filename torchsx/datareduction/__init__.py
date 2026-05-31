@@ -25,6 +25,20 @@ from .spotfinding import (
     find_spots_on_frame,
     spots_to_q,
 )
+from .peakfinder import TorchPeakFinderParams, find_peaks_prob, find_spots_torch, radial_background
+from .refine import (
+    RefineResult,
+    crystals_from_stream,
+    lattice_log_likelihood,
+    refine_geometry,
+    refine_lattice,
+)
+from .noise_model import (
+    EmpiricalNull,
+    NoiseModel,
+    calibrate_noise,
+    calibrate_null,
+)
 from .indexing import HEWL_CELL, IndexResult, index_spots
 from .curate import FrameRecord, curate_file, parse_dap, save_hits
 from .to_stream import build_stream, crystal_to_chunk, reciprocal_vectors
@@ -35,6 +49,19 @@ __all__ = [
     "PeakFinder8Params",
     "find_spots",
     "find_spots_on_frame",
+    "find_spots_torch",
+    "find_peaks_prob",
+    "radial_background",
+    "TorchPeakFinderParams",
+    "NoiseModel",
+    "EmpiricalNull",
+    "calibrate_noise",
+    "calibrate_null",
+    "refine_lattice",
+    "refine_geometry",
+    "crystals_from_stream",
+    "lattice_log_likelihood",
+    "RefineResult",
     "spots_to_q",
     "index_spots",
     "IndexResult",

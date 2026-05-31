@@ -309,6 +309,9 @@ class Geometry:
         ss: torch.Tensor,
         fs: torch.Tensor,
         panel_id: torch.Tensor | None = None,
+        *,
+        dclen: torch.Tensor | None = None,
+        dbeam: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Convert detector (ss, fs) to lab-frame positions in meters.
 
@@ -363,6 +366,14 @@ class Geometry:
             xyz[:, :2] /= self.res
 
         xyz[:, 2] += self.clen + coffset_t[pid]
+
+        # optional differentiable geometry perturbations (for refinement):
+        # dclen (scalar, m) shifts the camera length; dbeam (2,, m) translates the
+        # beam center in the detector plane. Added out-of-place so autograd flows.
+        if dclen is not None:
+            xyz = torch.cat([xyz[:, :2], (xyz[:, 2] + dclen).reshape(-1, 1)], dim=1)
+        if dbeam is not None:
+            xyz = torch.cat([xyz[:, :2] + dbeam.reshape(1, 2), xyz[:, 2:]], dim=1)
         return xyz
 
     def pixel_to_lab(
@@ -415,6 +426,9 @@ class Geometry:
         fs: torch.Tensor,
         panel_id: torch.Tensor | None = None,
         wavelength: float | None = None,
+        *,
+        dclen: torch.Tensor | None = None,
+        dbeam: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Convert detector (ss, fs) to reciprocal-space scattering vectors.
 
@@ -442,7 +456,7 @@ class Geometry:
         q : (N, 3) float tensor — scattering vectors in Å⁻¹.
         """
         lam = self.wavelength_A if wavelength is None else float(wavelength)
-        p = self.to_lab(ss, fs, panel_id=panel_id)  # (N, 3) meters
+        p = self.to_lab(ss, fs, panel_id=panel_id, dclen=dclen, dbeam=dbeam)  # (N,3) m
         s_hat = p / p.norm(dim=1, keepdim=True)
         s0 = torch.tensor([0.0, 0.0, 1.0], device=p.device, dtype=p.dtype)
         return (s_hat - s0) / lam

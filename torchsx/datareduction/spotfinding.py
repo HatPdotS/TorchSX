@@ -128,14 +128,45 @@ def find_spots_on_frame(
     reader,
     i: int,
     geom: Geometry,
-    params: PeakFinder8Params | None = None,
+    params=None,
+    *,
+    backend: str = "pf8",
+    noise_model=None,
+    null=None,
 ) -> torch.Tensor:
     """Convenience: read frame ``i`` and find spots, using the geometry's
-    cached pixel-radius map for ``pix_r``."""
+    cached pixel-radius map for ``pix_r``.
+
+    ``backend`` selects the finder:
+
+    * ``"pf8"`` — the compiled peakfinder8 (default); returns ``(M, 4)``.
+    * ``"torch"`` — the native thresholdless probabilistic finder
+      (:func:`~torchsx.datareduction.peakfinder.find_peaks_prob`); returns
+      ``(M, 5)`` with a per-peak probability column. Pass ``noise_model`` /
+      ``null`` (from :mod:`~torchsx.datareduction.noise_model`) for calibrated σ
+      and multiplicity-corrected probabilities.
+    * ``"torch-threshold"`` — the native peakfinder8-style threshold finder
+      (:func:`~torchsx.datareduction.peakfinder.find_spots_torch`); returns ``(M, 4)``.
+
+    ``params`` may be the matching params dataclass for the backend, or ``None``.
+    """
     panels = reader.panels(i).to(torch.float32)
     mask = reader.mask_panels()
     n_panels, n_ss, n_fs = panels.shape
     pix_r = geom.pixel_radius_px.reshape(n_panels, n_ss, n_fs)
+    if backend == "torch":
+        # lazy import: peakfinder imports column constants from this module
+        from .peakfinder import find_peaks_prob
+        return find_peaks_prob(panels, mask, pix_r, params,
+                               noise_model=noise_model, null=null)
+    if backend == "torch-threshold":
+        from .peakfinder import find_spots_torch
+        return find_spots_torch(panels, mask, pix_r, params)
+    if backend != "pf8":
+        raise ValueError(
+            f"unknown spot-finder backend {backend!r} "
+            "(use 'pf8', 'torch', or 'torch-threshold')"
+        )
     return find_spots(panels, mask, pix_r, params)
 
 

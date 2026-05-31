@@ -17,6 +17,7 @@ from ..geometry import Geometry
 from ..io._stream_builder import StreamBuilder, StreamChunk
 from ..stream import SFXStream
 from .indexing import HEWL_CELL, IndexResult, index_spots
+from .peakfinder import PROB
 from .spotfinding import FS, INTENSITY, PANEL, SS, PeakFinder8Params, find_spots_on_frame, spots_to_q
 
 
@@ -60,6 +61,10 @@ def crystal_to_chunk(
     n = int(sp.shape[0])
 
     I = sp[:, INTENSITY].to(torch.float32)
+    # per-spot probability/weight (probabilistic finder appends a PROB column);
+    # persisted so refinement can reload `w` from the .sfx. 1.0 if not present.
+    prob = (sp[:, PROB].to(torch.float32) if sp.shape[1] > PROB
+            else torch.ones(n, dtype=torch.float32))
     obs = {
         "hkl": hkl,
         "I": I,
@@ -70,6 +75,7 @@ def crystal_to_chunk(
         "ss": sp[:, SS].to(torch.float32),
         "panel_id": sp[:, PANEL].to(torch.int16),
         "crystal_id": torch.zeros(n, dtype=torch.int32),  # chunk-local
+        "prob": prob,
     }
 
     bstar_mat = reciprocal_vectors(result.basis)         # rows a*, b*, c* (Å⁻¹)
@@ -106,20 +112,49 @@ def build_stream(
     geom: Geometry,
     frames,
     *,
-    params: PeakFinder8Params | None = None,
+    params=None,
     initial_cell: torch.Tensor = HEWL_CELL,
     spacegroup: str = "P 43 21 2",
     device: str = "cpu",
     min_num_spots: int = 8,
     source_path: str = "",
+    backend: str = "pf8",
+    calibrate: bool = True,
+    n_calib: int = 150,
     verbose: bool = False,
 ) -> tuple[SFXStream, dict]:
     """Index a list of frames and assemble them into one :class:`SFXStream`.
 
     Returns ``(stream, summary)``. Frames that don't index (or yield too few
     indexed spots) are skipped; ``summary`` reports how many crystals made it in.
+
+    For ``backend="torch"`` with ``calibrate=True`` a one-time per-run calibration
+    pass fits the noise model ``σ²(μ)`` and the empirical null on ``n_calib`` sampled
+    frames, so the per-peak probabilities are calibrated and multiplicity-corrected.
     """
-    params = params or PeakFinder8Params()
+    if params is None:
+        if backend.startswith("torch"):
+            from .peakfinder import TorchPeakFinderParams
+            params = TorchPeakFinderParams()
+        else:
+            params = PeakFinder8Params()
+
+    noise_model = null = None
+    calib_dbg = None
+    if backend == "torch" and calibrate:
+        from .noise_model import calibrate_noise, calibrate_null
+        frames = list(frames)
+        n = reader.n_frames
+        step = max(1, n // max(1, n_calib))
+        calib_idx = list(range(0, n, step))[:n_calib]
+        noise_model, calib_dbg = calibrate_noise(reader, geom, calib_idx, device=device)
+        null = calibrate_null(reader, geom, noise_model, calib_idx,
+                              peak_min_distance=params.peak_min_distance, device=device)
+        if verbose:
+            print(f"[calib] noise σ²(μ) coef a0..a3="
+                  f"{[round(c, 4) for c in calib_dbg['coef']]}  "
+                  f"null n_lmax/frame={null.n_lmax_per_frame:.0f}")
+
     builder = StreamBuilder.initialize(
         geometry=geom, spacegroup=spacegroup, source_path=source_path
     )
@@ -127,11 +162,15 @@ def build_stream(
     n_tried = n_indexed = total_obs = 0
     for i in frames:
         n_tried += 1
-        spots = find_spots_on_frame(reader, i, geom, params)
+        spots = find_spots_on_frame(reader, i, geom, params, backend=backend,
+                                    noise_model=noise_model, null=null)
         if spots.shape[0] < min_num_spots:
             continue
         q = spots_to_q(spots, geom)
-        res = index_spots(q, initial_cell, device=device, min_num_spots=min_num_spots)
+        # probabilistic finder appends a PROB column → use it to weight indexing
+        weights = spots[:, PROB] if spots.shape[1] > PROB else None
+        res = index_spots(q, initial_cell, weights=weights, device=device,
+                          min_num_spots=min_num_spots)
         if not res.success or res.n_indexed < min_num_spots:
             continue
         chunk = crystal_to_chunk(

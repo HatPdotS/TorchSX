@@ -73,6 +73,10 @@ def main() -> None:
     ap.add_argument("--spacegroup", default="P 43 21 2")
     ap.add_argument("--dap", default=None)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--finder", choices=["pf8", "torch", "torch-threshold"],
+                    default="pf8",
+                    help="spot-finder backend: compiled peakfinder8, native "
+                         "probabilistic torch ('torch'), or native threshold torch")
     ap.add_argument("--adc-thresh", type=float, default=150.0)
     ap.add_argument("--min-snr", type=float, default=8.0)
     ap.add_argument("--min-peaks", type=int, default=15)
@@ -93,14 +97,18 @@ def main() -> None:
     if not frames:
         raise SystemExit("no candidate frames; loosen thresholds")
 
-    params = PeakFinder8Params(adc_thresh=args.adc_thresh, min_snr=args.min_snr)
+    if args.finder.startswith("torch"):
+        from torchsx.datareduction import TorchPeakFinderParams
+        params = TorchPeakFinderParams(adc_thresh=args.adc_thresh, min_snr=args.min_snr)
+    else:
+        params = PeakFinder8Params(adc_thresh=args.adc_thresh, min_snr=args.min_snr)
     # NB: leave source_path empty — it is the "original .stream to copy from"
     # for write_stream; ingested data has none, so the header is synthesized.
     # Frame provenance lives in the builder's (file, frame) row-range index.
     stream, summary = build_stream(
         reader, geom, frames, params=params, spacegroup=args.spacegroup,
         device=args.device, min_num_spots=args.min_num_spots,
-        verbose=True,
+        backend=args.finder, verbose=True,
     )
     print(f"[build] {summary}")
 
