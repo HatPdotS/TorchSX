@@ -461,6 +461,69 @@ class Geometry:
         s0 = torch.tensor([0.0, 0.0, 1.0], device=p.device, dtype=p.dtype)
         return (s_hat - s0) / lam
 
+    def recip_to_pixel(
+        self,
+        q_lab: torch.Tensor,
+        wavelength: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project reciprocal vectors onto the detector — inverse of :meth:`to_reciprocal`.
+
+        Given lab-frame scattering vectors ``q_lab`` (Å⁻¹), reconstruct the
+        diffracted unit ray ``ŝ = λ·q + ŝ₀`` (with the same ``ŝ₀ = (0,0,1)`` beam
+        convention) and intersect it with each panel plane to find the pixel it
+        hits. Returns **assembled** ``(fs, ss)`` (panel offset folded into ``ss``
+        via ``min_ss``, matching the finders / :func:`integrate_reflections`) and
+        the ``panel_id`` (``-1`` where the ray misses every panel or goes
+        backward). Vectorised over reflections; loops the (few) panels.
+
+        Parameters
+        ----------
+        q_lab : (N, 3) float — reciprocal lattice points in the lab frame (Å⁻¹).
+        wavelength : float, optional — Å; defaults to :attr:`wavelength_A`.
+
+        Returns
+        -------
+        fs, ss : (N,) float — predicted assembled pixel coords (``-1`` if off-detector).
+        panel_id : (N,) int64 — panel index (``-1`` if off-detector).
+        """
+        lam = self.wavelength_A if wavelength is None else float(wavelength)
+        device = q_lab.device
+        s_in = torch.zeros(3, device=device, dtype=q_lab.dtype)
+        s_in[2] = 1.0
+        s_out = lam * q_lab + s_in                       # (N, 3)
+        s_out = s_out / s_out.norm(dim=-1, keepdim=True)
+
+        N = q_lab.shape[0]
+        fs_out = torch.full((N,), -1.0, device=device, dtype=q_lab.dtype)
+        ss_out = torch.full((N,), -1.0, device=device, dtype=q_lab.dtype)
+        pid_out = torch.full((N,), -1, dtype=torch.long, device=device)
+        res = max(self.res, 1.0)
+        sz = s_out[:, 2]
+
+        for pi, p in enumerate(self.panels):
+            fv = torch.tensor(p.fs_vec, device=device, dtype=q_lab.dtype)
+            sv = torch.tensor(p.ss_vec, device=device, dtype=q_lab.dtype)
+            det = fv[0] * sv[1] - fv[1] * sv[0]
+            if abs(float(det)) < 1e-10:
+                continue
+            z_panel = self.clen + p.coffset
+            t = z_panel / sz.clamp(min=1e-10)            # ray parameter (N,)
+            dx = (t * s_out[:, 0]) * res - p.corner_x    # pixel offset from corner
+            dy = (t * s_out[:, 1]) * res - p.corner_y
+            dfs = (dx * sv[1] - dy * sv[0]) / det
+            dss = (-dx * fv[1] + dy * fv[0]) / det
+            in_panel = (
+                (dfs >= -0.5) & (dfs < p.n_fs - 0.5)
+                & (dss >= -0.5) & (dss < p.n_ss - 0.5)
+                & (sz > 0)                               # forward hemisphere only
+            )
+            mask = in_panel & (pid_out < 0)              # first panel wins
+            fs_out[mask] = (dfs + p.min_fs)[mask]
+            ss_out[mask] = (dss + p.min_ss)[mask]
+            pid_out[mask] = pi
+
+        return fs_out, ss_out, pid_out
+
     # ── Radial distance map ──────────────────────────────────────────────
 
     def radial_map(self) -> np.ndarray:

@@ -18,6 +18,7 @@ from ..io._stream_builder import StreamBuilder, StreamChunk
 from ..stream import SFXStream
 from ._schema import FS, INTENSITY, PANEL, PROB, SS
 from .indexing import HEWL_CELL, IndexResult, index_spots
+from .integrate import IntegrationResult, integrate_reflections
 from .spotfinding import PeakFinder8Params, find_spots_on_frame, spots_to_q
 
 
@@ -41,6 +42,7 @@ def crystal_to_chunk(
     beam_energy_eV: float | None = None,
     n_peaks_frame: int | None = None,
     profile_rad: float = 0.004,
+    integration: IntegrationResult | None = None,
 ) -> StreamChunk:
     """Build a one-crystal :class:`StreamChunk` from an indexing result.
 
@@ -52,6 +54,11 @@ def crystal_to_chunk(
     only_inliers : keep only spots assigned to the lattice (recommended).
     beam_energy_eV : photon energy; defaults to ``geom.photon_energy_eV``.
     n_peaks_frame : total peaks found on the frame (image-level); defaults to M.
+    integration : optional :class:`~torchsx.datareduction.integrate.IntegrationResult`
+        for the same (masked, inlier-ordered) spots; when given, ``I``/``sigma``/
+        ``background``/``peak`` come from the proper disk integration + noise-model
+        propagation. When ``None``, the finder's quick-sum ``I`` is used with a
+        Poisson ``sigma`` placeholder (back-compat).
     """
     mask = result.inlier_mask if only_inliers else torch.ones(
         result.n_spots, dtype=torch.bool
@@ -60,7 +67,22 @@ def crystal_to_chunk(
     hkl = result.hkl[mask].to(torch.int16)
     n = int(sp.shape[0])
 
-    I = sp[:, INTENSITY].to(torch.float32)
+    if integration is not None:
+        if integration.I.shape[0] != n:
+            raise ValueError(
+                f"integration has {integration.I.shape[0]} reflections but "
+                f"{n} (masked) spots — they must be aligned (same inlier order)."
+            )
+        I = integration.I.to(torch.float32)
+        sigma = integration.sigma.to(torch.float32)
+        background = integration.background.to(torch.float32)
+        peak = integration.peak.to(torch.float32)
+    else:
+        I = sp[:, INTENSITY].to(torch.float32)
+        sigma = torch.sqrt(I.clamp(min=1.0))             # Poisson placeholder
+        background = torch.zeros(n, dtype=torch.float32)
+        peak = I.clone()
+
     # per-spot probability/weight (probabilistic finder appends a PROB column);
     # persisted so refinement can reload `w` from the .sfx. 1.0 if not present.
     prob = (sp[:, PROB].to(torch.float32) if sp.shape[1] > PROB
@@ -68,9 +90,9 @@ def crystal_to_chunk(
     obs = {
         "hkl": hkl,
         "I": I,
-        "sigma": torch.sqrt(I.clamp(min=1.0)),       # Poisson placeholder
-        "background": torch.zeros(n, dtype=torch.float32),
-        "peak": I.clone(),
+        "sigma": sigma,
+        "background": background,
+        "peak": peak,
         "fs": sp[:, FS].to(torch.float32),
         "ss": sp[:, SS].to(torch.float32),
         "panel_id": sp[:, PANEL].to(torch.int16),
@@ -118,33 +140,41 @@ def _resolve_params(backend: str, params):
 
 
 def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
-               verbose: bool = False):
-    """Per-run calibration pass: fit the noise model ``σ²(μ)`` + empirical null.
+               want_null: bool = True, verbose: bool = False):
+    """Per-run calibration pass: fit the noise model ``σ²(μ)`` (+ empirical null).
 
-    Samples ``n_calib`` frames evenly across ``reader.n_frames``. Returns
-    ``(noise_model, null, calib_dbg)``.
+    Samples ``n_calib`` frames evenly across ``reader.n_frames``. The noise model
+    is always fit (it feeds integration for *every* backend); the empirical null
+    is fit only when ``want_null`` (the probabilistic finder needs it, and it
+    requires ``params.peak_min_distance``). Returns ``(noise_model, null, dbg)``.
     """
     from .noise_model import calibrate_noise, calibrate_null
     n = reader.n_frames
     step = max(1, n // max(1, n_calib))
     calib_idx = list(range(0, n, step))[:n_calib]
     noise_model, calib_dbg = calibrate_noise(reader, geom, calib_idx, device=device)
-    null = calibrate_null(reader, geom, noise_model, calib_idx,
-                          peak_min_distance=params.peak_min_distance, device=device)
+    null = None
+    if want_null:
+        null = calibrate_null(reader, geom, noise_model, calib_idx,
+                              peak_min_distance=params.peak_min_distance, device=device)
     if verbose:
-        print(f"[calib] noise σ²(μ) coef a0..a3="
-              f"{[round(c, 4) for c in calib_dbg['coef']]}  "
-              f"null n_lmax/frame={null.n_lmax_per_frame:.0f}")
+        msg = (f"[calib] noise σ²(μ) coef a0..a3="
+               f"{[round(c, 4) for c in calib_dbg['coef']]}")
+        if null is not None:
+            msg += f"  null n_lmax/frame={null.n_lmax_per_frame:.0f}"
+        print(msg)
     return noise_model, null, calib_dbg
 
 
 def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
                  noise_model, null, initial_cell: torch.Tensor, device: str,
-                 min_num_spots: int):
-    """Find spots on one frame and index them.
+                 min_num_spots: int, int_radius: int = 4):
+    """Find spots on one frame, index them, and integrate the indexed reflections.
 
-    Returns ``(chunk, n_obs, n_spots)`` for a successfully-indexed frame, or
-    ``None`` if the frame has too few spots or fails to index.
+    Returns ``(chunk, n_obs, n_spots, result)`` for a successfully-indexed frame,
+    or ``None`` if the frame has too few spots or fails to index. Integration
+    runs on the indexed inliers (fixed-radius disk + global-radial background +
+    per-pixel ``noise_model`` propagation) — see :mod:`integrate`.
     """
     spots = find_spots_on_frame(reader, i, geom, params, backend=backend,
                                 noise_model=noise_model, null=null)
@@ -157,9 +187,20 @@ def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
                       min_num_spots=min_num_spots)
     if not res.success or res.n_indexed < min_num_spots:
         return None
+
+    # Integrate the indexed inliers (deep integration with the index solution).
+    # NB: re-reads the frame (the finder read it too) — a known v1 inefficiency.
+    sp_in = spots[res.inlier_mask]
+    panels = reader.panels(int(i)).to(torch.float32)
+    good = reader.mask_panels().to(torch.bool)
+    P, n_ss, n_fs = panels.shape
+    radius = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32)
+    integ = integrate_reflections(panels, good, radius, sp_in, noise_model,
+                                  r_int=int_radius)
+
     chunk = crystal_to_chunk(
         spots, res, geom, frame_key=(reader.path, int(i)),
-        n_peaks_frame=int(spots.shape[0]),
+        n_peaks_frame=int(spots.shape[0]), integration=integ,
     )
     return chunk, int(res.n_indexed), int(spots.shape[0]), res
 
@@ -178,6 +219,7 @@ def build_stream(
     backend: str = "pf8",
     calibrate: bool = True,
     n_calib: int = 150,
+    int_radius: int = 4,
     verbose: bool = False,
 ) -> tuple[SFXStream, dict]:
     """Index a list of frames and assemble them into one :class:`SFXStream`.
@@ -187,16 +229,20 @@ def build_stream(
     (or yield too few indexed spots) are skipped; ``summary`` reports how many
     crystals made it in.
 
-    For ``backend="torch"`` with ``calibrate=True`` a one-time per-run calibration
-    pass fits the noise model ``σ²(μ)`` and the empirical null on ``n_calib`` sampled
-    frames, so the per-peak probabilities are calibrated and multiplicity-corrected.
+    When ``calibrate=True`` a one-time per-run pass fits the detector noise model
+    ``σ²(μ)`` on ``n_calib`` sampled frames — needed by integration for *every*
+    backend — plus the empirical null (probabilistic finder only). Each indexed
+    frame's source ``(filename, event)`` is recorded in the stream's image-level
+    metadata so the result can be re-opened by :meth:`SFXStream.excise_patches`.
     """
     params = _resolve_params(backend, params)
 
     noise_model = null = None
-    if backend == "torch" and calibrate:
-        noise_model, null, _ = _calibrate(reader, geom, params, n_calib=n_calib,
-                                          device=device, verbose=verbose)
+    if calibrate:
+        noise_model, null, _ = _calibrate(
+            reader, geom, params, n_calib=n_calib, device=device,
+            want_null=(backend == "torch"), verbose=verbose,
+        )
 
     builder = StreamBuilder.initialize(
         geometry=geom, spacegroup=spacegroup, source_path=source_path
@@ -208,7 +254,7 @@ def build_stream(
         out = _index_frame(reader, geom, i, params, backend=backend,
                            noise_model=noise_model, null=null,
                            initial_cell=initial_cell, device=device,
-                           min_num_spots=min_num_spots)
+                           min_num_spots=min_num_spots, int_radius=int_radius)
         if out is None:
             continue
         chunk, n_obs, n_spots, res = out
@@ -220,6 +266,7 @@ def build_stream(
                   f"cell={[round(float(x),1) for x in res.cell_lengths]}")
 
     core = builder.finalize()
+    _attach_frame_metadata(core, builder)
     stream = SFXStream(core)
     summary = {
         "frames_tried": n_tried,
@@ -228,3 +275,27 @@ def build_stream(
         "spacegroup": spacegroup,
     }
     return stream, summary
+
+
+def _attach_frame_metadata(core, builder) -> None:
+    """Write per-image ``filename``/``event`` into ``core.metadata['image']``.
+
+    :class:`~torchsx.io._excise.excise_patches` resolves each observation to a raw
+    frame via ``metadata['image']['filename']`` + ``['event']`` (``"//N"`` → frame
+    index ``N``). ``build_stream`` doesn't otherwise populate these, so excision on
+    a datareduction-built stream would fail. We reconstruct them from the builder's
+    ``key → row-range`` index (``key = (reader.path, frame_index)``), placing each
+    frame's identity at its image row — robust to chunk ordering.
+    """
+    n_img = core.n_images
+    filename = [""] * n_img
+    event = [""] * n_img
+    for key, ranges in builder.index.items():
+        if "image" not in ranges or not isinstance(key, tuple) or len(key) != 2:
+            continue
+        start, _ = ranges["image"]
+        path, frame_i = key
+        if 0 <= start < n_img:
+            filename[start] = str(path)
+            event[start] = f"//{int(frame_i)}"
+    core.metadata["image"] = {"filename": filename, "event": event}
