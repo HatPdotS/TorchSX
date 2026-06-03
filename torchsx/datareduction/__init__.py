@@ -13,8 +13,10 @@ Two finder families emit this same table:
 
 * :mod:`.spotfinding` — the compiled pf8 / threshold backends (and the
   ``find_spots_on_frame`` dispatcher + reciprocal mapping). Emits ``(M, 4)``.
-* :mod:`.peakfinder` — the native-torch reimplementation and the thresholdless
-  *probabilistic* finder (``find_peaks_prob``), which adds the ``PROB`` column → ``(M, 5)``.
+* :mod:`.peakfinder` — the native-torch reimplementation, the thresholdless
+  *probabilistic* finder (``find_peaks_prob``), and the fully-Bayesian
+  matched-filter finder (``find_peaks_bayes``), both of which add the ``PROB``
+  column → ``(M, 5)``.
 
 Use ``find_spots_on_frame`` as the entry point; it selects a backend.
 
@@ -39,7 +41,14 @@ from .spotfinding import (
     find_spots_on_frame,
     spots_to_q,
 )
-from .peakfinder import TorchPeakFinderParams, find_peaks_prob, find_spots_torch, radial_background
+from .peakfinder import (
+    TorchPeakFinderParams,
+    find_peaks_bayes,
+    find_peaks_prob,
+    find_spots_torch,
+    radial_background,
+)
+from .spot_profile import SpotProfile
 from .refine import (
     RefineResult,
     crystals_from_stream,
@@ -52,6 +61,7 @@ from .noise_model import (
     NoiseModel,
     calibrate_noise,
     calibrate_null,
+    calibrate_spot_profile,
 )
 from .indexing import HEWL_CELL, IndexResult, index_spots
 from .curate import FrameRecord, curate_file, parse_dap, save_hits
@@ -64,12 +74,15 @@ __all__ = [
     "find_spots_on_frame",
     "find_spots_torch",
     "find_peaks_prob",
+    "find_peaks_bayes",
     "radial_background",
     "TorchPeakFinderParams",
+    "SpotProfile",
     "NoiseModel",
     "EmpiricalNull",
     "calibrate_noise",
     "calibrate_null",
+    "calibrate_spot_profile",
     "refine_lattice",
     "refine_geometry",
     "crystals_from_stream",

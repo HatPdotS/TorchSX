@@ -86,6 +86,8 @@ class SFXStream:
                 stream = cls(core)
                 if merge_friedel:
                     stream = stream.symmetrize()
+                else:
+                    stream = cls(stream._core.replace(friedel_merged=False))
                 return stream
 
         core = parse_stream(
@@ -99,6 +101,8 @@ class SFXStream:
         stream = cls(core)
         if merge_friedel:
             stream = stream.symmetrize()
+        else:
+            stream = cls(stream._core.replace(friedel_merged=False))
         return stream
 
     @classmethod
@@ -126,6 +130,8 @@ class SFXStream:
             )
         if merge_friedel:
             stream = stream.symmetrize()
+        else:
+            stream = cls(stream._core.replace(friedel_merged=False))
         return stream
 
     def save(self, path: str | Path):
@@ -197,6 +203,16 @@ class SFXStream:
     @property
     def n_images(self) -> int:
         return self._core.n_images
+
+    @property
+    def friedel_merged(self) -> bool:
+        """Whether ``hkl`` has been Friedel-merged (canonicalized to ASU).
+
+        Set at load time from the ``merge_friedel`` argument and updated by
+        :meth:`symmetrize` to True.  Drives anomalous-aware MTZ writing in
+        :meth:`torchsx.merging.posterior.Posterior.integrate`.
+        """
+        return bool(getattr(self._core, "friedel_merged", True))
 
     @property
     def d_min(self) -> float:
@@ -760,6 +776,7 @@ class SFXStream:
         new_core = self._core.replace(
             hkl=canonical_hkl.to(torch.int16),
             spacegroup=sg,
+            friedel_merged=True,
         )
         return SFXStream(new_core)
 

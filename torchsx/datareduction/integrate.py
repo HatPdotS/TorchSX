@@ -58,6 +58,13 @@ class IntegrationResult:
     peak: Tensor
     npix: Tensor
 
+    def cpu(self) -> "IntegrationResult":
+        """Return a copy with every field moved to host (chunk-building boundary)."""
+        return IntegrationResult(
+            I=self.I.cpu(), sigma=self.sigma.cpu(), background=self.background.cpu(),
+            peak=self.peak.cpu(), npix=self.npix.cpu(),
+        )
+
 
 def integrate_reflections(
     panels: Tensor,           # (P, n_ss, n_fs) frame data (au)

@@ -84,6 +84,7 @@ class BaseStream:
         metadata: StreamMetadata | None = None,
         spacegroup: str = "P 1",
         source_path: str = "",
+        friedel_merged: bool = True,
     ):
         self.levels = levels
         self.joins = joins if joins is not None else _default_sx_joins()
@@ -91,6 +92,11 @@ class BaseStream:
         self.metadata = metadata if metadata is not None else StreamMetadata()
         self.spacegroup = spacegroup
         self.source_path = source_path
+        # Whether ``hkl`` has already been Friedel-merged (canonicalized to the
+        # P-1 ASU, mates collapsed).  Drives anomalous-aware MTZ writing in
+        # :meth:`torchsx.merging.posterior.Posterior.integrate`.  Default True
+        # for backwards compatibility (the historical behaviour).
+        self.friedel_merged = bool(friedel_merged)
 
     # ---- attribute-compat shim ----------------------------------------
 
@@ -132,13 +138,15 @@ class BaseStream:
         metadata: StreamMetadata,
         spacegroup: str,
         source_path: str,
+        friedel_merged: bool = True,
     ) -> "BaseStream":
         """Build a new stream from levels, bypassing the legacy constructor,
         and refine to the most specific subclass given which columns exist."""
         target = _classify(levels)
         obj = target.__new__(target)
         BaseStream.__init__(
-            obj, levels, joins, geometry, metadata, spacegroup, source_path
+            obj, levels, joins, geometry, metadata, spacegroup, source_path,
+            friedel_merged=friedel_merged,
         )
         obj._validate()
         return obj
@@ -151,6 +159,7 @@ class BaseStream:
         return self._make(
             self.levels, self.joins, self.geometry, self.metadata,
             self.spacegroup, self.source_path,
+            friedel_merged=self.friedel_merged,
         )
 
     def _validate(self) -> None:
@@ -173,7 +182,8 @@ class BaseStream:
         new_levels = {name: lvl.to(device) for name, lvl in self.levels.items()}
         meta = self.metadata.to(device) if self.metadata else StreamMetadata()
         return self._make(
-            new_levels, self.joins, self.geometry, meta, self.spacegroup, self.source_path
+            new_levels, self.joins, self.geometry, meta, self.spacegroup, self.source_path,
+            friedel_merged=self.friedel_merged,
         )
 
     def select_cascade(self, masks: dict[str, torch.Tensor]) -> "BaseStream":
@@ -212,7 +222,8 @@ class BaseStream:
 
         meta = _subset_metadata(self.metadata, masks)
         return self._make(
-            new_levels, self.joins, self.geometry, meta, self.spacegroup, self.source_path
+            new_levels, self.joins, self.geometry, meta, self.spacegroup, self.source_path,
+            friedel_merged=self.friedel_merged,
         )
 
     def with_columns(self, level: str, **columns: torch.Tensor) -> "BaseStream":
@@ -236,6 +247,7 @@ class BaseStream:
         return self._make(
             new_levels, self.joins, self.geometry, self.metadata,
             self.spacegroup, self.source_path,
+            friedel_merged=self.friedel_merged,
         )
 
     def broadcast(self, column: str, from_level: str, to_level: str = "obs") -> torch.Tensor:
@@ -265,6 +277,7 @@ class BaseStream:
         attrs: dict[str, object] = {
             "geometry": self.geometry, "metadata": self.metadata,
             "spacegroup": self.spacegroup, "source_path": self.source_path,
+            "friedel_merged": self.friedel_merged,
         }
         level_over: dict[str, Level] = {}
         col_over: dict[str, dict[str, torch.Tensor]] = {}
@@ -299,6 +312,7 @@ class BaseStream:
         return self._make(
             new_levels, self.joins, attrs["geometry"], attrs["metadata"],
             attrs["spacegroup"], attrs["source_path"],
+            friedel_merged=attrs["friedel_merged"],
         )
 
     @classmethod
@@ -338,9 +352,18 @@ class BaseStream:
             ln: Level.concat([pc[ln] for pc in per_core]) for ln in level_names
         }
         merged_meta = _merge_metadata([c.metadata for c in cores])
+        fm0 = bool(cores[0].friedel_merged)
+        for i, c in enumerate(cores[1:], start=1):
+            if bool(c.friedel_merged) != fm0:
+                raise ValueError(
+                    f"concat: cores disagree on friedel_merged "
+                    f"(core[0]={fm0}, core[{i}]={bool(c.friedel_merged)}). "
+                    "All inputs must share the same Friedel-merge state."
+                )
         return cls._make(
             out_levels, joins, cores[0].geometry, merged_meta,
             cores[0].spacegroup, cores[0].source_path,
+            friedel_merged=fm0,
         )
 
     def __repr__(self) -> str:
@@ -386,6 +409,7 @@ class SFXStreamCore(BaseStream):
         metadata: StreamMetadata | None = None,
         spacegroup: str = "P 1",
         source_path: str = "",
+        friedel_merged: bool = True,
     ):
         n_obs, n_crystals, n_images = hkl.shape[0], cell.shape[0], beam_energy.shape[0]
         if camera_length is None:
@@ -408,7 +432,8 @@ class SFXStreamCore(BaseStream):
             levels[level_name].__setitem__(fname, local[fname], spec)
 
         super().__init__(
-            levels, _default_sx_joins(), geometry, metadata, spacegroup, source_path
+            levels, _default_sx_joins(), geometry, metadata, spacegroup, source_path,
+            friedel_merged=friedel_merged,
         )
         self._validate()
 

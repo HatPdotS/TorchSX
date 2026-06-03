@@ -169,6 +169,115 @@ def assign_timepoints_to_images(
     )
 
 
+def load_split_labels(
+    path: str | Path,
+) -> dict[tuple[str, str], str]:
+    """Load a CrystFEL/partialator ``.split`` file.
+
+    Format: each line ``<filename> <event> <label>`` (whitespace separated).
+    ``label`` is the partialator dataset name (e.g. ``"dark"``,
+    ``"45ps_5uJ"``).
+
+    Returns a dict mapping ``(filename, event) → label`` for all rows.
+    Duplicate keys keep the last value with a warning.
+    """
+    import warnings
+
+    lookup: dict[tuple[str, str], str] = {}
+    n_dup = 0
+    with open(path) as f:
+        for ln_no, raw in enumerate(f, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                raise ValueError(
+                    f"{path}:{ln_no}: expected 'filename event label', got {line!r}"
+                )
+            fname, event, label = parts[0], parts[1], parts[2].strip()
+            key = (fname, event)
+            if key in lookup and lookup[key] != label:
+                n_dup += 1
+            lookup[key] = label
+    if n_dup:
+        warnings.warn(
+            f"load_split_labels({path}): {n_dup} duplicate (filename, event) "
+            "keys with conflicting labels — last value wins",
+            stacklevel=2,
+        )
+    return lookup
+
+
+def filter_stream_by_split_label(
+    stream,
+    split_lookup: dict[tuple[str, str], str],
+    *,
+    keep_labels: Iterable[str] | None = None,
+    drop_labels: Iterable[str] | None = None,
+    verbose: bool = True,
+):
+    """Filter an :class:`SFXStream` by per-image labels from a ``.split`` file.
+
+    Looks up each image's ``(filename, event)`` in ``split_lookup``;
+    images whose label is in ``keep_labels`` (or NOT in ``drop_labels``)
+    are kept.  Images absent from the lookup are dropped.
+
+    Exactly one of ``keep_labels`` / ``drop_labels`` must be given.
+    """
+    import torch as _torch
+
+    if (keep_labels is None) == (drop_labels is None):
+        raise ValueError("filter_stream_by_split_label: pass exactly one of "
+                         "keep_labels / drop_labels")
+    keep_set = set(keep_labels) if keep_labels is not None else None
+    drop_set = set(drop_labels) if drop_labels is not None else None
+
+    fnames = stream.filenames
+    events = stream.events
+    if len(fnames) != stream.n_images or len(events) != stream.n_images:
+        raise ValueError(
+            "filter_stream_by_split_label: stream metadata missing "
+            "filename/event columns (n_images mismatch)"
+        )
+
+    keep_mask = _torch.zeros(stream.n_images, dtype=_torch.bool)
+    label_counts: dict[str, int] = {}
+    n_unlabelled = 0
+    for i in range(stream.n_images):
+        key = (fnames[i], events[i])
+        label = split_lookup.get(key)
+        if label is None:
+            n_unlabelled += 1
+            continue
+        label_counts[label] = label_counts.get(label, 0) + 1
+        if keep_set is not None:
+            keep_mask[i] = label in keep_set
+        else:
+            keep_mask[i] = label not in drop_set
+    n_kept = int(keep_mask.sum().item())
+
+    if verbose:
+        print(
+            f"[split-filter] stream has {stream.n_images} images; "
+            f"matched {stream.n_images - n_unlabelled} in split file "
+            f"({n_unlabelled} unmatched, dropped)",
+            flush=True,
+        )
+        print(
+            f"[split-filter] keeping {n_kept} images "
+            f"(keep={keep_labels} drop={drop_labels})",
+            flush=True,
+        )
+        if verbose and label_counts:
+            top = sorted(label_counts.items(), key=lambda kv: -kv[1])[:12]
+            print("[split-filter] label counts (top 12):", flush=True)
+            for lbl, n in top:
+                print(f"  {lbl:20s}  {n}", flush=True)
+
+    return stream.filter_images(keep_mask)
+
+
 def unique_finite_timepoints(timepoints: Iterable[float]) -> list[float]:
     """Sorted unique non-NaN timepoints — convenient for kinetic-model grids."""
     out: set[float] = set()

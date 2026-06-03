@@ -11,6 +11,7 @@ wrapper drives a single frame and reports the top solution.
 
 from __future__ import annotations
 
+import functools
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,38 @@ def _load_weighted_toro():
     _load_toro()  # ensure the clone is importable (adds it to sys.path)
     from ._toro_weighted import WeightedToroIndexer
     return WeightedToroIndexer
+
+
+@functools.lru_cache(maxsize=None)
+def _get_indexer(
+    weighted: bool,
+    device_str: str,
+    lattice_size: int,
+    num_iterations: int,
+    error_precision: float,
+    filter_precision: float,
+    filter_min_num_spots: int,
+):
+    """Build (once) and cache a TORO indexer for the given (weighted, device, hyperparams).
+
+    ``ToroIndexer.__init__`` regenerates the 50 000-point ``unite_sphere_lattice`` buffer
+    every time — frame-independent work we must not repeat per frame. The forward pass
+    carries no per-call autograd/instance state (it runs under ``torch.no_grad()``); the
+    only mutable state is ``WeightedToroIndexer._peak_weights``, which the caller resets
+    each frame *before* ``forward``. Weighted and unweighted indexers are distinct cached
+    instances (the ``weighted`` flag is part of the key), so weights never leak across modes.
+
+    Process-lifetime caching of ≤2 modules per device (~600 KB lattice each) is the intended
+    "build once, reuse for the whole run".
+    """
+    Indexer = _load_weighted_toro() if weighted else _load_toro()
+    return Indexer(
+        lattice_size=lattice_size,
+        num_iterations=num_iterations,
+        error_precision=error_precision,
+        filter_precision=filter_precision,
+        filter_min_num_spots=filter_min_num_spots,
+    ).to(torch.device(device_str))
 
 
 @dataclass
@@ -135,19 +168,15 @@ def index_spots(
     w = None
     if weights is not None:
         w = weights.to(device=device, dtype=torch.float32).reshape(-1)
-        Indexer = _load_weighted_toro()
-    else:
-        Indexer = _load_toro()
 
-    im = Indexer(
-        lattice_size=lattice_size,
-        num_iterations=num_iterations,
-        error_precision=error_precision,
-        filter_precision=filter_precision,
-        filter_min_num_spots=filter_min_num_spots,
-    ).to(device)
+    # Reuse one cached indexer per (weighted, device, hyperparams) — the 50k-point
+    # sphere lattice is frame-independent and must not be rebuilt every frame.
+    im = _get_indexer(
+        w is not None, str(device), lattice_size, num_iterations,
+        error_precision, filter_precision, filter_min_num_spots,
+    )
     if w is not None:
-        im.set_peak_weights(w.unsqueeze(0))  # (1, N)
+        im.set_peak_weights(w.unsqueeze(0))  # (1, N) — reset fresh each frame
 
     params = [
         torch.tensor(min_num_spots),
@@ -170,15 +199,18 @@ def index_spots(
             weighted_inlier_mass=0.0 if w is not None else None,
         )
 
-    # crystal 0 is the best (solutions are appended best-first)
-    basis = bases[0, 0].detach().cpu()              # (3, 3)
+    # crystal 0 is the best (solutions are appended best-first). Keep a device
+    # copy for refinement; the IndexResult itself stays CPU-resident (the chunk
+    # builders consume it on CPU).
+    basis_dev = bases[0, 0].detach()                # (3, 3) on device
+    basis = basis_dev.cpu()
     inlier_mask = masks[0, 0].detach().cpu().bool() # (N,)
     success = bool(successes[0, 0])
     max_error = float(errors[0, 0])
 
+    q_dev = peaks[0]                                # (N, 3) float32 on device
     # hkl = round(q · a/b/c) with rows of basis being the real-space cell vectors
-    proj = q.to(torch.float32) @ basis.T            # (N, 3)
-    hkl = torch.round(proj).long()
+    hkl = torch.round(q_dev @ basis_dev.T).long().cpu()
 
     peak_prob = w.detach().cpu() if w is not None else None
     weighted_mass = (
@@ -190,22 +222,26 @@ def index_spots(
     refined_basis = responsibilities = loglik = hit_score = None
     if refine:
         from .refine import refine_lattice
-        rw = peak_prob if peak_prob is not None else torch.ones(n_spots)
+        # refine on the working device: q / weights / basis / ref_cell are all there.
+        rw = w if w is not None else torch.ones(n_spots, device=device)
         rr = refine_lattice(
-            q.to(torch.float32).cpu(), rw, basis,
+            q_dev, rw, basis_dev,
             sigma_d=sigma_d, refine_cell=refine_cell,
-            cell_restraint=cell_restraint, ref_cell=initial_cell.detach().cpu(),
+            cell_restraint=cell_restraint, ref_cell=initial_cell,
         )
-        refined_basis = rr.basis
-        responsibilities = rr.responsibilities
+        refined_basis = rr.basis.cpu()
+        responsibilities = rr.responsibilities.cpu()
         loglik, hit_score = rr.loglik, rr.hit_score
         # re-assign hkl / inliers from the refined basis
-        hkl = torch.round(q.to(torch.float32) @ refined_basis.T).long()
+        hkl = torch.round(q_dev @ rr.basis.T).long().cpu()
         inlier_mask = responsibilities > 0.5
 
     return IndexResult(
         success=success,
-        basis=basis,
+        # When refinement ran, the refined cell IS the solution (matches the
+        # docstring + cell_lengths/cell_angles); fall back to the TORO basis when
+        # refine was skipped (refined_basis is None).
+        basis=refined_basis if refined_basis is not None else basis,
         inlier_mask=inlier_mask,
         hkl=hkl,
         n_indexed=int(inlier_mask.sum()),

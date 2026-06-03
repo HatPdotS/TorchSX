@@ -22,13 +22,15 @@ The variance form mirrors ``GaussianPolynomialVariance`` in
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
 from ..geometry import Geometry
-from .peakfinder import radial_background
+from .peakfinder import TorchPeakFinderParams, bayes_score_map, radial_background
+from .spot_profile import SpotProfile
 
 
 # ─────────────────────────────── noise model ────────────────────────────────
@@ -57,12 +59,23 @@ class NoiseModel:
         return torch.sqrt(self.variance(mu))
 
 
-def _frame_residuals(reader, geom: Geometry, i: int, *, n_iters, bin_width):
-    """(mu, e, good) flat tensors for frame i: mu=b(r), e=I-b(r)."""
-    panels = reader.panels(i).to(torch.float32)
-    good = reader.mask_panels().to(torch.bool)
+def _load_panels(reader, i: int, device):
+    """Frame ``i`` as float32 on ``device``. Uses the GPU bslz4 decode
+    (``panels_gpu``, bit-exact vs h5py) on CUDA when available; CPU h5py otherwise."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and hasattr(reader, "panels_gpu"):
+        return reader.panels_gpu(int(i), dev).to(torch.float32)
+    return reader.panels(int(i)).to(torch.float32).to(dev)
+
+
+def _frame_residuals(reader, geom: Geometry, i: int, *, n_iters, bin_width, device="cpu"):
+    """(mu, e, good) flat tensors for frame i: mu=b(r), e=I-b(r). Computed on
+    ``device`` (radial background runs there), matching the per-frame finder path."""
+    dev = torch.device(device)
+    panels = _load_panels(reader, i, dev)
+    good = reader.mask_panels().to(torch.bool).to(dev)
     P, n_ss, n_fs = panels.shape
-    r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32)
+    r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(dev)
     val = panels.reshape(-1)
     g = good.reshape(-1)
     b = radial_background(val, g, r.reshape(-1), n_iters=n_iters, bin_width=bin_width)
@@ -78,7 +91,9 @@ def calibrate_noise(
     degree: int = 3,
     n_iters: int = 5,
     bin_width: float = 1.0,
-    max_pool_px: int = 6_000_000,
+    # Kept under torch.quantile's ~16.7M-element limit (used for the bin edges);
+    # the strided draw below — not the raw size — is what makes the fit reproducible.
+    max_pool_px: int = 12_000_000,
     device: str = "cpu",
 ) -> tuple[NoiseModel, dict]:
     """Fit ``sigma^2(mu)`` by pooling per-frame-background residuals over frames.
@@ -94,10 +109,14 @@ def calibrate_noise(
     per_frame_cap = max(1, max_pool_px // max(1, len(frame_indices)))
     mus, es = [], []
     for i in frame_indices:
-        mu, e, g = _frame_residuals(reader, geom, int(i), n_iters=n_iters, bin_width=bin_width)
+        mu, e, g = _frame_residuals(reader, geom, int(i), n_iters=n_iters,
+                                    bin_width=bin_width, device=device)
         sel = (g & torch.isfinite(e)).nonzero(as_tuple=False).squeeze(1)
-        if sel.numel() > per_frame_cap:                  # subsample pixels
-            sub = torch.randint(sel.numel(), (per_frame_cap,))
+        if sel.numel() > per_frame_cap:                  # deterministic strided subsample
+            # Evenly-spaced (not random) so the σ²(μ) fit is reproducible run-to-run.
+            # Unseeded random draws here made the fitted coefficients — hence every
+            # spot's significance z=(I−b)/σ — vary between otherwise-identical runs.
+            sub = torch.linspace(0, sel.numel() - 1, per_frame_cap, device=sel.device).long()
             sel = sel[sub]
         mus.append(mu[sel].to(device))
         es.append(e[sel].to(device))
@@ -152,11 +171,21 @@ class EmpiricalNull:
     z_sorted: torch.Tensor
     n_lmax_per_frame: float
 
+    def to(self, device) -> "EmpiricalNull":
+        """Return a copy with ``z_sorted`` on ``device`` (e.g. migrate to GPU once)."""
+        return EmpiricalNull(z_sorted=self.z_sorted.to(device),
+                             n_lmax_per_frame=self.n_lmax_per_frame)
+
     def sf(self, z: torch.Tensor) -> torch.Tensor:
-        """Null survival function 1 - F0(z) via the stored sample."""
+        """Null survival function 1 - F0(z) via the stored sample.
+
+        ``z_sorted`` is kept on the working device (CUDA when calibrated on GPU);
+        ``torch.searchsorted`` runs there with no host round-trip. The ``.to(...)``
+        guards are no-ops when ``z`` and ``z_sorted`` already share a device.
+        """
         n = self.z_sorted.numel()
         rank = torch.searchsorted(self.z_sorted, z.to(self.z_sorted.device), right=True)
-        return (n - rank).clamp(min=0).to(torch.float32) / max(n, 1)
+        return ((n - rank).clamp(min=0).to(torch.float32) / max(n, 1)).to(z.device)
 
     def prob(self, zsel: torch.Tensor) -> torch.Tensor:
         """Multiplicity-corrected P(real) for a frame's selected maxima (tail FDR).
@@ -188,8 +217,9 @@ def calibrate_null(
     peak_min_distance: int = 2,
     n_iters: int = 5,
     bin_width: float = 1.0,
-    max_keep: int = 2_000_000,
+    max_keep: int = 150_000_000,
     device: str = "cpu",
+    profile: SpotProfile | None = None,
 ) -> EmpiricalNull:
     """Pool background local-maximum significance over frames → :class:`EmpiricalNull`.
 
@@ -197,30 +227,186 @@ def calibrate_null(
     local-max significance is null-dominated; the handful of real-peak maxima are a
     negligible high-z tail. A reservoir caps memory at ``max_keep`` z-values while the
     true maximum count feeds ``n_lmax_per_frame``.
+
+    By default the significance is the per-pixel ``z = (I − b)/σ`` (for the z-map
+    finder :func:`~torchsx.datareduction.peakfinder.find_peaks_prob`). When a
+    ``profile`` is supplied the significance is instead the oriented matched-filter
+    score ``S`` (for :func:`~torchsx.datareduction.peakfinder.find_peaks_bayes`), so
+    the FDR null matches exactly the statistic that finder ranks on.
     """
+    bayes = profile is not None
+    operator = None
+    if bayes:
+        params = TorchPeakFinderParams(
+            n_bg_iters=n_iters, bin_width=bin_width, peak_min_distance=peak_min_distance,
+        )
+        angle_full = geom.pixel_angle_rad.to(torch.float32).to(device)
+        # Build the fused matched-filter operator ONCE and reuse it for every
+        # calibration frame — the null is computed on exactly the score the finder
+        # ranks on, so it must use the same fast path (geometry+mask+profile fixed).
+        if torch.device(device).type == "cuda":
+            from .spot_profile import build_matched_filter_operator
+            P0 = reader.n_panels
+            n_ss0, n_fs0 = 514, geom.detector_shape[1]
+            good0 = reader.mask_panels().to(torch.bool).to(device)
+            r0 = geom.pixel_radius_px.reshape(P0, n_ss0, n_fs0).to(torch.float32).to(device)
+            ang0 = angle_full.reshape(P0, n_ss0, n_fs0)
+            operator = build_matched_filter_operator(ang0, r0, good0, profile)
     pool, total_lmax, n_frames = [], 0, 0
     per_frame_cap = max(1, max_keep // max(1, len(frame_indices)))
     for i in frame_indices:
-        panels = reader.panels(int(i)).to(torch.float32).to(device)
+        panels = _load_panels(reader, int(i), device)
         good = reader.mask_panels().to(torch.bool).to(device)
         P, n_ss, n_fs = panels.shape
         r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(device)
         val = panels
-        b = radial_background(val.reshape(-1), good.reshape(-1), r.reshape(-1),
-                              n_iters=n_iters, bin_width=bin_width).view(P, n_ss, n_fs)
-        sig = noise_model.sigma(b)
-        z = torch.where(good, (val - b) / sig.clamp(min=1e-6),
-                        torch.full_like(val, float("-inf")))
+        if bayes:
+            angle = angle_full.reshape(P, n_ss, n_fs)
+            z, _b, _g = bayes_score_map(val, good, r, angle, params,
+                                        noise_model=noise_model, profile=profile,
+                                        operator=operator)
+        else:
+            b = radial_background(val.reshape(-1), good.reshape(-1), r.reshape(-1),
+                                  n_iters=n_iters, bin_width=bin_width).view(P, n_ss, n_fs)
+            sig = noise_model.sigma(b)
+            z = torch.where(good, (val - b) / sig.clamp(min=1e-6),
+                            torch.full_like(val, float("-inf")))
         d = peak_min_distance
         pooled = F.max_pool2d(z.unsqueeze(1), kernel_size=2 * d + 1, stride=1, padding=d)
         is_max = (z == pooled.squeeze(1)) & good
         zmax = z[is_max]
         total_lmax += int(zmax.numel())
         n_frames += 1
-        if zmax.numel() > per_frame_cap:               # reservoir subsample
-            sub = torch.randint(zmax.numel(), (per_frame_cap,), device=zmax.device)
+        if zmax.numel() > per_frame_cap:               # deterministic strided subsample
+            # Evenly-spaced (not random) so the empirical null — especially its high-z
+            # tail that sets prob(z) — is reproducible. The default cap now keeps
+            # ~all maxima (~772k/frame here); only an unusually large pool subsamples,
+            # and then deterministically.
+            sub = torch.linspace(0, zmax.numel() - 1, per_frame_cap, device=zmax.device).long()
             zmax = zmax[sub]
-        pool.append(zmax.cpu())
+        pool.append(zmax)                              # keep on the working device
     z_sorted = torch.sort(torch.cat(pool))[0]
     return EmpiricalNull(z_sorted=z_sorted,
                          n_lmax_per_frame=total_lmax / max(1, n_frames))
+
+
+def calibrate_spot_profile(
+    reader,
+    geom: Geometry,
+    noise_model: NoiseModel,
+    frame_indices,
+    *,
+    init: SpotProfile | None = None,
+    min_snr: float = 8.0,
+    min_spots: int = 200,
+    n_radius_bins: int = 4,
+    min_per_bin: int = 30,
+    window: int = 4,
+    n_iters: int = 5,
+    bin_width: float = 1.0,
+    device: str = "cpu",
+) -> SpotProfile:
+    """Bootstrap the anisotropic spot-width **curves** σ_radial(r), σ_azimuthal(r).
+
+    Detects high-SNR peaks on the calibration frames with the isotropic ``init``
+    profile, then measures, for each bright peak, the background-subtracted,
+    intensity-weighted second moments of the local pixel patch in the
+    **(radial, tangential)** basis (the moment along an axis equals that axis'
+    Gaussian variance). Peaks are pooled, **binned by radius** into ``n_radius_bins``
+    quantile bins, and the robust (median) width per bin gives a control point of
+    the radius curve — capturing the growth of (especially radial) spot size with
+    resolution. The matched-filter kernel radius is sized to the widest band.
+
+    **Fallbacks**: if fewer than ``min_spots`` bright peaks are found, returns
+    ``init`` unchanged; bins with fewer than ``min_per_bin`` peaks are dropped, and
+    if only one survives the result is a constant (radius-independent) profile.
+    """
+    init = init or SpotProfile.FALLBACK
+    angle_full = geom.pixel_angle_rad.to(torch.float32).to(device)
+    var_r, var_a, rad_pk = [], [], []
+    n_spots = 0
+    for i in frame_indices:
+        panels = _load_panels(reader, int(i), device)
+        good = reader.mask_panels().to(torch.bool).to(device)
+        P, n_ss, n_fs = panels.shape
+        r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(device)
+        b = radial_background(panels.reshape(-1), good.reshape(-1), r.reshape(-1),
+                              n_iters=n_iters, bin_width=bin_width).view(P, n_ss, n_fs)
+        sig = noise_model.sigma(b)
+        z = torch.where(good, (panels - b) / sig.clamp(min=1e-6),
+                        torch.full_like(panels, float("-inf")))
+        # bright, isolated local maxima (3×3) above the SNR cut
+        pooled = F.max_pool2d(z.unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1)
+        is_max = (z == pooled) & good & (z > min_snr)
+        idx = is_max.reshape(-1).nonzero(as_tuple=False).squeeze(1)
+        if idx.numel() == 0:
+            continue
+        pk_panel = idx // (n_ss * n_fs)
+        rem = idx % (n_ss * n_fs)
+        pk_ss = rem // n_fs
+        pk_fs = rem % n_fs
+        theta = angle_full.reshape(-1)[idx]                   # radial angle at each peak
+        r_at = r.reshape(-1)[idx]                             # radius at each peak
+
+        w = window
+        offs = torch.arange(-w, w + 1, device=device)
+        doff_ss, doff_fs = torch.meshgrid(offs, offs, indexing="ij")
+        doff_ss = doff_ss.reshape(-1)
+        doff_fs = doff_fs.reshape(-1)
+        win_ss = pk_ss[:, None] + doff_ss[None, :]
+        win_fs = pk_fs[:, None] + doff_fs[None, :]
+        valid = (win_ss >= 0) & (win_ss < n_ss) & (win_fs >= 0) & (win_fs < n_fs)
+        win_ss_c = win_ss.clamp(0, n_ss - 1)
+        win_fs_c = win_fs.clamp(0, n_fs - 1)
+        flat_win = pk_panel[:, None] * (n_ss * n_fs) + win_ss_c * n_fs + win_fs_c
+        ibs = ((panels.reshape(-1)[flat_win] - b.reshape(-1)[flat_win]).clamp(min=0.0)
+               * (good.reshape(-1)[flat_win] & valid).to(torch.float32))   # (M, W)
+        wsum = ibs.sum(dim=1).clamp(min=1e-6)
+        # intensity-weighted centroid offsets within the window
+        cen_ss = (ibs * doff_ss[None, :].to(torch.float32)).sum(1) / wsum
+        cen_fs = (ibs * doff_fs[None, :].to(torch.float32)).sum(1) / wsum
+        dss = doff_ss[None, :].to(torch.float32) - cen_ss[:, None]
+        dfs = doff_fs[None, :].to(torch.float32) - cen_fs[:, None]
+        # rotate offsets into the local (radial u, tangential v) frame
+        ct, st = torch.cos(theta)[:, None], torch.sin(theta)[:, None]
+        u = dfs * ct + dss * st
+        v = -dfs * st + dss * ct
+        vr = (ibs * u * u).sum(1) / wsum
+        va = (ibs * v * v).sum(1) / wsum
+        var_r.append(vr)
+        var_a.append(va)
+        rad_pk.append(r_at)
+        n_spots += int(idx.numel())
+
+    if n_spots < min_spots:
+        return init
+    vr = torch.cat(var_r).clamp(min=0.0)
+    va = torch.cat(var_a).clamp(min=0.0)
+    rr = torch.cat(rad_pk)
+
+    # quantile radius bins → one (radius, σ_radial, σ_azimuthal) control point each
+    nb = max(1, int(n_radius_bins))
+    qs = torch.linspace(0.0, 1.0, nb + 1, device=rr.device)
+    edges = torch.quantile(rr, qs)
+    radii, sr_pts, sa_pts = [], [], []
+    for k in range(nb):
+        lo, hi = edges[k], edges[k + 1]
+        sel = (rr >= lo) & (rr <= hi) if k == nb - 1 else (rr >= lo) & (rr < hi)
+        if int(sel.sum()) < min_per_bin:
+            continue
+        radii.append(float(rr[sel].median()))
+        sr_pts.append(max(float(torch.sqrt(vr[sel].median())), 0.5))
+        sa_pts.append(max(float(torch.sqrt(va[sel].median())), 0.5))
+    if not radii:                                   # too sparse per bin → global median
+        radii = [float(rr.median())]
+        sr_pts = [max(float(torch.sqrt(vr.median())), 0.5)]
+        sa_pts = [max(float(torch.sqrt(va.median())), 0.5)]
+
+    widest = max(max(sr_pts), max(sa_pts))
+    kernel_radius = int(min(6, max(init.kernel_radius, math.ceil(2.5 * widest))))
+    return SpotProfile(
+        radii=torch.tensor(radii),
+        sigma_radial=torch.tensor(sr_pts),
+        sigma_azimuthal=torch.tensor(sa_pts),
+        kernel_radius=kernel_radius, n_orient=init.n_orient,
+    )

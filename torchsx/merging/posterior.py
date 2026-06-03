@@ -1026,6 +1026,15 @@ class Posterior:
         F_fallback = 0.5 * I0_sigma_cpu / F_cpu.clamp(min=1e-6)
         F_sigma_cpu = torch.where(bad_Fs, F_fallback, F_sigma_cpu)
 
+        # Tell torchref explicitly whether the input was Friedel-merged so it
+        # doesn't have to infer from canonicalization side-effects.  When
+        # ``merge_friedel=False`` was used at load time, the stream still
+        # carries both `(h,k,l)` and `(-h,-k,-l)` as distinct entries; torchref
+        # will canonicalize them to a shared ASU rep, populate ``friedel_flags``,
+        # and write an anomalous (phenix-style) MTZ with `F-obs(+)/F-obs(-)`
+        # columns instead of duplicate-row legacy output.
+        friedel_merged = bool(getattr(self._loss._stream, "friedel_merged", True))
+
         data = ReflectionData.from_tensors(
             hkl=prep.hkl_valid.detach().cpu().int(),
             F=F_cpu,
@@ -1033,6 +1042,7 @@ class Posterior:
             cell=cell,
             spacegroup=spacegroup,
             rfree_flags=rfree_flags,
+            friedel_merged=friedel_merged,
         )
         data.I = I0_cpu
         data.I_sigma = I0_sigma_cpu

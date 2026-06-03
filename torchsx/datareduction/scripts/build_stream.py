@@ -73,10 +73,11 @@ def main() -> None:
     ap.add_argument("--spacegroup", default="P 43 21 2")
     ap.add_argument("--dap", default=None)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--finder", choices=["pf8", "torch", "torch-threshold"],
+    ap.add_argument("--finder", choices=["pf8", "torch", "bayes", "torch-threshold"],
                     default="pf8",
                     help="spot-finder backend: compiled peakfinder8, native "
-                         "probabilistic torch ('torch'), or native threshold torch")
+                         "probabilistic torch ('torch'), fully-Bayesian matched-filter "
+                         "('bayes'), or native threshold torch")
     ap.add_argument("--adc-thresh", type=float, default=150.0)
     ap.add_argument("--min-snr", type=float, default=8.0)
     ap.add_argument("--min-peaks", type=int, default=15)
@@ -97,7 +98,7 @@ def main() -> None:
     if not frames:
         raise SystemExit("no candidate frames; loosen thresholds")
 
-    if args.finder.startswith("torch"):
+    if args.finder.startswith("torch") or args.finder == "bayes":
         from torchsx.datareduction import TorchPeakFinderParams
         params = TorchPeakFinderParams(adc_thresh=args.adc_thresh, min_snr=args.min_snr)
     else:

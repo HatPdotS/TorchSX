@@ -316,6 +316,8 @@ def time_binned_merge(
     posterior_prior: str = "flat",
     shared_alpha_beta: bool = False,
     prefit_refine_kwargs: dict[str, Any] | None = None,
+    merge_dark: bool = False,
+    dark_mtz_name: str = "dark.mtz",
     skip_existing: bool = False,
     verbose: bool = True,
 ) -> list[BinResult]:
@@ -351,6 +353,15 @@ def time_binned_merge(
         ``LogSpaceLoss.refine`` kwargs for the full-stream pre-fit when
         ``shared_alpha_beta=True``.  Defaults to ``refine_kwargs`` (same
         budget as a regular per-bin refine).
+    merge_dark :
+        If True, after the time-bin loop also merge the crystals in
+        ``stream`` whose timepoint is NaN (no label / dark) as a single
+        extra MTZ.  Requires ``shared_alpha_beta=True`` so the dark merge
+        uses the same per-HKL α, β as every light bin — yields an
+        unbiased F(light_b) − F(dark) baseline.  The dark merge's input
+        is ``stream.filter_crystals(crystal_tp.isnan())``.
+    dark_mtz_name :
+        Filename for the dark MTZ (placed directly in ``output_dir``).
     skip_existing :
         If True, bins whose target MTZ already exists are skipped (the
         result list still includes a ``BinResult`` for them).
@@ -585,6 +596,109 @@ def time_binned_merge(
             mtz_path=mtz_path,
             diagnostics=diag,
         ))
+
+    # ── Optional dark merge (NaN-timepoint crystals) ──────────────────
+    # Uses the same gain (pinned) and α, β (from pre-fit on light+dark
+    # combined) as every light bin.  The dark merge is a single, unweighted
+    # full-stream merge on the NaN-timepoint sub-stream, so cross-bin
+    # difference F(light_b) − F(dark) is calibrated against the same
+    # scatter shape.  Requires shared_alpha_beta=True — without the
+    # shared pre-fit, the dark MTZ would have its own α, β and the
+    # difference becomes ill-defined.
+    if merge_dark:
+        if prefit_hkl_lookup is None:
+            raise ValueError(
+                "merge_dark=True requires shared_alpha_beta=True so the dark "
+                "merge uses the same α, β as the time bins."
+            )
+        crystal_tp_list = stream.crystal_timepoints()
+        if isinstance(crystal_tp_list, torch.Tensor):
+            crystal_tp = crystal_tp_list.to(torch.float64).cpu()
+        else:
+            crystal_tp = torch.tensor(crystal_tp_list, dtype=torch.float64)
+        dark_mask = torch.isnan(crystal_tp)
+        n_dark = int(dark_mask.sum().item())
+        if verbose:
+            print(
+                f"\n[dark merge] {n_dark} dark crystals "
+                f"(NaN timepoint) — shared α, β from full pre-fit",
+                flush=True,
+            )
+        if n_dark == 0:
+            if verbose:
+                print(
+                    "  ⚠ merge_dark=True but no NaN-timepoint crystals found — skipping",
+                    flush=True,
+                )
+        else:
+            dark_path = output_dir / dark_mtz_name
+            skip_dark = skip_existing and dark_path.exists()
+            if skip_dark:
+                if verbose:
+                    print(f"  ↳ {dark_path} exists — skipping", flush=True)
+            else:
+                dark_stream = stream.filter_crystals(dark_mask)
+                if verbose:
+                    print(
+                        f"  sub-stream: n_crystals={dark_stream.n_crystals}  "
+                        f"n_obs={dark_stream.n_observations}",
+                        flush=True,
+                    )
+                dark_loss = dark_stream.make_loss(**make_loss_kwargs)
+                with torch.no_grad():
+                    dark_hkl = dark_loss._prep.hkl_valid.detach().cpu().long()
+                    n_valid_dark = dark_hkl.shape[0]
+                    la_default = dark_loss._params.log_alpha.detach().cpu().clone()
+                    lb_default = dark_loss._params.log_beta.detach().cpu().clone()
+                    la_dark = la_default.clone()
+                    lb_dark = lb_default.clone()
+                    n_missing = 0
+                    for i in range(n_valid_dark):
+                        key = (int(dark_hkl[i, 0]), int(dark_hkl[i, 1]), int(dark_hkl[i, 2]))
+                        pre = prefit_hkl_lookup.get(key)
+                        if pre is None:
+                            n_missing += 1
+                            continue
+                        la_dark[i] = pre[0]
+                        lb_dark[i] = pre[1]
+                from torchsx.merging.scatter_shape import FixedShape
+                dark_loss.swap_scatter_shape(FixedShape(la_dark, lb_dark))
+                if verbose:
+                    miss_msg = (
+                        f"  ({n_missing} HKLs not in pre-fit — kept init)"
+                        if n_missing else ""
+                    )
+                    print(
+                        f"  shared α, β: frozen "
+                        f"{n_valid_dark - n_missing}/{n_valid_dark} HKLs{miss_msg}",
+                        flush=True,
+                    )
+                dark_loss.refine(**refine_kwargs)
+                dark_posterior = dark_loss.posterior(prior=posterior_prior)
+                dark_data = dark_posterior.integrate()
+                dark_data.write_mtz(str(dark_path))
+                if verbose:
+                    print(
+                        f"  ↳ wrote {dark_path}  (final NLL = {dark_loss.final_nll})",
+                        flush=True,
+                    )
+                results.append(BinResult(
+                    bin_idx=-1,
+                    center_rank=-1,
+                    center_time=float("nan"),
+                    effective_n_crystals=float(n_dark),
+                    n_contributing_crystals=n_dark,
+                    mtz_path=dark_path,
+                    diagnostics={
+                        "n_crystals": dark_stream.n_crystals,
+                        "n_observations": dark_stream.n_observations,
+                        "gain": dark_loss.stats.get("gain"),
+                        "n_valid": dark_loss.stats.get("n_valid"),
+                        "final_data_nll": dark_loss.final_nll,
+                        "shared_alpha_beta": True,
+                        "kind": "dark",
+                    },
+                ))
 
     return results
 

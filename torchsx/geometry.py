@@ -287,6 +287,30 @@ class Geometry:
             pid_map[p.min_ss : p.max_ss + 1, p.min_fs : p.max_fs + 1] = i
         return pid_map
 
+    @cached_property
+    def _device_cache(self) -> dict:
+        """Per-device copies of the panel tensors, populated on first use.
+
+        Keyed by ``torch.device`` so ``to_lab`` doesn't re-``.to(device)`` the CPU
+        caches on every call. Assumes panels are immutable post-construction (true
+        for the existing ``cached_property`` tensors).
+        """
+        return {"params": {}, "pid_map": {}}
+
+    def _panel_params_on(self, device) -> dict[str, torch.Tensor]:
+        device = torch.device(device)
+        cache = self._device_cache["params"]
+        if device not in cache:
+            cache[device] = {k: v.to(device) for k, v in self._panel_params.items()}
+        return cache[device]
+
+    def _panel_id_map_on(self, device) -> torch.Tensor:
+        device = torch.device(device)
+        cache = self._device_cache["pid_map"]
+        if device not in cache:
+            cache[device] = self._panel_id_map.to(device)
+        return cache[device]
+
     # ── Beam / wavelength ─────────────────────────────────────────────────
 
     @property
@@ -336,22 +360,22 @@ class Geometry:
 
         # ── resolve panel id ──
         if panel_id is None:
-            pid_map = self._panel_id_map.to(device)
+            pid_map = self._panel_id_map_on(device)
             ss_idx = ss.long().clamp(0, self.detector_shape[0] - 1)
             fs_idx = fs.long().clamp(0, self.detector_shape[1] - 1)
             pid = pid_map[ss_idx, fs_idx].long()
         else:
             pid = panel_id.long()
 
-        # ── panel parameter tensors on the right device ──
-        pp = self._panel_params
-        corner_x = pp["corner_x"].to(device)
-        corner_y = pp["corner_y"].to(device)
-        fs_vecs = pp["fs_vecs"].to(device)
-        ss_vecs = pp["ss_vecs"].to(device)
-        min_fs_t = pp["min_fs"].to(device)
-        min_ss_t = pp["min_ss"].to(device)
-        coffset_t = pp["coffset"].to(device)
+        # ── panel parameter tensors on the right device (cached per device) ──
+        pp = self._panel_params_on(device)
+        corner_x = pp["corner_x"]
+        corner_y = pp["corner_y"]
+        fs_vecs = pp["fs_vecs"]
+        ss_vecs = pp["ss_vecs"]
+        min_fs_t = pp["min_fs"]
+        min_ss_t = pp["min_ss"]
+        coffset_t = pp["coffset"]
 
         # ── vectorised transform ──
         dfs = fs - min_fs_t[pid]
@@ -555,6 +579,41 @@ class Geometry:
         background by radius); a thin torch view over :meth:`radial_map`.
         """
         return torch.from_numpy(self.radial_map())
+
+    def angle_map(self) -> np.ndarray:
+        """Build (total_ss, total_fs) per-pixel radial angle ``atan2(y, x)`` (rad).
+
+        Same per-panel ``x, y`` construction as :meth:`radial_map`; the angle gives
+        the orientation of the radial direction at each pixel, used to orient the
+        anisotropic spot kernel in the matched-filter finder.
+        """
+        total_ss, total_fs = self.detector_shape
+        a_map = np.zeros((total_ss, total_fs), dtype=np.float32)
+
+        for p in self.panels:
+            ss0, ss1 = p.min_ss, p.max_ss
+            n_ss = ss1 - ss0 + 1
+            n_fs = p.max_fs - p.min_fs + 1
+            cx, cy = p.corner_x, p.corner_y
+            fsx, fsy, _ = p.fs_vec
+            ssx, ssy, _ = p.ss_vec
+            dfs = np.arange(n_fs, dtype=np.float32)[None, :]
+            dss = np.arange(n_ss, dtype=np.float32)[:, None]
+            x = cx + dfs * fsx + dss * ssx
+            y = cy + dfs * fsy + dss * ssy
+            a_map[ss0 : ss1 + 1, p.min_fs : p.max_fs + 1] = np.arctan2(y, x)
+
+        return a_map
+
+    @cached_property
+    def pixel_angle_rad(self) -> torch.Tensor:
+        """Per-pixel radial angle from the beam center, in **radians**.
+
+        Cached ``(total_ss, total_fs)`` float32 tensor; a thin torch view over
+        :meth:`angle_map`. Used to orient the anisotropic spot kernel in
+        :func:`~torchsx.datareduction.peakfinder.find_peaks_bayes`.
+        """
+        return torch.from_numpy(self.angle_map())
 
     # ── Panel map ────────────────────────────────────────────────────────
 

@@ -62,7 +62,12 @@ class TorchPeakFinderParams:
     prob_midpoint: float = 5.0
     prob_scale: float = 1.5
     peak_min_distance: int = 2   # local-max neighbourhood radius (peaks ≥ this apart)
-    window: int = 3              # centroid/integration half-window (px)
+    window: int = 3              # integration half-window (px)
+    # bayes centroid: "smax" = sub-pixel parabolic peak of the matched-filter score
+    # (the score is the denoised matched signal, and for the symmetric kernel its peak
+    # IS the Bragg position — tighter than the box COM, and reuses the score map);
+    # "com" = the legacy intensity-weighted box centroid.
+    centroid_mode: str = "smax"
     # NB on parity with peakfinder8: pf8 grows each blob below the seed threshold
     # and so keeps single-pixel peaks even at min_pix_count=2; this finder applies
     # min_pix_count to the above-threshold blob directly, so the default rejects
@@ -382,6 +387,204 @@ def find_peaks_prob(
 
     if null is not None:
         prob = null.prob(zsel)                            # multiplicity-corrected
+    else:
+        prob = torch.sigmoid((zsel - params.prob_midpoint) / params.prob_scale)
+
+    out = torch.empty((top_n, 5), dtype=torch.float32, device=device)
+    out[:, PANEL] = pk_panel.to(torch.float32)
+    out[:, SS] = com_ss + pk_panel.to(torch.float32) * n_ss
+    out[:, FS] = com_fs
+    out[:, INTENSITY] = intensity
+    out[:, PROB] = prob
+    return out
+
+
+@torch.no_grad()
+def bayes_score_map(
+    panels: torch.Tensor,
+    mask_panels: torch.Tensor,
+    pix_r_panels: torch.Tensor,
+    angle_panels: torch.Tensor,
+    params: TorchPeakFinderParams | None = None,
+    *,
+    noise_model=None,
+    profile=None,
+    operator=None,
+):
+    """Whitened residual ``w``, background ``b``, and matched-filter score ``S``.
+
+    The single statistic shared by :func:`find_peaks_bayes` and
+    :func:`~torchsx.datareduction.noise_model.calibrate_null` so the FDR null is
+    computed on exactly the score the finder ranks on. ``b`` is the per-frame
+    :func:`radial_background`; ``σ`` is ``noise_model.sigma(b)`` (or the empirical
+    per-radius σ when ``noise_model`` is ``None``); ``S`` is the oriented
+    matched-filter score of :func:`~torchsx.datareduction.spot_profile.matched_filter_score`.
+
+    Returns ``(S, b, good)``, each ``(P, ss, fs)`` (``good`` is bool).
+    """
+    from .spot_profile import (
+        SpotProfile, matched_filter_score, matched_filter_score_fused,
+    )
+
+    params = params or TorchPeakFinderParams()
+    profile = profile or SpotProfile.FALLBACK
+    P, n_ss, n_fs = panels.shape
+    eps = 1e-6
+
+    val = panels.to(torch.float32)
+    good = mask_panels.to(torch.bool)
+    radius = pix_r_panels.to(torch.float32)
+    angle = angle_panels.to(torch.float32)
+
+    if noise_model is not None:
+        mean_px = radial_background(
+            val.reshape(-1), good.reshape(-1), radius.reshape(-1),
+            n_iters=params.n_bg_iters, min_snr=params.min_snr, bin_width=params.bin_width,
+        ).view(P, n_ss, n_fs)
+        sigma_px = noise_model.sigma(mean_px)
+    else:
+        mean_px, sigma_px, _thr = _radial_stats(
+            val.reshape(-1), good.reshape(-1), radius.reshape(-1),
+            n_iters=params.n_bg_iters, min_snr=params.min_snr,
+            adc_thresh=params.adc_thresh, bin_width=params.bin_width,
+        )
+        mean_px = mean_px.view(P, n_ss, n_fs)
+        sigma_px = sigma_px.view(P, n_ss, n_fs)
+
+    w = (val - mean_px) / sigma_px.clamp(min=eps)
+    w = torch.where(good, w, torch.zeros_like(w))         # masked → 0 evidence
+    if operator is not None and w.is_cuda:
+        # exact-fp32 fused Triton path; ~13x the conv path, no materialized bank
+        S = matched_filter_score_fused(w, operator)
+    else:
+        S = matched_filter_score(w, good, angle, profile, radius=radius)
+    S = torch.where(good, S, torch.full_like(S, float("-inf")))   # masked never maxima
+    return S, mean_px, good
+
+
+@torch.no_grad()
+def find_peaks_bayes(
+    panels: torch.Tensor,
+    mask_panels: torch.Tensor,
+    pix_r_panels: torch.Tensor,
+    angle_panels: torch.Tensor,
+    params: TorchPeakFinderParams | None = None,
+    *,
+    noise_model=None,
+    null=None,
+    profile=None,
+    operator=None,
+) -> torch.Tensor:
+    """Fully-Bayesian matched-filter spot finder — always returns the top-N peaks.
+
+    Like :func:`find_peaks_prob`, but a pixel's significance is the **oriented
+    matched-filter score** ``S`` rather than its own ``z = (I − b)/σ``: the
+    convolution with the anisotropic spot kernel ``g`` folds in the neighbours'
+    evidence weighted by the expected spot shape, so a coherent multi-pixel blob
+    outscores an isolated hot pixel of the same height (a property the per-pixel
+    z-finder lacks). See :mod:`~torchsx.datareduction.spot_profile`.
+
+    Parameters mirror :func:`find_peaks_prob` plus ``angle_panels`` (per-pixel
+    radial angle, ``geom.pixel_angle_rad``) and ``profile`` (the anisotropic
+    :class:`~torchsx.datareduction.spot_profile.SpotProfile`; defaults to the
+    isotropic fallback). ``noise_model`` / ``null`` are used exactly as in
+    :func:`find_peaks_prob` — the per-peak probability is the multiplicity-corrected
+    ``null.prob(S)`` (tail FDR) when ``null`` is given, else a logistic of ``S``.
+
+    .. note::
+       **GPU-only hit-finder.** The score is ``n_bands × n_orient`` convolutions
+       over the full module stack per frame — milliseconds on a GPU, but several
+       seconds per frame on CPU (and ``calibrate_null`` repeats it once per
+       calibration frame). Run with ``device="cuda"``; the CPU path is for tests
+       and small checks only.
+
+    Returns
+    -------
+    spots : (M, 5) float32 ``[panel, ss, fs, intensity, prob]`` in assembled
+        coordinates, ranked by ``S`` (``M ≤ top_n``). Empty → ``(0, 5)``.
+    """
+    params = params or TorchPeakFinderParams()
+    device = panels.device
+    _P, n_ss, n_fs = panels.shape
+    eps = 1e-6
+
+    val = panels.to(torch.float32)
+
+    # ── 1. background + matched-filter score map ─────────────────────────────
+    z, mean_px, good = bayes_score_map(
+        panels, mask_panels, pix_r_panels, angle_panels, params,
+        noise_model=noise_model, profile=profile, operator=operator,
+    )
+
+    # ── 2. per-panel local maxima of the score ───────────────────────────────
+    d = params.peak_min_distance
+    pooled = F.max_pool2d(z.unsqueeze(1), kernel_size=2 * d + 1, stride=1, padding=d)
+    is_max = (z == pooled.squeeze(1)) & good
+
+    flat_max = is_max.reshape(-1).nonzero(as_tuple=False).squeeze(1)
+    if flat_max.numel() == 0:
+        return torch.empty((0, 5), dtype=torch.float32, device=device)
+
+    # ── 3. rank by score, keep top_n ─────────────────────────────────────────
+    zf = z.reshape(-1)
+    zvals = zf[flat_max]
+    top_n = min(params.top_n, flat_max.numel())
+    top = torch.topk(zvals, top_n)
+    sel = flat_max[top.indices]
+    zsel = top.values
+
+    pk_panel = sel // (n_ss * n_fs)
+    rem = sel % (n_ss * n_fs)
+    pk_ss = rem // n_fs
+    pk_fs = rem % n_fs
+
+    # ── 4. centroid + background-subtracted integrated intensity ──────────────
+    w = params.window
+    offs = torch.arange(-w, w + 1, device=device)
+    doff_ss, doff_fs = torch.meshgrid(offs, offs, indexing="ij")
+    doff_ss = doff_ss.reshape(-1)
+    doff_fs = doff_fs.reshape(-1)
+    win_ss = pk_ss[:, None] + doff_ss[None, :]
+    win_fs = pk_fs[:, None] + doff_fs[None, :]
+    valid = (win_ss >= 0) & (win_ss < n_ss) & (win_fs >= 0) & (win_fs < n_fs)
+    win_ss_c = win_ss.clamp(0, n_ss - 1)
+    win_fs_c = win_fs.clamp(0, n_fs - 1)
+    flat_win = pk_panel[:, None] * (n_ss * n_fs) + win_ss_c * n_fs + win_fs_c
+
+    vwin = val.reshape(-1)[flat_win]
+    mwin = mean_px.reshape(-1)[flat_win]
+    gwin = good.reshape(-1)[flat_win] & valid
+    ibs = (vwin - mwin).clamp(min=0.0) * gwin.to(torch.float32)
+    intensity = ibs.sum(dim=1)
+
+    if params.centroid_mode == "smax":
+        # Sub-pixel peak of the matched-filter score: separable 3-point parabolic
+        # fit on the score map (reuses zf). For the even-symmetric kernel the score
+        # peaks at the Bragg position, so this is tighter than the box COM (which is
+        # noisy + box-truncated for radially-elongated spots) and needs no extra gather.
+        def _samp(ss, fs):
+            idx = pk_panel * (n_ss * n_fs) + ss.clamp(0, n_ss - 1) * n_fs + fs.clamp(0, n_fs - 1)
+            return zf[idx]
+
+        s_c = zsel
+        s_up, s_dn = _samp(pk_ss + 1, pk_fs), _samp(pk_ss - 1, pk_fs)
+        s_r, s_l = _samp(pk_ss, pk_fs + 1), _samp(pk_ss, pk_fs - 1)
+
+        def _subpix(s_lo, s_hi, at_border):
+            den = s_lo - 2.0 * s_c + s_hi
+            d = 0.5 * (s_lo - s_hi) / den
+            ok = torch.isfinite(s_lo) & torch.isfinite(s_hi) & (den < -1e-6) & (~at_border)
+            return torch.where(ok, d.clamp(-1.0, 1.0), torch.zeros_like(d))
+
+        com_ss = pk_ss.to(torch.float32) + _subpix(s_dn, s_up, (pk_ss == 0) | (pk_ss == n_ss - 1))
+        com_fs = pk_fs.to(torch.float32) + _subpix(s_l, s_r, (pk_fs == 0) | (pk_fs == n_fs - 1))
+    else:  # "com" — legacy intensity-weighted box centroid
+        wsum = ibs.sum(dim=1).clamp(min=eps)
+        com_ss = (ibs * win_ss.to(torch.float32)).sum(dim=1) / wsum
+        com_fs = (ibs * win_fs.to(torch.float32)).sum(dim=1) / wsum
+
+    if null is not None:
+        prob = null.prob(zsel)
     else:
         prob = torch.sigmoid((zsel - params.prob_midpoint) / params.prob_scale)
 

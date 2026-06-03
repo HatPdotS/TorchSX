@@ -138,6 +138,12 @@ def find_spots_on_frame(
     backend: str = "pf8",
     noise_model=None,
     null=None,
+    profile=None,
+    panels: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    pix_r: torch.Tensor | None = None,
+    angle: torch.Tensor | None = None,
+    operator=None,
 ) -> torch.Tensor:
     """Convenience: read frame ``i`` and find spots, using the geometry's
     cached pixel-radius map for ``pix_r``.
@@ -150,27 +156,48 @@ def find_spots_on_frame(
       ``(M, 5)`` with a per-peak probability column. Pass ``noise_model`` /
       ``null`` (from :mod:`~torchsx.datareduction.noise_model`) for calibrated σ
       and multiplicity-corrected probabilities.
+    * ``"bayes"`` — the fully-Bayesian matched-filter finder
+      (:func:`~torchsx.datareduction.peakfinder.find_peaks_bayes`); like ``"torch"``
+      but ranks pixels by the oriented matched-filter score that folds in
+      neighbour evidence weighted by the anisotropic spot ``profile``. Also returns
+      ``(M, 5)``. Pass ``noise_model`` / ``null`` / ``profile`` for calibrated σ,
+      multiplicity-corrected probabilities, and the bootstrapped spot shape.
+      **GPU-only** in practice (several seconds/frame on CPU) — use ``device="cuda"``.
     * ``"torch-threshold"`` — the native peakfinder8-style threshold finder
       (:func:`~torchsx.datareduction.peakfinder.find_spots_torch`); returns ``(M, 4)``.
 
     ``params`` may be the matching params dataclass for the backend, or ``None``.
+
+    ``panels`` / ``mask`` / ``pix_r`` / ``angle`` may be supplied pre-loaded (e.g.
+    already on the GPU) to avoid re-reading the frame; when ``None`` they are read
+    here (``angle`` only for the ``"bayes"`` backend).
     """
-    panels = reader.panels(i).to(torch.float32)
-    mask = reader.mask_panels()
+    if panels is None:
+        panels = reader.panels(i).to(torch.float32)
+    if mask is None:
+        mask = reader.mask_panels()
     n_panels, n_ss, n_fs = panels.shape
-    pix_r = geom.pixel_radius_px.reshape(n_panels, n_ss, n_fs)
+    if pix_r is None:
+        pix_r = geom.pixel_radius_px.reshape(n_panels, n_ss, n_fs)
     if backend == "torch":
         # lazy import: peakfinder imports column constants from this module
         from .peakfinder import find_peaks_prob
         return find_peaks_prob(panels, mask, pix_r, params,
                                noise_model=noise_model, null=null)
+    if backend == "bayes":
+        from .peakfinder import find_peaks_bayes
+        if angle is None:
+            angle = geom.pixel_angle_rad.reshape(n_panels, n_ss, n_fs)
+        return find_peaks_bayes(panels, mask, pix_r, angle, params,
+                                noise_model=noise_model, null=null, profile=profile,
+                                operator=operator)
     if backend == "torch-threshold":
         from .peakfinder import find_spots_torch
         return find_spots_torch(panels, mask, pix_r, params)
     if backend != "pf8":
         raise ValueError(
             f"unknown spot-finder backend {backend!r} "
-            "(use 'pf8', 'torch', or 'torch-threshold')"
+            "(use 'pf8', 'torch', 'bayes', or 'torch-threshold')"
         )
     return find_spots(panels, mask, pix_r, params)
 
