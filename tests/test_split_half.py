@@ -1,11 +1,16 @@
-"""Tests for split-half comparison metrics."""
+"""Tests for split-half comparison metrics.
+
+Exercises the live ``torchsx.merging.indexing.stats`` implementation (the
+deprecated ``merge._stats`` copy is retained for frozen ``deprecated``
+subpackages; see ``torchsx.deprecated``).
+"""
 
 import math
 
 import torch
 import pytest
 
-from torchsx.merge._stats import (
+from torchsx.merging.indexing.stats import (
     MatchedHalves,
     cc_half,
     cc_star,

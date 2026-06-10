@@ -18,10 +18,10 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tests.test_heteroscedastic.generate import sample_gengauss
-from torchsx.merge._dstep import (
+from torchsx.deprecated.merge._dstep import (
     fit_I0_poisson_log, fit_alpha, _fit_alpha_resolution_prior,
 )
-from torchsx.merge._distribution import _laplacian_smooth
+from torchsx.deprecated.merge._distribution import _laplacian_smooth
 
 
 def generate_one_trial(I0_true, alpha_true, beta_val, obs_per_hkl, background, seed):

@@ -1,0 +1,5 @@
+node_modules/
+# dist/ is the built bundle. It is shipped inside the wheel as package-data
+# (built in CI at release). Ignore it in dev to keep build artifacts out of git;
+# remove this line if you prefer to commit a prebuilt bundle.
+dist/

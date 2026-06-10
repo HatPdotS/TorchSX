@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from torchsx.forward._attraction_loss import AttractionLoss, AttractionResult
+from torchsx.deprecated.forward._attraction_loss import AttractionLoss, AttractionResult
 
 
 def _make_batch(B=10, ph=11, pw=11, device="cpu"):

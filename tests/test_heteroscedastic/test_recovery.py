@@ -9,8 +9,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from torchsx.merge._dstep import fit_I0_poisson, fit_alpha, d_step
-from torchsx.merge._distribution import _build_adjacency
+from torchsx.deprecated.merge._dstep import fit_I0_poisson, fit_alpha, d_step
+from torchsx.deprecated.merge._distribution import _build_adjacency
 
 from .generate import generate_synthetic, generate_variable_alpha
 

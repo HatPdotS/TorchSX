@@ -3,12 +3,12 @@
 
 import torch, csv, time
 from torchsx.stream import SFXStream
-from torchsx.merge import (
+from torchsx.deprecated.merge import (
     compute_hkl_index, merge_median,
     match_halves, shell_stats, cc_half, r_split,
     fit_em, EMConfig, ScaleBCorrection,
 )
-import torchsx.merge._dstep as dstep
+import torchsx.deprecated.merge._dstep as dstep
 _orig = dstep._prepare_quadrature
 def _patched(alpha, beta, obs_counts, sigma2_poisson, n_quad=21, device=None):
     return _orig(alpha, beta, obs_counts, sigma2_poisson, n_quad=51, device=device)

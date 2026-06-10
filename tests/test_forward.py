@@ -7,23 +7,23 @@ import math
 import pytest
 import torch
 
-from torchsx.scaling._orientation import CrystalOrientation
-from torchsx.forward.coords import RefinableGeometry
-from torchsx.forward.relp import RelpProfile
-from torchsx.forward.spectrum import GaussianSpectrum
-from torchsx.forward.corrections import (
+from torchsx.deprecated.scaling._orientation import CrystalOrientation
+from torchsx.deprecated.forward.coords import RefinableGeometry
+from torchsx.deprecated.forward.relp import RelpProfile
+from torchsx.deprecated.forward.spectrum import GaussianSpectrum
+from torchsx.deprecated.forward.corrections import (
     polarization_correction,
     solid_angle_correction,
     estimate_background,
 )
-from torchsx.forward.likelihood import PixelLikelihood
-from torchsx.forward.forward_model import PixelForwardModel
-from torchsx.forward.batch import ROIBatch, _build_pixel_grids, _compute_pixel_geometry
-from torchsx.forward.refine import RefinementStage, _set_requires_grad, _module_for_group
+from torchsx.deprecated.forward.likelihood import PixelLikelihood
+from torchsx.deprecated.forward.forward_model import PixelForwardModel
+from torchsx.deprecated.forward.batch import ROIBatch, _build_pixel_grids, _compute_pixel_geometry
+from torchsx.deprecated.forward.refine import RefinementStage, _set_requires_grad, _module_for_group
 from torchsx.geometry import Geometry, Panel
-from torchsx.merge._structure_factor import MergedStructureFactor
-from torchsx.scaling._absolute import AbsoluteScale
-from torchsx.scaling._bscale import BScale
+from torchsx.deprecated.merge._structure_factor import MergedStructureFactor
+from torchsx.deprecated.scaling._absolute import AbsoluteScale
+from torchsx.deprecated.scaling._bscale import BScale
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +534,7 @@ class TestForwardSteps:
         Geometry: single panel at 100 mm, 100 µm pixels.
         Wavelength 1.0 Å (12.4 keV).
         """
-        from torchsx.forward.forward_model import ForwardResult
+        from torchsx.deprecated.forward.forward_model import ForwardResult
 
         n_crystals = 1
         n_unique = 1
@@ -925,7 +925,7 @@ def _make_predicted_from_core(
     add_extra : number of extra predicted-only reflections to add
     position_offset : pixel offset to apply to predicted positions
     """
-    from torchsx.forward.predict import PredictedReflections
+    from torchsx.deprecated.forward.predict import PredictedReflections
 
     n_obs = core.n_observations
     n_keep = int(n_obs * (1.0 - drop_frac))
@@ -975,7 +975,7 @@ def _make_predicted_from_core(
 class TestPredictionDiagnostics:
     def test_perfect_match(self):
         """All observations are predicted and vice versa."""
-        from torchsx.forward.predict import compare_predictions
+        from torchsx.deprecated.forward.predict import compare_predictions
 
         core = _make_mini_core(2, 5)
         pred = _make_predicted_from_core(core, drop_frac=0.0, add_extra=0)
@@ -989,7 +989,7 @@ class TestPredictionDiagnostics:
 
     def test_partial_overlap(self):
         """80% of observations matched, plus some predicted-only."""
-        from torchsx.forward.predict import compare_predictions
+        from torchsx.deprecated.forward.predict import compare_predictions
 
         core = _make_mini_core(2, 5)
         # Drop 20% of observations from prediction, add 3 extra
@@ -1009,7 +1009,7 @@ class TestPredictionDiagnostics:
 
     def test_position_accuracy(self):
         """Known position offset → correct median error."""
-        from torchsx.forward.predict import compare_predictions
+        from torchsx.deprecated.forward.predict import compare_predictions
 
         core = _make_mini_core(1, 10)
         offset = 2.5
@@ -1023,7 +1023,7 @@ class TestPredictionDiagnostics:
 
     def test_empty_prediction(self):
         """Zero predictions → hit_rate=0, recovery_rate=0."""
-        from torchsx.forward.predict import compare_predictions, PredictedReflections
+        from torchsx.deprecated.forward.predict import compare_predictions, PredictedReflections
 
         core = _make_mini_core(1, 5)
         empty_pred = PredictedReflections(
@@ -1043,7 +1043,7 @@ class TestPredictionDiagnostics:
 
     def test_resolution_shells(self):
         """Shell stats should have consistent totals."""
-        from torchsx.forward.predict import compare_predictions
+        from torchsx.deprecated.forward.predict import compare_predictions
 
         core = _make_mini_core(2, 5)
         pred = _make_predicted_from_core(core, drop_frac=0.1, add_extra=2)
@@ -1061,7 +1061,7 @@ class TestPredictionDiagnostics:
 
     def test_summary_nonempty(self):
         """summary() should produce a non-empty string."""
-        from torchsx.forward.predict import compare_predictions
+        from torchsx.deprecated.forward.predict import compare_predictions
 
         core = _make_mini_core(2, 5)
         pred = _make_predicted_from_core(core)
@@ -1079,7 +1079,7 @@ class TestPredictionDiagnostics:
 class TestUpdateObservationsModes:
     def test_position_only_unchanged_count(self):
         """position_only mode should not change observation count."""
-        from torchsx.forward.predict import update_observations
+        from torchsx.deprecated.forward.predict import update_observations
 
         core = _make_mini_core(2, 5)
         pred = _make_predicted_from_core(core, position_offset=2.0, add_extra=3)
@@ -1091,7 +1091,7 @@ class TestUpdateObservationsModes:
 
     def test_expand_adds_new(self):
         """expand mode should add predicted-only observations."""
-        from torchsx.forward.predict import update_observations
+        from torchsx.deprecated.forward.predict import update_observations
 
         core = _make_mini_core(2, 5)
         n_extra = 4
@@ -1110,7 +1110,7 @@ class TestUpdateObservationsModes:
 
     def test_expand_updates_n_refl(self):
         """Crystal n_refl tensor should match new observation count."""
-        from torchsx.forward.predict import update_observations
+        from torchsx.deprecated.forward.predict import update_observations
 
         core = _make_mini_core(2, 5)
         pred = _make_predicted_from_core(core, add_extra=3)
@@ -1129,7 +1129,7 @@ class TestUpdateObservationsModes:
 
     def test_full_removes_unmatched(self):
         """full mode should remove observed-only spots."""
-        from torchsx.forward.predict import update_observations
+        from torchsx.deprecated.forward.predict import update_observations
 
         core = _make_mini_core(2, 5)
         n_extra = 2
@@ -1147,7 +1147,7 @@ class TestUpdateObservationsModes:
 
     def test_expand_with_excitation_error_gate(self):
         """min_excitation_error should gate which predicted-only spots are added."""
-        from torchsx.forward.predict import update_observations, PredictedReflections
+        from torchsx.deprecated.forward.predict import update_observations, PredictedReflections
 
         core = _make_mini_core(1, 5)
 
@@ -1175,7 +1175,7 @@ class TestUpdateObservationsModes:
 
     def test_invalid_mode_raises(self):
         """Invalid mode should raise ValueError."""
-        from torchsx.forward.predict import update_observations
+        from torchsx.deprecated.forward.predict import update_observations
 
         core = _make_mini_core(1, 3)
         pred = _make_predicted_from_core(core)

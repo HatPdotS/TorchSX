@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from torchsx.merge._distribution import (
+from torchsx.deprecated.merge._distribution import (
     DistributionComparison,
     HKLDistribution,
     _build_adjacency,
@@ -138,7 +138,7 @@ def _make_synthetic_stream(
             self.n_crystals = n_crystals
 
         def split_random(self, n_parts=2, seed=None):
-            from torchsx.merge._filter import filter_crystals as _fc
+            from torchsx.deprecated.merge._filter import filter_crystals as _fc
             g = torch.Generator()
             if seed is not None:
                 g.manual_seed(seed)

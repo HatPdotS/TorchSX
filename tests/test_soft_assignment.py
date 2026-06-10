@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from torchsx.forward._soft_assignment import SoftAssignmentLoss, SoftAssignmentResult
+from torchsx.deprecated.forward._soft_assignment import SoftAssignmentLoss, SoftAssignmentResult
 
 
 def _make_batch(B=10, ph=11, pw=11, device="cpu"):

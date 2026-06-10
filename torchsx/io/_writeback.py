@@ -34,7 +34,11 @@ def write_stream_reconstruct(
     from torchsx.io import _native
 
     mod = _native.load()
-    if mod is None:
+    # The native writer's argument list is fixed and carries no peak arrays, so a
+    # core that holds the raw peak search (a ``peak`` level, e.g. from build_stream)
+    # is written via the Python writer, which emits the "Peaks from peak search"
+    # section. Peak-less streams (parsed/merged) keep the fast native path.
+    if mod is None or "peak" in getattr(core, "levels", {}):
         return _write_stream_reconstruct_python(core, path, original_stream)
 
     return _write_stream_reconstruct_native(core, path, original_stream, mod, n_threads)
@@ -248,8 +252,32 @@ def _write_stream_reconstruct_python(
         iid = int(image_id_np[cid])
         image_to_crystals.setdefault(iid, []).append(cid)
 
-    # Panel name lookup array
-    max_pid = int(panel_id_np.max()) + 1 if len(panel_id_np) > 0 else 0
+    # --- Raw peak search (the `peak` level), if present ---
+    # Sorted by image id so each image's peaks are a contiguous slice; `peak_recip`
+    # is |q| in Å⁻¹ (= 1/d), converted to nm⁻¹ on write.
+    peak_lvl = core.levels.get("peak") if hasattr(core, "levels") else None
+    peak_offsets = pk_fs = pk_ss = pk_panel = pk_int = pk_recip = None
+    if peak_lvl is not None and peak_lvl.n > 0:
+        pk_img = peak_lvl["peak_image_id"].cpu().numpy()
+        pk_sort = np.argsort(pk_img, kind="stable")
+        pk_fs = peak_lvl["peak_fs"].cpu().numpy()[pk_sort]
+        pk_ss = peak_lvl["peak_ss"].cpu().numpy()[pk_sort]
+        pk_panel = peak_lvl["peak_panel"].cpu().numpy()[pk_sort]
+        pk_int = peak_lvl["peak_intensity"].cpu().numpy()[pk_sort]
+        pk_recip = peak_lvl["peak_recip"].cpu().numpy()[pk_sort]
+        pk_img = pk_img[pk_sort]
+        peak_offsets = np.zeros(core.n_images + 1, dtype=np.int64)
+        counts = np.bincount(pk_img, minlength=core.n_images)
+        np.cumsum(counts, out=peak_offsets[1:])
+
+    # Panel name lookup array (covers obs *and* peak panels; geometry names first,
+    # then "m{i}" fallback — peaks on un-indexed hits have no obs to bound the max).
+    peak_max_pid = int(pk_panel.max()) + 1 if pk_panel is not None and len(pk_panel) else 0
+    max_pid = max(
+        int(panel_id_np.max()) + 1 if len(panel_id_np) > 0 else 0,
+        peak_max_pid,
+        len(panel_names),
+    )
     pname_arr = [
         panel_names[i] if i < len(panel_names) else f"m{i}"
         for i in range(max_pid)
@@ -321,9 +349,16 @@ def _write_stream_reconstruct_python(
 
             crystal_ids = image_to_crystals.get(iid, [])
 
-            # Empty peak list (we don't store raw peaks)
+            # Peaks from peak search (the raw `peak` level, if present)
             f.write("Peaks from peak search\n")
             f.write("  fs/px   ss/px (1/d)/nm^-1   Intensity  Panel\n")
+            if peak_offsets is not None:
+                plo, phi = int(peak_offsets[iid]), int(peak_offsets[iid + 1])
+                f.write("".join(
+                    f"{pk_fs[j]:7.2f} {pk_ss[j]:7.2f} {pk_recip[j] * 10.0:11.6f} "
+                    f"{pk_int[j]:11.2f} {pname_arr[pk_panel[j]]}\n"
+                    for j in range(plo, phi)
+                ))
             f.write("End of peak list\n")
 
             # Crystals

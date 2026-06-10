@@ -581,11 +581,32 @@ class Geometry:
         return torch.from_numpy(self.radial_map())
 
     def angle_map(self) -> np.ndarray:
-        """Build (total_ss, total_fs) per-pixel radial angle ``atan2(y, x)`` (rad).
+        """Build (total_ss, total_fs) per-pixel radial angle in the **pixel frame** (rad).
 
-        Same per-panel ``x, y`` construction as :meth:`radial_map`; the angle gives
-        the orientation of the radial direction at each pixel, used to orient the
-        anisotropic spot kernel in the matched-filter finder.
+        This is the angle the matched-filter kernel needs to orient the anisotropic
+        spot profile, and it is **not** the lab-frame azimuth ``atan2(y, x)``. The
+        kernel is built on integer pixel offsets ``(dfs, dss)``, so it must be
+        steered by the outward radial direction *as it lies on the pixel grid*. The
+        two differ by the panel's in-plane rotation, which for JUNGFRAU is ≈90° and
+        *varies around the detector* (the panel axes are fixed in the lab while the
+        radial direction sweeps 360°), so using the lab azimuth misaligns the kernel
+        by a position-dependent amount and the anisotropy washes out.
+
+        Computed exactly per pixel (float64), with no orthonormality assumption:
+
+        * each pixel's full 3-D lab position ``P = corner + dfs·fs + dss·ss`` is
+          formed from the **3-D** edge vectors (out-of-plane tilt included);
+        * the radial reference ``R`` is the vector from the direct-beam foot to the
+          pixel, which lies in the panel plane (``R = P − foot``, ``foot`` = where the
+          beam axis pierces the plane) — for a flat ⟂ detector this is just ``(x, y, 0)``;
+        * ``R`` is resolved into the (fast, slow) pixel basis by solving the exact
+          2×2 basis-metric system ``G·[α, β]ᵀ = [fs·R, ss·R]ᵀ`` (``G`` = the Gram
+          matrix of the edge vectors), so non-unit / non-orthogonal / tilted edge
+          vectors are handled to float precision rather than approximated;
+        * the steering angle is ``θ = atan2(β, α)``.
+
+        ``α, β`` are the pixel-grid components of the radial direction, so the
+        kernel axis ``(cos θ, sin θ)·(dfs, dss)`` maps back onto ``R`` in the lab.
         """
         total_ss, total_fs = self.detector_shape
         a_map = np.zeros((total_ss, total_fs), dtype=np.float32)
@@ -594,23 +615,41 @@ class Geometry:
             ss0, ss1 = p.min_ss, p.max_ss
             n_ss = ss1 - ss0 + 1
             n_fs = p.max_fs - p.min_fs + 1
-            cx, cy = p.corner_x, p.corner_y
-            fsx, fsy, _ = p.fs_vec
-            ssx, ssy, _ = p.ss_vec
-            dfs = np.arange(n_fs, dtype=np.float32)[None, :]
-            dss = np.arange(n_ss, dtype=np.float32)[:, None]
-            x = cx + dfs * fsx + dss * ssx
-            y = cy + dfs * fsy + dss * ssy
-            a_map[ss0 : ss1 + 1, p.min_fs : p.max_fs + 1] = np.arctan2(y, x)
+            a = np.asarray(p.fs_vec, dtype=np.float64)   # fast-scan edge (3-D, px units)
+            b = np.asarray(p.ss_vec, dtype=np.float64)   # slow-scan edge
+            # panel-plane normal and the (generally non-orthonormal) basis metric
+            nrm = np.cross(a, b)
+            nn = np.linalg.norm(nrm)
+            nrm = nrm / nn if nn > 0 else np.array([0.0, 0.0, 1.0])
+            G = np.array([[a @ a, a @ b], [a @ b, b @ b]])
+            Ginv = np.linalg.inv(G)
+
+            dfs = np.arange(n_fs, dtype=np.float64)[None, :]
+            dss = np.arange(n_ss, dtype=np.float64)[:, None]
+            Px = p.corner_x + dfs * a[0] + dss * b[0]
+            Py = p.corner_y + dfs * a[1] + dss * b[1]
+            Pz = p.coffset + dfs * a[2] + dss * b[2]
+            # direct-beam foot: the beam axis (0,0,t) pierces the panel plane (P·n̂ = d)
+            # at z = d/n̂_z; its in-plane coords are the origin, so R = P − foot.
+            d = p.corner_x * nrm[0] + p.corner_y * nrm[1] + p.coffset * nrm[2]
+            foot_z = d / nrm[2] if abs(nrm[2]) > 1e-12 else 0.0
+            Rx, Ry, Rz = Px, Py, Pz - foot_z
+            # resolve R into the (fast, slow) pixel basis via the exact metric inverse
+            aR = a[0] * Rx + a[1] * Ry + a[2] * Rz
+            bR = b[0] * Rx + b[1] * Ry + b[2] * Rz
+            alpha = Ginv[0, 0] * aR + Ginv[0, 1] * bR    # fast-scan (dfs) component
+            beta = Ginv[1, 0] * aR + Ginv[1, 1] * bR     # slow-scan (dss) component
+            a_map[ss0 : ss1 + 1, p.min_fs : p.max_fs + 1] = np.arctan2(beta, alpha).astype(np.float32)
 
         return a_map
 
     @cached_property
     def pixel_angle_rad(self) -> torch.Tensor:
-        """Per-pixel radial angle from the beam center, in **radians**.
+        """Per-pixel radial angle in the **pixel frame**, in **radians**.
 
         Cached ``(total_ss, total_fs)`` float32 tensor; a thin torch view over
-        :meth:`angle_map`. Used to orient the anisotropic spot kernel in
+        :meth:`angle_map` (see there for why this is the pixel-frame radial angle,
+        not the lab azimuth). Used to orient the anisotropic spot kernel in
         :func:`~torchsx.datareduction.peakfinder.find_peaks_bayes`.
         """
         return torch.from_numpy(self.angle_map())

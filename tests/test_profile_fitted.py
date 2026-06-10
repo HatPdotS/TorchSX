@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from torchsx.forward._profile_fitted import ProfileFittedLoss, ProfileFittedResult
+from torchsx.deprecated.forward._profile_fitted import ProfileFittedLoss, ProfileFittedResult
 
 
 def _make_batch(B=10, ph=11, pw=11, device="cpu"):

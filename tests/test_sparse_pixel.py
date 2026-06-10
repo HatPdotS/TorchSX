@@ -3,12 +3,12 @@
 import torch
 import pytest
 
-from torchsx.forward._pixel_matching import (
+from torchsx.deprecated.forward._pixel_matching import (
     PixelReflectionPairs,
     SparseForwardResult,
     match_pixels_to_reflections,
 )
-from torchsx.forward._sparse_pixel_loss import SparsePixelLoss, SparsePixelResult
+from torchsx.deprecated.forward._sparse_pixel_loss import SparsePixelLoss, SparsePixelResult
 
 
 # ── Matching tests ─────────────────────────────────────────────────────
@@ -345,7 +345,7 @@ class TestScatterAdd:
 
 class TestPixelIndexMapperReverse:
     def test_flat_to_ss_fs(self):
-        from torchsx.forward._sparse_data import PixelIndexMapper
+        from torchsx.deprecated.forward._sparse_data import PixelIndexMapper
 
         # 4×4 mask with some bad pixels
         mask = torch.ones(4, 4, dtype=torch.bool)

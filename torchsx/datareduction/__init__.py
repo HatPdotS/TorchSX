@@ -63,6 +63,12 @@ from .noise_model import (
     calibrate_null,
     calibrate_spot_profile,
 )
+from .masking import (
+    build_detector_mask,
+    load_external_mask,
+    load_mask,
+    save_mask,
+)
 from .indexing import HEWL_CELL, IndexResult, index_spots
 from .curate import FrameRecord, curate_file, parse_dap, save_hits
 from .to_stream import build_stream, crystal_to_chunk, reciprocal_vectors
@@ -83,6 +89,10 @@ __all__ = [
     "calibrate_noise",
     "calibrate_null",
     "calibrate_spot_profile",
+    "build_detector_mask",
+    "load_external_mask",
+    "load_mask",
+    "save_mask",
     "refine_lattice",
     "refine_geometry",
     "crystals_from_stream",

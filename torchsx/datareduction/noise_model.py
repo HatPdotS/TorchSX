@@ -68,12 +68,16 @@ def _load_panels(reader, i: int, device):
     return reader.panels(int(i)).to(torch.float32).to(dev)
 
 
-def _frame_residuals(reader, geom: Geometry, i: int, *, n_iters, bin_width, device="cpu"):
+def _frame_residuals(reader, geom: Geometry, i: int, *, n_iters, bin_width, device="cpu",
+                     mask=None):
     """(mu, e, good) flat tensors for frame i: mu=b(r), e=I-b(r). Computed on
-    ``device`` (radial background runs there), matching the per-frame finder path."""
+    ``device`` (radial background runs there), matching the per-frame finder path.
+
+    ``mask`` (a ``(P,514,fs)`` good-mask) overrides ``reader.mask_panels()`` when given.
+    """
     dev = torch.device(device)
     panels = _load_panels(reader, i, dev)
-    good = reader.mask_panels().to(torch.bool).to(dev)
+    good = (reader.mask_panels() if mask is None else mask).to(torch.bool).to(dev)
     P, n_ss, n_fs = panels.shape
     r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(dev)
     val = panels.reshape(-1)
@@ -95,6 +99,7 @@ def calibrate_noise(
     # the strided draw below — not the raw size — is what makes the fit reproducible.
     max_pool_px: int = 12_000_000,
     device: str = "cpu",
+    mask=None,
 ) -> tuple[NoiseModel, dict]:
     """Fit ``sigma^2(mu)`` by pooling per-frame-background residuals over frames.
 
@@ -110,7 +115,7 @@ def calibrate_noise(
     mus, es = [], []
     for i in frame_indices:
         mu, e, g = _frame_residuals(reader, geom, int(i), n_iters=n_iters,
-                                    bin_width=bin_width, device=device)
+                                    bin_width=bin_width, device=device, mask=mask)
         sel = (g & torch.isfinite(e)).nonzero(as_tuple=False).squeeze(1)
         if sel.numel() > per_frame_cap:                  # deterministic strided subsample
             # Evenly-spaced (not random) so the σ²(μ) fit is reproducible run-to-run.
@@ -220,6 +225,8 @@ def calibrate_null(
     max_keep: int = 150_000_000,
     device: str = "cpu",
     profile: SpotProfile | None = None,
+    clean_null: bool = True,
+    mask=None,
 ) -> EmpiricalNull:
     """Pool background local-maximum significance over frames → :class:`EmpiricalNull`.
 
@@ -248,7 +255,7 @@ def calibrate_null(
             from .spot_profile import build_matched_filter_operator
             P0 = reader.n_panels
             n_ss0, n_fs0 = 514, geom.detector_shape[1]
-            good0 = reader.mask_panels().to(torch.bool).to(device)
+            good0 = (reader.mask_panels() if mask is None else mask).to(torch.bool).to(device)
             r0 = geom.pixel_radius_px.reshape(P0, n_ss0, n_fs0).to(torch.float32).to(device)
             ang0 = angle_full.reshape(P0, n_ss0, n_fs0)
             operator = build_matched_filter_operator(ang0, r0, good0, profile)
@@ -256,7 +263,7 @@ def calibrate_null(
     per_frame_cap = max(1, max_keep // max(1, len(frame_indices)))
     for i in frame_indices:
         panels = _load_panels(reader, int(i), device)
-        good = reader.mask_panels().to(torch.bool).to(device)
+        good = (reader.mask_panels() if mask is None else mask).to(torch.bool).to(device)
         P, n_ss, n_fs = panels.shape
         r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(device)
         val = panels
@@ -272,9 +279,17 @@ def calibrate_null(
             z = torch.where(good, (val - b) / sig.clamp(min=1e-6),
                             torch.full_like(val, float("-inf")))
         d = peak_min_distance
-        pooled = F.max_pool2d(z.unsqueeze(1), kernel_size=2 * d + 1, stride=1, padding=d)
-        is_max = (z == pooled.squeeze(1)) & good
-        zmax = z[is_max]
+        # Pool the null from background TROUGHS — local maxima of −z. Spots are
+        # positive excursions, so −z contains none of them: this is a
+        # contamination-free random-fluctuation null even on hit-rich runs (its
+        # depth distribution mirrors the background's positive maxima by the
+        # near-symmetry of the background; measured skew ~0.04). The old positive
+        # path (clean_null=False) pools real Bragg peaks into the high-z tail and
+        # biases p low whenever the calibration frames contain crystals.
+        score = torch.where(good, -z, torch.full_like(z, float("-inf"))) if clean_null else z
+        pooled = F.max_pool2d(score.unsqueeze(1), kernel_size=2 * d + 1, stride=1, padding=d)
+        is_max = (score == pooled.squeeze(1)) & good
+        zmax = score[is_max]
         total_lmax += int(zmax.numel())
         n_frames += 1
         if zmax.numel() > per_frame_cap:               # deterministic strided subsample
@@ -305,6 +320,7 @@ def calibrate_spot_profile(
     n_iters: int = 5,
     bin_width: float = 1.0,
     device: str = "cpu",
+    mask=None,
 ) -> SpotProfile:
     """Bootstrap the anisotropic spot-width **curves** σ_radial(r), σ_azimuthal(r).
 
@@ -327,7 +343,7 @@ def calibrate_spot_profile(
     n_spots = 0
     for i in frame_indices:
         panels = _load_panels(reader, int(i), device)
-        good = reader.mask_panels().to(torch.bool).to(device)
+        good = (reader.mask_panels() if mask is None else mask).to(torch.bool).to(device)
         P, n_ss, n_fs = panels.shape
         r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(device)
         b = radial_background(panels.reshape(-1), good.reshape(-1), r.reshape(-1),

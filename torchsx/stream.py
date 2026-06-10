@@ -117,7 +117,9 @@ class SFXStream:
         import warnings
         from torchsx.io._safetensors import load_sfx
 
-        stream = cls(load_sfx(path))
+        loaded = load_sfx(path)
+        detector_mask = getattr(loaded, "detector_mask", None)
+        stream = cls(loaded)
         sg = stream._core.spacegroup
         if not sg or sg == "P 1":
             warnings.warn(
@@ -132,6 +134,10 @@ class SFXStream:
             stream = stream.symmetrize()
         else:
             stream = cls(stream._core.replace(friedel_merged=False))
+        # The detector mask is a per-run constant; re-attach it after the
+        # symmetrize/replace post-processing (which rebuilds the core).
+        if detector_mask is not None:
+            stream._core.detector_mask = detector_mask
         return stream
 
     def save(self, path: str | Path):
@@ -232,6 +238,11 @@ class SFXStream:
         return self._core.metadata
 
     @property
+    def detector_mask(self) -> torch.Tensor | None:
+        """Embedded detector good-pixel mask ``(P, ss, fs)`` bool (True=good), or None."""
+        return getattr(self._core, "detector_mask", None)
+
+    @property
     def cell(self) -> torch.Tensor:
         """(N_crystals, 6) cell parameters in Å and degrees."""
         return self._core.cell
@@ -330,7 +341,8 @@ class SFXStream:
         if not fnames:
             return self
 
-        new_fnames = [re.sub(pattern, replacement, f) for f in fnames]
+        from torchsx._core import abspath_str
+        new_fnames = [abspath_str(re.sub(pattern, replacement, f)) for f in fnames]
 
         new_meta = deepcopy(self._core.metadata)
         new_meta["image"]["filename"] = new_fnames

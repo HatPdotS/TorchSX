@@ -5,14 +5,14 @@ import math
 import torch
 import pytest
 
-from torchsx.scaling import (
+from torchsx.deprecated.scaling import (
     AbsoluteScale,
     BScale,
     CompositeScalingLoss,
     ScalerInputs,
     prepare_scaler_inputs,
 )
-from torchsx.merge import MergedStructureFactor
+from torchsx.deprecated.merge import MergedStructureFactor
 
 
 # ---------------------------------------------------------------------------

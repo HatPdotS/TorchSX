@@ -11,12 +11,22 @@ chunks and concatenates them into the three-level core.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
+from .._core import abspath_str, _sx_joins_with_peaks
 from ..geometry import Geometry
 from ..io._stream_builder import StreamBuilder, StreamChunk
 from ..stream import SFXStream
 from ._schema import FS, INTENSITY, PANEL, PROB, SS
+from .masking import (
+    build_detector_mask,
+    default_mask_path,
+    load_external_mask,
+    load_mask,
+    save_mask,
+)
 from .indexing import HEWL_CELL, IndexResult, index_spots
 from .integrate import IntegrationResult, integrate_reflections
 from .spotfinding import PeakFinder8Params, find_spots_on_frame, spots_to_q
@@ -212,6 +222,62 @@ def predicted_to_chunk(
                        key=frame_key)
 
 
+def peaks_level(spots: torch.Tensor, geom: Geometry) -> dict[str, torch.Tensor]:
+    """Build the raw ``peak``-level columns from a finder spot table.
+
+    One row per spot the finder returned for the frame — the *full* peak search,
+    independent of indexing. Columns mirror the CrystFEL "Peaks from peak search"
+    record: detector position (``peak_fs``/``peak_ss`` in the same assembled-pixel
+    convention as obs ``fs``/``ss``, with ``peak_panel``), ``peak_intensity``, the
+    per-peak finder probability ``peak_prob`` (1.0 for non-probabilistic finders),
+    and the resolution ``peak_recip`` = |q| (Å⁻¹, i.e. 1/d). ``peak_image_id`` is
+    chunk-local (0); the builder offsets it onto the global image rows.
+
+    Distinct column names (``peak_*``/``peak_image_id``) keep the level from
+    shadowing obs/crystal columns through the ``BaseStream.__getattr__`` shim.
+    """
+    n = int(spots.shape[0])
+    q = spots_to_q(spots, geom)
+    recip = q.norm(dim=1).to(torch.float32) if n else torch.zeros(0, dtype=torch.float32)
+    prob = (spots[:, PROB].to(torch.float32) if spots.shape[1] > PROB
+            else torch.ones(n, dtype=torch.float32))
+    return {
+        "peak_fs": spots[:, FS].to(torch.float32),
+        "peak_ss": spots[:, SS].to(torch.float32),
+        "peak_panel": spots[:, PANEL].to(torch.int16),
+        "peak_intensity": spots[:, INTENSITY].to(torch.float32),
+        "peak_prob": prob,
+        "peak_recip": recip,
+        "peak_image_id": torch.zeros(n, dtype=torch.int32),  # chunk-local
+    }
+
+
+def image_only_chunk(
+    spots: torch.Tensor,
+    geom: Geometry,
+    *,
+    frame_key=None,
+    beam_energy_eV: float | None = None,
+) -> StreamChunk:
+    """A :class:`StreamChunk` for a HIT frame that did **not** index.
+
+    Carries the image-level record (with ``n_peaks``) plus the raw ``peak`` level,
+    but no crystal / observation rows — so every hit appears in the stream
+    (matching CrystFEL, which writes a chunk per hit whether or not it indexed).
+    """
+    n_peaks = int(spots.shape[0])
+    energy = geom.photon_energy_eV if beam_energy_eV is None else beam_energy_eV
+    image = {
+        "beam_energy": torch.tensor([energy], dtype=torch.float32),
+        "det_shift_x": torch.zeros(1, dtype=torch.float32),
+        "det_shift_y": torch.zeros(1, dtype=torch.float32),
+        "n_peaks": torch.tensor([n_peaks], dtype=torch.int32),
+        "camera_length": torch.tensor([geom.clen], dtype=torch.float32),
+    }
+    return StreamChunk(levels={"image": image, "peak": peaks_level(spots, geom)},
+                       key=frame_key)
+
+
 def _resolve_params(backend: str, params):
     """Pick a default finder-params object for ``backend`` when none is given."""
     if params is not None:
@@ -224,7 +290,7 @@ def _resolve_params(backend: str, params):
 
 def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
                want_null: bool = True, backend: str = "pf8", verbose: bool = False,
-               sigma_radial: float = 2.0, sigma_azimuthal: float = 0.7):
+               sigma_radial: float = 2.0, sigma_azimuthal: float = 0.7, mask=None):
     """Per-run calibration pass: fit the noise model ``σ²(μ)`` (+ empirical null).
 
     Samples ``n_calib`` frames evenly across ``reader.n_frames``. The noise model
@@ -244,7 +310,7 @@ def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
     n = reader.n_frames
     step = max(1, n // max(1, n_calib))
     calib_idx = list(range(0, n, step))[:n_calib]
-    noise_model, calib_dbg = calibrate_noise(reader, geom, calib_idx, device=device)
+    noise_model, calib_dbg = calibrate_noise(reader, geom, calib_idx, device=device, mask=mask)
     profile = None
     if backend == "bayes":
         # NOTE: σ_azimuthal≈0.7 is robust (mosaicity/divergence); σ_radial≈2.0 is the
@@ -257,7 +323,7 @@ def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
     if want_null:
         null = calibrate_null(reader, geom, noise_model, calib_idx,
                               peak_min_distance=params.peak_min_distance, device=device,
-                              profile=profile)
+                              profile=profile, mask=mask)
     if verbose:
         msg = (f"[calib] noise σ²(μ) coef a0..a3="
                f"{[round(c, 4) for c in calib_dbg['coef']]}")
@@ -277,12 +343,15 @@ def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
                  min_num_spots: int, int_radius: int = 4,
                  hit_min_sumprob: float = 2.0, profile=None, operator=None,
                  predict: bool = False, offset_max: float | None = None,
-                 pred_d_min: float | None = None):
+                 pred_d_min: float | None = None, keep_unindexed_hits: bool = True,
+                 mask=None):
     """Find spots on one frame, index them, and integrate.
 
-    Returns ``(chunk, n_obs, n_spots, result)`` for a successfully-indexed frame,
-    or ``None`` if the frame has too few spots or fails to index. Two integration
-    modes:
+    Returns ``(chunk, n_obs, n_spots, result)`` or ``None``. ``n_obs == 0`` flags
+    a **hit that did not index** (an image-only chunk carrying just the peak list);
+    ``n_obs > 0`` is a successfully-indexed crystal. ``None`` means not a hit (too
+    few spots, or gated out as near-blank), or — when ``keep_unindexed_hits`` is
+    False — a hit that failed to index. Two integration modes:
 
     * default (``predict=False``) — integrate the indexed **inliers** (found ∩
       indexed) at their found centroids;
@@ -303,7 +372,7 @@ def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
         panels = reader.panels_gpu(int(i), dev).to(torch.float32)
     else:
         panels = reader.panels(int(i)).to(torch.float32).to(dev)
-    good = reader.mask_panels().to(torch.bool).to(dev)
+    good = (reader.mask_panels() if mask is None else mask).to(torch.bool).to(dev)
     P, n_ss, n_fs = panels.shape
     radius = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(dev)
 
@@ -328,7 +397,13 @@ def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
     # `success` discarded >half the true hits. Refining every gated frame costs
     # more (refine is ~95 ms/frame on the A100) but ~doubles the indexed yield.
     if res.n_indexed < min_num_spots:
-        return None
+        # A hit (passed the spot-count + sum-prob gates) that failed to index.
+        # Keep it in the stream as an image-only chunk with its peak list, so the
+        # output mirrors CrystFEL (a chunk per hit, indexed or not).
+        if not keep_unindexed_hits:
+            return None
+        chunk = image_only_chunk(spots.cpu(), geom, frame_key=(reader.path, int(i)))
+        return chunk, 0, int(spots.shape[0]), res
 
     # Frame pixels for integration: reuse the tensors loaded above (single read).
     # The per-frame compute (find/index/integrate) ran on `dev`; the chunk/stream
@@ -353,16 +428,21 @@ def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
             pred, integ.cpu(), res.basis, cell6, geom,
             frame_key=(reader.path, int(i)), n_peaks_frame=int(spots.shape[0]),
         )
+        # Attach the raw peak search (all found spots) alongside the crystal.
+        chunk.levels["peak"] = peaks_level(spots.cpu(), geom)
         return chunk, len(pred), int(spots.shape[0]), res
 
     # default: integrate the indexed inliers at their found centroids
     sp_in = spots[inlier_dev]
     integ = integrate_reflections(panels, good, radius, sp_in, noise_model,
                                   r_int=int_radius)
+    spots_cpu = spots.cpu()
     chunk = crystal_to_chunk(
-        spots.cpu(), res, geom, frame_key=(reader.path, int(i)),
+        spots_cpu, res, geom, frame_key=(reader.path, int(i)),
         n_peaks_frame=int(spots.shape[0]), integration=integ.cpu(),
     )
+    # Attach the raw peak search (all found spots) alongside the crystal.
+    chunk.levels["peak"] = peaks_level(spots_cpu, geom)
     return chunk, int(res.n_indexed), int(spots.shape[0]), res
 
 
@@ -387,6 +467,14 @@ def build_stream(
     predict: bool = False,
     offset_max: float | None = None,
     pred_d_min: float | None = None,
+    keep_unindexed_hits: bool = True,
+    mask_detector: bool = True,
+    external_mask=None,
+    mask_path: str | None = None,
+    force_rebuild_mask: bool = False,
+    edge_dilate: int = 1,
+    module_border: int = 1,
+    persist_frac: float = 0.30,
     progress: bool = True,
     progress_interval: float = 10.0,
     verbose: bool = False,
@@ -408,12 +496,45 @@ def build_stream(
     if predict and offset_max is None:
         raise ValueError("predict=True requires offset_max (the Ewald-offset cutoff, Å⁻¹)")
 
+    # ── detector mask: build once (beamstop + edges, on top of pixel_mask), load a
+    # sidecar if present, or accept an externally-supplied mask. ``mask=None`` means
+    # the legacy behaviour (each callee reads ``reader.mask_panels()``). The auto-build
+    # needs a samplable reader; stub readers without ``n_frames`` skip it.
+    mask = None
+    sidecar = mask_path or (default_mask_path(source_path) if source_path else None)
+    if external_mask is not None and not mask_detector:
+        mask = load_external_mask(external_mask, n_panels=reader.n_panels,
+                                  det_fs=geom.detector_shape[1])
+        if verbose:
+            print(f"[mask] using external mask, good {float(mask.float().mean()) * 100:.2f}%")
+    elif mask_detector and hasattr(reader, "n_frames"):
+        if (sidecar and os.path.exists(sidecar) and not force_rebuild_mask
+                and external_mask is None):
+            mask = load_mask(sidecar)
+            if verbose:
+                print(f"[mask] loaded sidecar {sidecar}, good {float(mask.float().mean()) * 100:.2f}%")
+        else:
+            nfr = reader.n_frames
+            step = max(1, nfr // max(1, n_calib))
+            calib_idx = list(range(0, nfr, step))[:n_calib]
+            mask = build_detector_mask(
+                reader, geom, calib_idx, external=external_mask,
+                edge_dilate=edge_dilate, module_border=module_border,
+                persist_frac=persist_frac, device=device, verbose=verbose)
+            if sidecar:
+                save_mask(mask, sidecar, attrs={
+                    "edge_dilate": edge_dilate, "module_border": module_border,
+                    "persist_frac": persist_frac, "n_calib": len(calib_idx)})
+                if verbose:
+                    print(f"[mask] saved sidecar {sidecar}")
+    masked_frac = float((~mask.bool()).float().mean()) if mask is not None else None
+
     noise_model = null = profile = operator = None
     if calibrate:
         noise_model, null, profile, _ = _calibrate(
             reader, geom, params, n_calib=n_calib, device=device,
             want_null=(backend in ("torch", "bayes")), backend=backend, verbose=verbose,
-            sigma_radial=sigma_radial, sigma_azimuthal=sigma_azimuthal,
+            sigma_radial=sigma_radial, sigma_azimuthal=sigma_azimuthal, mask=mask,
         )
     # Build the fused matched-filter operator ONCE (geometry+mask+profile fixed) and
     # reuse it for every frame — the bayes finder's ~13x speedup over the conv path.
@@ -421,19 +542,23 @@ def build_stream(
         from .spot_profile import build_matched_filter_operator
         P0 = reader.n_panels
         n_ss0, n_fs0 = 514, geom.detector_shape[1]
-        good0 = reader.mask_panels().to(torch.bool).to(device)
+        good0 = (reader.mask_panels() if mask is None else mask).to(torch.bool).to(device)
         r0 = geom.pixel_radius_px.reshape(P0, n_ss0, n_fs0).to(torch.float32).to(device)
         ang0 = geom.pixel_angle_rad.reshape(P0, n_ss0, n_fs0).to(torch.float32).to(device)
         operator = build_matched_filter_operator(ang0, r0, good0, profile)
 
+    # The raw peak search rides along as a 4th ``peak`` level joined to image, so
+    # the builder must offset ``peak_image_id`` too (peak-less builders use the
+    # default two joins).
     builder = StreamBuilder.initialize(
-        geometry=geom, spacegroup=spacegroup, source_path=source_path
+        geometry=geom, spacegroup=spacegroup, source_path=source_path,
+        joins=_sx_joins_with_peaks(),
     )
 
     total = len(frames) if hasattr(frames, "__len__") else None
     pbar = _make_pbar(total, enabled=progress, interval=progress_interval)
 
-    n_tried = n_indexed = total_obs = 0
+    n_tried = n_hits = n_indexed = total_obs = 0
     for i in frames:
         n_tried += 1
         out = _index_frame(reader, geom, i, params, backend=backend,
@@ -443,31 +568,38 @@ def build_stream(
                            min_num_spots=min_num_spots, int_radius=int_radius,
                            hit_min_sumprob=hit_min_sumprob,
                            predict=predict, offset_max=offset_max,
-                           pred_d_min=pred_d_min)
+                           pred_d_min=pred_d_min,
+                           keep_unindexed_hits=keep_unindexed_hits, mask=mask)
         if out is not None:
             chunk, n_obs, n_spots, res = out
             builder.add(chunk)
-            n_indexed += 1
-            total_obs += n_obs
-            if verbose:
-                print(f"  frame {i}: indexed {n_obs}/{n_spots} "
-                      f"cell={[round(float(x),1) for x in res.cell_lengths]}")
+            n_hits += 1
+            if n_obs > 0:                       # indexed (n_obs == 0 ⇒ hit, no index)
+                n_indexed += 1
+                total_obs += n_obs
+                if verbose:
+                    print(f"  frame {i}: indexed {n_obs}/{n_spots} "
+                          f"cell={[round(float(x),1) for x in res.cell_lengths]}")
         if pbar is not None:
             pbar.update(1)
             # indexed-vs-processed + accumulated observations; rate/ETA are native
-            pbar.set_postfix(indexed=f"{n_indexed}/{n_tried}", obs=total_obs,
-                             refresh=False)
+            pbar.set_postfix(indexed=f"{n_indexed}/{n_tried}", hits=n_hits,
+                             obs=total_obs, refresh=False)
     if pbar is not None:
         pbar.close()
 
     core = builder.finalize()
     _attach_frame_metadata(core, builder)
+    if mask is not None:
+        core.detector_mask = mask.detach().to(torch.bool).cpu()
     stream = SFXStream(core)
     summary = {
         "frames_tried": n_tried,
+        "hits": n_hits,
         "crystals_indexed": n_indexed,
         "n_observations": total_obs,
         "spacegroup": spacegroup,
+        "masked_fraction": masked_frac,
     }
     return stream, summary
 
@@ -491,6 +623,8 @@ def _attach_frame_metadata(core, builder) -> None:
         start, _ = ranges["image"]
         path, frame_i = key
         if 0 <= start < n_img:
-            filename[start] = str(path)
+            # Store the frame's source path absolute so finetuning/excise can
+            # reload it regardless of the working directory.
+            filename[start] = abspath_str(str(path))
             event[start] = f"//{int(frame_i)}"
     core.metadata["image"] = {"filename": filename, "event": event}

@@ -19,6 +19,8 @@ import h5py
 import numpy as np
 import torch
 
+from torchsx._core import abspath_str
+
 # JUNGFRAU JF06T32V07: 32 modules stacked along the slow-scan axis, each 514×1030.
 JF_N_PANELS = 32
 JF_PANEL_SS = 514
@@ -48,7 +50,9 @@ class JungfrauReader:
     """
 
     def __init__(self, path: str | Path, data_path: str = DEFAULT_DATA_PATH):
-        self.path = str(path)
+        # Absolute so the path recorded in the stream (image filename, builder
+        # key) resolves regardless of the working directory at reload time.
+        self.path = abspath_str(str(path))
         self.data_path = data_path
         self._group_path = data_path.rsplit("/", 1)[0]  # e.g. /data/JF06T32V07
         self._h5: h5py.File | None = h5py.File(self.path, "r")

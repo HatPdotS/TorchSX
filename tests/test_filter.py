@@ -1,8 +1,13 @@
-"""Tests for filtering operations."""
+"""Tests for filtering operations.
+
+Exercises the live ``torchsx.merging.indexing.filter`` implementation (the
+deprecated ``merge._filter`` copy is retained for frozen ``deprecated``
+subpackages; see ``torchsx.deprecated``).
+"""
 
 import torch
 
-from torchsx.merge._filter import (
+from torchsx.merging.indexing.filter import (
     filter_cell,
     filter_crystals,
     filter_images,

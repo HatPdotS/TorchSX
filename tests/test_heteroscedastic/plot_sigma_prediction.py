@@ -26,7 +26,7 @@ from scipy.optimize import minimize_scalar
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tests.test_heteroscedastic.generate import sample_gengauss
-from torchsx.merge._dstep import fit_I0_poisson_log, fit_alpha
+from torchsx.deprecated.merge._dstep import fit_I0_poisson_log, fit_alpha
 
 
 def generate_one_trial(I0_true, alpha_true, beta_val, obs_per_hkl, background, seed):

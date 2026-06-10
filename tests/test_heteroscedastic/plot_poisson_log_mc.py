@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tests.test_heteroscedastic.generate import sample_gengauss, _make_positive_arrays
-from torchsx.merge._dstep import fit_I0_poisson_log, fit_I0_log, _log_gg_norm
+from torchsx.deprecated.merge._dstep import fit_I0_poisson_log, fit_I0_log, _log_gg_norm
 
 
 # ── Data generation (one trial) ─────────────────────────────────

@@ -126,6 +126,54 @@ def test_radial_map_shape(sample_geometry):
     assert r_map.dtype == np.float32
 
 
+def _max_steering_error_deg(geom: Geometry) -> float:
+    """Max angle (deg) between the matched-filter kernel radial axis — the stored
+    pixel-frame angle θ, mapped back to the lab via the real 3-D edge vectors as
+    ``cosθ·fs + sinθ·ss`` — and the true in-plane radial ``R = P − beam_foot``.
+
+    This is the actual quantity the anisotropic spot kernel is steered by, so it
+    must be ~0 (down to the float32 quantization of the stored angle) for the
+    matched filter to point radially. Lab-azimuth steering gives 90–180° here.
+    """
+    amap = geom.angle_map()
+    worst = 0.0
+    for p in geom.panels:
+        a = np.asarray(p.fs_vec); b = np.asarray(p.ss_vec)
+        n = np.cross(a, b); n = n / np.linalg.norm(n)
+        dfs = np.arange(p.n_fs)[None, :]; dss = np.arange(p.n_ss)[:, None]
+        Px = p.corner_x + dfs * a[0] + dss * b[0]
+        Py = p.corner_y + dfs * a[1] + dss * b[1]
+        Pz = p.coffset + dfs * a[2] + dss * b[2]
+        d = p.corner_x * n[0] + p.corner_y * n[1] + p.coffset * n[2]
+        foot_z = d / n[2]
+        R = np.stack([Px + 0 * dss, Py + 0 * dfs, Pz - foot_z], axis=-1)
+        th = amap[p.min_ss : p.max_ss + 1, p.min_fs : p.max_fs + 1].astype(np.float64)
+        u = np.cos(th)[..., None] * a + np.sin(th)[..., None] * b   # kernel axis → lab
+        cos = (u * R).sum(-1) / (np.linalg.norm(u, axis=-1) * np.linalg.norm(R, axis=-1) + 1e-30)
+        worst = max(worst, float(np.degrees(np.arccos(np.clip(cos, -1, 1))).max()))
+    return worst
+
+
+def _one_panel_geom(fs_vec, ss_vec, *, cx=-300.0, cy=200.0, coffset=0.0, n=64) -> Geometry:
+    p = Panel("t", 0, n - 1, 0, n - 1, cx, cy, tuple(fs_vec), tuple(ss_vec), coffset)
+    return Geometry(panels=[p], photon_energy_eV=12000.0, clen=0.1, res=1e4)
+
+
+def test_angle_map_steers_radially_real_geom(sample_geometry):
+    """Kernel radial axis aligns with the true radial to float precision."""
+    assert _max_steering_error_deg(sample_geometry) < 1e-4
+
+
+def test_angle_map_steers_radially_rotated_skewed_tilted():
+    """Exact for in-plane rotation, non-orthonormal (skew + non-unit) edges, and
+    out-of-plane tilt — no orthonormality assumption."""
+    c, s = np.cos(np.radians(30)), np.sin(np.radians(30))
+    assert _max_steering_error_deg(_one_panel_geom((c, s, 0), (-s, c, 0))) < 1e-4
+    assert _max_steering_error_deg(_one_panel_geom((1.007, 0.05, 0), (0.02, 0.987, 0))) < 1e-4
+    t = np.radians(15)
+    assert _max_steering_error_deg(_one_panel_geom((1, 0, 0), (0, np.cos(t), np.sin(t)))) < 1e-4
+
+
 def test_panel_corners_mm(sample_geometry):
     corners = sample_geometry.panels[0].corners_mm(sample_geometry.res)
     assert corners.shape == (4, 2)

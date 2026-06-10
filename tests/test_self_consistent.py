@@ -5,8 +5,8 @@ import math
 import torch
 import pytest
 
-from torchsx.scaling import AbsoluteScale, BScale, ScalerInputs
-from torchsx.target import SelfConsistentTarget
+from torchsx.deprecated.scaling import AbsoluteScale, BScale, ScalerInputs
+from torchsx.deprecated.target import SelfConsistentTarget
 
 
 # ---------------------------------------------------------------------------

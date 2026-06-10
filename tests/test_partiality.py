@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from torchsx.scaling._partiality import EwaldPartiality
+from torchsx.deprecated.scaling._partiality import EwaldPartiality
 
 
 @pytest.fixture

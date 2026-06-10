@@ -54,7 +54,10 @@ def _oriented_bank(sigma_radial: float, sigma_azimuthal: float, R: int,
     the unmasked matched-filter response unit-variance under an ``N(0,1)`` null.
     """
     offs = torch.arange(-R, R + 1, device=device, dtype=dtype)
-    dss, dfs = torch.meshgrid(offs, offs, indexing="ij")   # dss≈lab y, dfs≈lab x
+    # dss/dfs are slow/fast-scan *pixel* offsets; the steering angle (geom.angle_map)
+    # is the radial direction already resolved into this pixel frame, so u/v below are
+    # the radial/tangential axes on the pixel grid regardless of panel orientation.
+    dss, dfs = torch.meshgrid(offs, offs, indexing="ij")
     sr2 = max(float(sigma_radial), 1e-3) ** 2
     sa2 = max(float(sigma_azimuthal), 1e-3) ** 2
     thetas = torch.arange(n_orient, device=device, dtype=dtype) * (math.pi / n_orient)

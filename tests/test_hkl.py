@@ -1,8 +1,13 @@
-"""Tests for HKL indexing and merging."""
+"""Tests for HKL indexing and merging.
+
+Exercises the live ``torchsx.merging.indexing.hkl`` implementation (the
+deprecated ``merge._hkl`` copy it was lifted from is retained only because
+frozen ``deprecated`` subpackages still import it; see ``torchsx.deprecated``).
+"""
 
 import torch
 
-from torchsx.merge._hkl import compute_hkl_index, merge_intensities
+from torchsx.merging.indexing.hkl import compute_hkl_index, merge_intensities
 
 
 def test_compute_hkl_index_basic():

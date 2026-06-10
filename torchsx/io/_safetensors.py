@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 
-from torchsx._core import BaseStream, JoinSpec, _SFXStreamCore
+from torchsx._core import BaseStream, JoinSpec, _SFXStreamCore, absolutize_image_filenames
 from torchsx.geometry import Geometry
 from torchsx.io._metadata import StreamMetadata
 from torchsx.levels import Level
@@ -53,6 +53,11 @@ def save_sfx(core: BaseStream, path: str | Path):
                 v = v.to(torch.int32)
             tensors[f"_meta/{k}"] = v.contiguous().cpu()
 
+    # Detector good-pixel mask (True=good), embedded so the .sfx is self-contained.
+    detector_mask = getattr(core, "detector_mask", None)
+    if detector_mask is not None:
+        tensors["_detector_mask"] = detector_mask.to(torch.bool).contiguous().cpu()
+
     save_file(tensors, str(path))
 
     sidecar = {
@@ -62,6 +67,7 @@ def save_sfx(core: BaseStream, path: str | Path):
         "spacegroup": core.spacegroup,
         "source_path": core.source_path,
         "metadata_schema": meta_schema,
+        "has_detector_mask": detector_mask is not None,
     }
     if core.geometry:
         sidecar["geometry"] = core.geometry.to_dict()
@@ -90,6 +96,9 @@ def load_sfx(path: str | Path) -> BaseStream:
         StreamMetadata.from_tensors(meta_tensors, meta_schema)
         if meta_schema else StreamMetadata()
     )
+    # Normalise per-image source paths to absolute (covers streams written with
+    # relative paths); source_path itself is normalised in BaseStream.__init__.
+    absolutize_image_filenames(metadata)
 
     if sidecar.get("format") == "columnar-v2":
         levels = {
@@ -97,10 +106,13 @@ def load_sfx(path: str | Path) -> BaseStream:
             for name, lv_schema in sidecar["levels"].items()
         }
         joins = [JoinSpec(*j) for j in sidecar["joins"]]
-        return BaseStream._make(
+        obj = BaseStream._make(
             levels, joins, geometry, metadata,
             sidecar.get("spacegroup", "P 1"), sidecar.get("source_path", ""),
         )
+        if "_detector_mask" in all_tensors:
+            obj.detector_mask = all_tensors["_detector_mask"].to(torch.bool)
+        return obj
 
     return _load_legacy(all_tensors, sidecar, geometry, metadata)
 

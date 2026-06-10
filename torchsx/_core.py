@@ -15,9 +15,43 @@ attribute access (``core.hkl``, ``core.cell``, ``core.beam_energy``) is served b
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
+
+
+def abspath_str(p: str) -> str:
+    """Resolve a path string to an absolute, ``~``-expanded path.
+
+    Streams store filesystem paths (``source_path``, per-image ``filename``) so
+    that downstream consumers — finetuning / refinement reloads frames by
+    ``metadata['image']['filename']``, ``write_stream`` copies a header from
+    ``source_path`` — resolve correctly regardless of the current working
+    directory. Normalising to absolute at every ingress makes that robust.
+
+    Empty strings (e.g. an un-indexed image's filename placeholder) and
+    non-strings pass through unchanged; the call is idempotent on paths that are
+    already absolute.
+    """
+    if not isinstance(p, str) or not p:
+        return p
+    return os.path.abspath(os.path.expanduser(p))
+
+
+def absolutize_image_filenames(metadata) -> None:
+    """In place: rewrite ``metadata['image']['filename']`` entries to absolute paths.
+
+    Used at the load boundary so a stream written with relative paths comes back
+    with absolute ones. Safe on freshly-built metadata; no-op when the image
+    filename list is absent.
+    """
+    img = metadata.get("image") if metadata else None
+    if not img:
+        return
+    fnames = img.get("filename")
+    if fnames:
+        img["filename"] = [abspath_str(f) for f in fnames]
 
 from torchsx.geometry import Geometry
 from torchsx.io._metadata import StreamMetadata
@@ -66,6 +100,17 @@ def _default_sx_joins() -> list[JoinSpec]:
     ]
 
 
+def _sx_joins_with_peaks() -> list[JoinSpec]:
+    """Join set for a stream that carries a raw peak-search ``peak`` level.
+
+    The ``peak`` level holds one row per spot found by the peak finder (indexed or
+    not) and joins straight to ``image`` (peaks are an image-level product, not a
+    crystal one). Used by :func:`~torchsx.datareduction.to_stream.build_stream`;
+    the two-join default is kept for peak-less streams (parsed/legacy).
+    """
+    return _default_sx_joins() + [JoinSpec("peak", "peak_image_id", "image")]
+
+
 class BaseStream:
     """Generic columnar container: named :class:`Level`s + a join registry.
 
@@ -91,12 +136,17 @@ class BaseStream:
         self.geometry = geometry
         self.metadata = metadata if metadata is not None else StreamMetadata()
         self.spacegroup = spacegroup
-        self.source_path = source_path
+        # Always store provenance paths absolute (idempotent; "" passes through).
+        self.source_path = abspath_str(source_path)
         # Whether ``hkl`` has already been Friedel-merged (canonicalized to the
         # P-1 ASU, mates collapsed).  Drives anomalous-aware MTZ writing in
         # :meth:`torchsx.merging.posterior.Posterior.integrate`.  Default True
         # for backwards compatibility (the historical behaviour).
         self.friedel_merged = bool(friedel_merged)
+        # Optional detector good-pixel mask ``(P, ss, fs)`` bool (True=good) built by
+        # the masking pass. Carried here so it can be embedded in the .sfx; not threaded
+        # through transforms (set on a freshly built/loaded core). See torchsx.io._safetensors.
+        self.detector_mask: torch.Tensor | None = None
 
     # ---- attribute-compat shim ----------------------------------------
 
@@ -189,20 +239,46 @@ class BaseStream:
     def select_cascade(self, masks: dict[str, torch.Tensor]) -> "BaseStream":
         """Apply per-level boolean masks and rebuild contiguous join keys.
 
-        ``masks`` must supply a bool mask for each level (the caller cascades
-        obs↔crystal↔image consistency). This generalises the old ``_reindex``:
-        every column is subset in one loop and each :class:`JoinSpec`'s key
-        column is remapped onto the surviving parent rows.
+        ``masks`` need only supply a bool mask for the levels the caller cares
+        about (typically obs/crystal/image). Any child level present in the
+        stream but *absent* from ``masks`` (e.g. the raw ``peak`` level) has its
+        mask **derived** from its parent's: a child row survives iff its parent
+        does. This keeps every level join-consistent without each filter needing
+        to know about every level. Each column is then subset in one loop and
+        each :class:`JoinSpec`'s key column is remapped onto the surviving parent
+        rows.
         """
+        # Derive masks for child levels that the caller didn't supply, from the
+        # parent mask through the join (fixpoint: handles chains parent→child→…).
+        masks = dict(masks)
+        changed = True
+        while changed:
+            changed = False
+            for join in self.joins:
+                child = self.levels.get(join.child_level)
+                if child is None or join.key_column not in child:
+                    continue
+                if join.child_level in masks:
+                    continue
+                parent_mask = masks.get(join.parent_level)
+                if parent_mask is None:
+                    continue
+                key = child[join.key_column].long()
+                masks[join.child_level] = parent_mask[key]
+                changed = True
+
         new_levels: dict[str, Level] = {}
         for name, lvl in self.levels.items():
             mask = masks.get(name)
             new_levels[name] = lvl.select(mask) if mask is not None else lvl
 
         for join in self.joins:
+            child_level = self.levels.get(join.child_level)
+            if child_level is None or join.key_column not in child_level:
+                continue
             child_mask = masks.get(join.child_level)
             parent_mask = masks.get(join.parent_level)
-            if parent_mask is None or join.key_column not in self.levels[join.child_level]:
+            if parent_mask is None:
                 continue
             old_key = self.levels[join.child_level][join.key_column]
             kept_parent = parent_mask.nonzero(as_tuple=True)[0]
@@ -309,11 +385,13 @@ class BaseStream:
                 fresh.__setitem__(cname, val, lvl.schema.get(cname))
             new_levels[name] = fresh
 
-        return self._make(
+        obj = self._make(
             new_levels, self.joins, attrs["geometry"], attrs["metadata"],
             attrs["spacegroup"], attrs["source_path"],
             friedel_merged=attrs["friedel_merged"],
         )
+        obj.detector_mask = self.detector_mask  # detector-level constant; survives replace
+        return obj
 
     @classmethod
     def concat(cls, cores: list["BaseStream"]) -> "BaseStream":

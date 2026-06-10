@@ -47,7 +47,7 @@ def test_sfxstream_write_stream(sample_core, tmp_path):
     """Write stream via SFXStream API."""
     stream = SFXStream(sample_core)
     out_path = tmp_path / "output.stream"
-    stream.write_stream(out_path, mode="reconstruct")
+    stream.write_stream(out_path)
 
     text = out_path.read_text()
     assert "CrystFEL stream format 2.3" in text
@@ -164,6 +164,18 @@ def test_concat_preserves_data(sample_core):
     assert torch.equal(joined.hkl[:s.n_observations], s.hkl)
 
 
+def test_concat_carries_extra_column(sample_core):
+    """An arbitrary obs column (shoebox) rides along through concat."""
+    n = sample_core.n_observations
+    core = sample_core.with_columns("obs", shoebox=torch.arange(n * 4.0).reshape(n, 2, 2))
+    s = SFXStream(core)
+    joined = SFXStream.concat([s, s])
+    sb = joined._core.levels["obs"]["shoebox"]
+    assert sb.shape == (2 * n, 2, 2)
+    assert torch.equal(sb[:n], core.levels["obs"]["shoebox"])
+    assert type(joined._core).__name__ == "ShoeboxStreamCore"
+
+
 # ---------------------------------------------------------------------------
 # split_random
 # ---------------------------------------------------------------------------
@@ -176,11 +188,9 @@ def test_concat_preserves_data(sample_core):
 
 def test_symmetrize_friedel_mates(sample_core):
     """Friedel mates collapse to same canonical HKL under P -1."""
-    import dataclasses
-
     # Insert both (1,0,0) and (-1,0,0) as observations
     hkl = torch.tensor([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [2, 0, 0], [0, 2, 0]], dtype=torch.int16)
-    core = dataclasses.replace(sample_core, hkl=hkl)
+    core = sample_core.replace(hkl=hkl)
     stream = SFXStream(core)
 
     sym = stream.symmetrize("P -1")
@@ -201,9 +211,7 @@ def test_symmetrize_preserves_count(sample_core):
 
 def test_symmetrize_default_spacegroup(sample_core):
     """Uses core.spacegroup when no argument given."""
-    import dataclasses
-
-    core = dataclasses.replace(sample_core, spacegroup="P -1")
+    core = sample_core.replace(spacegroup="P -1")
     stream = SFXStream(core)
     sym = stream.symmetrize()
     assert sym._core.spacegroup == "P -1"
@@ -213,10 +221,8 @@ def test_symmetrize_default_spacegroup(sample_core):
 
 def test_load_merge_friedel(sample_core, tmp_path):
     """load() with merge_friedel applies symmetrize."""
-    import dataclasses
-
     hkl = torch.tensor([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [2, 0, 0], [0, 2, 0]], dtype=torch.int16)
-    core = dataclasses.replace(sample_core, hkl=hkl, spacegroup="P -1")
+    core = sample_core.replace(hkl=hkl, spacegroup="P -1")
     stream = SFXStream(core)
     path = tmp_path / "test.sfx"
     stream.save(path)

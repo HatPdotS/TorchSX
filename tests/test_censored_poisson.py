@@ -6,12 +6,12 @@ import torch
 import pytest
 from torch import Tensor
 
-from torchsx.forward._censored_poisson import (
+from torchsx.deprecated.forward._censored_poisson import (
     CensoredPoissonLoss,
     CensoredPoissonResult,
     compute_censoring_threshold,
 )
-from torchsx.forward._sparse_data import PixelIndexMapper
+from torchsx.deprecated.forward._sparse_data import PixelIndexMapper
 
 
 # ──────────────────────── compute_censoring_threshold ────────────────────────
