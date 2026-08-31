@@ -29,7 +29,7 @@ from torch import Tensor
 from torchref.refinement.loss_state import LossState
 
 from torchsx.merging.config import MergeConfig
-from torchsx.merging.indexing import PoissonNoiseModel
+from torchsx.merging.hkl import PoissonNoiseModel
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import PreparedObs, prepare_observations
 from torchsx.merging.parameters import Parameters

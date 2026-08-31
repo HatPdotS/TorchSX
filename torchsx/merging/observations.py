@@ -1,7 +1,7 @@
 """Observation preparation: stream → sorted tensors + initial estimates.
 
 Ported from ``torchsx.merging_clean.observations`` with imports redirected
-to the new ``torchsx.merging.indexing`` primitives.  ``ObsInfo`` lives
+to the new ``torchsx.merging.hkl`` primitives.  ``ObsInfo`` lives
 here too (it is per-observation *metadata*, not a correction-specific
 construct — keeping it next to ``PreparedObs`` avoids a circular import
 path once ``ScaleModel`` subclasses need it).
@@ -16,7 +16,7 @@ import torch
 from torch import Tensor
 
 from torchsx.merging.config import MergeConfig
-from torchsx.merging.indexing import (
+from torchsx.merging.hkl import (
     Adjacency,
     PoissonNoiseModel,
     build_adjacency,

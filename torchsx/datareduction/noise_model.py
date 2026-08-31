@@ -162,6 +162,61 @@ def calibrate_noise(
     return model, debug
 
 
+def calibrate_fixed_pattern(
+    reader,
+    geom: Geometry,
+    noise_model: NoiseModel,
+    frame_indices,
+    *,
+    n_iters: int = 5,
+    bin_width: float = 1.0,
+    wclip: float = 8.0,
+    device: str = "cpu",
+    mask=None,
+) -> torch.Tensor:
+    """Per-run beam-fixed background pattern ``f(p)`` in σ units, ``(P, 514, fs)``.
+
+    The per-frame radial background ``b(r)`` centers each shell's *mean* at ~0 but
+    leaves a large *within-shell* azimuthal structure (panel/module gain steps,
+    beamstop rim) that the matched filter integrates into a fat positive score tail —
+    making the FDR null collapse and the finder flag every frame as a hit. That
+    structure is **beam-fixed**, i.e. conserved across frames (validated split-half
+    Pearson r≈0.975 on run0032-lyso), so it is estimated once per run as
+
+        f(p) = ⟨ clamp( (I − b(r,frame)) / σ(b), ±wclip ) ⟩_frames
+
+    over good pixels. The whitened residual the Bayes finder ranks on is then
+    ``w = (I − b)/σ − f(p)``, which is white again. Winsorizing to ``±wclip`` keeps
+    sparse Bragg peaks / zingers out of the mean (they are rare per pixel over the
+    sample). Computed on ``device`` (radial background runs there), matching the
+    per-frame finder path; ``mask`` overrides ``reader.mask_panels()`` when given.
+
+    Returns ``f(p)`` as a CPU float32 tensor ``(P, 514, fs)`` (masked pixels = 0).
+    """
+    dev = torch.device(device)
+    good = (reader.mask_panels() if mask is None else mask).to(torch.bool).to(dev)
+    P, n_ss, n_fs = good.shape
+    r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(dev)
+    g = good.reshape(-1)
+    gf = g.to(torch.float64)
+    r_flat = r.reshape(-1)
+
+    s1 = torch.zeros(P * n_ss * n_fs, dtype=torch.float64, device=dev)
+    cnt = torch.zeros_like(s1)
+    for i in frame_indices:
+        panels = _load_panels(reader, int(i), dev).reshape(-1)
+        b = radial_background(panels, g, r_flat, n_iters=n_iters, min_snr=8.0,
+                              bin_width=bin_width)
+        sig = noise_model.sigma(b).clamp(min=1e-6)
+        w = torch.where(g, (panels - b) / sig, torch.zeros_like(panels))
+        w = w.clamp(-wclip, wclip)
+        s1 += w.to(torch.float64) * gf
+        cnt += gf
+    f = (s1 / cnt.clamp(min=1.0)).to(torch.float32).view(P, n_ss, n_fs)
+    f = torch.where(good, f, torch.zeros_like(f))
+    return f.cpu()
+
+
 # ──────────────────────────── empirical null ────────────────────────────────
 @dataclass
 class EmpiricalNull:
@@ -227,6 +282,8 @@ def calibrate_null(
     profile: SpotProfile | None = None,
     clean_null: bool = True,
     mask=None,
+    fixed_pattern: torch.Tensor | None = None,
+    calib=None,
 ) -> EmpiricalNull:
     """Pool background local-maximum significance over frames → :class:`EmpiricalNull`.
 
@@ -243,6 +300,10 @@ def calibrate_null(
     """
     bayes = profile is not None
     operator = None
+    fp = fixed_pattern.to(device) if fixed_pattern is not None else None
+    # The empirical calib is built on CPU (calibrate_* return .cpu()); the null is computed
+    # on `device`, so migrate it once here — bayes_score_map's calib branch reads its tensors.
+    calib = calib.to(device) if calib is not None else None
     if bayes:
         params = TorchPeakFinderParams(
             n_bg_iters=n_iters, bin_width=bin_width, peak_min_distance=peak_min_distance,
@@ -271,7 +332,7 @@ def calibrate_null(
             angle = angle_full.reshape(P, n_ss, n_fs)
             z, _b, _g = bayes_score_map(val, good, r, angle, params,
                                         noise_model=noise_model, profile=profile,
-                                        operator=operator)
+                                        operator=operator, fixed_pattern=fp, calib=calib)
         else:
             b = radial_background(val.reshape(-1), good.reshape(-1), r.reshape(-1),
                                   n_iters=n_iters, bin_width=bin_width).view(P, n_ss, n_fs)
@@ -303,6 +364,99 @@ def calibrate_null(
     z_sorted = torch.sort(torch.cat(pool))[0]
     return EmpiricalNull(z_sorted=z_sorted,
                          n_lmax_per_frame=total_lmax / max(1, n_frames))
+
+
+def calibrate_artefact_mask(
+    reader,
+    geom: Geometry,
+    noise_model: NoiseModel,
+    profile: SpotProfile,
+    fixed_pattern: torch.Tensor | None,
+    frame_indices,
+    *,
+    mask=None,
+    tau: float = 4.0,
+    zthr: float = 8.0,
+    min_fire: int = 3,
+    peak_min_distance: int = 2,
+    n_iters: int = 5,
+    bin_width: float = 1.0,
+    device: str = "cpu",
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Per-run **recurring-artefact** mask from matched-filter-score recurrence.
+
+    Bragg peaks are random per shot — a given pixel almost never fires; detector
+    artefacts (beamstop rim, aperture diffraction, panel edges, hot pixels) recur at
+    the **same** pixels. Over ``frame_indices`` count how often each pixel is a
+    score local maximum with ``S > tau`` (the f(p)-corrected matched-filter score the
+    Bayes finder ranks on), then compare to the **radius-stratified baseline**
+    ``lambda(shell)`` — the trimmed-mean firing rate over the shell (the typical
+    Bragg+noise rate at that radius, robust to the artefact tail). A pixel is flagged
+    when its count is a ``z > zthr`` Poisson outlier above ``N*lambda`` with at least
+    ``min_fire`` firings; the flagged region is dilated 1 px to cover the matched
+    filter's halo.
+
+    Validated on run0032-lyso (``experiments/hitfind_validation/artefact_diagnose.py``):
+    isolates the beamstop ring + panel edges in ~0.03% of pixels, ~100x separated from
+    the Bragg/noise bulk. Supersedes ``masking.build_detector_mask``'s weak
+    threshold-finder persistent-peak pass. Returns a bool mask **True = artefact**
+    ``(P, 514, fs)`` on CPU (AND its complement into the good mask).
+    """
+    dev = torch.device(device)
+    good = (reader.mask_panels() if mask is None else mask).to(torch.bool).to(dev)
+    P, n_ss, n_fs = good.shape
+    r = geom.pixel_radius_px.reshape(P, n_ss, n_fs).to(torch.float32).to(dev)
+    angle = geom.pixel_angle_rad.reshape(P, n_ss, n_fs).to(torch.float32).to(dev)
+    fp = fixed_pattern.to(dev) if fixed_pattern is not None else None
+    params = TorchPeakFinderParams(n_bg_iters=n_iters, bin_width=bin_width,
+                                   peak_min_distance=peak_min_distance)
+    # Build the fused operator once (geometry+mask+profile fixed) for the per-frame score.
+    operator = None
+    if dev.type == "cuda":
+        from .spot_profile import build_matched_filter_operator
+        operator = build_matched_filter_operator(angle, r, good, profile)
+
+    d = peak_min_distance
+    fire = torch.zeros(P * n_ss * n_fs, dtype=torch.float32, device=dev)
+    n_frames = 0
+    for i in frame_indices:
+        panels = _load_panels(reader, int(i), dev)
+        S, _b, _g = bayes_score_map(panels, good, r, angle, params,
+                                    noise_model=noise_model, profile=profile,
+                                    operator=operator, fixed_pattern=fp)
+        pooled = F.max_pool2d(S.unsqueeze(1), kernel_size=2 * d + 1, stride=1,
+                              padding=d).squeeze(1)
+        is_max = (S == pooled) & good & (S > tau)
+        fire += is_max.reshape(-1).to(torch.float32)
+        n_frames += 1
+
+    # radius-stratified baseline lambda(shell) = trimmed-mean firing rate (drop the
+    # top decile = artefact tail), then per-pixel Poisson z over N*lambda.
+    rb = r.reshape(-1).round().long().clamp(min=0)
+    nbin = int(rb.max().item()) + 1
+    gfl = good.reshape(-1)
+    rate = fire / max(1, n_frames)
+    lam = torch.zeros(nbin, device=dev)
+    for b in range(nbin):
+        m = gfl & (rb == b)
+        if int(m.sum()) < 50:
+            continue
+        rr = rate[m]
+        hi = torch.quantile(rr, 0.90).clamp(min=1e-9)
+        keep = rr <= hi
+        lam[b] = rr[keep].mean() if bool(keep.any()) else rr.mean()
+    mu = (n_frames * lam[rb]).clamp(min=1e-6)
+    z = (fire - mu) / mu.sqrt()
+    artefact = (gfl & (z > zthr) & (fire >= float(min_fire))).view(P, n_ss, n_fs)
+
+    from .masking import _dilate_bad
+    artefact = ~_dilate_bad(~artefact, 1)              # grow artefact region by 1 px
+    if verbose:
+        print(f"[artefact] recurring: {int(artefact.sum()):,} px "
+              f"({100.0 * float(artefact.float().mean()):.3f}%) over {n_frames} frames "
+              f"(τ={tau}, z>{zthr})")
+    return artefact.cpu()
 
 
 def calibrate_spot_profile(

@@ -20,7 +20,7 @@ from torchsx.merging.quadrature import TrapezoidalLogGrid
 from torchsx.merging.scale import CompositeScale, ScaleBPerCrystal
 from torchsx.merging.scatter import GenGaussLogScatter
 from torchsx.merging.targets import DataNLLTarget
-from torchsx.merging.indexing import build_adjacency
+from torchsx.merging.hkl import build_adjacency
 
 
 def _fake_prep(n_obs: int = 600, n_hkl: int = 12, n_crystals: int = 4, seed: int = 0) -> PreparedObs:

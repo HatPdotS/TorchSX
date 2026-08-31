@@ -48,13 +48,15 @@ class Reprocessor:
         if key not in self._calib:
             from torchsx.datareduction.peakfinder import TorchPeakFinderParams
             from torchsx.datareduction.to_stream import _calibrate
-            nm, null, profile, _ = _calibrate(
+            nm, null, profile, fp, good, _, _ = _calibrate(
                 reader, self.geom, TorchPeakFinderParams(),
                 n_calib=self.n_calib, device=str(self.device),
                 want_null=True, backend="bayes",
                 sigma_radial=sr, sigma_azimuthal=sa,
             )
-            self._calib[key] = (nm, null, profile)
+            fp = fp.to(self.device) if fp is not None else None
+            good = good.to(self.device) if good is not None else None
+            self._calib[key] = (nm, null, profile, fp, good)
         return self._calib[key]
 
     # ── stage 1: find peaks ──────────────────────────────────────────────────
@@ -70,7 +72,7 @@ class Reprocessor:
         sr = self.DEFAULT_SR if sigma_radial is None else float(sigma_radial)
         sa = self.DEFAULT_SA if sigma_azimuthal is None else float(sigma_azimuthal)
         reader, fidx = self._reader_for(i)
-        nm, null, profile = self._calibrate(reader, sr, sa)
+        nm, null, profile, fixed_pattern, good_cal = self._calibrate(reader, sr, sa)
 
         params = TorchPeakFinderParams(top_n=int(top_n),
                                        peak_min_distance=int(peak_min_distance))
@@ -78,11 +80,13 @@ class Reprocessor:
             panels = reader.panels_gpu(fidx, self.device).to(torch.float32)
         else:
             panels = reader.panels(fidx).to(torch.float32).to(self.device)
-        good = reader.mask_panels().to(torch.bool).to(self.device)
+        good = (good_cal if good_cal is not None
+                else reader.mask_panels().to(torch.bool).to(self.device))
         spots = find_spots_on_frame(
             reader, fidx, self.geom, params, backend="bayes",
             noise_model=nm, null=null, profile=profile,
             panels=panels, mask=good, pix_r=self._radius, angle=self._angle,
+            fixed_pattern=fixed_pattern,
         ).detach().cpu().numpy()
 
         has_prob = spots.shape[1] > PROB

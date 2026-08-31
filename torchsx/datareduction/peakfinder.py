@@ -289,6 +289,7 @@ def find_peaks_prob(
     *,
     noise_model=None,
     null=None,
+    calib=None,
 ) -> torch.Tensor:
     """Thresholdless probabilistic spot finder — always returns the top-N peaks.
 
@@ -338,7 +339,15 @@ def find_peaks_prob(
         sigma_px = sigma_px.view(P, n_ss, n_fs)
 
     # ── 2. significance map (−inf at masked pixels so they're never maxima) ───
-    z = (val - mean_px) / sigma_px.clamp(min=eps)
+    if calib is not None:
+        from .calibration import _whiten_from_bg
+        z = _whiten_from_bg(
+            val.reshape(-1), mean_px.reshape(-1), sigma_px.clamp(min=eps).reshape(-1),
+            good.reshape(-1), empirical=calib.empirical,
+            per_pixel=calib.per_pixel, fixed_pattern=calib.fixed_pattern,
+        ).view(P, n_ss, n_fs)
+    else:
+        z = (val - mean_px) / sigma_px.clamp(min=eps)
     z = torch.where(good, z, torch.full_like(z, float("-inf")))
 
     # ── 3. per-panel local maxima ────────────────────────────────────────────
@@ -410,6 +419,8 @@ def bayes_score_map(
     noise_model=None,
     profile=None,
     operator=None,
+    fixed_pattern=None,
+    calib=None,
 ):
     """Whitened residual ``w``, background ``b``, and matched-filter score ``S``.
 
@@ -451,8 +462,25 @@ def bayes_score_map(
         mean_px = mean_px.view(P, n_ss, n_fs)
         sigma_px = sigma_px.view(P, n_ss, n_fs)
 
-    w = (val - mean_px) / sigma_px.clamp(min=eps)
-    w = torch.where(good, w, torch.zeros_like(w))         # masked → 0 evidence
+    if calib is not None:
+        # Empirical calibration: normal-score transform w = Φ⁻¹(F(e|μ)) — N(0,1) under
+        # background — instead of the Gaussian (I−b)/σ − f(p). Reuses the b/σ just computed
+        # so the FDR null (calibrate_null) and the finder whiten through the SAME code.
+        from .calibration import _whiten_from_bg
+        w = _whiten_from_bg(
+            val.reshape(-1), mean_px.reshape(-1), sigma_px.clamp(min=eps).reshape(-1),
+            good.reshape(-1), empirical=calib.empirical,
+            per_pixel=calib.per_pixel, fixed_pattern=calib.fixed_pattern,
+        ).view(P, n_ss, n_fs)
+    else:
+        w = (val - mean_px) / sigma_px.clamp(min=eps)
+        w = torch.where(good, w, torch.zeros_like(w))         # masked → 0 evidence
+        if fixed_pattern is not None:
+            # Subtract the beam-fixed background pattern f(p) (σ units) so the residual
+            # is white again — without it the matched filter integrates the conserved
+            # within-shell structure into a fat positive tail (see calibrate_fixed_pattern).
+            w = torch.where(good, w - fixed_pattern.to(device=w.device, dtype=w.dtype),
+                            torch.zeros_like(w))
     if operator is not None and w.is_cuda:
         # exact-fp32 fused Triton path; ~13x the conv path, no materialized bank
         S = matched_filter_score_fused(w, operator)
@@ -474,6 +502,8 @@ def find_peaks_bayes(
     null=None,
     profile=None,
     operator=None,
+    fixed_pattern=None,
+    calib=None,
 ) -> torch.Tensor:
     """Fully-Bayesian matched-filter spot finder — always returns the top-N peaks.
 
@@ -514,6 +544,7 @@ def find_peaks_bayes(
     z, mean_px, good = bayes_score_map(
         panels, mask_panels, pix_r_panels, angle_panels, params,
         noise_model=noise_model, profile=profile, operator=operator,
+        fixed_pattern=fixed_pattern, calib=calib,
     )
 
     # ── 2. per-panel local maxima of the score ───────────────────────────────

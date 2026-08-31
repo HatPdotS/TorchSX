@@ -1,18 +1,18 @@
-"""HKL indexing, filtering, shell statistics, noise model, adjacency.
+"""HKL-level data-prep primitives: indexing, filtering, shell statistics,
+noise model, adjacency.
 
-These are data-preparation primitives used by ``stream.py`` and by
-``observations.prepare_observations``.  Ported from the legacy
-``torchsx.merge`` package; that package will be moved to
-``torchsx.deprecated`` once the refactor lands end-to-end.
+Used by ``stream.py`` and by ``observations.prepare_observations``.  This is the
+HKL/reflection bookkeeping layer of the merge engine — *not* crystallographic
+lattice indexing (that lives in ``torchsx.datareduction.indexing``).
 """
 
-from torchsx.merging.indexing.hkl import (
+from torchsx.merging.hkl.hkl import (
     HKLIndex,
     compute_hkl_index,
     merge_intensities,
     merge_median,
 )
-from torchsx.merging.indexing.filter import (
+from torchsx.merging.hkl.filter import (
     filter_resolution,
     filter_ewald,
     filter_crystals,
@@ -20,7 +20,7 @@ from torchsx.merging.indexing.filter import (
     filter_outliers,
     filter_cell,
 )
-from torchsx.merging.indexing.stats import (
+from torchsx.merging.hkl.stats import (
     completeness,
     multiplicity,
     match_halves,
@@ -34,13 +34,13 @@ from torchsx.merging.indexing.stats import (
     format_shell_table,
     write_shell_csv,
 )
-from torchsx.merging.indexing.noise import (
+from torchsx.merging.hkl.noise import (
     PoissonNoiseModel,
     compute_sigma2_LN,
     compute_sigma2_LN_exact,
 )
-from torchsx.merging.indexing.shell_fit import fit_shell_gengauss_gauss
-from torchsx.merging.indexing.adjacency import Adjacency, build_adjacency, dirichlet_energy
+from torchsx.merging.hkl.shell_fit import fit_shell_gengauss_gauss
+from torchsx.merging.hkl.adjacency import Adjacency, build_adjacency, dirichlet_energy
 
 __all__ = [
     "HKLIndex",

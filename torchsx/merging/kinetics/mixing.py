@@ -108,6 +108,8 @@ class KineticMixing(nn.Module):
         # into A so the user-facing ``n_states`` matches the number of
         # structurally distinct states.
         self.light_activated = bool(light_activated)
+        self.activation_level = float(activation_level)
+        self.instrument_function = str(instrument_function)
         if self.light_activated:
             init_state = self.kinetic.initial_state
             inactive_state = init_state + "*"
@@ -163,6 +165,26 @@ class KineticMixing(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Build ``(F_total_re, F_total_im)`` per observation.
 
+        Computes ``populations()`` internally — use
+        :meth:`mix_with_populations` when the caller has already
+        computed the populations tensor and wants to reuse it across
+        many mix calls (per-chunk kinetic loss, hot path).
+        """
+        pops = self.populations()                        # (n_t, K)
+        return self.mix_with_populations(
+            pops, params, hkl_idx, crystal_id, crystal_delay_bin,
+        )
+
+    def mix_with_populations(
+        self,
+        pops: Tensor,                 # (n_timepoints, K) precomputed
+        params,                       # KineticEnsembleParameters
+        hkl_idx: Tensor,              # (Nobs,) int64
+        crystal_id: Tensor,           # (Nobs,) int64
+        crystal_delay_bin: Tensor,    # (n_crystals,) int64
+    ) -> tuple[Tensor, Tensor]:
+        """Same as :meth:`mix` but consumes a caller-supplied ``pops`` tensor.
+
         Notes
         -----
         ``crystal_delay_bin`` is per-crystal (full table), so we
@@ -176,7 +198,6 @@ class KineticMixing(nn.Module):
                 f"but KineticMixing has {self.n_states}"
             )
 
-        pops = self.populations()                        # (n_t, K)
         obs_bin = crystal_delay_bin[crystal_id]          # (Nobs,)
         # Sentinel -1 (unlabelled crystal) is *not* allowed here — caller
         # should have filtered it out at PreparedObs construction time.

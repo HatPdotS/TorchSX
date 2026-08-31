@@ -11,7 +11,7 @@ from typing import Literal
 
 from torch import Tensor
 
-from torchsx.merging.indexing.adjacency import Adjacency, dirichlet_energy
+from torchsx.merging.hkl.adjacency import Adjacency, dirichlet_energy
 from torchsx.merging.parameters import Parameters
 from torchsx.merging.regularizers.base import Regularizer
 
@@ -24,7 +24,7 @@ class MillerGraphSmoothness(Regularizer):
     Parameters
     ----------
     adjacency : ±1 Miller adjacency graph over the valid HKLs
-        (from :func:`torchsx.merging.indexing.build_adjacency`).
+        (from :func:`torchsx.merging.hkl.build_adjacency`).
     target : which per-HKL parameter field to smooth (``log_I0``,
         ``log_alpha``, or ``log_beta``).
     """

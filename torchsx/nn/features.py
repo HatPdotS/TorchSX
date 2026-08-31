@@ -40,7 +40,7 @@ import torch
 from torch import Tensor
 
 from torchsx.merging.observations import _ewald_offset
-from torchsx.merging.indexing import compute_hkl_index
+from torchsx.merging.hkl import compute_hkl_index
 from torchsx.nn.pad import group_offsets_from_counts, pack, unpack
 
 # Default smooth-geometry + per-crystal-aggregate features the scale head may see.

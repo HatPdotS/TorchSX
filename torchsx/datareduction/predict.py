@@ -154,14 +154,17 @@ def signal_vs_offset(
     initial_cell = HEWL_CELL if initial_cell is None else initial_cell
 
     noise_model = null = profile = None
-    nm, nl, prof, _ = _calibrate(reader, geom, params, n_calib=n_calib, device=device,
-                                 want_null=(backend in ("torch", "bayes")), backend=backend)
+    nm, nl, prof, fp, good, _, _ = _calibrate(reader, geom, params, n_calib=n_calib, device=device,
+                                              want_null=(backend in ("torch", "bayes")), backend=backend)
     noise_model, null, profile = nm, nl, prof
+    fixed_pattern = fp.to(device) if fp is not None else None
+    good_mask = good.to(device) if good is not None else None
 
     abs_r, i_over_sig, i_vals = [], [], []
     for i in frames:
         spots = find_spots_on_frame(reader, i, geom, params, backend=backend,
-                                    noise_model=noise_model, null=null, profile=profile)
+                                    noise_model=noise_model, null=null, profile=profile,
+                                    mask=good_mask, fixed_pattern=fixed_pattern)
         if spots.shape[0] < min_num_spots:
             continue
         q = spots_to_q(spots, geom)

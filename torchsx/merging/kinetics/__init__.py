@@ -26,15 +26,31 @@ against per-timepoint pre-merged amplitudes.
 from torchsx.merging.kinetics.parameters import KineticEnsembleParameters
 from torchsx.merging.kinetics.mixing import KineticMixing
 from torchsx.merging.kinetics.phase_restraint import PhaseRestraint
+from torchsx.merging.kinetics.regularizers import ExcitedAmplitudeAnchor
 from torchsx.merging.kinetics.initial_fit import (
     PerBinAmplitudes,
     fit_initial_kinetic_ensemble,
+    per_bin_premerging,
+)
+from torchsx.merging.kinetics.data_target import KineticDataNLLTarget
+from torchsx.merging.kinetics.loss import KineticLogSpaceLoss
+from torchsx.merging.kinetics.output import (
+    write_kinetic_params_json,
+    write_per_state_mtzs,
+    write_predicted_bin_mtzs,
 )
 
 __all__ = [
     "KineticEnsembleParameters",
     "KineticMixing",
     "PhaseRestraint",
+    "ExcitedAmplitudeAnchor",
     "PerBinAmplitudes",
     "fit_initial_kinetic_ensemble",
+    "per_bin_premerging",
+    "KineticDataNLLTarget",
+    "KineticLogSpaceLoss",
+    "write_kinetic_params_json",
+    "write_per_state_mtzs",
+    "write_predicted_bin_mtzs",
 ]

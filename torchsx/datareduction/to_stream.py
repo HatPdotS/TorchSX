@@ -290,7 +290,9 @@ def _resolve_params(backend: str, params):
 
 def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
                want_null: bool = True, backend: str = "pf8", verbose: bool = False,
-               sigma_radial: float = 2.0, sigma_azimuthal: float = 0.7, mask=None):
+               sigma_radial: float = 2.0, sigma_azimuthal: float = 0.7, mask=None,
+               artefact_filter: bool = True, calib_mode: str = "legacy",
+               bragg_mean: float = 10.0):
     """Per-run calibration pass: fit the noise model ``σ²(μ)`` (+ empirical null).
 
     Samples ``n_calib`` frames evenly across ``reader.n_frames``. The noise model
@@ -302,10 +304,21 @@ def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
     radially smeared by the beam's spectral bandwidth but azimuthally sharp, so this
     indexes ~+45% more crystals than an isotropic profile (and the bootstrap
     ``calibrate_spot_profile`` over-estimated σ ~3× and missed the anisotropy). The
-    null is fit on that score. Returns ``(noise_model, null, profile, dbg)``.
+    null is fit on that score. For ``"bayes"`` the beam-fixed background pattern
+    ``f(p)`` (:func:`~torchsx.datareduction.noise_model.calibrate_fixed_pattern`) is
+    also fit, and (when ``artefact_filter``) recurring detector artefacts (beamstop
+    rim/edges) are masked by score recurrence
+    (:func:`~torchsx.datareduction.noise_model.calibrate_artefact_mask`); the null is
+    calibrated on the f-corrected score over the refined mask. Returns
+    ``(noise_model, null, profile, fixed_pattern, good, dbg, calib)`` — ``good`` is the
+    (artefact-refined) good-pixel mask to use for the operator + per-frame finding, and
+    ``calib`` is the empirical :class:`~torchsx.datareduction.calibration.Calibration`
+    (``None`` unless ``calib_mode`` is ``"empirical"``/``"per_pixel"``); when set, the
+    finder whitens with the normal-score transform instead of ``(I−b)/σ − f(p)``.
     """
     import math
-    from .noise_model import calibrate_noise, calibrate_null
+    from .noise_model import (calibrate_artefact_mask, calibrate_fixed_pattern,
+                              calibrate_noise, calibrate_null)
     from .spot_profile import SpotProfile
     n = reader.n_frames
     step = max(1, n // max(1, n_calib))
@@ -319,11 +332,52 @@ def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
         R = int(min(8, max(2, math.ceil(3 * sigma_radial))))
         profile = SpotProfile.constant(sigma_radial, sigma_azimuthal,
                                        kernel_radius=R, n_orient=12)
+    # Beam-fixed background pattern f(p) (σ units) — Bayes path only. Must be fit
+    # BEFORE the null, because the null is calibrated on the f-corrected score.
+    fixed_pattern = None
+    if backend == "bayes":
+        fixed_pattern = calibrate_fixed_pattern(reader, geom, noise_model, calib_idx,
+                                                device=device, mask=mask)
+    # Recurring-artefact mask (beamstop rim/edges) from score recurrence — Bayes path
+    # only, needs noise+f(p). Refine the good mask; the null + operator use the result.
+    base = (reader.mask_panels() if mask is None else mask).to(torch.bool)
+    good = base
+    n_artefact = 0
+    if backend == "bayes" and artefact_filter:
+        artefact = calibrate_artefact_mask(reader, geom, noise_model, profile,
+                                           fixed_pattern, calib_idx, mask=base,
+                                           device=device, verbose=verbose)
+        good = base & ~artefact.to(base.device)
+        n_artefact = int(artefact.sum())
+    # Empirical calibration: replace the Gaussian (I−b)/σ − f(p) whitening with the
+    # normal-score transform w = Φ⁻¹(F(e|μ)). "per_pixel" adds the constant channel
+    # (c_p, σ_p) in place of f(p); "empirical" keeps f(p). Built on the refined `good`
+    # mask; the null below MUST be calibrated on the same calib so it matches the finder.
+    calib = None
+    if calib_mode in ("empirical", "per_pixel", "bragg_lr") and backend == "bayes":
+        from .calibration import (Calibration, calibrate_empirical_noise,
+                                  calibrate_per_pixel)
+        if calib_mode == "per_pixel":
+            ppm = calibrate_per_pixel(reader, geom, noise_model, calib_idx,
+                                      device=device, mask=good)
+            emp = calibrate_empirical_noise(reader, geom, noise_model, calib_idx,
+                                            per_pixel=ppm, device=device, mask=good)
+            calib = Calibration(noise_model=noise_model, empirical=emp, per_pixel=ppm)
+        else:
+            # "empirical" = null-only normal-score; "bragg_lr" adds the Bragg log-LR signal
+            # term (design doc §2) that re-ranks weak peaks above the white background.
+            bm = bragg_mean if calib_mode == "bragg_lr" else None
+            emp = calibrate_empirical_noise(reader, geom, noise_model, calib_idx,
+                                            fixed_pattern=fixed_pattern, bragg_mean=bm,
+                                            device=device, mask=good)
+            calib = Calibration(noise_model=noise_model, empirical=emp,
+                                fixed_pattern=fixed_pattern)
     null = None
     if want_null:
         null = calibrate_null(reader, geom, noise_model, calib_idx,
                               peak_min_distance=params.peak_min_distance, device=device,
-                              profile=profile, mask=mask)
+                              profile=profile, mask=good, calib=calib,
+                              fixed_pattern=(None if calib is not None else fixed_pattern))
     if verbose:
         msg = (f"[calib] noise σ²(μ) coef a0..a3="
                f"{[round(c, 4) for c in calib_dbg['coef']]}")
@@ -332,16 +386,23 @@ def _calibrate(reader, geom: Geometry, params, *, n_calib: int, device: str,
             msg += (f"  spot σ_rad={float(sr.min()):.2f}-{float(sr.max()):.2f} "
                     f"σ_azim={float(sa.min()):.2f}-{float(sa.max()):.2f} "
                     f"over {profile.n_bands} radius band(s)")
+        if fixed_pattern is not None:
+            msg += f"  fixed-pattern RMS={float(fixed_pattern.pow(2).mean().sqrt()):.3f}σ"
+        if n_artefact:
+            msg += f"  artefact px={n_artefact}"
         if null is not None:
             msg += f"  null n_lmax/frame={null.n_lmax_per_frame:.0f}"
+        if calib is not None:
+            msg += f"  calib_mode={calib_mode}"
         print(msg)
-    return noise_model, null, profile, calib_dbg
+    return noise_model, null, profile, fixed_pattern, good, calib_dbg, calib
 
 
 def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
                  noise_model, null, initial_cell: torch.Tensor, device: str,
                  min_num_spots: int, int_radius: int = 4,
                  hit_min_sumprob: float = 2.0, profile=None, operator=None,
+                 fixed_pattern=None, calib=None,
                  predict: bool = False, offset_max: float | None = None,
                  pred_d_min: float | None = None, keep_unindexed_hits: bool = True,
                  mask=None):
@@ -378,7 +439,8 @@ def _index_frame(reader, geom: Geometry, i, params, *, backend: str,
 
     spots = find_spots_on_frame(reader, i, geom, params, backend=backend,
                                 noise_model=noise_model, null=null, profile=profile,
-                                panels=panels, mask=good, pix_r=radius, operator=operator)
+                                panels=panels, mask=good, pix_r=radius, operator=operator,
+                                fixed_pattern=fixed_pattern, calib=calib)
     if spots.shape[0] < min_num_spots:
         return None
     # Hit gate: the probabilistic finder (PROB column) returns top-N peaks on
@@ -475,6 +537,9 @@ def build_stream(
     edge_dilate: int = 1,
     module_border: int = 1,
     persist_frac: float = 0.30,
+    artefact_filter: bool = True,
+    calib_mode: str = "legacy",
+    bragg_mean: float = 10.0,
     progress: bool = True,
     progress_interval: float = 10.0,
     verbose: bool = False,
@@ -520,7 +585,10 @@ def build_stream(
             mask = build_detector_mask(
                 reader, geom, calib_idx, external=external_mask,
                 edge_dilate=edge_dilate, module_border=module_border,
-                persist_frac=persist_frac, device=device, verbose=verbose)
+                persist_frac=persist_frac, device=device, verbose=verbose,
+                # the score-based recurrence pass in _calibrate supersedes the weak
+                # threshold-finder persistent-peak pass when artefact_filter is on.
+                persistent=not (artefact_filter and backend == "bayes"))
             if sidecar:
                 save_mask(mask, sidecar, attrs={
                     "edge_dilate": edge_dilate, "module_border": module_border,
@@ -529,13 +597,18 @@ def build_stream(
                     print(f"[mask] saved sidecar {sidecar}")
     masked_frac = float((~mask.bool()).float().mean()) if mask is not None else None
 
-    noise_model = null = profile = operator = None
+    noise_model = null = profile = operator = fixed_pattern = calib = None
     if calibrate:
-        noise_model, null, profile, _ = _calibrate(
+        noise_model, null, profile, fixed_pattern, good_refined, _, calib = _calibrate(
             reader, geom, params, n_calib=n_calib, device=device,
             want_null=(backend in ("torch", "bayes")), backend=backend, verbose=verbose,
             sigma_radial=sigma_radial, sigma_azimuthal=sigma_azimuthal, mask=mask,
+            artefact_filter=artefact_filter, calib_mode=calib_mode, bragg_mean=bragg_mean,
         )
+        # adopt the artefact-refined good mask for the operator, per-frame finding, and
+        # the embedded .sfx mask (None-mask case: _calibrate resolved reader.mask_panels()).
+        if good_refined is not None:
+            mask = good_refined
     # Build the fused matched-filter operator ONCE (geometry+mask+profile fixed) and
     # reuse it for every frame — the bayes finder's ~13x speedup over the conv path.
     if backend == "bayes" and profile is not None and torch.device(device).type == "cuda":
@@ -546,6 +619,12 @@ def build_stream(
         r0 = geom.pixel_radius_px.reshape(P0, n_ss0, n_fs0).to(torch.float32).to(device)
         ang0 = geom.pixel_angle_rad.reshape(P0, n_ss0, n_fs0).to(torch.float32).to(device)
         operator = build_matched_filter_operator(ang0, r0, good0, profile)
+    # Move the per-run calibration objects to the working device once (reused every frame).
+    # When empirical `calib` is active it owns the centering (c_p / f(p)), so the standalone
+    # fixed_pattern is not also subtracted.
+    calib_dev = calib.to(device) if calib is not None else None
+    fixed_pattern_dev = (None if calib_dev is not None else
+                         (fixed_pattern.to(device) if fixed_pattern is not None else None))
 
     # The raw peak search rides along as a 4th ``peak`` level joined to image, so
     # the builder must offset ``peak_image_id`` too (peak-less builders use the
@@ -563,7 +642,8 @@ def build_stream(
         n_tried += 1
         out = _index_frame(reader, geom, i, params, backend=backend,
                            noise_model=noise_model, null=null, profile=profile,
-                           operator=operator,
+                           operator=operator, fixed_pattern=fixed_pattern_dev,
+                           calib=calib_dev,
                            initial_cell=initial_cell, device=device,
                            min_num_spots=min_num_spots, int_radius=int_radius,
                            hit_min_sumprob=hit_min_sumprob,
@@ -592,6 +672,8 @@ def build_stream(
     _attach_frame_metadata(core, builder)
     if mask is not None:
         core.detector_mask = mask.detach().to(torch.bool).cpu()
+    if fixed_pattern is not None:
+        core.fixed_pattern = fixed_pattern.detach().to(torch.float32).cpu()
     stream = SFXStream(core)
     summary = {
         "frames_tried": n_tried,

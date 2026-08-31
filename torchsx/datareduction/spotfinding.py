@@ -144,6 +144,8 @@ def find_spots_on_frame(
     pix_r: torch.Tensor | None = None,
     angle: torch.Tensor | None = None,
     operator=None,
+    fixed_pattern=None,
+    calib=None,
 ) -> torch.Tensor:
     """Convenience: read frame ``i`` and find spots, using the geometry's
     cached pixel-radius map for ``pix_r``.
@@ -183,14 +185,14 @@ def find_spots_on_frame(
         # lazy import: peakfinder imports column constants from this module
         from .peakfinder import find_peaks_prob
         return find_peaks_prob(panels, mask, pix_r, params,
-                               noise_model=noise_model, null=null)
+                               noise_model=noise_model, null=null, calib=calib)
     if backend == "bayes":
         from .peakfinder import find_peaks_bayes
         if angle is None:
             angle = geom.pixel_angle_rad.reshape(n_panels, n_ss, n_fs)
         return find_peaks_bayes(panels, mask, pix_r, angle, params,
                                 noise_model=noise_model, null=null, profile=profile,
-                                operator=operator)
+                                operator=operator, fixed_pattern=fixed_pattern, calib=calib)
     if backend == "torch-threshold":
         from .peakfinder import find_spots_torch
         return find_spots_torch(panels, mask, pix_r, params)

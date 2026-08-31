@@ -16,7 +16,7 @@ from torch import Tensor
 from torchref.refinement.loss_state import LossState
 
 from torchsx.merging.config import MergeConfig
-from torchsx.merging.indexing import PoissonNoiseModel
+from torchsx.merging.hkl import PoissonNoiseModel
 from torchsx.merging.likelihood import (
     DetectionLikelihood,
     Poisson,

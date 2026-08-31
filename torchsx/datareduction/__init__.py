@@ -59,9 +59,19 @@ from .refine import (
 from .noise_model import (
     EmpiricalNull,
     NoiseModel,
+    calibrate_artefact_mask,
+    calibrate_fixed_pattern,
     calibrate_noise,
     calibrate_null,
     calibrate_spot_profile,
+)
+from .calibration import (
+    Calibration,
+    EmpiricalNoise,
+    PerPixelModel,
+    calibrate_empirical_noise,
+    calibrate_per_pixel,
+    whitened_residual,
 )
 from .masking import (
     build_detector_mask,
@@ -86,9 +96,17 @@ __all__ = [
     "SpotProfile",
     "NoiseModel",
     "EmpiricalNull",
+    "calibrate_artefact_mask",
+    "calibrate_fixed_pattern",
     "calibrate_noise",
     "calibrate_null",
     "calibrate_spot_profile",
+    "Calibration",
+    "EmpiricalNoise",
+    "PerPixelModel",
+    "calibrate_empirical_noise",
+    "calibrate_per_pixel",
+    "whitened_residual",
     "build_detector_mask",
     "load_external_mask",
     "load_mask",

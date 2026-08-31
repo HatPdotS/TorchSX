@@ -11,7 +11,7 @@ scalar loss that LBFGS minimises.
 
 Public API is populated incrementally as subpackages land.  See
 ``torchsx.merging.parameters``, ``torchsx.merging.observations``,
-``torchsx.merging.config``, and ``torchsx.merging.indexing``.
+``torchsx.merging.config``, and ``torchsx.merging.hkl``.
 """
 
 from torchsx.merging.config import MergeConfig

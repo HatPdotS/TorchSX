@@ -58,6 +58,12 @@ def save_sfx(core: BaseStream, path: str | Path):
     if detector_mask is not None:
         tensors["_detector_mask"] = detector_mask.to(torch.bool).contiguous().cpu()
 
+    # Beam-fixed background pattern f(p) (σ units, (P,514,fs)) used by the Bayes
+    # hit-finder; embedded alongside the mask for reproducibility.
+    fixed_pattern = getattr(core, "fixed_pattern", None)
+    if fixed_pattern is not None:
+        tensors["_fixed_pattern"] = fixed_pattern.to(torch.float32).contiguous().cpu()
+
     save_file(tensors, str(path))
 
     sidecar = {
@@ -68,6 +74,7 @@ def save_sfx(core: BaseStream, path: str | Path):
         "source_path": core.source_path,
         "metadata_schema": meta_schema,
         "has_detector_mask": detector_mask is not None,
+        "has_fixed_pattern": fixed_pattern is not None,
     }
     if core.geometry:
         sidecar["geometry"] = core.geometry.to_dict()
@@ -112,6 +119,8 @@ def load_sfx(path: str | Path) -> BaseStream:
         )
         if "_detector_mask" in all_tensors:
             obj.detector_mask = all_tensors["_detector_mask"].to(torch.bool)
+        if "_fixed_pattern" in all_tensors:
+            obj.fixed_pattern = all_tensors["_fixed_pattern"].to(torch.float32)
         return obj
 
     return _load_legacy(all_tensors, sidecar, geometry, metadata)

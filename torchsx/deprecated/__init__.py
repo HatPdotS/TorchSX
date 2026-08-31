@@ -26,7 +26,7 @@ these leaves, so deleting them would cascade into code with no live
 replacement. Their *tests* were repointed at the live modules, so coverage now
 tracks the maintained implementation:
 - ``torchsx.deprecated.merge._filter`` / ``_hkl`` / ``_stats``
-                                      → tests use ``torchsx.merging.indexing.{filter,hkl,stats}``.
+                                      → tests use ``torchsx.merging.hkl.{filter,hkl,stats}``.
 - ``torchsx.deprecated.scaling._absolute`` / ``_bscale`` / ``_loss``
                                       ↔ ``torchsx.merging.scale.*`` (not a 1:1 API;
                                       ``test_forward`` still consumes these).

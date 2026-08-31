@@ -119,6 +119,7 @@ class SFXStream:
 
         loaded = load_sfx(path)
         detector_mask = getattr(loaded, "detector_mask", None)
+        fixed_pattern = getattr(loaded, "fixed_pattern", None)
         stream = cls(loaded)
         sg = stream._core.spacegroup
         if not sg or sg == "P 1":
@@ -138,6 +139,8 @@ class SFXStream:
         # symmetrize/replace post-processing (which rebuilds the core).
         if detector_mask is not None:
             stream._core.detector_mask = detector_mask
+        if fixed_pattern is not None:
+            stream._core.fixed_pattern = fixed_pattern
         return stream
 
     def save(self, path: str | Path):
@@ -241,6 +244,12 @@ class SFXStream:
     def detector_mask(self) -> torch.Tensor | None:
         """Embedded detector good-pixel mask ``(P, ss, fs)`` bool (True=good), or None."""
         return getattr(self._core, "detector_mask", None)
+
+    @property
+    def fixed_pattern(self) -> torch.Tensor | None:
+        """Embedded beam-fixed background pattern ``f(p)`` ``(P, ss, fs)`` float32
+        (σ units) used by the Bayes hit-finder, or None."""
+        return getattr(self._core, "fixed_pattern", None)
 
     @property
     def cell(self) -> torch.Tensor:
@@ -525,7 +534,7 @@ class SFXStream:
 
         Returns (n_bins,) tensor.
         """
-        from torchsx.merging.indexing import completeness
+        from torchsx.merging.hkl import completeness
         return completeness(self._core, n_bins)
 
     def multiplicity(self, n_bins: int = 20) -> torch.Tensor:
@@ -533,7 +542,7 @@ class SFXStream:
 
         Returns (n_bins,) tensor.
         """
-        from torchsx.merging.indexing import multiplicity
+        from torchsx.merging.hkl import multiplicity
         return multiplicity(self._core, n_bins)
 
     def cell_distribution(self) -> torch.Tensor:
@@ -547,7 +556,7 @@ class SFXStream:
         -------
         HKLIndex with unique_hkl (N_unique, 3), hkl_id (N_obs,), n_unique
         """
-        from torchsx.merging.indexing import compute_hkl_index
+        from torchsx.merging.hkl import compute_hkl_index
         return compute_hkl_index(self._core.hkl)
 
     def merge(self):
@@ -561,7 +570,7 @@ class SFXStream:
             sigma : (N_unique,) float32 — merged sigma
             multiplicity : (N_unique,) int32 — observations per reflection
         """
-        from torchsx.merging.indexing import compute_hkl_index, merge_intensities
+        from torchsx.merging.hkl import compute_hkl_index, merge_intensities
         idx = compute_hkl_index(self._core.hkl)
         I_m, sig_m, mult = merge_intensities(
             idx.hkl_id, self._core.I, self._core.sigma, idx.n_unique,
@@ -581,7 +590,7 @@ class SFXStream:
         dict mapping (h, k, l) tuples to (N_i,) float32 tensors of intensities
         for that reflection.
         """
-        from torchsx.merging.indexing import compute_hkl_index
+        from torchsx.merging.hkl import compute_hkl_index
 
         idx = compute_hkl_index(self._core.hkl)
         # Sort by hkl_id for efficient splitting
@@ -605,7 +614,7 @@ class SFXStream:
 
     def filter_resolution(self, d_min: float = 0.0, d_max: float = 999.0) -> SFXStream:
         """Keep only observations within resolution range."""
-        from torchsx.merging.indexing import filter_resolution
+        from torchsx.merging.hkl import filter_resolution
         return SFXStream(filter_resolution(self._core, d_min, d_max))
 
     def filter_ewald(
@@ -620,29 +629,29 @@ class SFXStream:
         Supply exactly one of ``max_offset`` (absolute Å⁻¹) or
         ``max_offset_rel`` (fraction of per-crystal ``profile_rad``).
         """
-        from torchsx.merging.indexing import filter_ewald
+        from torchsx.merging.hkl import filter_ewald
         return SFXStream(filter_ewald(
             self._core, max_offset, invert, max_offset_rel=max_offset_rel,
         ))
 
     def filter_crystals(self, mask: torch.Tensor) -> SFXStream:
         """Keep crystals where mask is True."""
-        from torchsx.merging.indexing import filter_crystals
+        from torchsx.merging.hkl import filter_crystals
         return SFXStream(filter_crystals(self._core, mask))
 
     def filter_images(self, mask: torch.Tensor) -> SFXStream:
         """Keep images where mask is True."""
-        from torchsx.merging.indexing import filter_images
+        from torchsx.merging.hkl import filter_images
         return SFXStream(filter_images(self._core, mask))
 
     def filter_outliers(self, n_sigma: float = 4.0) -> SFXStream:
         """Remove per-hkl outlier observations."""
-        from torchsx.merging.indexing import filter_outliers
+        from torchsx.merging.hkl import filter_outliers
         return SFXStream(filter_outliers(self._core, n_sigma))
 
     def filter_cell(self, tolerance: float = 0.1) -> SFXStream:
         """Remove crystals with unit cell deviating from median by > tolerance."""
-        from torchsx.merging.indexing import filter_cell
+        from torchsx.merging.hkl import filter_cell
         return SFXStream(filter_cell(self._core, tolerance))
 
     # --- Patch extraction ---

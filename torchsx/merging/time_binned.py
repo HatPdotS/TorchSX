@@ -182,6 +182,7 @@ def gaussian_rank_bins(
     *,
     sigma_rank: float | None = None,
     truncate_sigma: float = 3.0,
+    inset_rank: float | None = None,
 ) -> GaussianRankBins:
     """Evenly-spaced Gaussian-in-rank bins.
 
@@ -200,6 +201,15 @@ def gaussian_rank_bins(
     truncate_sigma :
         Zero weights past this many σ.  Default 3 → ~99.7 % of the
         Gaussian mass is retained.
+    inset_rank :
+        If given, place the first/last bin centers at ``inset_rank`` and
+        ``n_valid − 1 − inset_rank`` respectively (instead of at the rank
+        boundaries 0 and ``n_valid − 1``).  Useful for sweeping σ_rank:
+        set ``inset_rank ≥ 2·σ_rank`` so the truncated Gaussian doesn't
+        clip the data edge, giving every bin equal effective_n.  Bin
+        centers are stable across a sweep if ``inset_rank`` is fixed —
+        which makes per-bin SVD time courses commensurate across configs.
+        Default ``None`` recovers the original 0…N−1 placement.
 
     Returns
     -------
@@ -219,8 +229,19 @@ def gaussian_rank_bins(
     if n_bins == 1:
         centers_rank = torch.tensor([(n_valid - 1) // 2], dtype=torch.int64)
     else:
-        # Evenly spaced from 0 to n_valid-1 inclusive.
-        edges = torch.linspace(0.0, float(n_valid - 1), n_bins, dtype=torch.float64)
+        if inset_rank is None:
+            lo, hi = 0.0, float(n_valid - 1)
+        else:
+            if inset_rank < 0:
+                raise ValueError(f"inset_rank must be ≥ 0, got {inset_rank}")
+            lo = float(inset_rank)
+            hi = float(n_valid - 1) - float(inset_rank)
+            if hi < lo:
+                raise ValueError(
+                    f"inset_rank={inset_rank} too large for n_valid={n_valid}: "
+                    f"would invert the center range"
+                )
+        edges = torch.linspace(lo, hi, n_bins, dtype=torch.float64)
         centers_rank = edges.round().to(torch.int64).clamp(0, n_valid - 1)
 
     return _build_bins(centers_rank, sigma_rank, truncate_sigma, rank, crystal_tp)
@@ -302,6 +323,123 @@ class BinResult:
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
+# ── Shared α/β pre-fit (extracted helper) ──────────────────────────────
+
+
+PrefitLookup = dict[tuple[int, int, int], tuple[float, float, float]]
+
+
+def compute_prefit_lookup(
+    stream,
+    *,
+    make_loss_kwargs: dict[str, Any],
+    refine_kwargs: dict[str, Any] | None = None,
+    verbose: bool = True,
+) -> PrefitLookup:
+    """Run the joint α, β pre-fit on the full stream and return a lookup.
+
+    The lookup maps each HKL tuple ``(h, k, l)`` to
+    ``(log_α, log_β, log_I0)`` from the joint fit (α, β under the
+    Laplacian smoothness prior, log_I0 as the warm-start anchor for
+    per-bin LBFGS).
+
+    Reusable across e.g. a σ_rank sweep where the α, β pre-fit depends
+    only on the input stream — not on the bin geometry.
+
+    Parameters
+    ----------
+    stream :
+        Timepoint-labelled :class:`SFXStream`.
+    make_loss_kwargs :
+        Forwarded to :meth:`SFXStream.make_loss`.  Should not contain
+        ``crystal_weights``.
+    refine_kwargs :
+        Forwarded to :meth:`LogSpaceLoss.refine`.  Optional.
+    verbose :
+        Print progress + summary on completion.
+    """
+    refine_kwargs = dict(refine_kwargs or {})
+    if verbose:
+        print(
+            f"[prefit] joint α, β fit on {stream.n_crystals} crystals, "
+            f"{stream.n_observations} obs ...",
+            flush=True,
+        )
+    loss = stream.make_loss(**make_loss_kwargs)
+    loss.refine(**refine_kwargs)
+    with torch.no_grad():
+        hkl = loss._prep.hkl_valid.detach().cpu().long()
+        log_alpha = loss._params.log_alpha.detach().cpu()
+        log_beta = loss._params.log_beta.detach().cpu()
+        log_I0 = loss._params.log_I0.detach().cpu()
+    lookup: PrefitLookup = {
+        (int(hkl[i, 0]), int(hkl[i, 1]), int(hkl[i, 2])):
+            (float(log_alpha[i]), float(log_beta[i]), float(log_I0[i]))
+        for i in range(hkl.shape[0])
+    }
+    if verbose:
+        la_med = float(log_alpha.median())
+        lb_med = float(log_beta.median())
+        lI_med = float(log_I0.median())
+        print(
+            f"[prefit] done: {len(lookup)} HKLs, "
+            f"median log α={la_med:.3f} (α≈{math.exp(la_med):.3f}), "
+            f"median log β={lb_med:.3f} (β≈{math.exp(lb_med):.3f}), "
+            f"median log I0={lI_med:.3f} (I0≈{math.exp(lI_med):.3f}), "
+            f"final NLL={loss.final_nll:.4e}",
+            flush=True,
+        )
+    del loss
+    return lookup
+
+
+def save_prefit_lookup(lookup: PrefitLookup, path: str | Path) -> None:
+    """Persist a pre-fit lookup as a small safetensors blob."""
+    from safetensors.torch import save_file
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not lookup:
+        raise ValueError("Refusing to save an empty pre-fit lookup")
+    keys = list(lookup.keys())
+    hkl = torch.tensor(keys, dtype=torch.int32)
+    n = len(keys)
+    log_alpha = torch.empty(n, dtype=torch.float32)
+    log_beta = torch.empty(n, dtype=torch.float32)
+    log_I0 = torch.empty(n, dtype=torch.float32)
+    for i, k in enumerate(keys):
+        la, lb, lI = lookup[k]
+        log_alpha[i] = la
+        log_beta[i] = lb
+        log_I0[i] = lI
+    save_file(
+        {
+            "hkl": hkl,
+            "log_alpha": log_alpha,
+            "log_beta": log_beta,
+            "log_I0": log_I0,
+        },
+        str(path),
+    )
+
+
+def load_prefit_lookup(path: str | Path) -> PrefitLookup:
+    """Reverse of :func:`save_prefit_lookup`."""
+    from safetensors.torch import load_file
+
+    blob = load_file(str(path))
+    hkl = blob["hkl"].to(torch.int64)
+    log_alpha = blob["log_alpha"].to(torch.float64)
+    log_beta = blob["log_beta"].to(torch.float64)
+    log_I0 = blob["log_I0"].to(torch.float64)
+    n = hkl.shape[0]
+    return {
+        (int(hkl[i, 0]), int(hkl[i, 1]), int(hkl[i, 2])):
+            (float(log_alpha[i]), float(log_beta[i]), float(log_I0[i]))
+        for i in range(n)
+    }
+
+
 # ── Driver ──────────────────────────────────────────────────────────────
 
 
@@ -316,6 +454,8 @@ def time_binned_merge(
     posterior_prior: str = "flat",
     shared_alpha_beta: bool = False,
     prefit_refine_kwargs: dict[str, Any] | None = None,
+    prefit_lookup: PrefitLookup | None = None,
+    prefit_cache_path: str | Path | None = None,
     merge_dark: bool = False,
     dark_mtz_name: str = "dark.mtz",
     skip_existing: bool = False,
@@ -353,6 +493,18 @@ def time_binned_merge(
         ``LogSpaceLoss.refine`` kwargs for the full-stream pre-fit when
         ``shared_alpha_beta=True``.  Defaults to ``refine_kwargs`` (same
         budget as a regular per-bin refine).
+    prefit_lookup :
+        Pre-computed ``{(h,k,l): (log_α, log_β, log_I0)}`` from
+        :func:`compute_prefit_lookup`.  When provided (with
+        ``shared_alpha_beta=True``), the in-line pre-fit is skipped and
+        this lookup is used directly.  Lets a caller (e.g. a σ_rank
+        sweep) reuse one pre-fit across many bin configurations.
+    prefit_cache_path :
+        Optional safetensors path for the pre-fit lookup.  If it exists
+        on disk, the lookup is loaded from it (skipping the pre-fit);
+        otherwise the pre-fit is computed and the result saved here for
+        future runs.  Ignored unless ``shared_alpha_beta=True`` and
+        ``prefit_lookup`` is None.
     merge_dark :
         If True, after the time-bin loop also merge the crystals in
         ``stream`` whose timepoint is NaN (no label / dark) as a single
@@ -392,7 +544,7 @@ def time_binned_merge(
     # instead of N_bins).
     gain_spec = make_loss_kwargs.get("gain", "auto")
     if isinstance(gain_spec, str):
-        from torchsx.merging.indexing import PoissonNoiseModel
+        from torchsx.merging.hkl import PoissonNoiseModel
         from torchsx.merging.observations import _ewald_offset
         pn = PoissonNoiseModel(
             r_peak=make_loss_kwargs.get("r_peak", 7.0),
@@ -432,47 +584,55 @@ def time_binned_merge(
                 flush=True,
             )
 
-    # ── Pre-fit α, β on the full stream when shared across bins ───────
-    # The scatter shape (α, β) is a per-HKL property of the protein/
-    # dataset, not a per-bin quantity.  Refining it independently per
-    # bin gives noisier α/β at low-multiplicity HKLs and adds spurious
-    # cross-bin variance.  Sharing: pre-fit on the full stream once,
-    # then per-bin we swap to a FixedShape with the pre-fit values
-    # mapped to that bin's HKL subset (and refine only log_I0 + scale
-    # + partiality).
-    prefit_hkl_lookup: dict[tuple[int, int, int], tuple[float, float]] | None = None
+    # ── Resolve the shared α, β pre-fit lookup ────────────────────────
+    # Three paths, in order of precedence:
+    #   1) caller passed an explicit ``prefit_lookup`` — use it as-is.
+    #   2) caller passed ``prefit_cache_path`` and the file exists — load.
+    #   3) otherwise compute via :func:`compute_prefit_lookup` on the
+    #      input stream, and save to ``prefit_cache_path`` if given.
+    # Either way, the lookup feeds :class:`FixedShape` (frozen α, β)
+    # and warm-starts log_I0 per bin (LBFGS converges from joint optimum
+    # without per-bin overshoot).
+    prefit_hkl_lookup: PrefitLookup | None = None
     if shared_alpha_beta:
-        prefit_refine_kwargs = dict(prefit_refine_kwargs or refine_kwargs or {})
+        if prefit_lookup is not None:
+            prefit_hkl_lookup = prefit_lookup
+            if verbose:
+                print(
+                    f"\n[time-binned merge] using caller-supplied pre-fit lookup "
+                    f"({len(prefit_hkl_lookup)} HKLs)",
+                    flush=True,
+                )
+        elif prefit_cache_path is not None and Path(prefit_cache_path).exists():
+            prefit_hkl_lookup = load_prefit_lookup(prefit_cache_path)
+            if verbose:
+                print(
+                    f"\n[time-binned merge] loaded pre-fit lookup from cache: "
+                    f"{prefit_cache_path}  ({len(prefit_hkl_lookup)} HKLs)",
+                    flush=True,
+                )
+        else:
+            prefit_hkl_lookup = compute_prefit_lookup(
+                stream,
+                make_loss_kwargs=make_loss_kwargs,
+                refine_kwargs=prefit_refine_kwargs or refine_kwargs,
+                verbose=verbose,
+            )
+            if prefit_cache_path is not None:
+                save_prefit_lookup(prefit_hkl_lookup, prefit_cache_path)
+                if verbose:
+                    print(
+                        f"[time-binned merge] saved pre-fit lookup to "
+                        f"{prefit_cache_path}",
+                        flush=True,
+                    )
+    elif prefit_lookup is not None or prefit_cache_path is not None:
         if verbose:
             print(
-                f"\n[time-binned merge] shared α, β requested — pre-fitting on "
-                f"full stream ({stream.n_crystals} crystals, "
-                f"{stream.n_observations} obs) ...",
+                "[time-binned merge] warning: prefit_lookup / prefit_cache_path "
+                "ignored because shared_alpha_beta=False",
                 flush=True,
             )
-        prefit_loss = stream.make_loss(**make_loss_kwargs)
-        prefit_loss.refine(**prefit_refine_kwargs)
-        with torch.no_grad():
-            full_hkl = prefit_loss._prep.hkl_valid.detach().cpu().long()
-            full_log_alpha = prefit_loss._params.log_alpha.detach().cpu()
-            full_log_beta = prefit_loss._params.log_beta.detach().cpu()
-        prefit_hkl_lookup = {
-            (int(full_hkl[i, 0]), int(full_hkl[i, 1]), int(full_hkl[i, 2])):
-                (float(full_log_alpha[i]), float(full_log_beta[i]))
-            for i in range(full_hkl.shape[0])
-        }
-        if verbose:
-            la_med = float(full_log_alpha.median())
-            lb_med = float(full_log_beta.median())
-            print(
-                f"[time-binned merge] pre-fit done: {len(prefit_hkl_lookup)} HKLs, "
-                f"median log α={la_med:.3f} (α≈{math.exp(la_med):.3f}), "
-                f"median log β={lb_med:.3f} (β≈{math.exp(lb_med):.3f}), "
-                f"final NLL={prefit_loss.final_nll:.4e}",
-                flush=True,
-            )
-        # Free the pre-fit loss; we only need the HKL lookup from here on.
-        del prefit_loss
 
     results: list[BinResult] = []
     n_bins = bins.n_bins
@@ -551,8 +711,10 @@ def time_binned_merge(
                 n_valid_bin = bin_hkl.shape[0]
                 la_default = loss._params.log_alpha.detach().cpu().clone()
                 lb_default = loss._params.log_beta.detach().cpu().clone()
+                lI_default = loss._params.log_I0.detach().cpu().clone()
                 la_bin = la_default.clone()
                 lb_bin = lb_default.clone()
+                lI_bin = lI_default.clone()
                 n_missing = 0
                 for i in range(n_valid_bin):
                     key = (int(bin_hkl[i, 0]), int(bin_hkl[i, 1]), int(bin_hkl[i, 2]))
@@ -562,17 +724,47 @@ def time_binned_merge(
                         continue
                     la_bin[i] = pre[0]
                     lb_bin[i] = pre[1]
+                    lI_bin[i] = pre[2]
             from torchsx.merging.scatter_shape import FixedShape
             fixed = FixedShape(la_bin, lb_bin)
             loss.swap_scatter_shape(fixed)
+            # Warm-start log_I0 from the pre-fit too.  Starting LBFGS near
+            # the joint-fit optimum avoids the per-bin overshoot that
+            # produced all-NaN posterior moments on large bins.
+            with torch.no_grad():
+                loss._params.log_I0.data.copy_(lI_bin.to(loss._params.log_I0.device))
             if verbose:
                 miss_msg = f"  ({n_missing} HKLs not in pre-fit — kept init)" if n_missing else ""
                 print(
-                    f"  shared α, β: frozen {n_valid_bin - n_missing}/{n_valid_bin} HKLs"
-                    f"{miss_msg}",
+                    f"  shared α, β, log_I0: frozen α/β + warm-started log_I0 on "
+                    f"{n_valid_bin - n_missing}/{n_valid_bin} HKLs{miss_msg}",
                     flush=True,
                 )
         loss.refine(**refine_kwargs)
+        # LBFGS guard: if any log_I0 went non-finite, restore those entries
+        # from the warm-start anchor.  Without this, 100 % non-finite log_I0
+        # produces an all-NaN posterior whose sanity_F mask masks everything
+        # and torchref errors out, killing the whole driver loop.  The
+        # restored entries are the joint-pre-fit estimate (finite by
+        # construction) — a conservative fallback for the affected HKLs.
+        n_log_I0_restored = 0
+        if prefit_hkl_lookup is not None:
+            with torch.no_grad():
+                lI_dev = loss._params.log_I0.data
+                bad = ~torch.isfinite(lI_dev)
+                if bad.any():
+                    n_log_I0_restored = int(bad.sum().item())
+                    # lI_bin lives on CPU (built from prefit lookup); move it
+                    # to the param's device before indexing — indexing across
+                    # devices throws "indices should be on the same device".
+                    lI_dev[bad] = lI_bin.to(lI_dev.device)[bad]
+                    if verbose:
+                        print(
+                            f"  ⚠ {n_log_I0_restored}/{n_valid_bin} log_I0 "
+                            f"went non-finite during refine — restored from "
+                            f"warm-start anchor (joint pre-fit estimate)",
+                            flush=True,
+                        )
         posterior = loss.posterior(prior=posterior_prior)
         data = posterior.integrate()
         data.write_mtz(str(mtz_path))
@@ -586,6 +778,7 @@ def time_binned_merge(
             "n_valid": loss.stats.get("n_valid"),
             "final_data_nll": loss.final_nll,
             "shared_alpha_beta": prefit_hkl_lookup is not None,
+            "n_log_I0_restored": n_log_I0_restored,
         }
         results.append(BinResult(
             bin_idx=b,
@@ -650,8 +843,10 @@ def time_binned_merge(
                     n_valid_dark = dark_hkl.shape[0]
                     la_default = dark_loss._params.log_alpha.detach().cpu().clone()
                     lb_default = dark_loss._params.log_beta.detach().cpu().clone()
+                    lI_default = dark_loss._params.log_I0.detach().cpu().clone()
                     la_dark = la_default.clone()
                     lb_dark = lb_default.clone()
+                    lI_dark = lI_default.clone()
                     n_missing = 0
                     for i in range(n_valid_dark):
                         key = (int(dark_hkl[i, 0]), int(dark_hkl[i, 1]), int(dark_hkl[i, 2]))
@@ -661,15 +856,20 @@ def time_binned_merge(
                             continue
                         la_dark[i] = pre[0]
                         lb_dark[i] = pre[1]
+                        lI_dark[i] = pre[2]
                 from torchsx.merging.scatter_shape import FixedShape
                 dark_loss.swap_scatter_shape(FixedShape(la_dark, lb_dark))
+                with torch.no_grad():
+                    dark_loss._params.log_I0.data.copy_(
+                        lI_dark.to(dark_loss._params.log_I0.device)
+                    )
                 if verbose:
                     miss_msg = (
                         f"  ({n_missing} HKLs not in pre-fit — kept init)"
                         if n_missing else ""
                     )
                     print(
-                        f"  shared α, β: frozen "
+                        f"  shared α, β, log_I0: frozen α/β + warm-started log_I0 on "
                         f"{n_valid_dark - n_missing}/{n_valid_dark} HKLs{miss_msg}",
                         flush=True,
                     )
@@ -707,7 +907,11 @@ def time_binned_merge(
 __all__ = [
     "BinResult",
     "GaussianRankBins",
+    "PrefitLookup",
+    "compute_prefit_lookup",
     "gaussian_rank_bins",
     "gaussian_rank_bins_at_times",
+    "load_prefit_lookup",
+    "save_prefit_lookup",
     "time_binned_merge",
 ]

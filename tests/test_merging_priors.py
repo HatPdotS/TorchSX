@@ -193,7 +193,7 @@ def test_wilson_match_gradient_flows() -> None:
 
 def test_miller_graph_smoothness_equals_dirichlet() -> None:
     """MillerGraphSmoothness equals the old hand-rolled Dirichlet block."""
-    from torchsx.merging.indexing import build_adjacency, dirichlet_energy
+    from torchsx.merging.hkl import build_adjacency, dirichlet_energy
     from torchsx.merging.regularizers import MillerGraphSmoothness
     from torchsx.merging.parameters import Parameters
 

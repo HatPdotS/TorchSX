@@ -17,7 +17,7 @@ from dataclasses import replace
 
 import torch
 
-from torchsx.merging.indexing import build_adjacency
+from torchsx.merging.hkl import build_adjacency
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
