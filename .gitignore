@@ -52,3 +52,7 @@ tests/**/*.pt
 experiments/**/*.pdf
 experiments/**/*.log
 experiments/**/*.json
+
+# compiled python
+__pycache__/
+*.pyc

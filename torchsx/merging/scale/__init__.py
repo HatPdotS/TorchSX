@@ -10,6 +10,7 @@ from torchsx.merging.scale.per_crystal import ScaleBPerCrystal
 from torchsx.merging.scale.panel import PanelScale
 from torchsx.merging.scale.fixed import FixedScale
 from torchsx.merging.scale.composite import CompositeScale
+from torchsx.merging.scale.amortized import AmortizedScale
 
 __all__ = [
     "ScaleModel",
@@ -17,4 +18,5 @@ __all__ = [
     "PanelScale",
     "FixedScale",
     "CompositeScale",
+    "AmortizedScale",
 ]

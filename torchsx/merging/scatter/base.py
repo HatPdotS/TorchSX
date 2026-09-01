@@ -19,8 +19,25 @@ class ScatterModel(nn.Module):
 
     The scatter is stateless with respect to observations; any per-HKL
     parameters (e.g. GenGauss α, β per HKL) are read from ``params`` and
-    indexed with ``meta.hkl_idx``.
+    indexed with ``meta.hkl_idx`` — via :meth:`log_alpha_beta_obs`, which is
+    the single seam where that indexing happens.
+
+    Overriding :meth:`log_alpha_beta_obs` is how a subclass supplies
+    **per-observation** shape parameters (e.g. predicted by a network) instead
+    of per-HKL ones.  Because the eager path, both Triton kernels, the
+    posterior moments and the residual diagnostics all route through this one
+    hook, such a subclass needs no other change anywhere in the stack.
     """
+
+    def log_alpha_beta_obs(
+        self, params: Parameters, meta: ObsInfo
+    ) -> tuple[Tensor, Tensor]:
+        """Per-observation ``(log α, log β)``.
+
+        Default: gather the per-HKL parameters with ``meta.hkl_idx``.
+        """
+        h = meta.hkl_idx
+        return params.log_alpha[h], params.log_beta[h]
 
     @abstractmethod
     def log_prob(

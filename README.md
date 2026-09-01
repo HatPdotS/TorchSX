@@ -7,6 +7,20 @@ scaling Serial Femtosecond Crystallography (SFX) data. It reads CrystFEL
 `.stream` files into stacked tensors at three levels (observations, crystals,
 images) and provides differentiable merging, scaling, and partiality correction.
 
+## Amortised scale model
+
+`torchsx.nn` trains one network to predict a per-observation scale, merging
+through a posterior integral over `I0` rather than a point estimate, so `I` and
+`sigma_I` come from the same integral. See
+`experiments/docs/amortized_scale_plan.md` for the design and
+`experiments/optimize_integration/README.md` for the measured state of the
+integration — including the node settings that should be used, and one open
+defect at the weak end.
+
+Validated against refinement rather than only CC1/2, since a merge can be
+systematically wrong and perfectly self-consistent: R_free 0.1397 against
+0.1825 for partialator + French-Wilson on the same model and free set.
+
 ## Installation
 
 ```bash

@@ -1,0 +1,576 @@
+"""Merge target from the I0 posterior — integrated, never fitted.
+
+The leave-one-out estimator in :mod:`torchsx.nn.merge_target` is the argmin of a
+**Gaussian weighted-least-squares surrogate**, while the objective it feeds is
+the **GenGauss marginal**.  Different optima, and that mismatch is the only
+reason detaching the target is approximate: were I0 the argmax of the *same*
+objective, ``dL/dI0 = 0`` and the envelope theorem would make detaching exact.
+
+This module removes the mismatch from the other end — it never fits I0 at all.
+
+Geometry
+--------
+On the log-intensity axis each observation is a bump: ``log K_j`` **slides** it
+(a multiplicative scale is a translation in log space) and ``alpha_j``
+**blurs** it.  Merging is sliding every observation of a reflection into a
+common frame and asking how well the bumps stack; the marginal likelihood is
+the *area under their product*.  Because the GenGauss is normalised, blurring
+also flattens — so agreement cannot be bought by widening the scatter.  That is
+the geometric form of the ``-log alpha`` normaliser.
+
+Why this is affordable
+----------------------
+The naive cost is one inner quadrature per outer grid point per observation.
+Two measured facts collapse it:
+
+1. **Individual observation curves are broad; only their product is narrow.**
+   ``f_j(mu) = log p(n'_j | mu)`` has the width of one observation's
+   uncertainty, while the posterior is ~sqrt(n) narrower.  So evaluate ``f_j``
+   on a **coarse** grid and linearly interpolate to a fine one.  Measured
+   requirement: ~25-33 coarse points (rel. error 5.6e-3 at 25, 8.2e-4 at 33),
+   which is why the writeout pipeline in :mod:`torchsx.merging.posterior` uses
+   ``K_coarse = 31``.
+2. **Linear interpolation commutes with the sum over observations.**
+   ``sum_j interp(f_j) = interp(sum_j f_j)``, so accumulate on the *coarse*
+   grid first — ``(n_hkl, K_coarse)``, tiny — and interpolate that.  The
+   ``(n_obs, M_fine)`` tensor never exists.
+
+With the Triton inner kernel the remaining cost is small: it never materialises
+the ``(M, K_inner)`` integrand (it saves six tensors of size M), so a pass is
+~60 MB of traffic rather than ~1.8 GB eager, and 31 passes come to roughly one
+eager pass — a few percent of a training step.  Use a **wide** FixedLogGrid so
+the Triton path applies without truncating the scatter; the inner node count is
+nearly free (K 501 -> 2001 costs +4 %).
+
+Grid geometry (centre, width) is **detached**: it only places quadrature nodes,
+exactly like choosing integration limits, and the answer is insensitive to it
+provided the mass is covered.  ``edge_mass`` reports whether it is — measured
+as weight in the outer 10 % of the *range*, which is node-count independent
+(the outermost single node's weight shrinks with n_grid and would measure
+resolution, not truncation).
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from torchsx.nn.pooling import group_sum
+
+try:
+    from torchsx.merging.quadrature._fused_posterior_triton import (
+        fused_posterior_logp,
+    )
+    _HAVE_FUSED = True
+except ImportError:                                  # pragma: no cover
+    _HAVE_FUSED = False
+
+__all__ = ["PosteriorOut", "PosteriorMergeTarget"]
+
+
+@dataclass
+class PosteriorOut:
+    """Per-reflection posterior summary plus the per-observation broadcast."""
+
+    log_Z: Tensor        # (n_hkl,) marginal likelihood; -inf where unseen
+    I0_mean: Tensor      # (n_hkl,) posterior mean
+    I0_sd: Tensor        # (n_hkl,) posterior sd -- sigI, from the same integral
+    I0_obs: Tensor       # (n,)     I0_mean broadcast to observations
+    seen: Tensor         # (n_hkl,) bool
+    edge_mass: Tensor    # (n_hkl,) truncation check, ~0 is healthy
+    n_floored: int
+
+
+class PosteriorMergeTarget(nn.Module):
+    """Differentiable posterior mean + marginal likelihood over I0.
+
+    Parameters
+    ----------
+    I0_init
+        ``(n_hkl,)`` seed intensities; the grid centre until the EMA moves.
+    k_coarse
+        Inner-quadrature evaluations per reflection.  The real cost knob.
+    m_fine
+        Interpolated integration points.  Nearly free — raise before ``k_coarse``.
+    n_sigma
+        Grid half-width in Laplace sigmas.  Measured: 5 suffices for the median
+        but the 90th-percentile error is *width*-limited (flat in node count),
+        so 8 is the safer default now that width is free.
+    prior
+        ``"flat_I0"`` integrates ``dI0`` (weight ``exp(v)``); ``"flat_log"``
+        integrates ``d log I0``; ``"wilson"`` uses ``p(I) = exp(-I/Sigma)/Sigma``
+        with ``Sigma`` the shell mean.  **Use wilson.**  Where the likelihood is
+        uninformative — and 84 % of observations here are noise-limited — the
+        posterior is whatever the prior says, and a flat-in-I0 prior on a log
+        grid drags those reflections toward the *top of the grid*.  Measured
+        consequence: per-shell CC1/2 improved at low resolution
+        (0.776 -> 0.821) while collapsing at high resolution
+        (0.359 -> 0.246, 0.159 -> 0.094), because exactly the weak reflections
+        were being inflated.
+    node_placement
+        ``"laplace"`` spaces nodes uniformly in ``log I0`` over
+        ``+- n_sigma * sigma``; ``"wilson"`` places them at quantiles of the
+        **approximate posterior** (Wilson prior x Gaussian likelihood, which is
+        a Gaussian truncated at zero — i.e. French-Wilson).
+
+        **``"wilson"`` is currently BROKEN — do not use.**  It gives a 58-65 %
+        systematic error against the Laplace reference and does *not* improve
+        with node count (0.650 / 0.611 / 0.577 at 9 / 17 / 31), so the fault is
+        in the importance weights ``du * p_W / q``, not the resolution.  Left in
+        place because the idea is right and the bug is findable.
+
+        The idea: nodes drawn through an inverse CDF live on ``u in (0, 1)``, so
+        the grid **cannot truncate**.  That deletes the
+        extent choice, the sigma estimate, and the ratchet that existed only to
+        stop the extent oscillating.  It interpolates correctly between regimes
+        — an uninformative reflection gets prior-like placement, a
+        well-determined one likelihood-like — which pure prior placement would
+        not (with 751 observations per reflection the posterior is far narrower
+        than the Wilson prior, so uniform-in-prior nodes would waste almost all
+        of themselves).
+    """
+
+    def __init__(
+        self,
+        I0_init: Tensor,
+        *,
+        k_coarse: int = 31,
+        m_fine: int = 257,
+        n_sigma: float = 8.0,
+        prior: str = "wilson",
+        node_placement: str = "laplace",
+        ema_decay: float = 0.99,
+        floor: float = 1e-3,
+        sigma_bounds: tuple[float, float] = (0.02, 4.0),
+        scan_points: int = 9,
+        scan_halfwidth: float = 8.0,
+        use_fused: bool = False,
+    ) -> None:
+        super().__init__()
+        if prior not in ("flat_I0", "flat_log", "wilson"):
+            raise ValueError(
+                f"prior must be 'flat_I0', 'flat_log' or 'wilson', got {prior!r}"
+            )
+        if node_placement not in ("laplace", "wilson"):
+            raise ValueError(
+                f"node_placement must be 'laplace' or 'wilson', got {node_placement!r}"
+            )
+        if k_coarse < 3 or m_fine < k_coarse:
+            raise ValueError("need k_coarse >= 3 and m_fine >= k_coarse")
+        self.n_hkl = int(I0_init.shape[0])
+        self.k_coarse, self.m_fine = int(k_coarse), int(m_fine)
+        self.n_sigma, self.prior = float(n_sigma), prior
+        self.node_placement = node_placement
+        self.ema_decay, self.floor = float(ema_decay), float(floor)
+        self.sigma_bounds = sigma_bounds
+        self.scan_points, self.scan_halfwidth = int(scan_points), float(scan_halfwidth)
+        self.use_fused = bool(use_fused)
+        self.lam = 0.0                      # API parity with LOOInBatchTarget
+
+        self.register_buffer("ema_I0", I0_init.detach().clone().float().clamp(min=floor))
+        self.register_buffer("ema_den", torch.zeros(self.n_hkl))
+        self.register_buffer("_den_seeded", torch.zeros((), dtype=torch.bool))
+        # Grid width, learned from the OBSERVED posterior rather than predicted
+        # from the Laplace approximation.  The Laplace sigma comes from the
+        # Gaussian variance model; for weak reflections the true posterior is
+        # wider and skewed, and the grid then clips it -- measured edge_mass up
+        # to 0.93 on a minority of reflections even at +-8 sigma, with the
+        # error tracking it exactly.  Measuring the width and rolling it forward
+        # makes the grid self-tuning, and edge_mass reports whether it worked.
+        self.register_buffer("ema_log_sigma", torch.zeros(self.n_hkl))
+        self.register_buffer("_sigma_seeded", torch.zeros((), dtype=torch.bool))
+        # Shell mean intensity Sigma for the Wilson prior; set via
+        # set_wilson_sigma().  Defaults to the seed intensities, which is the
+        # per-reflection rather than per-shell mean — adequate to start.
+        self.register_buffer("wilson_sigma", I0_init.detach().clone().float().clamp(min=floor))
+
+        u_c = torch.linspace(-n_sigma, n_sigma, k_coarse)
+        u_f = torch.linspace(-n_sigma, n_sigma, m_fine)
+        self.register_buffer("u_coarse", u_c)
+        self.register_buffer("u_fine", u_f)
+        # Interpolation is on the shared u axis, so the weights are the same for
+        # every reflection — precompute once.
+        idx = torch.searchsorted(u_c.contiguous(), u_f.contiguous()).clamp(1, k_coarse - 1)
+        t = ((u_f - u_c[idx - 1]) / (u_c[idx] - u_c[idx - 1])).clamp(0.0, 1.0)
+        self.register_buffer("_lo", idx - 1)
+        self.register_buffer("_hi", idx)
+        self.register_buffer("_t", t)
+
+    # ── grid geometry (detached) ───────────────────────────────────────
+
+    @torch.no_grad()
+    def locate(
+        self, objective, scatter, params, pred,
+        n_ph: Tensor, bg: Tensor, hkl_id: Tensor, meta,
+    ) -> tuple[Tensor, Tensor]:
+        """Find the peak and width of the log-likelihood curve by MEASURING it.
+
+        Three formulas for the grid width have now failed in three different
+        directions -- too narrow (edge_mass 0.93), oscillating (a
+        follow-the-measurement loop swinging 0.29 / 0.03 / 0.52), and too wide
+        (sigma pinned at its bound, half-width 30 in log I0, so the merge
+        returned the grid centre and the data contributed nothing).  Every one
+        was a *formula* for the posterior width derived from the Gaussian
+        variance model, and the posterior is not that shape.
+
+        So: sweep a deliberately generous grid once, then read the peak and
+        curvature off the curve itself.  A parabola through the maximum and its
+        neighbours gives ``v*`` and ``s = 1/sqrt(-S'')`` with no distributional
+        assumption and nothing that can pin at a bound.
+        """
+        v_scan = self.scan_grid()
+        S = self.accumulate(
+            objective, scatter, params, pred, n_ph, bg, hkl_id, meta, v_scan
+        )
+        return self.peak_from_scan(S)
+
+    @torch.no_grad()
+    def scan_grid(self) -> Tensor:
+        """Generous grid for the locating sweep: ``(n_hkl, scan_points)``."""
+        centre = self.ema_I0.clamp(min=self.floor).log()
+        u = torch.linspace(
+            -self.scan_halfwidth, self.scan_halfwidth, self.scan_points,
+            device=centre.device,
+        )
+        return centre[:, None] + u[None, :]
+
+    @torch.no_grad()
+    def peak_from_scan(self, S: Tensor) -> tuple[Tensor, Tensor]:
+        """Peak location and width read off an accumulated scan curve.
+
+        Separate from :meth:`locate` so a caller that spans several batches can
+        accumulate ``S`` itself first — the merge does, and previously called
+        ``nodes()`` instead, which still used the old closed-form width.  That
+        placed the merge grid by the very formula this replaces, and the merge
+        collapsed back onto the grid centre: per-shell CC1/2 read exactly
+        1.0000 in five shells, because both halves returned the same shared
+        ``ema_I0`` rather than anything from the data.
+        """
+        centre = self.ema_I0.clamp(min=self.floor).log()
+        u = torch.linspace(
+            -self.scan_halfwidth, self.scan_halfwidth, self.scan_points,
+            device=S.device,
+        )
+        h = float(u[1] - u[0])
+
+        k = S.argmax(dim=1).clamp(1, self.scan_points - 2)
+        rows = torch.arange(S.shape[0], device=S.device)
+        y0, y1, y2 = S[rows, k - 1], S[rows, k], S[rows, k + 1]
+        curv = (y0 - 2 * y1 + y2) / h**2                 # S'' < 0 at a maximum
+
+        denom = (y0 - 2 * y1 + y2)
+        shift = torch.where(
+            denom.abs() > 1e-12, 0.5 * (y0 - y2) / denom.clamp(min=-1e30),
+            torch.zeros_like(denom),
+        ).clamp(-1.0, 1.0) * h
+        v_meas = centre + u[k] + shift
+        sd_meas = (1.0 / (-curv).clamp(min=1e-8)).sqrt()
+
+        # Trust the measured peak only in proportion to how well the curve
+        # actually locates it.  For an uninformative reflection the curve is
+        # flat, argmax is essentially random over the whole +-scan_halfwidth,
+        # and taking it displaces the grid centre by a large random amount --
+        # independently in each half, which is exactly what destroys their
+        # correlation.  Measured: the two weakest shells fell 0.82 -> 0.73 and
+        # 0.69 -> 0.50 while shells 2-8 improved.
+        #
+        # The curve locates the peak to +-sd_meas, so compare that against the
+        # scan width: w = 1 when the peak is sharp, 0 when the curve says
+        # nothing, and the fallback is the prior centre with a wide grid.
+        peaked = curv < -1e-8
+        rel = (sd_meas / self.scan_halfwidth).clamp(0.0, 1.0)
+        trust = torch.where(peaked, (1.0 - rel).clamp(0.0, 1.0),
+                            torch.zeros_like(rel))
+        v_star = trust * v_meas + (1.0 - trust) * centre
+        sd = torch.where(peaked, sd_meas, torch.full_like(sd_meas, self.scan_halfwidth / 2))
+        sd = trust * sd + (1.0 - trust) * (self.scan_halfwidth / 2)
+        return v_star, sd.clamp(min=1e-3, max=self.scan_halfwidth)
+
+    @torch.no_grad()
+    def _centre_sigma(self) -> tuple[Tensor, Tensor]:
+        I0 = self.ema_I0.clamp(min=self.floor)
+        if not bool(self._sigma_seeded):
+            # Bootstrap from Laplace: Var(I0_hat) ~ 1/den => sigma ~ 1/(I0 sqrt(den))
+            den = self.ema_den.clamp(min=1e-12)
+            self.ema_log_sigma.copy_(
+                (1.0 / (I0 * den.sqrt())).clamp(*self.sigma_bounds).log()
+            )
+            self._sigma_seeded.fill_(True)
+        return I0.log(), self.ema_log_sigma.exp().clamp(*self.sigma_bounds)
+
+    @torch.no_grad()
+    def set_wilson_sigma(self, shell_id: Tensor, n_shells: int) -> None:
+        """Set ``Sigma`` to the shell mean of the current running merge."""
+        m = torch.zeros(n_shells, device=self.ema_I0.device)
+        c = torch.zeros(n_shells, device=self.ema_I0.device)
+        m.index_add_(0, shell_id, self.ema_I0)
+        c.index_add_(0, shell_id, torch.ones_like(self.ema_I0))
+        self.wilson_sigma.copy_((m / c.clamp(min=1))[shell_id].clamp(min=self.floor))
+
+    @torch.no_grad()
+    def _wilson_nodes(self) -> tuple[Tensor, Tensor]:
+        """Nodes at quantiles of the French-Wilson approximate posterior.
+
+        Wilson prior ``exp(-I/Sigma)`` times a Gaussian likelihood ``N(Ihat, s)``
+        is a Gaussian truncated at zero with mean ``Ihat - s^2/Sigma`` and the
+        same ``s``.  Drawing nodes through its inverse CDF means the domain is
+        ``u in (0,1)``: no extent to choose, and no truncation possible.
+        """
+        Ihat = self.ema_I0.clamp(min=self.floor)
+        sd = (1.0 / self.ema_den.clamp(min=1e-12).sqrt()).clamp(min=1e-6)
+        mu = Ihat - sd**2 / self.wilson_sigma.clamp(min=self.floor)
+
+        nrm = torch.distributions.Normal(0.0, 1.0)
+        a = (-mu / sd)                                   # lower truncation in z
+        Fa = nrm.cdf(a)
+        # stratified midpoints avoid the u->0/1 endpoints where Phi^-1 diverges
+        u = (torch.arange(self.k_coarse, device=Ihat.device) + 0.5) / self.k_coarse
+        z = nrm.icdf((Fa[:, None] + u[None, :] * (1.0 - Fa[:, None])).clamp(1e-6, 1 - 1e-6))
+        I_nodes = (mu[:, None] + sd[:, None] * z).clamp(min=self.floor)
+        v = I_nodes.log()
+
+        # importance weights: dI-integral of L*p_W with proposal q
+        #   w_k = du * p_W(I_k) / q(I_k)
+        log_pw = -I_nodes / self.wilson_sigma[:, None] - self.wilson_sigma.log()[:, None]
+        log_q = (
+            nrm.log_prob((I_nodes - mu[:, None]) / sd[:, None])
+            - sd.log()[:, None] - torch.log1p(-Fa)[:, None]
+        )
+        log_w = math.log(1.0 / self.k_coarse) + log_pw - log_q
+        return v, log_w
+
+    def accumulate(
+        self, objective, scatter, params, pred,
+        n_ph: Tensor, bg: Tensor, hkl_id: Tensor, meta, v_nodes: Tensor,
+    ) -> Tensor:
+        """Coarse log-likelihood curve summed over observations: ``(n_hkl, K)``.
+
+        The only inner-quadrature work.  Each column is accumulated separately,
+        so nothing of size ``(n_obs, k_coarse)`` is ever allocated.
+
+        **Additive over observations**, hence over batches — which is what lets
+        a merge over an arbitrary crystal subset reuse this directly instead of
+        reimplementing an estimator.  Accumulate ``S`` across batches, then call
+        :meth:`integrate` once.
+        """
+        base = pred.log_K - pred.log_e_s
+
+        # Fused path -- OFF by default; measured, not deprecated.  One launch
+        # for all C nodes instead of C, hoisting the Poisson factor out of the
+        # node loop and replacing the online-logsumexp maximum with a
+        # closed-form bound.  Against the float64 oracle it gives *better*
+        # values than the per-column path (I0_mean 3.1e-4 vs 6.0e-4 relative,
+        # I0_sd 6.9e-4 vs 1.1e-3) and is 2.08x faster at C = 32, but its
+        # gradient DIRECTION is 46-880x worse (1-cos on d/d log_alpha 3.3e-3 vs
+        # 5.0e-6, about 5 degrees).
+        #
+        # Cause: dropping the per-(m, c) running max costs dynamic range.  When
+        # one observation's accumulator underflows at a node, that node is
+        # floored, S[h, c] is annihilated, and with it the gradient
+        # contribution of every OTHER observation at that node.  The values
+        # survive because the node carried little weight; the direction does
+        # not.  Flooring higher instead over-estimates such nodes by up to 233
+        # nats (measured), which is worse.  A periodic rescale would fix it and
+        # would give back part of the speed the running max was costing.
+        #
+        # Speed also depends sharply on C: 2.08x at 32 and 2.10x at 64, but
+        # 1.03x at 21 and 0.61x at 33, because the tile is next_pow2(C).  So it
+        # only pays at a power-of-two k_coarse.
+        #
+        # Falls back silently -- it is a GenGauss x Poisson x FixedLogGrid
+        # specialisation with no d/d bg statistic, so a learned background must
+        # use the eager loop.
+        if self.use_fused:
+            from torchsx.merging.likelihood import Poisson
+            from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
+            from torchsx.merging.scatter.gengauss import GenGaussLogScatter
+            q = getattr(objective, "quadrature", None)
+            if (
+                _HAVE_FUSED and n_ph.is_cuda
+                and isinstance(q, FixedLogGrid)
+                and isinstance(getattr(objective, "likelihood", None), Poisson)
+                and isinstance(scatter, GenGaussLogScatter)
+                and not getattr(objective, "renormalize", False)
+                and not bg.requires_grad
+                # The fused kernel hardcodes the plain Poisson integrand, so a
+                # likelihood carrying extra structure -- e.g. bg_var_factor,
+                # which marginalises the background estimate's own error --
+                # would be SILENTLY ignored here while the eager loop honours
+                # it.  Refuse the fast path rather than compute a different
+                # quantity from the one the loss asked for.
+                and not float(getattr(objective.likelihood, "bg_var_factor",
+                                      0.0) or 0.0)
+            ):
+                la, lb = scatter.log_alpha_beta_obs(params, meta)
+                lp = fused_posterior_logp(
+                    base.contiguous(), n_ph, bg, la, lb, hkl_id, v_nodes,
+                    q.log_S_grid, q._trap_log_w(q.log_S_grid, q.n_points),
+                )
+                out = base.new_zeros(self.n_hkl, v_nodes.shape[1])
+                return out.index_add(0, hkl_id, lp)
+
+        cols = []
+        for c in range(v_nodes.shape[1]):   # not k_coarse: locate() uses its own width
+            v_c = v_nodes[:, c].index_select(0, hkl_id)
+            f = objective.log_prob(scatter, params, v_c + base, n_ph, bg, meta)
+            cols.append(group_sum(f, hkl_id, self.n_hkl))
+        return torch.stack(cols, dim=1)
+
+    def integrate(
+        self, S: Tensor, v_nodes: Tensor, log_w_nodes: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Coarse curve -> ``(log_Z, E[I0], posterior weights, v, edge_mass)``.
+
+        Shared by the loss and by the merge, so the quantity being scored is by
+        construction the quantity being minimised.
+        """
+        if log_w_nodes is None:
+            # uniform-in-u placement: interpolate to the fine grid, then weight
+            centre, sig_h = getattr(self, "_loc", None) or self._centre_sigma()
+            S_fine = self._interp(S)
+            v = centre[:, None] + sig_h[:, None] * self.u_fine[None, :]
+            du = float(2 * self.n_sigma / (self.m_fine - 1))
+            log_w = (sig_h * du).log()[:, None].expand_as(v).clone()
+            if self.prior == "flat_I0":
+                log_w = log_w + v                       # dI0 = I0 dv
+            elif self.prior == "wilson":
+                log_w = (
+                    log_w + v - v.exp() / self.wilson_sigma[:, None]
+                    - self.wilson_sigma.log()[:, None]
+                )
+            log_w[:, 0] -= math.log(2.0)
+            log_w[:, -1] -= math.log(2.0)
+        else:
+            S_fine, v, log_w = S, v_nodes, log_w_nodes
+
+        logits = S_fine + log_w
+        log_Z = torch.logsumexp(logits, dim=1)
+        w_post = torch.softmax(logits, dim=1)
+        I = v.exp()
+        I0_mean = (w_post * I).sum(dim=1)
+        # sigI falls out of the same integral -- no separate error model, and
+        # it is the posterior width rather than a propagated Laplace guess.
+        I0_sd = (
+            (w_post * (I - I0_mean[:, None]) ** 2).sum(dim=1).clamp(min=0)
+        ).sqrt()
+        n_edge = max(1, int(round(0.05 * logits.shape[1])))
+        edge_mass = (
+            w_post[:, :n_edge].sum(1) + w_post[:, -n_edge:].sum(1)
+        ).detach()
+        return log_Z, I0_mean, I0_sd, w_post, v, edge_mass
+
+    def nodes(self) -> tuple[Tensor, Tensor | None]:
+        """Integration nodes ``v`` and their log-weights (``None`` -> uniform)."""
+        if self.node_placement == "wilson":
+            return self._wilson_nodes()
+        centre, sig_h = self._centre_sigma()
+        return centre[:, None] + sig_h[:, None] * self.u_coarse[None, :], None
+
+    def _interp(self, S_coarse: Tensor) -> Tensor:
+        """``(n_hkl, k_coarse)`` -> ``(n_hkl, m_fine)``, linear on the u axis."""
+        lo = S_coarse.index_select(1, self._lo)
+        hi = S_coarse.index_select(1, self._hi)
+        return lo + (hi - lo) * self._t[None, :]
+
+    # ── forward ────────────────────────────────────────────────────────
+
+    def forward(
+        self, objective, scatter, params, pred,
+        n_ph: Tensor, bg: Tensor, sigma: Tensor, hkl_id: Tensor, meta,
+    ) -> PosteriorOut:
+        if self.node_placement == "wilson":
+            # Importance placement: nodes already sit where the mass is, so the
+            # coarse->fine interpolation that compensates for a badly placed
+            # uniform grid is unnecessary.  Integrate on the nodes directly.
+            v_nodes, log_w_nodes = self._wilson_nodes()
+            interpolate = False
+        else:
+            # Measure the curve, then place the grid on it.  One extra sweep of
+            # scan_points, against three failed attempts at a closed-form width.
+            centre, sig_h = self.locate(
+                objective, scatter, params, pred, n_ph, bg, hkl_id, meta
+            )
+            self._loc = (centre, sig_h)
+            v_nodes = centre[:, None] + sig_h[:, None] * self.u_coarse[None, :]
+            log_w_nodes = None
+            interpolate = True
+
+        S = self.accumulate(
+            objective, scatter, params, pred, n_ph, bg, hkl_id, meta, v_nodes
+        )
+
+        log_Z, I0_mean, I0_sd, w_post, v, edge_mass = self.integrate(
+            S, v_nodes, log_w_nodes
+        )
+        seen = torch.zeros(self.n_hkl, dtype=torch.bool, device=n_ph.device)
+        seen[hkl_id] = True
+        log_Z = torch.where(
+            seen, log_Z,
+            torch.full((self.n_hkl,), float("-inf"),
+                       device=log_Z.device, dtype=log_Z.dtype),
+        )
+
+        floored = I0_mean < self.floor
+        I0_mean = torch.where(seen, I0_mean.clamp(min=self.floor), self.ema_I0)
+        self._update_ema(pred, n_ph - bg, sigma, hkl_id)
+        if self.node_placement == "laplace":
+            # Only the uniform-grid path has an extent to maintain.  Wilson
+            # placement draws nodes through an inverse CDF over u in (0,1), so
+            # there is nothing to widen or shrink and nothing to truncate.
+            self._update_width(w_post, v, seen, edge_mass)
+
+        return PosteriorOut(
+            log_Z=log_Z, I0_mean=I0_mean, I0_sd=I0_sd,
+            I0_obs=I0_mean.index_select(0, hkl_id),
+            seen=seen, edge_mass=edge_mass,
+            n_floored=int((floored & seen).sum()),
+        )
+
+    @torch.no_grad()
+    def _update_width(self, w_post, v, seen, edge_mass) -> None:
+        """Roll the grid width forward from the posterior we just measured.
+
+        Uses the observed posterior sd in ``log I0``, inflated where the grid
+        clipped: if ``edge_mass`` is large the measured sd is itself an
+        underestimate (the tails were cut off), so widen rather than trust it.
+        """
+        mean = (w_post * v).sum(1)
+        sd = ((w_post * (v - mean[:, None]) ** 2).sum(1)).clamp(min=1e-12).sqrt()
+        cur = self.ema_log_sigma.exp()
+
+        # Ratchet, not a symmetric update.  A naive "measure and follow" loop
+        # oscillates (measured edge_mass 0.29 -> 0.03 -> 0.52 -> 0.01 -> 0.53):
+        # a clipped grid under-reports its own width, the correction overshoots,
+        # the now-wide grid measures a small sd, and it clips again.  So widen
+        # hard when clipping is detected and shrink only slowly and only when it
+        # is not, which is monotone enough to settle.
+        clipped = edge_mass > 0.01
+        widened = cur * (1.0 + 2.0 * edge_mass)
+        shrunk = torch.maximum(0.98 * cur, sd)          # never below the measurement
+        target = torch.where(clipped, widened, shrunk).clamp(*self.sigma_bounds)
+        self.ema_log_sigma[seen] = target[seen].log()
+
+    @torch.no_grad()
+    def _update_ema(self, pred, n_signal, sigma, hkl_id) -> None:
+        """Roll the grid centre and width forward with the current model."""
+        K = pred.log_K.exp().clamp(min=1e-8)
+        I0_ref = self.ema_I0[hkl_id].clamp(min=self.floor)
+        w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
+        var = (sigma**2 + (K * I0_ref) ** 2 * torch.expm1(w2)).clamp(min=1e-12)
+        num = group_sum(K * n_signal / var, hkl_id, self.n_hkl)
+        den = group_sum(K * K / var, hkl_id, self.n_hkl)
+        if not bool(self._den_seeded):
+            self.ema_den.copy_(den)
+            self._den_seeded.fill_(True)
+        seen = den > 0
+        if not bool(seen.any()):
+            return
+        batch = torch.zeros_like(self.ema_I0)
+        batch[seen] = (num[seen] / den[seen]).clamp(min=self.floor)
+        d = self.ema_decay
+        self.ema_I0[seen] = d * self.ema_I0[seen] + (1 - d) * batch[seen]
+        self.ema_den[seen] = d * self.ema_den[seen] + (1 - d) * den[seen]

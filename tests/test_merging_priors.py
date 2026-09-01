@@ -11,6 +11,7 @@ import math
 
 import pytest
 import torch
+from torchsx.merging.scatter_shape import FreePerHKLShape
 
 from torchsx.merging.priors import WilsonPrior, WilsonMatchPrior, FlatPrior
 
@@ -202,8 +203,7 @@ def test_miller_graph_smoothness_equals_dirichlet() -> None:
     adj = build_adjacency(hkl)
     params = Parameters(
         log_I0_init=torch.tensor([0.0, 2.0, 5.0]),
-        log_alpha_init=torch.tensor([-1.0, -1.0, -1.0]),
-        log_beta_init=torch.tensor([0.0, 0.0, 0.0]),
+        scatter_shape=FreePerHKLShape(torch.tensor([-1.0, -1.0, -1.0]), torch.tensor([0.0, 0.0, 0.0])),
     )
     reg = MillerGraphSmoothness(adj, target="log_I0")
     expected = dirichlet_energy(params.log_I0, adj)
@@ -216,8 +216,7 @@ def test_gaussian_anchor_equals_sum_of_squares() -> None:
 
     params = Parameters(
         log_I0_init=torch.tensor([1.0, 2.0, 3.0]),
-        log_alpha_init=torch.zeros(3),
-        log_beta_init=torch.zeros(3),
+        scatter_shape=FreePerHKLShape(torch.zeros(3), torch.zeros(3)),
     )
     reg = GaussianAnchor(target="log_I0", anchor=0.0)
     assert torch.isclose(reg(params), torch.tensor(1.0 + 4.0 + 9.0))
@@ -234,8 +233,7 @@ def test_sigma_cauchy_matches_manual() -> None:
     log_beta = torch.log(torch.tensor([1.5, 1.8, 1.2]))
     params = Parameters(
         log_I0_init=torch.zeros(3),
-        log_alpha_init=log_alpha,
-        log_beta_init=log_beta,
+        scatter_shape=FreePerHKLShape(log_alpha, log_beta),
     )
     reg = SigmaCauchy(tau=1.0)
     # Manual recomputation

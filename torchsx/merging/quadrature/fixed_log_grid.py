@@ -195,8 +195,9 @@ class FixedLogGrid(Quadrature):
         """Marginal ``log p(n | log_mean, α, β, bg)`` on the fixed log_S grid."""
         K = self.n_points
 
-        log_alpha_obs = params.log_alpha[meta.hkl_idx]
-        log_beta_obs = params.log_beta[meta.hkl_idx]
+        # Single seam for per-observation (α, β): the default gathers per-HKL
+        # parameters, a PredictedGenGaussScatter returns network outputs.
+        log_alpha_obs, log_beta_obs = scatter.log_alpha_beta_obs(params, meta)
 
         if self._can_use_triton(scatter, likelihood, log_mean):
             log_w = self._trap_log_w(self.log_S_grid, K)
@@ -210,9 +211,13 @@ class FixedLogGrid(Quadrature):
                     log_alpha_obs, log_beta_obs,
                     self.log_S_grid, log_w,
                 )
+            # A non-zero bg_var_factor marginalises the background estimate's
+            # own error to second order; 0 (the default) is the plain Poisson.
+            bvf = float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0)
             return marginalize_signal_triton(
                 log_mean, n_ph, bg, log_alpha_obs, log_beta_obs,
                 self.log_S_grid, log_w,
+                sig_b2=(bvf * bg.clamp(min=0.0)) if bvf > 0.0 else None,
             )
 
         # Eager fallback — bit-exact w.r.t. the original implementation.
@@ -287,8 +292,9 @@ class FixedLogGrid(Quadrature):
         K = self.n_points
         M = log_mean.shape[0]
 
-        log_alpha_obs = params.log_alpha[meta.hkl_idx]
-        log_beta_obs = params.log_beta[meta.hkl_idx]
+        # Single seam for per-observation (α, β): the default gathers per-HKL
+        # parameters, a PredictedGenGaussScatter returns network outputs.
+        log_alpha_obs, log_beta_obs = scatter.log_alpha_beta_obs(params, meta)
 
         log_S = self.log_S_grid[None, :].expand(M, K)            # (M, K)
         S     = self.S_grid[None, :].expand(M, K)                # (M, K)

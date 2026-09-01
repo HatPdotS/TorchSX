@@ -41,8 +41,7 @@ class GammaLogScatter(ScatterModel):
         params: Parameters,
         meta: ObsInfo,
     ) -> Tensor:               # (M, K)
-        h = meta.hkl_idx
-        log_alpha = params.log_alpha[h]                 # (M,)
+        log_alpha, _ = self.log_alpha_beta_obs(params, meta)   # (M,)
         alpha = log_alpha.exp().clamp(min=1e-3)         # (M,)
         # log p(ε; α) = α·log α − log Γ(α) + α·ε − α·exp(ε)
         log_norm = alpha * log_alpha - torch.lgamma(alpha)              # (M,)

@@ -5,9 +5,18 @@ in production). Other scatter/likelihood combinations fall back to the
 eager PyTorch path in :mod:`fixed_log_grid`.
 
 Per integrand evaluation the kernel emits a single per-observation
-``log_p`` plus four auxiliary statistics ``S1..S4`` (weighted softmax
+``log_p`` plus up to four auxiliary statistics ``S1..S4`` (weighted softmax
 sums over the K grid). Backward then applies analytic gradient formulas
-without recomputing the (M, K) integrand — see ``_apply_backward``.
+without recomputing the (M, K) integrand.
+
+Each statistic is gated by a ``constexpr`` derived from whether the matching
+input actually requires grad, because they are not cheap: an ablation probe
+with four of the five accumulators removed ran 25.1 ms -> 13.5 ms at
+M = 1.05e6, K = 2001, so together they are ~47 % of the kernel.  ``S2``
+(``d log p/d bg``) is the clearest case — ``bg`` is data except under the
+learned-background ``bg_mix`` mode — and the ``locate`` sweep in
+:mod:`torchsx.nn.posterior_target` runs under ``no_grad`` and needs none of
+them.  The gates read ``requires_grad``, so no caller has to opt in.
 
 Tuning is read from ``_fixed_log_grid_tuning.json`` (in-package),
 keyed by GPU name and K bucket. On unknown GPUs we fall back to the
@@ -107,10 +116,14 @@ if HAVE_TRITON:
     @triton.jit
     def _fwd_kernel(
         log_mean_ptr, n_ph_ptr, bg_ptr,
-        log_alpha_ptr, log_beta_ptr, log_nfact_ptr, log_norm_ptr,
+        log_alpha_ptr, log_beta_ptr, logpeak_ptr, log_norm_ptr, sig_b2_ptr,
         log_S_grid_ptr, S_grid_ptr, log_w_ptr,
         log_p_ptr, S1_ptr, S2_ptr, S3_ptr, S4_ptr,
         M, K,
+        BG_VAR: tl.constexpr,
+        NEED_MU: tl.constexpr,
+        NEED_AB: tl.constexpr,
+        NEED_BG: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
@@ -123,7 +136,9 @@ if HAVE_TRITON:
         bg = tl.load(bg_ptr + offs_m, mask=mask_m, other=0.0)
         log_alpha = tl.load(log_alpha_ptr + offs_m, mask=mask_m, other=0.0)
         log_beta = tl.load(log_beta_ptr + offs_m, mask=mask_m, other=0.0)
-        log_nfact = tl.load(log_nfact_ptr + offs_m, mask=mask_m, other=0.0)
+        logpeak = tl.load(logpeak_ptr + offs_m, mask=mask_m, other=0.0)
+        if BG_VAR:
+            sig_b2 = tl.load(sig_b2_ptr + offs_m, mask=mask_m, other=0.0)
         log_norm = tl.load(log_norm_ptr + offs_m, mask=mask_m, other=0.0)
 
         alpha = tl.exp(log_alpha)
@@ -131,7 +146,14 @@ if HAVE_TRITON:
         inv_alpha_safe = 1.0 / alpha_safe
         beta = tl.exp(log_beta)
         log_scatter_const = log_norm - log_alpha
-        log_lik_const = -log_nfact
+        # Reciprocal of n is per-OBSERVATION, so hoist it: as a division
+        # inside the k loop it is an SFU op evaluated M*K times and cost 29 %
+        # of the kernel; as a multiply against a hoisted reciprocal it is free.
+        # Floor at 1e-12, not 1: counts are gain-scaled and 0.07 % of them fall
+        # between 0 and 1, where flooring at 1 would silently use the wrong
+        # ratio.  At n = 0 the term vanishes anyway (0 * log(lam*1e12) = 0) and
+        # lam*1e12 stays inside float32 for any lam on this grid.
+        inv_n = 1.0 / tl.where(n_ph > 1e-12, n_ph, 1e-12)
 
         m_max = tl.full((BLOCK_M,), -1e30, dtype=tl.float32)
         T0 = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -158,36 +180,78 @@ if HAVE_TRITON:
 
             lam = S_k[None, :] + bg[:, None]
             lam = tl.where(lam > 1e-6, lam, 1e-6)
-            inv_lam = 1.0 / lam
 
+            # Poisson factor about its own peak, NOT as
+            # `n log(lam) - lam - log n!`.  Those three terms are each ~3e6 at
+            # the real batch's brightest observation (n = 2.7e5) and cancel to
+            # -6.4, so float32 -- which resolves 3e6 to +-0.2 -- leaves ~0.2-0.4
+            # nats of absolute error right at the peak, where the integrand
+            # carries all its mass.  Measured against a float64 reference: 0.457
+            # nats median error at n = 2e6 before this change.  Writing it as
+            # `n log(lam/n) - (lam - n) + logpeak(n)` cancels the large terms on
+            # paper; `logpeak = n log n - n - log n!` is formed once per
+            # observation in float64 on the host, where the cancellation is
+            # harmless.
             log_int = (
                 -z_pow
                 + log_scatter_const[:, None]
-                + n_ph[:, None] * 0.6931471805599453 * tl.math.log2(lam) - lam
-                + log_lik_const[:, None]
+                + n_ph[:, None] * 0.6931471805599453
+                * tl.math.log2(lam * inv_n[:, None]) - (lam - n_ph[:, None])
+                + logpeak[:, None]
                 + log_w_k[None, :]
             )
+            if BG_VAR:
+                # Second-order marginalisation of the BACKGROUND ESTIMATE's own
+                # error: bg comes from the 9-11 px annulus and carries
+                # sigma_b^2 = (n_peak/n_bg)*bg, which the plain Poisson treats
+                # as zero.  Exponential form, so it is never negative:
+                #     +0.5 sigma_b^2 [ (n/lam - 1)^2 - n/lam^2 ]
+                # -0.5 sigma_b^2/n at the peak (flattening), positive in the
+                # tails (broadening).  One reciprocal, no transcendental.
+                inv_lam = 1.0 / lam
+                rr = n_ph[:, None] * inv_lam
+                corr = 0.5 * sig_b2[:, None] * ((rr - 1.0) * (rr - 1.0)
+                                                - rr * inv_lam)
+                # the expansion needs sigma_b^2 |P''/P| << 1; clamp so a
+                # far-tail node, where the Poisson term is already e^-100,
+                # cannot blow up
+                log_int = log_int + tl.minimum(tl.maximum(corr, -10.0), 10.0)
             log_int = tl.where(mask_k[None, :], log_int, -1e30)
 
             m_chunk = tl.max(log_int, axis=1)
             m_new = tl.maximum(m_max, m_chunk)
             scale = tl.exp(m_max - m_new)
             T0 = T0 * scale
-            T1 = T1 * scale
-            T2 = T2 * scale
-            T3 = T3 * scale
-            T4 = T4 * scale
+            if NEED_MU:
+                T1 = T1 * scale
+            if NEED_BG:
+                T2 = T2 * scale
+            if NEED_AB:
+                T3 = T3 * scale
+                T4 = T4 * scale
 
             e_shift = tl.exp(log_int - m_new[:, None])
-
-            sign_eps = tl.where(eps > 0, 1.0, tl.where(eps < 0, -1.0, 0.0))
-            grad_lm = sign_eps * (z_pow / z_eff) * inv_alpha_safe[:, None]
-
             T0 += tl.sum(e_shift, axis=1)
-            T1 += tl.sum(e_shift * grad_lm, axis=1)
-            T2 += tl.sum(e_shift * (n_ph[:, None] * inv_lam - 1.0), axis=1)
-            T3 += tl.sum(e_shift * z_pow, axis=1)
-            T4 += tl.sum(e_shift * z_pow * log_z_eff, axis=1)
+
+            # Each aux statistic costs a full BLOCK_K cross-lane reduction, and
+            # together they are ~47 % of this kernel's runtime (measured by an
+            # ablation probe: 25.1 ms -> 13.5 ms at M=1.05e6, K=2001 with four
+            # of the five accumulators removed).  Every one of them is dead
+            # weight unless the matching input actually requires grad -- and
+            # the posterior accumulator's `locate` sweep runs under no_grad,
+            # while `bg` is data in every path except the learned-background
+            # `bg_mix` mode, where the gate turns S2 back on by itself.
+            if NEED_MU:
+                sign_eps = tl.where(eps > 0, 1.0, tl.where(eps < 0, -1.0, 0.0))
+                T1 += tl.sum(
+                    e_shift * sign_eps * (z_pow / z_eff) * inv_alpha_safe[:, None],
+                    axis=1,
+                )
+            if NEED_BG:
+                T2 += tl.sum(e_shift * (n_ph[:, None] / lam - 1.0), axis=1)
+            if NEED_AB:
+                T3 += tl.sum(e_shift * z_pow, axis=1)
+                T4 += tl.sum(e_shift * z_pow * log_z_eff, axis=1)
 
             m_max = m_new
 
@@ -195,10 +259,13 @@ if HAVE_TRITON:
         inv_T0 = 1.0 / T0
 
         tl.store(log_p_ptr + offs_m, log_p, mask=mask_m)
-        tl.store(S1_ptr + offs_m, T1 * inv_T0, mask=mask_m)
-        tl.store(S2_ptr + offs_m, T2 * inv_T0, mask=mask_m)
-        tl.store(S3_ptr + offs_m, T3 * inv_T0, mask=mask_m)
-        tl.store(S4_ptr + offs_m, T4 * inv_T0, mask=mask_m)
+        if NEED_MU:
+            tl.store(S1_ptr + offs_m, T1 * inv_T0, mask=mask_m)
+        if NEED_BG:
+            tl.store(S2_ptr + offs_m, T2 * inv_T0, mask=mask_m)
+        if NEED_AB:
+            tl.store(S3_ptr + offs_m, T3 * inv_T0, mask=mask_m)
+            tl.store(S4_ptr + offs_m, T4 * inv_T0, mask=mask_m)
 
 
 # ── Autograd.Function wrapper ──────────────────────────────────────────
@@ -222,7 +289,9 @@ class _MarginalizeSignalTriton(torch.autograd.Function):
         ctx,
         log_mean: Tensor, n_ph: Tensor, bg: Tensor,
         log_alpha_obs: Tensor, log_beta_obs: Tensor,
-        log_S_grid: Tensor, S_grid: Tensor, log_w: Tensor, log_nfact: Tensor,
+        log_S_grid: Tensor, S_grid: Tensor, log_w: Tensor, logpeak: Tensor,
+        sig_b2: Tensor | None = None,
+        need_mu: bool = True, need_ab: bool = True, need_bg: bool = True,
     ) -> Tensor:
         if not HAVE_TRITON:
             raise RuntimeError("triton not available — caller should fall back")
@@ -238,41 +307,57 @@ class _MarginalizeSignalTriton(torch.autograd.Function):
         device = log_mean.device
         dtype = log_mean.dtype
         log_p = torch.empty(M, dtype=dtype, device=device)
-        S1 = torch.empty(M, dtype=dtype, device=device)
-        S2 = torch.empty(M, dtype=dtype, device=device)
-        S3 = torch.empty(M, dtype=dtype, device=device)
-        S4 = torch.empty(M, dtype=dtype, device=device)
+        # A statistic that will not be stored needs no buffer -- but the kernel
+        # still takes a valid pointer, so give it a one-element placeholder.
+        # This is where the memory goes in the posterior accumulator: 21 outer
+        # nodes x 4 statistics x (M,) is 373 MB of saved activations at
+        # M = 1.1e6, none of which the no-grad `locate` sweep ever reads.
+        def _buf(need):
+            return torch.empty(M if need else 1, dtype=dtype, device=device)
+
+        S1, S2 = _buf(need_mu), _buf(need_bg)
+        S3, S4 = _buf(need_ab), _buf(need_ab)
 
         cfg = _lookup_config(K)
         BLOCK_M, BLOCK_K = cfg["BLOCK_M"], cfg["BLOCK_K"]
         grid = (triton.cdiv(M, BLOCK_M),)
         _fwd_kernel[grid](
             log_mean, n_ph, bg,
-            log_alpha_obs, log_beta_obs, log_nfact, log_norm,
+            log_alpha_obs, log_beta_obs, logpeak, log_norm,
+            sig_b2 if sig_b2 is not None else logpeak,
             log_S_grid, S_grid, log_w,
             log_p, S1, S2, S3, S4,
             M, K,
+            BG_VAR=sig_b2 is not None,
+            NEED_MU=need_mu, NEED_AB=need_ab, NEED_BG=need_bg,
             BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
             num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
         )
 
+        ctx.need = (need_mu, need_ab, need_bg)
         ctx.save_for_backward(log_alpha_obs, log_beta_obs, S1, S2, S3, S4)
         return log_p
 
     @staticmethod
     def backward(ctx, grad_log_p: Tensor):
         log_alpha_obs, log_beta_obs, S1, S2, S3, S4 = ctx.saved_tensors
+        need_mu, need_ab, need_bg = ctx.need
         beta = log_beta_obs.exp()
-        psi_recip_beta = torch.special.digamma(1.0 / beta)
 
-        g_log_mean = grad_log_p * (beta * S1)
-        g_bg = grad_log_p * S2
-        g_log_alpha_obs = grad_log_p * (beta * S3 - 1.0)
-        g_log_beta_obs = grad_log_p * (-beta * S4 + 1.0 + psi_recip_beta / beta)
+        g_log_mean = grad_log_p * (beta * S1) if need_mu else None
+        g_bg = grad_log_p * S2 if need_bg else None
+        if need_ab:
+            psi_recip_beta = torch.special.digamma(1.0 / beta)
+            g_log_alpha_obs = grad_log_p * (beta * S3 - 1.0)
+            g_log_beta_obs = grad_log_p * (
+                -beta * S4 + 1.0 + psi_recip_beta / beta
+            )
+        else:
+            g_log_alpha_obs = g_log_beta_obs = None
 
         return (
             g_log_mean, None, g_bg, g_log_alpha_obs, g_log_beta_obs,
-            None, None, None, None,
+            None, None, None, None, None, None, None, None,
         )
 
 
@@ -286,6 +371,7 @@ def marginalize_signal_triton(
     log_w: Tensor,
     *,
     log_nfact: Tensor | None = None,
+    sig_b2: Tensor | None = None,
 ) -> Tensor:
     """Return per-obs ``log_p`` of shape ``(M,)`` via the Triton kernel.
 
@@ -295,8 +381,22 @@ def marginalize_signal_triton(
     """
     if log_nfact is None:
         log_nfact = torch.lgamma(n_ph + 1)
+    # log of the Poisson factor at its own peak, formed in float64 so the
+    # ~3e6-magnitude cancellation happens where there are digits to spare.
+    n64 = n_ph.double()
+    logpeak = (
+        n64 * n64.clamp(min=1e-300).log() - n64 - log_nfact.double()
+    ).to(log_mean.dtype)
+    logpeak = torch.where(n_ph > 0, logpeak, torch.zeros_like(logpeak))
     S_grid = log_S_grid.exp()
+    # Compute the gradient gates HERE, not inside forward(): autograd runs
+    # Function.forward with grad mode off, so requires_grad is not a reliable
+    # signal in there.
+    on = torch.is_grad_enabled()
     return _MarginalizeSignalTriton.apply(
         log_mean, n_ph, bg, log_alpha_obs, log_beta_obs,
-        log_S_grid, S_grid, log_w, log_nfact,
+        log_S_grid, S_grid, log_w, logpeak, sig_b2,
+        on and log_mean.requires_grad,
+        on and (log_alpha_obs.requires_grad or log_beta_obs.requires_grad),
+        on and bg.requires_grad,
     )

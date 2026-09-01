@@ -6,6 +6,7 @@ import math
 
 import pytest
 import torch
+from torchsx.merging.scatter_shape import FreePerHKLShape
 
 from torchsx.merging.observations import ObsInfo
 from torchsx.merging.parameters import Parameters
@@ -20,8 +21,10 @@ from torchsx.merging.quadrature import TrapezoidalLogGrid
 def _make_toy_params(n_hkl: int, *, alpha: float = 0.8, beta: float = 1.3) -> Parameters:
     return Parameters(
         log_I0_init=torch.full((n_hkl,), math.log(5.0)),
-        log_alpha_init=torch.full((n_hkl,), math.log(alpha)),
-        log_beta_init=torch.full((n_hkl,), math.log(beta)),
+        scatter_shape=FreePerHKLShape(
+            torch.full((n_hkl,), math.log(alpha)),
+            torch.full((n_hkl,), math.log(beta)),
+        ),
     )
 
 

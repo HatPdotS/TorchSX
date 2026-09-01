@@ -28,11 +28,22 @@ def _reindex(
 def filter_resolution(
     core: _SFXStreamCore, d_min: float = 0.0, d_max: float = 999.0
 ) -> _SFXStreamCore:
-    """Keep observations within the resolution range [d_min, d_max] in Å."""
+    """Keep observations within the resolution range [d_min, d_max] in Å.
+
+    D-spacing is computed from the **median** cell, not each crystal's own.
+    Two reasons: ``get_d_spacing`` takes a single ``(6,)`` cell and has no
+    per-row form (the previous per-observation ``core.cell[crystal_id]`` call
+    raised ``ValueError`` for any stream with more than one crystal), and more
+    importantly ``prepare_observations`` derives ``prep.d_spacing`` from
+    ``core.cell.median(dim=0)`` — so using anything else here would cut on a
+    different resolution scale than every downstream shell, bin and d_min
+    report.  Cell spread within one crystal form is far below the width of a
+    resolution shell.
+    """
     from torchref.base.reciprocal.hkl import get_d_spacing
 
-    obs_cell = core.cell[core.crystal_id.long()]
-    d = get_d_spacing(core.hkl.float(), obs_cell)
+    median_cell = core.cell.median(dim=0).values
+    d = get_d_spacing(core.hkl.float(), median_cell)
 
     obs_mask = (d >= d_min) & (d <= d_max)
 

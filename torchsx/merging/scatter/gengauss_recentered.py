@@ -16,9 +16,16 @@ weak or strong.  See
 the empirical demonstration of why this matters.
 
 E[S] is computed via a global numerical quadrature over ε once at
-init time, given a single (α_ref, β_ref) for the dataset.  A
-per-HKL E[S(α_h, β_h)] is the natural extension once α/β estimation
-is stable.
+init time, given a single (α_ref, β_ref) for the dataset.
+
+**That global shift is an approximation, and it is load-bearing rather
+than cosmetic.**  E[exp(ε)] is a function of the width — 1.05 at w=0.3,
+3.90 at w=1.65, 22.8 at w=2.5 — so freezing it at one (α_ref, β_ref)
+leaves a residual bias wherever the actual width differs, and that bias
+grows with the width.  When the width is itself being fitted this closes
+a loop: wider scatter -> more biased target -> worse fit -> wider
+scatter.  Use :func:`torchsx.merging.scatter.gengauss.log_e_s_gengauss`
+for the per-observation (or per-HKL) value whenever α/β are not constant.
 """
 from __future__ import annotations
 

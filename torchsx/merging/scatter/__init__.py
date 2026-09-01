@@ -7,10 +7,15 @@ variation beyond what linear scale + B-factor capture.
 
 from torchsx.merging.scatter.base import ScatterModel
 from torchsx.merging.scatter.gamma import GammaLogScatter
-from torchsx.merging.scatter.gengauss import GenGaussLogScatter
+from torchsx.merging.scatter.gengauss import (
+    GenGaussLogScatter,
+    log_alpha_from_log_width,
+)
+from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 from torchsx.merging.scatter.gengauss_recentered import GenGaussLogScatterRecentered
 
 __all__ = [
     "ScatterModel", "GenGaussLogScatter", "GammaLogScatter",
-    "GenGaussLogScatterRecentered",
+    "GenGaussLogScatterRecentered", "PredictedGenGaussScatter",
+    "log_alpha_from_log_width",
 ]

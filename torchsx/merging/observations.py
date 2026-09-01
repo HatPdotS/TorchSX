@@ -40,6 +40,25 @@ class ObsInfo:
     populated by :func:`prepare_observations` when the stream carries
     image-level ``timepoint`` metadata (see
     :meth:`SFXStream.assign_timepoints`); otherwise they stay ``None``.
+
+    ``q_dir`` is the **lab-frame** unit scattering vector.  Direction is what
+    makes an orientation error expressible: if the refined orientation is wrong
+    by a small rotation ``delta``, the induced change in excitation error is
+    ``(delta x q) . s_hat`` — a function of *where* the reflection sits, not
+    just how far out.  With only ``s_sq`` (a magnitude) and a scalar
+    ``ewald_offset``, "reflections on this side of the pattern run high" is not
+    representable at all, so the peers cannot convey an orientation error and
+    the target reflection could not apply one.  Lab frame specifically: the
+    crystal-frame direction is just ``hkl`` and would be degenerate with I0,
+    whereas the lab-frame direction varies with each crystal's orientation.
+
+    ``obs_id`` is each observation's row index in the *full* (unsliced) list.
+    :meth:`slice` gives contiguous chunks, for which the caller's
+    ``obs_range=(s, e)`` is enough to index a per-observation side-channel; but
+    crystal-batched training gathers **non-contiguous** subsets, where
+    ``obs_range`` is meaningless.  Carrying ``obs_id`` lets any per-observation
+    cache — predicted scatter, ``FixedScale``, an EMA — be indexed correctly
+    under an arbitrary gather.
     """
 
     crystal_id: Tensor
@@ -52,6 +71,11 @@ class ObsInfo:
     peak: Tensor | None = None
     background: Tensor | None = None
     ewald_offset: Tensor | None = None
+    sigma: Tensor | None = None          # CrystFEL σ(I), same units as I_obs
+    q_dir: Tensor | None = None          # (n, 3) unit scattering vector, LAB frame
+    beam_energy: Tensor | None = None    # (n,) per-image photon energy (eV)
+    crystal_res: Tensor | None = None    # (n,) per-crystal diffraction limit
+    obs_id: Tensor | None = None         # (n,) int64 — row index in the FULL obs list
     # Kinetic-ensemble plumbing — both populated together or both ``None``.
     delay_bin_idx: Tensor | None = None     # (n_crystals,) int64, indexes unique_timepoints
     unique_timepoints: Tensor | None = None  # (n_timepoints,) float64, sorted
@@ -69,7 +93,46 @@ class ObsInfo:
             peak=None if self.peak is None else self.peak[s:e],
             background=None if self.background is None else self.background[s:e],
             ewald_offset=None if self.ewald_offset is None else self.ewald_offset[s:e],
+            sigma=None if self.sigma is None else self.sigma[s:e],
+            crystal_res=None if self.crystal_res is None else self.crystal_res[s:e],
+            beam_energy=None if self.beam_energy is None else self.beam_energy[s:e],
+            q_dir=None if self.q_dir is None else self.q_dir[s:e],
+            obs_id=None if self.obs_id is None else self.obs_id[s:e],
             delay_bin_idx=self.delay_bin_idx,            # per-crystal — full table kept
+            unique_timepoints=self.unique_timepoints,
+        )
+
+    def gather(self, idx: Tensor) -> "ObsInfo":
+        """Restrict to an **arbitrary** (possibly non-contiguous) row selection.
+
+        The crystal-batched counterpart of :meth:`slice`.  ``obs_id`` is carried
+        through so downstream per-observation lookups still resolve against the
+        full observation list.
+        """
+        def _g(t):
+            return None if t is None else t[idx]
+        if self.obs_id is None:
+            raise ValueError(
+                "ObsInfo.gather requires obs_id; build via prepare_observations "
+                "or set obs_id=torch.arange(n_obs) explicitly."
+            )
+        return ObsInfo(
+            crystal_id=self.crystal_id[idx],
+            s_sq=self.s_sq[idx],
+            hkl_idx=self.hkl_idx[idx],
+            n_crystals=self.n_crystals,
+            panel_id=_g(self.panel_id),
+            fs=_g(self.fs),
+            ss=_g(self.ss),
+            peak=_g(self.peak),
+            background=_g(self.background),
+            ewald_offset=_g(self.ewald_offset),
+            sigma=_g(self.sigma),
+            q_dir=_g(self.q_dir),
+            beam_energy=_g(self.beam_energy),
+            crystal_res=_g(self.crystal_res),
+            obs_id=self.obs_id[idx],
+            delay_bin_idx=self.delay_bin_idx,
             unique_timepoints=self.unique_timepoints,
         )
 
@@ -87,6 +150,11 @@ class ObsInfo:
             peak=_m(self.peak),
             background=_m(self.background),
             ewald_offset=_m(self.ewald_offset),
+            sigma=_m(self.sigma),
+            q_dir=_m(self.q_dir),
+            beam_energy=_m(self.beam_energy),
+            crystal_res=_m(self.crystal_res),
+            obs_id=_m(self.obs_id),
             delay_bin_idx=_m(self.delay_bin_idx),
             unique_timepoints=_m(self.unique_timepoints),
         )
@@ -137,7 +205,7 @@ def _build_delay_bins(stream, n_crystals: int) -> tuple[Tensor | None, Tensor | 
     return bin_idx, uniq_vals
 
 
-def _ewald_offset(core) -> Tensor:
+def _ewald_offset(core, return_q: bool = False):
     """Per-observation signed Ewald sphere offset ``‖q+s₀‖ − 1/λ`` (Å⁻¹).
 
     Physically-motivated proxy for predicted partiality: large ``|r|`` →
@@ -160,7 +228,10 @@ def _ewald_offset(core) -> Tensor:
     k0 = 1.0 / wavelength
     s0 = torch.zeros_like(q_lab)
     s0[:, 2] = k0
-    return (q_lab + s0).norm(dim=1) - k0
+    offset = (q_lab + s0).norm(dim=1) - k0
+    if return_q:
+        return offset, q_lab / q_lab.norm(dim=1, keepdim=True).clamp(min=1e-12)
+    return offset
 
 
 # ── Prepared-observation bundle ────────────────────────────────────────
@@ -263,7 +334,7 @@ def prepare_observations(
     # Per-observation signed Ewald sphere offset (Å⁻¹). Used by the σ²(bg)
     # gain calibration to gate to off-Bragg (predicted-zero-signal) obs,
     # and propagated to ObsInfo for downstream use.
-    ewald_offset_core = _ewald_offset(core)
+    ewald_offset_core, q_dir_core = _ewald_offset(core, return_q=True)
 
     # ── Detector gain (ADU / photon) ──
     gain_cfg = config.gain
@@ -489,6 +560,23 @@ def prepare_observations(
         peak=_chain("peak").float() if core.peak is not None else None,
         background=_chain("background").float() if core.background is not None else None,
         ewald_offset=ewald_offset_core[keep_all][sort_all].float(),
+        # CrystFEL σ(I), carried in the same photon units as I_obs (both are
+        # divided by the detector gain above).  Consumed by the agreement /
+        # marginal objective and by a supplied-σ likelihood.
+        sigma=(
+            (core.sigma / gain)[keep_all][sort_all].float()
+            if getattr(core, "sigma", None) is not None else None
+        ),
+        q_dir=q_dir_core[keep_all][sort_all].float(),
+        beam_energy=(
+            core.broadcast("beam_energy", "image", "obs")[keep_all][sort_all].float()
+            if hasattr(core, "broadcast") else None
+        ),
+        crystal_res=(
+            core.resolution[cid].float() if getattr(core, "resolution", None) is not None
+            else None
+        ),
+        obs_id=torch.arange(n_obs_total, dtype=torch.long),
         delay_bin_idx=delay_bin_idx,
         unique_timepoints=unique_t_tensor,
     )

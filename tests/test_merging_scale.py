@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 import torch
+from torchsx.merging.scatter_shape import FreePerHKLShape
 
 from torchsx.merging.observations import ObsInfo
 from torchsx.merging.parameters import Parameters
@@ -19,8 +20,7 @@ from torchsx.merging.scale import (
 def _params(n_hkl: int = 4) -> Parameters:
     return Parameters(
         log_I0_init=torch.zeros(n_hkl),
-        log_alpha_init=torch.zeros(n_hkl),
-        log_beta_init=torch.zeros(n_hkl),
+        scatter_shape=FreePerHKLShape(torch.zeros(n_hkl), torch.zeros(n_hkl)),
     )
 
 
