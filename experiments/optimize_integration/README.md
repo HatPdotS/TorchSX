@@ -361,7 +361,57 @@ widening by `c` already costs `log c` per observation and any
 `|lam_spread| < 1` leaves that restoring force intact.  `evdevup10.py` /
 `evdevup25.py` test that.
 
-## Open: the residual weak-end floor
+## The residual floor is the outer shells, not a population
+
+The corrected merge's `F_obs` vs `F_model` plot looks bimodal at the weak end.
+It is not centric/acentric -- this is P 1, Friedel-merged, so every reflection is
+acentric -- and it is not the free set (5.1 % vs 4.3 % across the two modes).
+A histogram over *all* weak reflections looks unimodal and nearly hid it; the dip
+only appears at fixed `F_model` (slice `log10 F_model` in [-0.50, -0.25), dip
+statistic 0.46, `bench/weak_slices.py`).
+
+The two modes have the **same `F_model`** (0.4624 vs 0.4630) and differ 2.64x in
+`F_obs`.  What separates them is resolution:
+
+| Wilson shell | d (A) | lower mode | upper mode | % upper |
+|---|---|---|---|---|
+| 0 | 0.908 | 4 | 82 | 95.3 % |
+| 1 | 0.924 | 3 | 69 | 95.8 % |
+| 2 | 0.941 | 18 | 51 | 73.9 % |
+| 3 | 0.960 | 41 | 26 | 38.8 % |
+| 4 | 0.981 | 53 | 11 | 17.2 % |
+| 5+ | >= 1.00 | 500 | 3 | ~0 % |
+
+with multiplicity 247 against 729 and `sigma_F` 2.15x wider in the upper mode.
+It is not a clamp: all 1116 `F` values in the slice are distinct (partialator
+*does* have one -- 5 reflections pinned at `F = 0.0822`).
+
+So the floor that survives the correction is concentrated in the last three
+shells, where multiplicity collapses and the Wilson posterior is most
+prior-dominated.  It reads as a second mode rather than a tail because
+`d_min = 0.9` is a hard cut and `Sigma` is a per-shell step function, so the
+outer shells form a discrete cluster.  **The remaining floor is a `d_min`
+question**: cutting at ~0.95-1.0 A removes the population entirely.  This is
+consistent with the note in the design doc that the 0.86-0.82 A shell holds only
+332 reflections and drags a junk shell into every comparison.
+
+## Against partialator
+
+Same model, cell and free set; partialator's intensities go through
+French-Wilson, ours do not.
+
+| merge | R_free (ml) | R_free (nll) | weak slope (ml) | strong slope (ml) |
+|---|---|---|---|---|
+| partialator + FW | 0.1472 | 0.1825 | 0.408 | 0.988 |
+| ours, plain Poisson | 0.1306 | 0.1350 | 0.182 | 0.983 |
+| **ours, deviance + `lam_spread` -0.25** | **0.1252** | **0.1269** | **0.948** | **1.008** |
+
+Partialator compresses the weak end too (slope 0.408), and floors at `F ~ 2.4`
+where the model says 0.83.  Its advantage over our *uncorrected* merge at the
+weak end (0.408 vs 0.182) is real and was worth knowing; the corrected merge
+beats it on both axes.
+
+## Open: what remains
 
 With the background handled, ground-truth recovery is 1.21 against a 1.02
 ceiling -- most of the bias is gone, some is not.  Against a common refined
