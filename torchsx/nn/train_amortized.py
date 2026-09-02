@@ -434,7 +434,17 @@ class AmortizedTrainer:
         K = pred.log_K.exp().clamp(min=1e-8)
         w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
         var_scatter = (K * I0) ** 2 * torch.expm1(w2)
-        var = (sigma**2 + var_scatter).clamp(min=1e-12)
+        # `sigma` is the counting variance alone.  When the likelihood carries
+        # the background ESTIMATE's variance the model claims
+        # lam + sigma_b^2 + scatter, and omitting that term makes `var_z` rise
+        # purely because the width head shrank -- so the metric would report a
+        # calibration change when nothing about the residuals moved.  At this
+        # data's median bg the term is 135 against sigma^2 = 136, so it is not
+        # a refinement.
+        bvf = float(getattr(getattr(self.objective, "likelihood", None),
+                            "bg_var_factor", 0.0) or 0.0)
+        var = (sigma**2 + bvf * bg.clamp(min=0.0)
+               + var_scatter).clamp(min=1e-12)
         resid = (n_ph - bg) - K * I0
         tgt = MergeTargetOut(
             log_I0=I0.clamp(min=1e-12).log(), I0=I0, resid=resid, var=var,

@@ -211,13 +211,15 @@ class FixedLogGrid(Quadrature):
                     log_alpha_obs, log_beta_obs,
                     self.log_S_grid, log_w,
                 )
-            # A non-zero bg_var_factor marginalises the background estimate's
-            # own error to second order; 0 (the default) is the plain Poisson.
+            # A non-zero bg_var_factor accounts for the background estimate's
+            # own variance; 0 (the default) is the plain Poisson.
             bvf = float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0)
             return marginalize_signal_triton(
                 log_mean, n_ph, bg, log_alpha_obs, log_beta_obs,
                 self.log_S_grid, log_w,
                 sig_b2=(bvf * bg.clamp(min=0.0)) if bvf > 0.0 else None,
+                bg_deviance=getattr(likelihood, "bg_var_mode", "deviance")
+                != "second_order",
             )
 
         # Eager fallback — bit-exact w.r.t. the original implementation.

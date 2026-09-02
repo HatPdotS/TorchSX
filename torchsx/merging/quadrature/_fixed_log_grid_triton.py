@@ -121,6 +121,7 @@ if HAVE_TRITON:
         log_p_ptr, S1_ptr, S2_ptr, S3_ptr, S4_ptr,
         M, K,
         BG_VAR: tl.constexpr,
+        BG_DEVIANCE: tl.constexpr,
         NEED_MU: tl.constexpr,
         NEED_AB: tl.constexpr,
         NEED_BG: tl.constexpr,
@@ -192,30 +193,46 @@ if HAVE_TRITON:
             # paper; `logpeak = n log n - n - log n!` is formed once per
             # observation in float64 on the host, where the cancellation is
             # harmless.
+            # -D/2, the Poisson log-factor measured from its own peak
+            neg_half_D = (n_ph[:, None] * 0.6931471805599453
+                          * tl.math.log2(lam * inv_n[:, None])
+                          - (lam - n_ph[:, None]))
+            if BG_VAR:
+                if BG_DEVIANCE:
+                    # bg is ESTIMATED from the 9-11 px annulus and carries
+                    # sigma_b^2 = (n_peak/n_bg)*bg, so the count's variance is
+                    # lam + sigma_b^2, not lam.  Scaling the Poisson deviance by
+                    # the dispersion phi = 1 + sigma_b^2/lam is the saddlepoint
+                    # density of that overdispersed law: it keeps the mode at
+                    # lam = n, matches the variance, collapses to the exact
+                    # Poisson at sigma_b^2 = 0, and is bounded -- so it needs no
+                    # clamp.  Measured against the exact marginal over the
+                    # annulus's Gamma posterior on a real batch, median error
+                    # 0.13 nats against the second-order form's 0.89.
+                    inv_lps2 = 1.0 / (lam + sig_b2[:, None])
+                    inv_phi = lam * inv_lps2
+                    neg_half_D = (neg_half_D * inv_phi
+                                  + 0.5 * 0.6931471805599453
+                                  * tl.math.log2(inv_phi))
+                else:
+                    # Legacy second-order expansion, kept only to reproduce the
+                    # earlier measurements: +0.5 sigma_b^2 [(n/lam-1)^2 - n/lam^2].
+                    # It is unbounded as lam leaves n, so it needs the +-10 clamp
+                    # -- which fires on 16 % of the grid points that carry mass
+                    # and inflates the weak quartile's posterior mean 5.4x.
+                    inv_lam = 1.0 / lam
+                    rr = n_ph[:, None] * inv_lam
+                    corr = 0.5 * sig_b2[:, None] * ((rr - 1.0) * (rr - 1.0)
+                                                    - rr * inv_lam)
+                    neg_half_D = neg_half_D + tl.minimum(
+                        tl.maximum(corr, -10.0), 10.0)
             log_int = (
                 -z_pow
                 + log_scatter_const[:, None]
-                + n_ph[:, None] * 0.6931471805599453
-                * tl.math.log2(lam * inv_n[:, None]) - (lam - n_ph[:, None])
+                + neg_half_D
                 + logpeak[:, None]
                 + log_w_k[None, :]
             )
-            if BG_VAR:
-                # Second-order marginalisation of the BACKGROUND ESTIMATE's own
-                # error: bg comes from the 9-11 px annulus and carries
-                # sigma_b^2 = (n_peak/n_bg)*bg, which the plain Poisson treats
-                # as zero.  Exponential form, so it is never negative:
-                #     +0.5 sigma_b^2 [ (n/lam - 1)^2 - n/lam^2 ]
-                # -0.5 sigma_b^2/n at the peak (flattening), positive in the
-                # tails (broadening).  One reciprocal, no transcendental.
-                inv_lam = 1.0 / lam
-                rr = n_ph[:, None] * inv_lam
-                corr = 0.5 * sig_b2[:, None] * ((rr - 1.0) * (rr - 1.0)
-                                                - rr * inv_lam)
-                # the expansion needs sigma_b^2 |P''/P| << 1; clamp so a
-                # far-tail node, where the Poisson term is already e^-100,
-                # cannot blow up
-                log_int = log_int + tl.minimum(tl.maximum(corr, -10.0), 10.0)
             log_int = tl.where(mask_k[None, :], log_int, -1e30)
 
             m_chunk = tl.max(log_int, axis=1)
@@ -292,6 +309,7 @@ class _MarginalizeSignalTriton(torch.autograd.Function):
         log_S_grid: Tensor, S_grid: Tensor, log_w: Tensor, logpeak: Tensor,
         sig_b2: Tensor | None = None,
         need_mu: bool = True, need_ab: bool = True, need_bg: bool = True,
+        bg_deviance: bool = True,
     ) -> Tensor:
         if not HAVE_TRITON:
             raise RuntimeError("triton not available — caller should fall back")
@@ -329,6 +347,7 @@ class _MarginalizeSignalTriton(torch.autograd.Function):
             log_p, S1, S2, S3, S4,
             M, K,
             BG_VAR=sig_b2 is not None,
+            BG_DEVIANCE=bg_deviance,
             NEED_MU=need_mu, NEED_AB=need_ab, NEED_BG=need_bg,
             BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
             num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
@@ -357,7 +376,7 @@ class _MarginalizeSignalTriton(torch.autograd.Function):
 
         return (
             g_log_mean, None, g_bg, g_log_alpha_obs, g_log_beta_obs,
-            None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         )
 
 
@@ -372,6 +391,7 @@ def marginalize_signal_triton(
     *,
     log_nfact: Tensor | None = None,
     sig_b2: Tensor | None = None,
+    bg_deviance: bool = True,
 ) -> Tensor:
     """Return per-obs ``log_p`` of shape ``(M,)`` via the Triton kernel.
 
@@ -393,10 +413,20 @@ def marginalize_signal_triton(
     # Function.forward with grad mode off, so requires_grad is not a reliable
     # signal in there.
     on = torch.is_grad_enabled()
+    need_bg = on and bg.requires_grad
+    if need_bg and sig_b2 is not None:
+        # S2 is d log_p/d bg for the PLAIN Poisson factor; neither background
+        # correction has that derivative, and bg additionally enters through
+        # sigma_b^2 = (n_peak/n_bg)*bg.  A learned background must not be
+        # combined with the correction rather than silently get a wrong grad.
+        raise RuntimeError(
+            "bg requires grad while the background-variance correction is on; "
+            "the analytic d log_p/d bg does not cover it (see bg_var_factor)"
+        )
     return _MarginalizeSignalTriton.apply(
         log_mean, n_ph, bg, log_alpha_obs, log_beta_obs,
         log_S_grid, S_grid, log_w, logpeak, sig_b2,
         on and log_mean.requires_grad,
         on and (log_alpha_obs.requires_grad or log_beta_obs.requires_grad),
-        on and bg.requires_grad,
+        need_bg, bg_deviance,
     )

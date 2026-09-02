@@ -84,3 +84,35 @@ def test_filter_cell_removes_outlier():
     result = filter_cell(core, tolerance=0.05)
     assert result.n_crystals == 2
     assert result.n_observations == 2
+
+
+def test_ewald_offset_is_friedel_invariant(sample_core):
+    """Negating a Miller index must not change its excitation error.
+
+    ``SFXStream.symmetrize()`` replaces each observed index by its ASU
+    representative, negating about half of them, and ``_ewald_offset`` reads
+    ``core.hkl``.  Before this was handled, half the offsets on any
+    Friedel-merged stream were those of ``-q`` and landed 0.4-0.9 Å⁻¹ away
+    instead of within 0.007 -- which silently broke the σ²(bg) gain
+    calibration (its off-Bragg gate selected Bragg peaks), ``filter_ewald``,
+    and the ``ewald_offset`` input feature of the amortised scale network.
+    """
+    from torchsx.merging.observations import _ewald_offset
+
+    ref = _ewald_offset(sample_core)
+    flipped = sample_core.replace(hkl=-sample_core.hkl)
+    got = _ewald_offset(flipped)
+
+    assert torch.allclose(ref.abs(), got.abs(), atol=1e-6), (
+        f"|ewald_offset| changed under h -> -h: {ref} vs {got}"
+    )
+
+
+def test_ewald_offset_matches_unmerged_when_not_friedel_merged(sample_core):
+    """With ``friedel_merged=False`` the raw ``+q`` branch is used as-is."""
+    from torchsx.merging.observations import _ewald_offset
+
+    raw = _ewald_offset(sample_core.replace(friedel_merged=False))
+    merged = _ewald_offset(sample_core.replace(friedel_merged=True))
+    # the fixed path may only ever pick the SMALLER of the two branches
+    assert (merged.abs() <= raw.abs() + 1e-6).all()

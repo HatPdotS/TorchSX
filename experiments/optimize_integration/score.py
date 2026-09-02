@@ -81,7 +81,9 @@ def production(prob, *, likelihood="poisson", k_coarse=21, m_fine=129,
     ).to(dev)
     tgt.wilson_sigma.copy_(cast(prob.wilson_sigma))     # true Sigma, not estimated
 
-    if likelihood == "poisson":
+    if not isinstance(likelihood, str):
+        lik = likelihood                       # caller supplies a configured one
+    elif likelihood == "poisson":
         lik = Poisson()
     else:
         # The Gaussian path already carries the background's ESTIMATION

@@ -229,6 +229,20 @@ def _ewald_offset(core, return_q: bool = False):
     s0 = torch.zeros_like(q_lab)
     s0[:, 2] = k0
     offset = (q_lab + s0).norm(dim=1) - k0
+    if bool(getattr(core, "friedel_merged", True)):
+        # ``symmetrize()`` replaces each observed Miller index by its ASU
+        # representative, which NEGATES it for about half the observations.
+        # The excitation error of ``-q`` is not the one that was measured: it
+        # lands 0.4-0.9 Å⁻¹ away, which is where the bimodal |offset|
+        # distribution comes from (q50 = 0.007, q75 = 0.43 on the dark stream)
+        # and why the off-Bragg gate at |r| > 0.25 selected 36 % of
+        # observations whose mean I was 68 photons -- Bragg peaks, not
+        # background.  Only one mate of a Friedel pair can be near diffracting
+        # condition, so take whichever it is.
+        offset_flip = (s0 - q_lab).norm(dim=1) - k0
+        flip = offset_flip.abs() < offset.abs()
+        offset = torch.where(flip, offset_flip, offset)
+        q_lab = torch.where(flip[:, None], -q_lab, q_lab)
     if return_q:
         return offset, q_lab / q_lab.norm(dim=1, keepdim=True).clamp(min=1e-12)
     return offset

@@ -560,6 +560,14 @@ class PosteriorMergeTarget(nn.Module):
         K = pred.log_K.exp().clamp(min=1e-8)
         I0_ref = self.ema_I0[hkl_id].clamp(min=self.floor)
         w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
+        # These weights deliberately do NOT carry the likelihood's
+        # background-estimate variance, even when it is switched on.  They set
+        # the grid CENTRE and the LOO blend, not the integral: the posterior is
+        # computed by quadrature against the full likelihood, so a slightly
+        # mis-weighted proposal costs nothing but a slightly worse-placed grid,
+        # and `edge_mass` reports if that ever matters.  Adding the term here
+        # would change the merge itself, which is a separate decision from
+        # changing the likelihood.
         var = (sigma**2 + (K * I0_ref) ** 2 * torch.expm1(w2)).clamp(min=1e-12)
         num = group_sum(K * n_signal / var, hkl_id, self.n_hkl)
         den = group_sum(K * K / var, hkl_id, self.n_hkl)
