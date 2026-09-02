@@ -14,12 +14,20 @@ through a posterior integral over `I0` rather than a point estimate, so `I` and
 `sigma_I` come from the same integral. See
 `experiments/docs/amortized_scale_plan.md` for the design and
 `experiments/optimize_integration/README.md` for the measured state of the
-integration — including the node settings that should be used, and one open
-defect at the weak end.
+integration — the node settings that should be used, the background likelihood,
+and the measurement traps that produced two wrong conclusions along the way.
 
 Validated against refinement rather than only CC1/2, since a merge can be
-systematically wrong and perfectly self-consistent: R_free 0.1397 against
-0.1825 for partialator + French-Wilson on the same model and free set.
+systematically wrong and perfectly self-consistent — and on this data it
+repeatedly is. **R_free 0.1269 (`nll`) / 0.1252 (`ml`)** against 0.1825 for
+partialator + French–Wilson on the same model, cell and free set, with the
+weak-end compression slope at 1.02 / 0.95 where the uncompensated merge gives
+0.16 / 0.18.
+
+That the two must be checked separately is not a formality here: the
+single best CC1/2 of any run trained (0.9982) came from a configuration whose
+merged intensities are **not monotone** in `F_model` and whose R_free is the
+worst of the trained set.
 
 ## Installation
 
