@@ -290,8 +290,27 @@ under both targets: 0.1350 -> 0.1269 (`nll`) and 0.1306 -> 0.1252 (`ml`), agains
 a repeat noise of ~0.0014.  This is the best accuracy measured in this project;
 the previous best was 0.1348.
 
-`w` lands at 1.091 (-0.10) and 1.111 (-0.25), against the 1.45 the unity-scale
-evidence scan makes optimal and the 0.895 the un-reversed prior produced.
+**`-0.25` is an interior optimum, not a point on a ramp.**  Three negative values
+bracket it:
+
+| lam_spread | median `w` | CC1/2 | R_split | R_free (nll) | slope weak |
+|---|---|---|---|---|---|
+| +0.05 | 0.895 | **0.9982** | 0.0536 | 0.1513 | 1.148 |
+| -0.10 | 1.091 | 0.9978 | 0.0537 | 0.1292 | 1.070 |
+| **-0.25** | 1.111 | 0.9978 | 0.0535 | **0.1269** | **1.023** |
+| -0.50 | 1.139 | 0.9978 | **0.0523** | 0.1315 | 0.875 |
+
+R_free turns at -0.25 and the weak-quartile slope passes through 1 there, going
+below it (0.875) at -0.50 -- past the optimum the correction starts
+*over*-shooting, the same failure the second-order form had, just reached from
+the other direction.
+
+Two things worth noting.  Median `w` moves only 1.091 -> 1.139 across a 5x change
+in the prior while R_free has a clear optimum, so the prior is reshaping the
+per-observation width distribution rather than just sliding its median.  And
+**R_split keeps improving monotonically (0.0537 -> 0.0535 -> 0.0523) straight
+through the R_free optimum and past it** -- one more instance of precision and
+accuracy pointing in different directions on this data.
 
 ## Why the width prior had to be reversed
 
