@@ -168,6 +168,13 @@ class PosteriorMergeTarget(nn.Module):
         self.ema_decay, self.floor = float(ema_decay), float(floor)
         self.sigma_bounds = sigma_bounds
         self.scan_points, self.scan_halfwidth = int(scan_points), float(scan_halfwidth)
+        # Recompute each outer node in backward instead of holding all C graphs.
+        # OFF by default: it roughly doubles the accumulate's compute, which is
+        # not worth paying on a data set that already fits.  Turn it on when the
+        # batch is memory-bound -- on a 114 k-reflection cell the in-batch
+        # redundancy that fits on a 40 GB card is ~4x below what a 14 k-reflection
+        # cell gets at the same batch size, and that is what it buys back.
+        self.checkpoint_nodes = False
         self.use_fused = bool(use_fused)
         self.lam = 0.0                      # API parity with LOOInBatchTarget
 
@@ -187,6 +194,17 @@ class PosteriorMergeTarget(nn.Module):
         # set_wilson_sigma().  Defaults to the seed intensities, which is the
         # per-reflection rather than per-shell mean — adequate to start.
         self.register_buffer("wilson_sigma", I0_init.detach().clone().float().clamp(min=floor))
+        # Centric reflections have a different Wilson distribution:
+        #     acentric  p(I) = exp(-I/Sigma) / Sigma
+        #     centric   p(I) = exp(-I/2Sigma) / sqrt(2 pi Sigma I)
+        # so the prior rate is 1/Sigma against 1/(2 Sigma), and the centric form
+        # carries an extra I^(-1/2) that puts much more weight near zero.  Using
+        # the acentric form on a centric reflection under-shrinks it, and in
+        # Laue class mmm the three principal zones are centric -- exactly the
+        # strong low-resolution reflections.  Default all-False, so a triclinic
+        # merge is unchanged bit-for-bit.
+        self.register_buffer("is_centric",
+                             torch.zeros_like(self.wilson_sigma, dtype=torch.bool))
 
         u_c = torch.linspace(-n_sigma, n_sigma, k_coarse)
         u_f = torch.linspace(-n_sigma, n_sigma, m_fine)
@@ -312,6 +330,16 @@ class PosteriorMergeTarget(nn.Module):
         self.wilson_sigma.copy_((m / c.clamp(min=1))[shell_id].clamp(min=self.floor))
 
     @torch.no_grad()
+    def set_is_centric(self, is_centric: Tensor) -> None:
+        """Mark which reflections take the centric Wilson prior."""
+        self.is_centric.copy_(is_centric.to(self.is_centric.device).bool())
+
+    def _prior_rate(self) -> Tensor:
+        """``1/Sigma`` acentric, ``1/(2 Sigma)`` centric."""
+        sig = self.wilson_sigma.clamp(min=self.floor)
+        return torch.where(self.is_centric, 0.5 / sig, 1.0 / sig)
+
+    @torch.no_grad()
     def _wilson_nodes(self) -> tuple[Tensor, Tensor]:
         """Nodes at quantiles of the French-Wilson approximate posterior.
 
@@ -322,7 +350,7 @@ class PosteriorMergeTarget(nn.Module):
         """
         Ihat = self.ema_I0.clamp(min=self.floor)
         sd = (1.0 / self.ema_den.clamp(min=1e-12).sqrt()).clamp(min=1e-6)
-        mu = Ihat - sd**2 / self.wilson_sigma.clamp(min=self.floor)
+        mu = Ihat - sd**2 * self._prior_rate()
 
         nrm = torch.distributions.Normal(0.0, 1.0)
         a = (-mu / sd)                                   # lower truncation in z
@@ -335,7 +363,14 @@ class PosteriorMergeTarget(nn.Module):
 
         # importance weights: dI-integral of L*p_W with proposal q
         #   w_k = du * p_W(I_k) / q(I_k)
-        log_pw = -I_nodes / self.wilson_sigma[:, None] - self.wilson_sigma.log()[:, None]
+        rate = self._prior_rate()[:, None]
+        log_sig = self.wilson_sigma.clamp(min=self.floor).log()[:, None]
+        log_pw = torch.where(
+            self.is_centric[:, None],
+            -I_nodes * rate - 0.5 * (math.log(2 * math.pi) + log_sig
+                                     + I_nodes.clamp(min=1e-30).log()),
+            -I_nodes * rate - log_sig,
+        )
         log_q = (
             nrm.log_prob((I_nodes - mu[:, None]) / sd[:, None])
             - sd.log()[:, None] - torch.log1p(-Fa)[:, None]
@@ -414,9 +449,29 @@ class PosteriorMergeTarget(nn.Module):
                 return out.index_add(0, hkl_id, lp)
 
         cols = []
+        ckpt = self.checkpoint_nodes and torch.is_grad_enabled() and base.requires_grad
         for c in range(v_nodes.shape[1]):   # not k_coarse: locate() uses its own width
-            v_c = v_nodes[:, c].index_select(0, hkl_id)
-            f = objective.log_prob(scatter, params, v_c + base, n_ph, bg, meta)
+            if ckpt:
+                # Each node runs the WHOLE inner marginal, and the graphs of all
+                # C nodes are otherwise alive at once.  The encoder and the
+                # marginal's observation chunks are already checkpointed; this
+                # loop was the one stage that was not, and it is the natural
+                # place for it -- the accumulation is additive over nodes, so a
+                # node can be recomputed in isolation from (base, v_c) alone.
+                # Pass the node INDEX, not v_c: v_c is (M,) and storing one
+                # per node is 4 B/obs x C, which at C=31 is as large as the
+                # aux statistics we are trying to avoid keeping.  v_nodes is
+                # (n_hkl, C) and costs nothing to close over.
+                f = torch.utils.checkpoint.checkpoint(
+                    lambda b, _c=c: objective.log_prob(
+                        scatter, params,
+                        v_nodes[:, _c].index_select(0, hkl_id) + b,
+                        n_ph, bg, meta),
+                    base, use_reentrant=False,
+                )
+            else:
+                v_c = v_nodes[:, c].index_select(0, hkl_id)
+                f = objective.log_prob(scatter, params, v_c + base, n_ph, bg, meta)
             cols.append(group_sum(f, hkl_id, self.n_hkl))
         return torch.stack(cols, dim=1)
 
@@ -438,9 +493,15 @@ class PosteriorMergeTarget(nn.Module):
             if self.prior == "flat_I0":
                 log_w = log_w + v                       # dI0 = I0 dv
             elif self.prior == "wilson":
-                log_w = (
-                    log_w + v - v.exp() / self.wilson_sigma[:, None]
-                    - self.wilson_sigma.log()[:, None]
+                rate = self._prior_rate()[:, None]
+                log_sig = self.wilson_sigma.clamp(min=self.floor).log()[:, None]
+                # v carries the dI = I dv Jacobian; the centric I^(-1/2) eats
+                # half of it, leaving 0.5 * v.
+                log_w = torch.where(
+                    self.is_centric[:, None],
+                    log_w + 0.5 * v - v.exp() * rate
+                    - 0.5 * (math.log(2 * math.pi) + log_sig),
+                    log_w + v - v.exp() * rate - log_sig,
                 )
             log_w[:, 0] -= math.log(2.0)
             log_w[:, -1] -= math.log(2.0)

@@ -218,6 +218,10 @@ class ObsFeatureSpec(nn.Module):
     #: no information and is treated as constant.
     CONST_REL_TOL: float = 1e-6
 
+    #: Rows used to estimate the per-feature mean and std.  Full-dataset stats
+    #: over 133 M observations buy nothing a 2 M sample does not already give.
+    STAT_SAMPLE: int = 2_000_000
+
     @torch.no_grad()
     def _recompute_stats(self) -> None:
         """Refresh normalisation over the full dataset.
@@ -228,7 +232,20 @@ class ObsFeatureSpec(nn.Module):
         is not a cosmetic issue — with the stats frozen at the initial
         reference, the synthetic recovery test fell from rho = 0.96 to 0.11.
         """
-        full = self._raw_columns(self._stat_obs_info, self._stat_names)
+        # Subsample.  These are per-feature means and standard deviations, and
+        # 2 M rows fix them to ~0.07 %; using all 133 M costs a 4 GB host-device
+        # transfer every epoch once `prep` is host-resident, because the
+        # module's own `_I`/`_sigma` buffers live on the compute device while
+        # the cached stat meta does not.  Deterministic, so the normalisation
+        # does not jitter between calls.
+        meta_s = self._stat_obs_info
+        n = int(meta_s.hkl_idx.numel())
+        if n > self.STAT_SAMPLE:
+            g = torch.Generator(device="cpu").manual_seed(0)
+            idx = torch.randperm(n, generator=g)[: self.STAT_SAMPLE]
+            meta_s = meta_s.gather(idx.to(meta_s.hkl_idx.device))
+        meta_s = meta_s.to(self._I.device)
+        full = self._raw_columns(meta_s, self._stat_names)
         mean = torch.stack([full[k].mean() for k in self._stat_names])
         raw_std = torch.stack([full[k].std() for k in self._stat_names])
 
@@ -276,13 +293,21 @@ class ObsFeatureSpec(nn.Module):
         out: dict[str, Tensor] = {}
         need = set(names)
 
+        I = sig = None
         if {"signed_log_I", "i_over_sigma", "obs_scale",
             "obs_scale_over_sigma"} & need:
-            I = self._I[oid]
+            I = self._I[oid.to(self._I.device)]
         if {"log_sigma", "i_over_sigma", "obs_scale_over_sigma"} & need:
-            sig = self._sigma[oid]
+            sig = self._sigma[oid.to(self._sigma.device)]
         if {"obs_scale", "obs_scale_over_sigma", "log_I0_ref"} & need:
-            I0 = self._I0_ref[meta.hkl_idx]
+            # `_I0_ref` is a buffer and follows the module's device, but the
+            # cached full-dataset meta used by `_recompute_stats` stays on the
+            # host once `prep` is host-resident (stream_batches).  Index on the
+            # meta's device: it is (n_hkl,), so moving it is free, whereas
+            # moving the meta would defeat the point of streaming.
+            I0 = self._I0_ref.to(meta.hkl_idx.device)[meta.hkl_idx]
+            I = I.to(I0.device) if I is not None else I
+            sig = sig.to(I0.device) if sig is not None else sig
 
         for k in need:
             if k == "s_sq":

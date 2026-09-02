@@ -82,6 +82,10 @@ class AmortizedScale(ScaleModel):
         self.encoder = encoder
         self.heads = heads
         self.n_crystals = int(n_crystals)
+        #: Crystals per encoder chunk; 0 runs the whole batch in one shot.
+        #: See :meth:`predict` -- the encoder is separable across crystals, so
+        #: chunking is exact and moves the checkpoint boundary off the blocks.
+        self.chunk_crystals = 0
         self.anchor_log_k = bool(anchor_log_k)
         if anchor_stat not in ("median", "mean"):
             raise ValueError(f"anchor_stat must be 'median' or 'mean', got {anchor_stat!r}")
@@ -172,8 +176,74 @@ class AmortizedScale(ScaleModel):
 
     # ── forward ────────────────────────────────────────────────────────
 
+    def set_encoder_chunking(self, crystals_per_chunk: int) -> None:
+        """Chunk the encoder over crystals, moving the checkpoint boundary.
+
+        Sets both halves of the change together: the chunk size, and turning
+        OFF the encoder's per-block checkpointing, which the chunk-level
+        checkpoint replaces.  Leaving both on would nest a recompute inside a
+        recompute and keep the per-block boundaries we are trying to drop.
+        """
+        n = int(crystals_per_chunk)
+        self.chunk_crystals = max(n, 0)
+        self.encoder.checkpoint = not (n > 0)
+
+    @staticmethod
+    def _crystal_chunks(crystal_id: Tensor, per_chunk: int):
+        """Slice bounds that never cut a crystal in half.
+
+        ``leave_one_out_mean`` pools WITHIN a crystal, so a chunk edge that
+        falls inside one silently gives that crystal a context built from part
+        of itself.  Rows arrive grouped by crystal (``CrystalIndex.rows``
+        concatenates per-crystal blocks), so the boundaries are just the points
+        where ``crystal_id`` changes.
+        """
+        n = crystal_id.numel()
+        change = (crystal_id[1:] != crystal_id[:-1]).nonzero().squeeze(1) + 1
+        # Chunking is only exact if each crystal occupies ONE contiguous run.
+        # `PreparedObs` is sorted by hkl, not by crystal, so passing it whole
+        # would split crystals across chunks and give each a context built from
+        # part of itself -- wrong, and silent.  `CrystalIndex.rows()` returns
+        # crystal-grouped rows, which is what the trainer feeds.
+        if change.numel() + 1 != int(torch.unique(crystal_id).numel()):
+            raise ValueError(
+                "encoder chunking needs crystal-grouped observations: "
+                f"{change.numel() + 1} contiguous runs for "
+                f"{int(torch.unique(crystal_id).numel())} crystals. "
+                "Index through CrystalIndex.rows() rather than passing "
+                "hkl-sorted PreparedObs directly."
+            )
+        edges = torch.cat([
+            crystal_id.new_zeros(1), change, crystal_id.new_tensor([n])
+        ]).tolist()
+        out, lo = [], 0
+        for i in range(1, len(edges)):
+            if i - lo >= per_chunk or i == len(edges) - 1:
+                out.append((edges[lo], edges[i]))
+                lo = i
+        return out
+
     def predict(self, meta: ObsInfo) -> ScalePrediction:
-        """One forward pass: ``meta`` → per-observation (log K, log w, β, log α)."""
+        """One forward pass: ``meta`` → per-observation (log K, log w, β, log α).
+
+        With ``chunk_crystals > 0`` the encoder runs in crystal-aligned chunks,
+        each wrapped in a SINGLE checkpoint.  That moves the checkpoint boundary
+        from the block to the chunk: measured at 1.67 M observations the encoder
+        held 14.0 GB, which is 16 retained ``(M, d_model)`` tensors at 512 B per
+        observation each, and every one of them is interior -- only ``log_K``,
+        ``log_w`` and ``beta`` leave.  Storing the chunk's inputs and outputs
+        instead is ~52 B per observation, and the 16 are rematerialised one
+        chunk at a time in backward.
+        """
+        n_chunk = int(getattr(self, "chunk_crystals", 0) or 0)
+        if n_chunk > 0:
+            # Chunk in EVERY mode, not only when building a graph.  The
+            # no-grad paths -- the locate sweep, evaluation, the merge -- store
+            # nothing, but a single SiLU on a whole batch is still one
+            # allocation: at R=200 that is 13.3 M rows and 12.7 GB, which OOMs
+            # a 40 GB card before any checkpointing question arises.  The
+            # checkpoint is what is conditional on grad, not the chunking.
+            return self._predict_chunked(meta, n_chunk)
         x_self, x_ctx = self.features.build(meta)
         z = self.encoder(x_self, x_ctx, meta.crystal_id, self.n_crystals)
         pred = self.heads(z)
@@ -188,6 +258,49 @@ class AmortizedScale(ScaleModel):
                 beta=pred.beta,
                 log_alpha=pred.log_alpha,
                 log_e_s=pred.log_e_s,
+            )
+        return pred
+
+    def _predict_chunked(self, meta: ObsInfo, per_chunk: int) -> ScalePrediction:
+        # Features are built once and persist: they are (M, ~10), i.e. 40 B per
+        # observation, against 8 KB for the interior tensors they let us drop.
+        x_self, x_ctx = self.features.build(meta)
+        cid = meta.crystal_id
+        spans = self._crystal_chunks(cid, per_chunk)
+
+        # The encoder's per-block checkpointing must be OFF for the whole
+        # lifetime of this call, not just the forward: toggling it back before
+        # backward makes recomputation take a different path from the original
+        # forward, and non-reentrant checkpoint detects that as a differing
+        # number of saved tensors and raises.  `set_encoder_chunking` turns it
+        # off permanently, so this only asserts it.
+        if self.encoder.checkpoint and torch.is_grad_enabled() and self.training:
+            raise RuntimeError(
+                "encoder.checkpoint must be False when chunk_crystals > 0; "
+                "use AmortizedScale.set_encoder_chunking() to set both"
+            )
+
+        def run(xs, xc, ci):
+            z = self.encoder(xs, xc, ci, self.n_crystals)
+            p = self.heads(z)
+            return p.log_K, p.log_w, p.beta, p.log_alpha, p.log_e_s
+
+        ckpt = torch.is_grad_enabled() and self.training
+        parts = [
+            torch.utils.checkpoint.checkpoint(
+                run, x_self[a:b], x_ctx[a:b], cid[a:b], use_reentrant=False
+            )
+            if ckpt else run(x_self[a:b], x_ctx[a:b], cid[a:b])
+            for a, b in spans
+        ]
+
+        pred = ScalePrediction(*[torch.cat(t) for t in zip(*parts)])
+        if self.anchor_log_k:
+            loc = (pred.log_K.median() if self.anchor_stat == "median"
+                   else pred.log_K.mean())
+            pred = ScalePrediction(
+                log_K=pred.log_K - loc, log_w=pred.log_w, beta=pred.beta,
+                log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
             )
         return pred
 

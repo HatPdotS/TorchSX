@@ -243,3 +243,65 @@ def test_sigma_cauchy_matches_manual() -> None:
     sigma2 = torch.exp(2.0 * log_sigma)
     expected = torch.log(1.0 + sigma2).sum()
     assert torch.isclose(reg(params), expected, atol=1e-6)
+
+
+def test_posterior_centric_prior_matches_wilson_analytically():
+    """The centric branch must integrate to the centric Wilson distribution.
+
+    Laue class mmm makes the three principal zones centric, and the amortised
+    merge applied the ACENTRIC prior to everything until this was added.  The
+    two differ where it matters most for a difference map: the centric form
+    carries an extra I^(-1/2), so it puts far more weight near zero and shrinks
+    weak reflections harder.
+
+    Check both the mean of the prior alone (acentric E[I] = Sigma, centric
+    E[I] = Sigma as well, but the VARIANCE differs: Sigma^2 against 2 Sigma^2)
+    and that P 1 is untouched.
+    """
+    import math
+
+    import torch
+
+    from torchsx.nn.posterior_target import PosteriorMergeTarget
+
+    n = 4
+    I0 = torch.full((n,), 10.0)
+    tgt = PosteriorMergeTarget(I0, k_coarse=31, m_fine=513, n_sigma=12.0,
+                               prior="wilson", node_placement="laplace")
+    tgt.wilson_sigma.fill_(10.0)
+    tgt.set_is_centric(torch.tensor([False, False, True, True]))
+
+    # a flat log-likelihood -> the posterior IS the prior
+    centre = torch.full((n,), math.log(10.0))
+    sig_h = torch.full((n,), 3.0)
+    tgt._loc = (centre, sig_h)
+    S = torch.zeros(n, tgt.k_coarse)
+    _, I_mean, I_sd, _, _, _ = tgt.integrate(S, None, None)
+
+    # acentric Wilson: mean Sigma, sd Sigma.  centric: mean Sigma, sd sqrt(2)*Sigma
+    assert torch.allclose(I_mean[:2], torch.tensor([10.0, 10.0]), rtol=0.05), I_mean
+    assert torch.allclose(I_mean[2:], torch.tensor([10.0, 10.0]), rtol=0.05), I_mean
+    assert torch.allclose(I_sd[:2], torch.tensor([10.0, 10.0]), rtol=0.08), I_sd
+    assert torch.allclose(I_sd[2:], torch.tensor([14.142, 14.142]), rtol=0.08), I_sd
+
+
+def test_posterior_centric_default_is_noop():
+    """Default all-acentric: a P 1 merge must be unchanged bit-for-bit."""
+    import math
+
+    import torch
+
+    from torchsx.nn.posterior_target import PosteriorMergeTarget
+
+    I0 = torch.full((3,), 5.0)
+    a = PosteriorMergeTarget(I0, k_coarse=21, m_fine=129, prior="wilson")
+    b = PosteriorMergeTarget(I0, k_coarse=21, m_fine=129, prior="wilson")
+    b.set_is_centric(torch.zeros(3, dtype=torch.bool))
+    for t in (a, b):
+        t.wilson_sigma.fill_(5.0)
+        t._loc = (torch.full((3,), math.log(5.0)), torch.full((3,), 2.0))
+    S = torch.randn(3, 21)
+    ra = a.integrate(S, None, None)
+    rb = b.integrate(S, None, None)
+    for x, y in zip(ra, rb):
+        assert torch.equal(x, y)

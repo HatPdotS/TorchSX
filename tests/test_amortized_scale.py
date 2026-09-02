@@ -446,3 +446,63 @@ def test_varying_features_are_still_standardised():
     x_self, _ = spec.build(prep.obs_info)
     i = spec.self_features.index("s_sq")
     assert x_self[:, i].std() > 0.5
+
+
+def test_encoder_chunking_is_exact_in_value_and_gradient():
+    """Crystal-chunked prediction must equal the one-shot pass, bit-for-bit-ish.
+
+    The chunking exists to move the checkpoint boundary from the block to the
+    chunk: measured on 1.67 M observations the encoder held 14.0 GB, all of it
+    16 interior ``(M, d_model)`` tensors, when only three ``(M,)`` outputs ever
+    leave.  That trade is only legitimate if it changes nothing, and the one
+    thing that could is ``leave_one_out_mean``: it pools within a crystal, so a
+    chunk edge inside a crystal would give that crystal a context built from
+    part of itself -- and would still run.
+    """
+    torch.manual_seed(0)
+    prep = _toy_prep()
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
+    # non-trivial weights: zero-init heads would hide any discrepancy
+    for prm in scale.parameters():
+        if prm.dim() >= 1:
+            torch.nn.init.normal_(prm, std=0.05)
+    scale.train()
+    # PreparedObs is hkl-sorted; the trainer feeds crystal-grouped rows, and
+    # chunking requires that ordering, so reproduce it here.
+    order = torch.argsort(prep.obs_info.crystal_id, stable=True)
+    meta = prep.obs_info.gather(order)
+
+    def run(chunk):
+        scale.set_encoder_chunking(chunk)
+        scale.zero_grad(set_to_none=True)
+        pred = scale.predict(meta)
+        loss = (pred.log_K.square().sum() + pred.log_w.sum()
+                + pred.beta.sum() + pred.log_alpha.sum())
+        loss.backward()
+        g = torch.cat([p.grad.flatten() for p in scale.parameters()
+                       if p.grad is not None])
+        return pred.log_K.detach().clone(), pred.log_w.detach().clone(), g
+
+    k0, w0, g0 = run(0)
+    for chunk in (1, 2):
+        k1, w1, g1 = run(chunk)
+        torch.testing.assert_close(k1, k0, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(w1, w0, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(g1, g0, rtol=1e-4, atol=1e-6)
+
+
+def test_encoder_chunks_never_split_a_crystal():
+    """The chunk bounds must land on crystal boundaries."""
+    cid = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2, 2, 3])
+    for per_chunk in (1, 2, 3, 10):
+        spans = AmortizedScale._crystal_chunks(cid, per_chunk)
+        assert spans[0][0] == 0 and spans[-1][1] == cid.numel()
+        for a, b in spans:
+            assert a < b
+            # a boundary may only sit where the crystal id changes
+            if a > 0:
+                assert cid[a] != cid[a - 1]
+            if b < cid.numel():
+                assert cid[b] != cid[b - 1]
+        # and they must tile the range with no gaps
+        assert [a for a, _ in spans[1:]] == [b for _, b in spans[:-1]]

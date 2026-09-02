@@ -117,6 +117,16 @@ class TrainConfig:
     #: peak; measured 0.003 in abismal and 0.586 in a collapsed run here.
     hkl_permutation_warn: float = 0.02
     max_obs_per_batch: int = 1_500_000
+    #: Size the batch by the in-batch REDUNDANCY it buys, not by an observation
+    #: count.  The in-batch merge target for a reflection is built from roughly
+    #: ``max_obs_per_batch / n_hkl`` observations, and that -- not the number of
+    #: crystals or observations -- is what decides whether the target is any
+    #: good.  The same 1.5 M observations give 106 obs/reflection on a 15 x 19 x
+    #: 19 A cell with 14 k unique reflections and 13 on a 61 x 91 x 150 A cell
+    #: with 114 k, so a batch size carried across data sets silently changes the
+    #: objective.  When set, ``max_obs_per_batch`` is derived as
+    #: ``target_redundancy * n_hkl`` and the configured value is ignored.
+    target_redundancy: float | None = None
     epochs: int = 10
     lr: float = 1e-3
     #: Linear LR warmup.  Matters once the encoder is a deep stack of exchange
@@ -170,6 +180,26 @@ class TrainConfig:
     #: posterior measures both changes at once.  Default posterior for every
     #: run, so CC1/2 differences reflect the scale model only.
     merge_estimator: str = "posterior"
+    #: Recompute each outer quadrature node in backward instead of keeping all
+    #: ``k_coarse`` node graphs alive at once.  Trades ~2x compute in
+    #: ``accumulate`` for a large drop in retained activations.  Only worth it
+    #: when the batch is memory-bound: on a 67 k-reflection cell the in-batch
+    #: redundancy that fits on a 40 GB card is several times below what a
+    #: 14 k-reflection cell gets at the same batch size, and redundancy is what
+    #: decides whether the in-batch merge target is any good.
+    #: Keep ``prep`` on the host and copy only the current batch's rows to the
+    #: device.  Measured on 133 M observations: ``prep`` is 13.85 GB resident
+    #: (10.65 GB of it ``obs_info``) and does not shrink with the batch, which
+    #: is 40 % of a 34.85 GB step and pure overhead -- the encoder activations
+    #: that actually scale with the batch are another 40 %.  The transfer is
+    #: ~320 MB per batch at redundancy 100, i.e. ~13 ms against a multi-second
+    #: step.  Off by default: it is a loss on a data set that already fits.
+    #: Crystals per encoder chunk (0 = the whole batch at once).  The encoder
+    #: is separable across crystals -- only ``leave_one_out_mean`` couples rows,
+    #: and only within a crystal -- so this is exact, not an approximation.
+    encoder_chunk_crystals: int = 0
+    stream_batches: bool = False
+    posterior_checkpoint_nodes: bool = False
     posterior_k_coarse: int = 31
     posterior_m_fine: int = 257
     posterior_n_sigma: float = 8.0
@@ -225,6 +255,21 @@ class AmortizedTrainer:
 
         oi = prep.obs_info
         self.index = CrystalIndex(oi.crystal_id.cpu(), oi.n_crystals)
+        if self.cfg.target_redundancy is not None:
+            want = int(round(self.cfg.target_redundancy * prep.n_valid))
+            avail = int(oi.crystal_id.numel())
+            self.cfg.max_obs_per_batch = min(want, avail)
+            print(
+                f"  [batch] target_redundancy={self.cfg.target_redundancy:g} "
+                f"x {prep.n_valid:,} reflections -> max_obs_per_batch="
+                f"{self.cfg.max_obs_per_batch:,}"
+                + ("  (capped at the whole set)" if want > avail else "")
+                + f"  ~{self.cfg.max_obs_per_batch / max(prep.n_valid, 1):.0f}"
+                f" obs/reflection",
+                flush=True,
+            )
+        if self.cfg.encoder_chunk_crystals:
+            self.scale.set_encoder_chunking(self.cfg.encoder_chunk_crystals)
         self.n_ph = (prep.I_obs + prep.bg).clamp(min=0)
         self.sigma = (
             oi.sigma if oi.sigma is not None
@@ -240,6 +285,8 @@ class AmortizedTrainer:
                 n_sigma=self.cfg.posterior_n_sigma,
                 prior=self.cfg.posterior_prior,
             ).to(self.device)
+            self.target.checkpoint_nodes = bool(
+                self.cfg.posterior_checkpoint_nodes)
         elif self.cfg.merge_target == "loo":
             self.target = LOOInBatchTarget(seed_I0, lam=self.cfg.lam0).to(self.device)
         else:
@@ -380,11 +427,26 @@ class AmortizedTrainer:
 
     # ── one step ───────────────────────────────────────────────────────
 
+    def _batch(self, rows: Tensor):
+        """``(meta, n_ph, bg, sigma)`` for one batch, on the compute device.
+
+        With ``stream_batches`` the per-observation state lives on the host and
+        only the gathered rows cross the bus; otherwise this is the plain
+        indexing it replaces, so the two paths give identical tensors.
+        """
+        if not self.cfg.stream_batches:
+            return (self.prep.obs_info.gather(rows), self.n_ph[rows],
+                    self.prep.bg[rows], self.sigma[rows])
+        r = rows.to(self.prep.bg.device)
+        return (
+            self.prep.obs_info.gather(r).to(self.device),
+            self.n_ph[r].to(self.device, non_blocking=True),
+            self.prep.bg[r].to(self.device, non_blocking=True),
+            self.sigma[r].to(self.device, non_blocking=True),
+        )
+
     def _forward(self, rows: Tensor, *, grad: bool):
-        meta = self.prep.obs_info.gather(rows)
-        n_ph = self.n_ph[rows]
-        bg = self.prep.bg[rows]
-        sigma = self.sigma[rows]
+        meta, n_ph, bg, sigma = self._batch(rows)
 
         ctx = torch.enable_grad() if grad else torch.no_grad()
         with ctx:
@@ -596,9 +658,12 @@ class AmortizedTrainer:
             # likelihood is only a density because we divided this out.
             out["grid_mass_median"] = float(gm.median().item())
             out["grid_mass_p01"] = float(gm.quantile(0.01).item())
-        ios = (self.n_ph[rows] - self.prep.bg[rows]) / self.sigma[rows]
+        _m_, _n_, _b_, _s_ = self._batch(rows)
+        ios = (_n_ - _b_) / _s_
+        # shell_of_obs is prep-derived and stays on the host under
+        # stream_batches, while z comes off the device.
         out.update(calibration_metrics(
-            z, shell_id=self.shell_of_obs[rows],
+            z, shell_id=self.shell_of_obs[rows].to(z.device),
             n_shells=self.cfg.shell_bins, i_over_sigma=ios,
         ))
         # Is the width head actually using its per-observation freedom?  var_z
@@ -627,7 +692,8 @@ class AmortizedTrainer:
             features={
                 "s_sq": meta.s_sq,
                 "ewald_offset": meta.ewald_offset,
-                "d_rank": self.shell_of_obs[rows].float(),
+                # prep-derived, so host-resident under stream_batches
+                "d_rank": self.shell_of_obs[rows].float().to(pred.log_K.device),
             },
         ))
         out["spearman_log_w_ewald"] = (
@@ -763,11 +829,11 @@ class AmortizedTrainer:
                     self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
                 ):
                     r = r.to(self.device)
-                    m = self.prep.obs_info.gather(r)
+                    m, _n, _b, _ = self._batch(r)
                     pr = self.scale.prime(m)
                     acc_s = acc_s + tgt.accumulate(
                         self.objective, self.scale.scatter, self.params, pr,
-                        self.n_ph[r], self.prep.bg[r], m.hkl_idx, m, scan,
+                        _n, _b, m.hkl_idx, m, scan,
                     )
                     self.scale.clear()
                 c, sd = tgt.peak_from_scan(acc_s)
@@ -783,13 +849,13 @@ class AmortizedTrainer:
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         ):
             rows = rows.to(self.device)
-            meta = self.prep.obs_info.gather(rows)
+            meta, _nph, _bg, _sig = self._batch(rows)
             pred = self.scale.prime(meta)
-            n_signal = self.n_ph[rows] - self.prep.bg[rows]
+            n_signal = _nph - _bg
             if posterior:
                 acc = acc + tgt.accumulate(
                     self.objective, self.scale.scatter, self.params, pred,
-                    self.n_ph[rows], self.prep.bg[rows], meta.hkl_idx, meta,
+                    _nph, _bg, meta.hkl_idx, meta,
                     v_nodes,
                 )
             else:
@@ -799,7 +865,7 @@ class AmortizedTrainer:
                 )
                 w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
                 V = (
-                    self.sigma[rows] ** 2 + (K * I0_ref) ** 2 * torch.expm1(w2)
+                    _sig ** 2 + (K * I0_ref) ** 2 * torch.expm1(w2)
                 ).clamp(min=1e-12)
                 num.index_add_(0, meta.hkl_idx, K * n_signal / V)
                 den.index_add_(0, meta.hkl_idx, K * K / V)
@@ -853,8 +919,10 @@ class AmortizedTrainer:
             Ib = torch.where(db > 0, nb / db.clamp(min=1e-30), torch.zeros_like(nb))
             return MatchedHalves(
                 F1=Ia[ok].cpu(), F2=Ib[ok].cpu(),
-                d_spacing=self.prep.d_spacing[ok].cpu(),
-                hkl=self.prep.hkl_valid[ok].cpu(),
+                # per-reflection and host-resident under stream_batches, so
+                # index with a host mask rather than the device one
+                d_spacing=self.prep.d_spacing[ok.cpu()].cpu(),
+                hkl=self.prep.hkl_valid[ok.cpu()].cpu(),
             ), ok
 
         rec = {
@@ -900,7 +968,7 @@ class AmortizedTrainer:
     def audit(self, rows: Tensor) -> dict:
         """Per-epoch leakage battery.  Run before trusting any headline number."""
         self.scale.eval()
-        meta = self.prep.obs_info.gather(rows)
+        meta, _, _, _ = self._batch(rows)
         rec = {
             "step": self.step_i,
             "phase": "audit",
@@ -925,10 +993,17 @@ class AmortizedTrainer:
 
     def _refresh_wilson_sigma(self) -> None:
         """Keep the Wilson Sigma on the shell mean of the running merge."""
-        t = self.target
-        if hasattr(t, "set_wilson_sigma"):
+        for t in (self.target, self.score_target):
+            if t is None or not hasattr(t, "set_wilson_sigma"):
+                continue
             sid = self.prep.shell_id_fw.to(self.device)
             t.set_wilson_sigma(sid, int(sid.max().item()) + 1)
+            # Centric reflections take a different Wilson prior.  This is a
+            # no-op in P 1 (nothing is centric) but not in any higher symmetry:
+            # in Laue class mmm the three principal zones are centric, and the
+            # acentric prior under-shrinks them.
+            if hasattr(t, "set_is_centric"):
+                t.set_is_centric(self.prep.is_centric.to(self.device))
 
     def _refresh_feature_reference(self) -> None:
         """Roll the obs_scale reference forward with the running merge."""
