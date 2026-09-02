@@ -261,26 +261,37 @@ earlier run.
 ## Result: correction in training, with the width prior reversed
 
 `lam_spread` had to go **negative**.  The only change between `evdev` and
-`evdevup10` is `lam_spread` 0.05 -> -0.10.  All merges at `n_sigma = 24`,
-`edge_mass = 0.000 %`, same free set, `--xray-mode nll`:
+`evdevup10` / `evdevup25` is `lam_spread` 0.05 -> -0.10 / -0.25.  All merges at
+`n_sigma = 24`, `edge_mass = 0.000 %`, same free set, same model and cell.  Both
+refinement targets, because `nll` weights purely by *our* sigma and every
+treatment of the background changes sigma, while `ml` carries a model-error term
+that absorbs a uniform sigma rescale:
 
-| merge | R_free | weak-quartile slope | strong-quartile slope | floor (model 2.95) |
+| merge | R_free (nll) | R_free (ml) | slope weak | slope strong |
 |---|---|---|---|---|
-| unity, plain Poisson | 0.1533 | 0.562 | 1.020 | 12.18 |
-| trained, broken ewald, plain | 0.1384 | 0.282 | 0.975 | 5.55 |
-| trained, fixed ewald, plain | 0.1350 | 0.158 | 0.986 | 4.70 |
-| trained WITH deviance, `w` collapsed | 0.1513 | 1.148 | 0.958 | 5.23 (non-monotone) |
-| **trained WITH deviance, width pulled up** | **0.1292** | **1.070** | **1.010** | **3.62** |
+| unity, plain Poisson | 0.1533 | 0.1482 | 0.562 / 0.915 | 1.020 / 0.973 |
+| trained, broken ewald, plain | 0.1384 | 0.1348 | 0.282 / 0.479 | 0.975 / 0.998 |
+| trained, fixed ewald, plain | 0.1350 | 0.1306 | 0.158 / 0.182 | 0.986 / 0.983 |
+| trained + deviance, `w` collapsed | 0.1513 | -- | 1.148 | 0.958 |
+| trained + deviance, `lam_spread` -0.10 | 0.1292 | 0.1291 | 1.070 / 1.029 | 1.010 / 1.016 |
+| **trained + deviance, `lam_spread` -0.25** | **0.1269** | **0.1252** | **1.023 / 0.948** | **1.021 / 1.008** |
 
-That is the best R_free of any merge in this project (previous best 0.1348) with
-the weak-end compression **gone** -- both slopes within 7 % of 1.  `evdevup25`
-(`lam_spread = -0.25`) reproduces the training numbers (CC1/2 0.9978, R_split
-0.0535, `w` 1.111), so the result is not perched on one coefficient.
+(slopes given as nll / ml where both were run.)
 
-Caveat on the floor column: it bins on `I_model` from a model refined against a
-*different* merge, and model decile correlates with resolution, so a difference
-in overall B between two merges tilts the profile.  Read the weakest decile and
-the slopes; do not over-read the middle deciles.
+Two things to read separately.
+
+**The compression is gone, unambiguously and target-independently.**  The
+weak-quartile slope goes 0.158 -> 1.023 under `nll` and 0.182 -> 0.948 under
+`ml`, while the strong quartile stays within 2 % of 1.  A merge that simply
+scaled everything down could not do that.
+
+**R_free improves by ~4x the refinement's repeat noise**, and by the same margin
+under both targets: 0.1350 -> 0.1269 (`nll`) and 0.1306 -> 0.1252 (`ml`), against
+a repeat noise of ~0.0014.  This is the best accuracy measured in this project;
+the previous best was 0.1348.
+
+`w` lands at 1.091 (-0.10) and 1.111 (-0.25), against the 1.45 the unity-scale
+evidence scan makes optimal and the 0.895 the un-reversed prior produced.
 
 ## Why the width prior had to be reversed
 
