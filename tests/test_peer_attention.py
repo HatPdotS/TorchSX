@@ -86,7 +86,7 @@ def test_token_mode_zeroes_the_query_measurement_channels():
     from torchsx.nn.obs_features import ObsFeatureSpec
 
     spec = ObsFeatureSpec(prep, token_mode=True, include_hkl=False)
-    x_self, x_ctx = spec.build(prep.obs_info)
+    x_self, x_ctx, _ = spec.build(prep.obs_info)
     assert x_self.shape == x_ctx.shape, "token mode must give one shared width"
     mask = spec.measurement_mask
     assert mask.any(), "no measurement channels identified"

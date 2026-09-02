@@ -56,11 +56,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from torchsx.merging.observations import ObsInfo, PreparedObs
+from torchsx.merging.observations import CRYSTAL_FEAT_COLUMNS, ObsInfo, PreparedObs
 
 __all__ = [
     "SELF_FEATURES",
     "CONTEXT_ONLY_FEATURES",
+    "CRYSTAL_FEATURES",
     "FORBIDDEN_IN_SELF",
     "CONDITION_FEATURES",
     "ObsFeatureSpec",
@@ -102,6 +103,12 @@ CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
 
 FORBIDDEN_IN_SELF: frozenset[str] = frozenset(CONTEXT_ONLY_FEATURES)
 
+#: Per-CRYSTAL metadata, one row per crystal (``ObsInfo.crystal_feat``).  Read
+#: by the encoder's crystal-level input head, once per crystal rather than once
+#: per observation.  No intensity, so no exclusion is needed.  ``beam_energy``
+#: and ``crystal_res`` also remain per-observation self features for now.
+CRYSTAL_FEATURES: tuple[str, ...] = CRYSTAL_FEAT_COLUMNS
+
 #: Never allowed in either tier.  See the module docstring.
 CONDITION_FEATURES: frozenset[str] = frozenset(
     {"delay_bin_idx", "unique_timepoints", "timepoint", "delay", "condition"}
@@ -129,6 +136,7 @@ class ObsFeatureSpec(nn.Module):
         context_features: tuple[str, ...] | None = None,
         include_hkl: bool = True,
         token_mode: bool = False,
+        crystal_features: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__()
         self.token_mode = bool(token_mode)
@@ -167,7 +175,20 @@ class ObsFeatureSpec(nn.Module):
                 f"Put them in context_features, where leave-one-out excludes "
                 f"the observation from its own pool."
             )
-        for tier, names in (("self", self_features), ("context", context_features)):
+        crystal_features = (
+            tuple(crystal_features) if crystal_features is not None
+            else (CRYSTAL_FEATURES if prep.obs_info.crystal_feat is not None else ())
+        )
+        unknown = set(crystal_features) - set(CRYSTAL_FEAT_COLUMNS)
+        if unknown:
+            raise KeyError(f"unknown crystal features {sorted(unknown)}")
+        if crystal_features and prep.obs_info.crystal_feat is None:
+            raise ValueError(
+                "crystal_features requested but ObsInfo.crystal_feat is None "
+                "(prepare_observations builds it from the stream core)"
+            )
+        for tier, names in (("self", self_features), ("context", context_features),
+                            ("crystal", crystal_features)):
             bad = CONDITION_FEATURES.intersection(names)
             if bad:
                 raise ValueError(
@@ -179,6 +200,7 @@ class ObsFeatureSpec(nn.Module):
 
         self.self_features = tuple(self_features)
         self.context_features = tuple(context_features)
+        self.crystal_features = tuple(crystal_features)
 
         oi = prep.obs_info
         if oi.obs_id is None:
@@ -212,6 +234,35 @@ class ObsFeatureSpec(nn.Module):
             "_const", torch.zeros(len(self._stat_names), dtype=torch.bool)
         )
         self._reported_const: list[str] = []
+
+        # Per-crystal table.  Standardised over CRYSTALS (rows of the table),
+        # with the same constant-column rule as the per-observation tiers.
+        n_cf = len(self.crystal_features)
+        if n_cf:
+            idx = [CRYSTAL_FEAT_COLUMNS.index(k) for k in self.crystal_features]
+            raw = oi.crystal_feat.float()[:, idx]
+            if raw.shape[0] != oi.n_crystals:
+                raise ValueError(
+                    f"crystal_feat has {raw.shape[0]} rows for {oi.n_crystals} crystals"
+                )
+        else:
+            raw = torch.zeros(oi.n_crystals, 0)
+        self.register_buffer("_crys_raw", raw)
+        self.register_buffer("_crys_mean", torch.zeros(n_cf))
+        self.register_buffer("_crys_std", torch.ones(n_cf))
+        self.register_buffer("_crys_const", torch.zeros(n_cf, dtype=torch.bool))
+        if n_cf:
+            # Only crystals that actually have observations define the stats.
+            present = torch.bincount(oi.crystal_id, minlength=oi.n_crystals) > 0
+            rows = raw[present.to(raw.device)]
+            mean = rows.mean(dim=0)
+            std = rows.std(dim=0) if rows.shape[0] > 1 else torch.zeros(n_cf)
+            scale = std.abs() + mean.abs() + 1.0
+            const = std <= self.CONST_REL_TOL * scale
+            self._crys_mean.copy_(mean)
+            self._crys_std.copy_(torch.where(const, torch.ones_like(std),
+                                             std.clamp(min=1e-6)))
+            self._crys_const.copy_(const)
         self._recompute_stats()
 
     #: A column whose spread is below this fraction of its own scale carries
@@ -372,6 +423,15 @@ class ObsFeatureSpec(nn.Module):
         return len(self.context_features)
 
     @property
+    def n_crystal(self) -> int:
+        return len(self.crystal_features)
+
+    def crystal_matrix(self) -> Tensor:
+        """``(n_crystals, n_crystal)`` standardised per-crystal table."""
+        x = (self._crys_raw - self._crys_mean) / self._crys_std
+        return x.masked_fill(self._crys_const, 0.0)
+
+    @property
     def measurement_mask(self) -> Tensor:
         """``(n_self,)`` bool — which query columns are measurement channels.
 
@@ -381,8 +441,12 @@ class ObsFeatureSpec(nn.Module):
             [f in FORBIDDEN_IN_SELF for f in self.self_features], dtype=torch.bool
         )
 
-    def build(self, meta: ObsInfo) -> tuple[Tensor, Tensor]:
-        """``meta`` (sliced or gathered) → ``(x_self, x_ctx)``, both normalised.
+    def build(self, meta: ObsInfo) -> tuple[Tensor, Tensor, Tensor]:
+        """``meta`` (sliced or gathered) → ``(x_self, x_ctx, x_crys)``, all normalised.
+
+        ``x_crys`` is the full ``(n_crystals, n_crystal)`` per-crystal table --
+        indexed by ``crystal_id``, not by row -- so it is the same object for
+        every slice, gather or chunk of the dataset.
 
         Under :attr:`token_mode` both are the same full token matrix, with the
         query copy's measurement channels zeroed — the token formulation.
@@ -399,8 +463,8 @@ class ObsFeatureSpec(nn.Module):
             assert bool((x_self[:, mask] == 0).all()), (
                 "token-mode query retains a measurement channel"
             )
-            return x_self, x_ctx
-        return self._matrix(meta, self.self_features), x_ctx
+            return x_self, x_ctx, self.crystal_matrix()
+        return self._matrix(meta, self.self_features), x_ctx, self.crystal_matrix()
 
 
 def _or_zeros(t: Tensor | None, meta: ObsInfo) -> Tensor:

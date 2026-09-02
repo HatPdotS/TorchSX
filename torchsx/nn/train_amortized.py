@@ -780,6 +780,13 @@ class AmortizedTrainer:
         torch.save(
             {
                 "state_dict": self._best_state,
+                # so a later merge builds the SAME forward, not the default one
+                "encoder": {
+                    k: getattr(self.scale.encoder, k, None)
+                    for k in ("context_folds", "obs_context_layers",
+                              "obs_self_layers", "d_model", "n_layers",
+                              "n_crystal_features")
+                },
                 "best_step": self.best_step,
                 "best_heldout": self.best_heldout,
                 "n_crystals": self.index.n_crystals,

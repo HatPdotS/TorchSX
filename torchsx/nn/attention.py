@@ -166,7 +166,9 @@ class PeerAttentionEncoder(nn.Module):
         x_ctx: Tensor,         # (n, F_ctx)   — full token
         group_id: Tensor,      # (n,) crystal index
         n_groups: int,
+        x_crys: Tensor | None = None,   # accepted for protocol parity; unused here
     ) -> Tensor:               # (n, d_model)
+        del x_crys
         order = torch.argsort(group_id, stable=True)
         inv = torch.empty_like(order)
         inv[order] = torch.arange(order.numel(), device=order.device)

@@ -75,6 +75,11 @@ class ObsInfo:
     q_dir: Tensor | None = None          # (n, 3) unit scattering vector, LAB frame
     beam_energy: Tensor | None = None    # (n,) per-image photon energy (eV)
     crystal_res: Tensor | None = None    # (n,) per-crystal diffraction limit
+    #: Per-CRYSTAL metadata, ``(n_crystals, len(CRYSTAL_FEAT_COLUMNS))``, indexed
+    #: by ``crystal_id`` -- the full table is kept under slice/gather, like
+    #: ``delay_bin_idx``.  Consumed by the crystal-level input head of the scale
+    #: encoder; carries no intensity.
+    crystal_feat: Tensor | None = None
     obs_id: Tensor | None = None         # (n,) int64 — row index in the FULL obs list
     # Kinetic-ensemble plumbing — both populated together or both ``None``.
     delay_bin_idx: Tensor | None = None     # (n_crystals,) int64, indexes unique_timepoints
@@ -97,6 +102,7 @@ class ObsInfo:
             crystal_res=None if self.crystal_res is None else self.crystal_res[s:e],
             beam_energy=None if self.beam_energy is None else self.beam_energy[s:e],
             q_dir=None if self.q_dir is None else self.q_dir[s:e],
+            crystal_feat=self.crystal_feat,              # per-crystal — full table kept
             obs_id=None if self.obs_id is None else self.obs_id[s:e],
             delay_bin_idx=self.delay_bin_idx,            # per-crystal — full table kept
             unique_timepoints=self.unique_timepoints,
@@ -131,6 +137,7 @@ class ObsInfo:
             q_dir=_g(self.q_dir),
             beam_energy=_g(self.beam_energy),
             crystal_res=_g(self.crystal_res),
+            crystal_feat=self.crystal_feat,
             obs_id=self.obs_id[idx],
             delay_bin_idx=self.delay_bin_idx,
             unique_timepoints=self.unique_timepoints,
@@ -154,10 +161,65 @@ class ObsInfo:
             q_dir=_m(self.q_dir),
             beam_energy=_m(self.beam_energy),
             crystal_res=_m(self.crystal_res),
+            crystal_feat=_m(self.crystal_feat),
             obs_id=_m(self.obs_id),
             delay_bin_idx=_m(self.delay_bin_idx),
             unique_timepoints=_m(self.unique_timepoints),
         )
+
+
+#: Columns of ``ObsInfo.crystal_feat``, in order.  One row per crystal; every
+#: column is metadata (no intensity), so the scale encoder may read it for a
+#: crystal without any leave-one-out.  A column the stream does not carry is
+#: emitted as zeros, which the feature standardisation then treats as constant.
+CRYSTAL_FEAT_COLUMNS: tuple[str, ...] = (
+    "cell_a", "cell_b", "cell_c", "cell_alpha", "cell_beta", "cell_gamma",
+    "beam_energy",      # per image, broadcast to the crystal
+    "crystal_res",      # diffraction limit
+    "log_n_refl",       # log1p(indexed reflections)
+    "det_shift_x", "det_shift_y",
+    "n_peaks",
+)
+
+
+def _crystal_feature_table(core, n_crystals: int) -> Tensor:
+    """``(n_crystals, len(CRYSTAL_FEAT_COLUMNS))`` float32 from the stream core."""
+    def _col(attr: str, level: str):
+        val = getattr(core, attr, None)
+        if val is None:
+            return None
+        if level == "image":
+            if not hasattr(core, "broadcast"):
+                return None
+            val = core.broadcast(attr, "image", "crystal")
+        val = torch.as_tensor(val)
+        if val.shape[0] != n_crystals:
+            return None
+        return val.float()
+
+    cols: list[Tensor] = []
+    cell = _col("cell", "crystal")
+    if cell is not None and cell.ndim == 2 and cell.shape[1] == 6:
+        cols.extend(cell[:, i] for i in range(6))
+    else:
+        cols.extend(torch.zeros(n_crystals) for _ in range(6))
+    for attr, level, tf in (
+        ("beam_energy", "image", None),
+        ("resolution", "crystal", None),
+        ("n_refl", "crystal", lambda t: torch.log1p(t.clamp(min=0))),
+        ("det_shift_x", "image", None),
+        ("det_shift_y", "image", None),
+        ("n_peaks", "image", None),
+    ):
+        v = _col(attr, level)
+        if v is None:
+            v = torch.zeros(n_crystals)
+        elif tf is not None:
+            v = tf(v)
+        cols.append(v.reshape(n_crystals))
+    table = torch.stack(cols, dim=1)
+    assert table.shape[1] == len(CRYSTAL_FEAT_COLUMNS)
+    return torch.nan_to_num(table, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _build_delay_bins(stream, n_crystals: int) -> tuple[Tensor | None, Tensor | None]:
@@ -590,6 +652,7 @@ def prepare_observations(
             core.resolution[cid].float() if getattr(core, "resolution", None) is not None
             else None
         ),
+        crystal_feat=_crystal_feature_table(core, n_crystals),
         obs_id=torch.arange(n_obs_total, dtype=torch.long),
         delay_bin_idx=delay_bin_idx,
         unique_timepoints=unique_t_tensor,

@@ -343,3 +343,94 @@ def test_large_lambda_recovers_the_fixed_target():
         prior_num=1e8 * I0_ema, prior_den=torch.tensor([1e8]),
     )
     torch.testing.assert_close(out, I0_ema.expand(4), rtol=1e-5, atol=1e-4)
+
+
+# ── leave-one-FOLD-out: the crystal-level context ──────────────────────
+
+from torchsx.nn.pooling import fold_ids, leave_fold_out_mean  # noqa: E402
+
+
+def _brute_fold_table(x, gid, n_groups, fold, K, fill=0.0):
+    shape = (n_groups * K,) + tuple(x.shape[1:])
+    out = torch.full(shape, fill, dtype=x.dtype)
+    cnt = torch.zeros(n_groups * K, dtype=torch.long)
+    for g in range(n_groups):
+        for f in range(K):
+            sel = (gid == g) & (fold != f)
+            cnt[g * K + f] = int(sel.sum())
+            if sel.any():
+                out[g * K + f] = x[sel].mean(dim=0)
+    return out, cnt
+
+
+@pytest.mark.parametrize("K", [2, 3])
+@pytest.mark.parametrize("ndim", [1, 2])
+def test_fold_mean_matches_bruteforce(ragged, K, ndim):
+    gid, n_groups = ragged
+    x = torch.randn(gid.numel()) if ndim == 1 else torch.randn(gid.numel(), 4)
+    fold = fold_ids(gid, n_groups, K)
+    table, cnt, valid = leave_fold_out_mean(x, gid, n_groups, fold, K, fill=0.0)
+    ref, ref_cnt = _brute_fold_table(x, gid, n_groups, fold, K)
+    torch.testing.assert_close(table, ref)
+    assert torch.equal(cnt, ref_cnt)
+    assert torch.equal(valid, ref_cnt > 0)
+
+
+def test_fold_mean_empty_complement_gets_fill(ragged):
+    """A singleton crystal (group 1) has an empty complement for its own fold,
+    and the absent group 3 has an empty complement for every fold."""
+    gid, n_groups = ragged
+    K = 2
+    fold = fold_ids(gid, n_groups, K)
+    x = torch.randn(gid.numel(), 3)
+    table, cnt, valid = leave_fold_out_mean(x, gid, n_groups, fold, K, fill=-7.0)
+    # group 1 = single member in fold 0 -> complement of fold 1 has 1 member,
+    # complement of fold 0 has none
+    assert valid[1 * K + 1] and not valid[1 * K + 0]
+    assert (table[1 * K + 0] == -7.0).all()
+    assert cnt[1 * K + 0] == 0
+    assert not valid[3 * K: 3 * K + K].any()
+
+
+def test_fold_ids_depend_only_on_within_group_order():
+    """Grouped vs interleaved presentation must give identical folds per row."""
+    torch.manual_seed(3)
+    gid = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2])
+    perm = torch.randperm(gid.numel())
+    # rows of one group keep their relative order under a stable sort of perm
+    inv = torch.argsort(gid[perm], stable=True)
+    f_grouped = fold_ids(gid, 3, 2)
+    f_shuffled = fold_ids(gid[perm], 3, 2)
+    # map shuffled labels back to grouped order
+    assert torch.equal(f_shuffled[inv], f_grouped)
+    # balanced to within one per group
+    for g in range(3):
+        c = torch.bincount(f_grouped[gid == g], minlength=2)
+        assert int(c.max() - c.min()) <= 1
+
+
+def test_fold_mean_gradient_is_bit_zero_for_own_fold():
+    """No sum-minus-self cancellation: a row never enters its own fold's table.
+
+    This is the property that makes the fold pool a *stronger* exclusion than
+    leave-one-out, whose forward value depends on ``x[j]`` at rounding scale.
+    """
+    gid = torch.tensor([0, 0, 0, 0, 1, 1, 1])
+    K = 2
+    fold = fold_ids(gid, 2, K)
+    x = torch.randn(gid.numel(), 3, requires_grad=True)
+    table, cnt, _ = leave_fold_out_mean(x, gid, 2, fold, K)
+    for j in range(gid.numel()):
+        row = int(gid[j]) * K + int(fold[j])          # j's own fold -> excluded
+        g, = torch.autograd.grad(table[row].sum(), x, retain_graph=True)
+        assert torch.equal(g[j], torch.zeros(3)), f"row {j} leaks into its own fold"
+        other = int(gid[j]) * K + (1 - int(fold[j]))  # j's complement -> 1/count
+        g2, = torch.autograd.grad(table[other].sum(), x, retain_graph=True)
+        torch.testing.assert_close(g2[j], torch.full((3,), 1.0 / float(cnt[other])))
+    # forward: perturb x[j], own-fold table row bit-identical
+    x0 = x.detach().clone()
+    t0, _, _ = leave_fold_out_mean(x0, gid, 2, fold, K)
+    x1 = x0.clone(); x1[2] += 1e3
+    t1, _, _ = leave_fold_out_mean(x1, gid, 2, fold, K)
+    own = int(gid[2]) * K + int(fold[2])
+    assert torch.equal(t0[own], t1[own])

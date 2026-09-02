@@ -126,6 +126,9 @@ class AmortizedScale(ScaleModel):
         n_heads: int = 8,
         max_tokens: int | None = 512,
         include_hkl: bool = False,
+        context_folds: int = 0,
+        obs_context_layers: int | None = None,
+        obs_self_layers: int | None = None,
         w_init: float = 1.65,
         beta_init: float = 2.0,
         predict_width: bool = True,
@@ -151,6 +154,10 @@ class AmortizedScale(ScaleModel):
                 features.n_self, features.n_context,
                 d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
                 dropout=dropout,
+                n_crystal_features=features.n_crystal,
+                context_folds=context_folds,
+                obs_context_layers=obs_context_layers,
+                obs_self_layers=obs_self_layers,
             )
         heads = ScaleHeads(
             d_model,
@@ -244,8 +251,8 @@ class AmortizedScale(ScaleModel):
             # a 40 GB card before any checkpointing question arises.  The
             # checkpoint is what is conditional on grad, not the chunking.
             return self._predict_chunked(meta, n_chunk)
-        x_self, x_ctx = self.features.build(meta)
-        z = self.encoder(x_self, x_ctx, meta.crystal_id, self.n_crystals)
+        x_self, x_ctx, x_crys = self.features.build(meta)
+        z = self.encoder(x_self, x_ctx, meta.crystal_id, self.n_crystals, x_crys=x_crys)
         pred = self.heads(z)
         if self.anchor_log_k:
             loc = (
@@ -264,7 +271,7 @@ class AmortizedScale(ScaleModel):
     def _predict_chunked(self, meta: ObsInfo, per_chunk: int) -> ScalePrediction:
         # Features are built once and persist: they are (M, ~10), i.e. 40 B per
         # observation, against 8 KB for the interior tensors they let us drop.
-        x_self, x_ctx = self.features.build(meta)
+        x_self, x_ctx, x_crys = self.features.build(meta)
         cid = meta.crystal_id
         spans = self._crystal_chunks(cid, per_chunk)
 
@@ -280,17 +287,17 @@ class AmortizedScale(ScaleModel):
                 "use AmortizedScale.set_encoder_chunking() to set both"
             )
 
-        def run(xs, xc, ci):
-            z = self.encoder(xs, xc, ci, self.n_crystals)
+        def run(xs, xc, ci, xcr):
+            z = self.encoder(xs, xc, ci, self.n_crystals, x_crys=xcr)
             p = self.heads(z)
             return p.log_K, p.log_w, p.beta, p.log_alpha, p.log_e_s
 
         ckpt = torch.is_grad_enabled() and self.training
         parts = [
             torch.utils.checkpoint.checkpoint(
-                run, x_self[a:b], x_ctx[a:b], cid[a:b], use_reentrant=False
+                run, x_self[a:b], x_ctx[a:b], cid[a:b], x_crys, use_reentrant=False
             )
-            if ckpt else run(x_self[a:b], x_ctx[a:b], cid[a:b])
+            if ckpt else run(x_self[a:b], x_ctx[a:b], cid[a:b], x_crys)
             for a, b in spans
         ]
 
@@ -315,9 +322,9 @@ class AmortizedScale(ScaleModel):
         the context carries ``obs_scale = n'/I0``, because permuting hkl also
         permutes the *peers'* I0 lookup — which is legitimate use, not leakage.
         """
-        x_self, _ = self.features.build(meta_self)
-        _, x_ctx = self.features.build(meta_ctx)
-        z = self.encoder(x_self, x_ctx, meta_ctx.crystal_id, self.n_crystals)
+        x_self, _, _ = self.features.build(meta_self)
+        _, x_ctx, x_crys = self.features.build(meta_ctx)
+        z = self.encoder(x_self, x_ctx, meta_ctx.crystal_id, self.n_crystals, x_crys=x_crys)
         pred = self.heads(z)
         if self.anchor_log_k:
             loc = (

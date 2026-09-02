@@ -112,9 +112,9 @@ def test_features_are_normalised_against_the_full_dataset():
     """Batch statistics would leak batch composition into the features."""
     prep = _toy_prep()
     spec = ObsFeatureSpec(prep)
-    full_self, _ = spec.build(prep.obs_info)
+    full_self, _, _ = spec.build(prep.obs_info)
     assert full_self.mean().abs() < 0.1
-    sub, _ = spec.build(prep.obs_info.gather(torch.arange(10)))
+    sub, _, _ = spec.build(prep.obs_info.gather(torch.arange(10)))
     # A sub-batch is NOT re-standardised, so its mean need not be ~0.
     assert sub.shape == (10, spec.n_self)
 
@@ -430,7 +430,7 @@ def test_constant_features_are_zeroed_not_standardised():
         spec = ObsFeatureSpec(prep, include_hkl=False)
     assert any("carry no information" in str(c.message) for c in caught)
 
-    x_self, x_ctx = spec.build(prep.obs_info)
+    x_self, x_ctx, _ = spec.build(prep.obs_info)
     assert torch.isfinite(x_self).all() and torch.isfinite(x_ctx).all()
     assert x_self.abs().max() < 50.0, "constant column was standardised"
     i = spec.self_features.index("beam_energy")
@@ -443,7 +443,7 @@ def test_varying_features_are_still_standardised():
 
     prep = _toy_prep()
     spec = ObsFeatureSpec(prep, include_hkl=False)
-    x_self, _ = spec.build(prep.obs_info)
+    x_self, _, _ = spec.build(prep.obs_info)
     i = spec.self_features.index("s_sq")
     assert x_self[:, i].std() > 0.5
 
@@ -506,3 +506,214 @@ def test_encoder_chunks_never_split_a_crystal():
                 assert cid[b] != cid[b - 1]
         # and they must tile the range with no gaps
         assert [a for a, _ in spans[1:]] == [b for _, b in spans[:-1]]
+
+
+# ── fold-pooled (crystal-shared) context and the crystal-level head ─────
+
+from torchsx.merging.observations import CRYSTAL_FEAT_COLUMNS, _crystal_feature_table  # noqa: E402
+from torchsx.nn.deepsets import DeepSetsEncoder  # noqa: E402
+from torchsx.nn.pooling import fold_ids  # noqa: E402
+
+
+def _toy_prep_with_crystal_feat(**kw):
+    prep = _toy_prep(**kw)
+    torch.manual_seed(5)
+    n_c = prep.obs_info.n_crystals
+    feat = torch.randn(n_c, len(CRYSTAL_FEAT_COLUMNS))
+    feat[:, 9] = 0.0                      # det_shift_x absent -> constant column
+    prep.obs_info.crystal_feat = feat
+    return prep
+
+
+def _randomise(scale, std=0.3):
+    for p in scale.parameters():
+        if p.dim() > 1:
+            torch.nn.init.normal_(p, std=std)
+
+
+def test_fold_mode_own_fold_cannot_move_own_log_k():
+    """Bit-exact: perturbing I_j changes nothing in j's fold, something in the
+    other fold of j's crystal, nothing in any other crystal."""
+    prep = _toy_prep_with_crystal_feat()
+    torch.manual_seed(1)
+    scale = AmortizedScale.from_prep(
+        prep, d_model=16, n_layers=2, anchor_log_k=False, context_folds=2,
+    )
+    _randomise(scale)
+    meta = prep.obs_info
+    base = scale.predict(meta).log_K.detach().clone()
+    j = 7
+    scale.features._I[j] += 500.0
+    moved = scale.predict(meta).log_K.detach()
+
+    fold = fold_ids(meta.crystal_id, meta.n_crystals, 2)
+    same_c = meta.crystal_id == meta.crystal_id[j]
+    own = same_c & (fold == fold[j])
+    other = same_c & (fold != fold[j])
+    assert torch.equal(moved[own], base[own]), "own fold saw its own intensity"
+    assert (moved[other] - base[other]).abs().max() > 1e-4, "pool is inert"
+    assert torch.equal(moved[~same_c], base[~same_c])
+
+
+def test_fold_mode_zero_init_gives_unity_scale():
+    prep = _toy_prep_with_crystal_feat()
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, context_folds=2)
+    pred = scale.predict(prep.obs_info)
+    assert torch.allclose(pred.log_K, torch.zeros_like(pred.log_K), atol=1e-6)
+
+
+def test_legacy_path_is_bit_identical_with_crystal_head_present():
+    """context_folds=0 with the (zero-init) crystal head equals the old encoder."""
+    prep = _toy_prep_with_crystal_feat()
+    torch.manual_seed(2)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_log_k=False)
+    _randomise(scale)
+    torch.nn.init.zeros_(scale.encoder.input_crystal.weight)   # as constructed
+    enc = scale.encoder
+    assert enc.context_folds == 0 and enc.obs_context_layers == 2 and enc.obs_self_layers == 2
+    x_self, x_ctx, x_crys = scale.features.build(prep.obs_info)
+    with torch.no_grad():
+        z_new = enc(x_self, x_ctx, prep.obs_info.crystal_id, prep.obs_info.n_crystals, x_crys=x_crys)
+        # the pre-change forward, written out
+        h = enc.input_context(x_ctx)
+        for blk in enc.context_blocks:
+            h = blk(h)
+        from torchsx.nn.pooling import leave_one_out_mean
+        ctx, _ = leave_one_out_mean(h, prep.obs_info.crystal_id, prep.obs_info.n_crystals)
+        z_old = enc.input_self(x_self) + ctx
+        for blk in enc.self_blocks:
+            z_old = blk(z_old)
+    assert torch.equal(z_new, z_old)
+
+
+def test_old_checkpoint_without_crystal_head_loads():
+    prep = _toy_prep_with_crystal_feat()
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
+    sd = {k: v for k, v in scale.state_dict().items() if "input_crystal" not in k}
+    scale.load_state_dict(sd)          # strict, as to_mtz / restore_best do
+    assert (scale.encoder.input_crystal.weight == 0).all()
+
+
+def test_crystal_head_moves_only_its_crystal():
+    prep = _toy_prep_with_crystal_feat()
+    torch.manual_seed(4)
+    scale = AmortizedScale.from_prep(
+        prep, d_model=16, n_layers=2, anchor_log_k=False, context_folds=2,
+    )
+    _randomise(scale)
+    torch.nn.init.normal_(scale.encoder.input_crystal.weight, std=0.3)
+    meta = prep.obs_info
+    base = scale.predict(meta).log_K.detach().clone()
+    c = 3
+    scale.features._crys_raw[c, 0] += 5.0
+    moved = scale.predict(meta).log_K.detach()
+    sel = meta.crystal_id == c
+    assert (moved[sel] - base[sel]).abs().min() > 1e-6     # both folds move
+    assert torch.equal(moved[~sel], base[~sel])
+    # a constant column is zeroed, so poking it does nothing
+    scale.features._crys_raw[c, 9] += 5.0
+    assert torch.equal(scale.predict(meta).log_K.detach(), moved)
+
+
+def test_crystal_feature_tier_rejects_condition_fields():
+    prep = _toy_prep_with_crystal_feat()
+    with pytest.raises(KeyError):
+        ObsFeatureSpec(prep, crystal_features=("cell_a", "delay"))
+
+
+def test_fold_predictions_do_not_depend_on_row_grouping():
+    """hkl-sorted vs crystal-grouped input give the same log_K per obs_id."""
+    prep = _toy_prep_with_crystal_feat()
+    torch.manual_seed(6)
+    scale = AmortizedScale.from_prep(
+        prep, d_model=16, n_layers=2, anchor_log_k=False, context_folds=2,
+    )
+    _randomise(scale)
+    meta = prep.obs_info
+    order = torch.argsort(meta.crystal_id, stable=True)
+    a = scale.predict(meta).log_K.detach()
+    b = scale.predict(meta.gather(order)).log_K.detach()
+    torch.testing.assert_close(b, a[order], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("split", [(1, 1), (2, 2), (0, 2)])
+def test_fold_chunking_is_exact_in_value_and_gradient(split):
+    torch.manual_seed(0)
+    prep = _toy_prep_with_crystal_feat()
+    scale = AmortizedScale.from_prep(
+        prep, d_model=16, n_layers=2, context_folds=2,
+        obs_context_layers=split[0], obs_self_layers=split[1],
+    )
+    for prm in scale.parameters():
+        if prm.dim() >= 1:
+            torch.nn.init.normal_(prm, std=0.05)
+    scale.train()
+    order = torch.argsort(prep.obs_info.crystal_id, stable=True)
+    meta = prep.obs_info.gather(order)
+
+    def run(chunk):
+        scale.set_encoder_chunking(chunk)
+        scale.zero_grad(set_to_none=True)
+        pred = scale.predict(meta)
+        loss = (pred.log_K.square().sum() + pred.log_w.sum()
+                + pred.beta.sum() + pred.log_alpha.sum())
+        loss.backward()
+        g = torch.cat([p.grad.flatten() for p in scale.parameters()
+                       if p.grad is not None])
+        return pred.log_K.detach().clone(), g
+
+    k0, g0 = run(0)
+    for chunk in (1, 3):
+        k1, g1 = run(chunk)
+        torch.testing.assert_close(k1, k0, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(g1, g0, rtol=1e-4, atol=1e-6)
+
+
+def test_fold_mode_depth_split_moves_blocks_to_the_table():
+    """Per-observation blocks still see (n, D); the rest run on (G*K, D)."""
+    enc = DeepSetsEncoder(4, 6, d_model=8, n_layers=3, context_folds=2,
+                          obs_context_layers=1, obs_self_layers=1)
+    seen = []
+    for blk in list(enc.context_blocks) + list(enc.self_blocks):
+        blk.register_forward_hook(lambda m, i, o: seen.append(o.shape[0]))
+    n, G = 40, 5
+    gid = torch.arange(n) % G
+    enc(torch.randn(n, 4), torch.randn(n, 6), gid, G)
+    # context: 1 per-obs (n) + 2 table (G*K); self: 2 table + 1 per-obs
+    assert seen == [n, G * 2, G * 2, G * 2, G * 2, n]
+
+
+def test_crystal_feature_table_column_order_and_missing_columns():
+    class Core:
+        cell = torch.tensor([[10., 11., 12., 90., 90., 90.], [10.1, 11., 12., 90., 89., 90.]])
+        resolution = torch.tensor([1.5, 1.7])
+        n_refl = torch.tensor([99, 199])
+        beam_energy = torch.tensor([12000., 12010.])     # per image
+        image_id = torch.tensor([1, 0])                  # crystal -> image
+        # det_shift_x / det_shift_y / n_peaks deliberately absent
+
+        def broadcast(self, col, frm, to):
+            assert (frm, to) == ("image", "crystal")
+            return getattr(self, col)[self.image_id]
+
+    t = _crystal_feature_table(Core(), 2)
+    assert t.shape == (2, len(CRYSTAL_FEAT_COLUMNS))
+    torch.testing.assert_close(t[:, :6], Core.cell)
+    torch.testing.assert_close(t[:, 6], torch.tensor([12010., 12000.]))
+    torch.testing.assert_close(t[:, 7], Core.resolution)
+    torch.testing.assert_close(t[:, 8], torch.log1p(Core.n_refl.float()))
+    assert (t[:, 9:] == 0).all()
+
+
+def test_state_dict_refuses_a_different_encoder_architecture():
+    """Same parameter names in every mode, so this has to be explicit."""
+    prep = _toy_prep_with_crystal_feat()
+    fold = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, context_folds=2)
+    loo = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
+    with pytest.raises(RuntimeError, match="architecture mismatch"):
+        loo.load_state_dict(fold.state_dict())
+    with pytest.raises(RuntimeError, match="architecture mismatch"):
+        fold.load_state_dict(loo.state_dict())
+    # pre-arch checkpoints were leave-one-out at full depth: they still load there
+    sd = {k: v for k, v in loo.state_dict().items() if not k.endswith("_arch")}
+    loo.load_state_dict(sd)

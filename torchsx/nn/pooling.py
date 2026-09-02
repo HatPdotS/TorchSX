@@ -70,6 +70,8 @@ __all__ = [
     "group_sum",
     "group_count",
     "leave_one_out_mean",
+    "fold_ids",
+    "leave_fold_out_mean",
     "loo_ratio",
     "loo_weighted_mean",
 ]
@@ -164,6 +166,113 @@ def leave_one_out_mean(
         out = torch.where(valid, out, torch.full_like(out, fill))
 
     return out.to(x.dtype), valid
+
+
+def fold_ids(gid: Tensor, n_groups: int, n_folds: int) -> Tensor:
+    """Deterministic fold label per row: its rank within its group, mod ``n_folds``.
+
+    Rows of one group are dealt round-robin into the folds **in the order they
+    arrive**, so the assignment depends only on the relative order of a group's
+    rows and not on how groups are interleaved.  A crystal-grouped batch and
+    the hkl-sorted full table therefore give the same folds, and so does every
+    chunk of a chunked pass -- which is what lets the fold pool replace
+    leave-one-out under :meth:`AmortizedScale.predict` without changing a value.
+
+    Because the rows of a crystal arrive in hkl order, the folds interleave in
+    resolution: both halves of a crystal span its whole diffraction pattern.
+    """
+    if gid.ndim != 1:
+        raise ValueError(f"gid must be 1-D, got shape {tuple(gid.shape)}")
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2, got {n_folds}")
+    order = torch.argsort(gid, stable=True)
+    counts = torch.bincount(gid, minlength=n_groups)
+    starts = torch.cumsum(counts, 0) - counts
+    pos = torch.empty_like(gid)
+    pos[order] = (
+        torch.arange(gid.numel(), device=gid.device) - starts.index_select(0, gid[order])
+    )
+    return pos % n_folds
+
+
+def leave_fold_out_mean(
+    x: Tensor,
+    gid: Tensor,
+    n_groups: int,
+    fold: Tensor,
+    n_folds: int,
+    *,
+    fill: float = 0.0,
+    accum_dtype: torch.dtype | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Mean over each group **excluding one fold**, as a per-(group, fold) table.
+
+    ``table[g * n_folds + f] = mean{ x[i] : gid[i] == g, fold[i] != f }``
+
+    The crystal-level counterpart of :func:`leave_one_out_mean`.  Leave-one-out
+    gives every member its own context -- the group mean minus itself -- which
+    differs between two members of one group by a single term but still has to
+    be materialised and processed per member.  Leaving a *fold* out instead
+    gives every member of fold ``f`` the same context, so the context is a
+    group-level object: ``n_groups * n_folds`` rows, processed once, and read
+    back per member with ``table.index_select(0, gid * n_folds + fold)``.
+
+    The exclusion is **stronger** than leave-one-out, not weaker.  Member ``j``
+    never enters the sum it is scored against, so both the forward value and
+    the gradient are independent of ``x[j]`` bit-exactly -- there is no
+    sum-minus-self cancellation to round.  What is given up is peers:
+    ``(n_folds - 1) / n_folds`` of the group instead of ``n - 1``.  At ~180
+    observations per crystal (SwissFEL) or ~2000 (SACLA) that is immaterial.
+
+    Returns
+    -------
+    (table, count, valid)
+        ``table`` is ``(n_groups * n_folds, D)`` in ``x``'s dtype; ``count`` the
+        ``(n_groups * n_folds,)`` number of members each mean was taken over;
+        ``valid`` is ``False`` where that count is zero and ``fill`` was
+        written -- a group with fewer members than folds, or a group absent
+        from this batch entirely.
+    """
+    if gid.ndim != 1 or fold.ndim != 1:
+        raise ValueError("gid and fold must be 1-D")
+    if not (x.shape[0] == gid.shape[0] == fold.shape[0]):
+        raise ValueError(
+            f"length mismatch: x={x.shape[0]} gid={gid.shape[0]} fold={fold.shape[0]}"
+        )
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2, got {n_folds}")
+
+    work = x if accum_dtype is None else x.to(accum_dtype)
+    cell = gid * n_folds + fold
+    n_cells = n_groups * n_folds
+    cell_sum = group_sum(work, cell, n_cells)
+    cell_cnt = group_count(cell, n_cells)
+
+    shape = (n_groups, n_folds) + tuple(work.shape[1:])
+    cell_sum = cell_sum.view(shape)
+    cell_cnt = cell_cnt.view(n_groups, n_folds)
+    # Complement of fold f = the sum over the OTHER folds, formed directly.
+    # ``total - fold_f`` is the same number in exact arithmetic but not in
+    # floating point: the total contains fold f's own values, so their
+    # rounding would leak into the complement at 1e-7 -- exactly the
+    # sum-minus-self residue leave-one-out has and this pool must not.
+    others = [
+        [f2 for f2 in range(n_folds) if f2 != f] for f in range(n_folds)
+    ]
+    comp_sum = torch.stack([cell_sum[:, o].sum(dim=1) for o in others], dim=1)
+    comp_cnt = torch.stack([cell_cnt[:, o].sum(dim=1) for o in others], dim=1)
+
+    count = comp_cnt.reshape(n_cells)
+    valid = count > 0
+    den = count.to(work.dtype).clamp(min=1.0)
+    table = comp_sum.reshape(n_cells, *work.shape[1:])
+    if table.ndim == 2:
+        table = table / den[:, None]
+        table = torch.where(valid[:, None], table, torch.full_like(table, fill))
+    else:
+        table = table / den
+        table = torch.where(valid, table, torch.full_like(table, fill))
+    return table.to(x.dtype), count, valid
 
 
 def loo_ratio(
