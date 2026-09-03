@@ -9,7 +9,6 @@ downstream routes through that hook, so this class is accepted unchanged by:
   fast path is kept — the kernel already takes per-observation
   ``log_alpha_obs`` / ``log_beta_obs`` and returns analytic gradients for both),
 * :func:`~torchsx.merging.posterior.compute_posterior_moments`,
-* :func:`~torchsx.merging.diagnostics.compute_residuals`,
 * and therefore :class:`~torchsx.merging.merger.Merger` itself.
 
 Predictions are addressed by ``ObsInfo.obs_id``, not by position, so an
