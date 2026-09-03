@@ -1,2 +1,0 @@
-/das/work/units/LBR-FEL/p17490/Peter/torchsx/torchsx/scaling/_inputs.py:11: UserWarning: TorchRef auto-configured 10 threads. Set TORCHREF_NUM_THREADS to override.
-  from torchref.base.reciprocal.hkl import get_d_spacing
