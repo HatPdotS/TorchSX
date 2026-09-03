@@ -2,18 +2,21 @@
 
 GPU-friendly stacked tensors for unmerged serial crystallography data.
 
-TorchSX provides a PyTorch-native framework for processing, merging, and
-scaling Serial Femtosecond Crystallography (SFX) data. It reads CrystFEL
-`.stream` files into stacked tensors at three levels (observations, crystals,
-images) and provides differentiable merging, scaling, and partiality correction.
+TorchSX merges and scales Serial Femtosecond Crystallography (SFX) data. It
+reads indexed reflections into stacked tensors at three levels (observations,
+crystals, images) and provides differentiable merging, scaling and partiality
+correction on top of them.
+
+It does **not** do data reduction. Pixels, peak finding and indexing belong to
+[probixi](https://github.com/ryan-odea/probixi) or CrystFEL; TorchSX starts
+where observations of the same reflection first meet.
 
 ## Amortised scale model
 
 `torchsx.nn` trains one network to predict a per-observation scale, merging
 through a posterior integral over `I0` rather than a point estimate, so `I` and
-`sigma_I` come from the same integral. See
-`experiments/docs/amortized_scale_plan.md` for the design and
-`experiments/optimize_integration/README.md` for the measured state of the
+`sigma_I` come from the same integral. See `docs/amortized_scale_plan.md` for
+the design and `docs/optimize_integration.md` for the measured state of the
 integration — the node settings that should be used, the background likelihood,
 and the measurement traps that produced two wrong conclusions along the way.
 
@@ -24,115 +27,138 @@ partialator + French–Wilson on the same model, cell and free set, with the
 weak-end compression slope at 1.02 / 0.95 where the uncompensated merge gives
 0.16 / 0.18.
 
-That the two must be checked separately is not a formality here: the
-single best CC1/2 of any run trained (0.9982) came from a configuration whose
-merged intensities are **not monotone** in `F_model` and whose R_free is the
-worst of the trained set.
+That the two must be checked separately is not a formality here: the single best
+CC1/2 of any run trained (0.9982) came from a configuration whose merged
+intensities are **not monotone** in `F_model` and whose R_free is the worst of
+the trained set.
 
 ## Installation
 
 ```bash
-pip install -e .
+pip install -e .              # merging + scaling
+pip install -e '.[duckdb]'    # + read probixi runs
 ```
 
-Requires Python >= 3.10 and `torchref >= 0.4` (provides torch, numpy, gemmi).
+Requires Python >= 3.10 and `torchref >= 0.6.4`, which provides torch, triton
+and gemmi. The remaining extras are optional because each is imported lazily:
+
+| Extra | Enables |
+|---|---|
+| `duckdb` | `SFXStream.from_duckdb` — read probixi runs |
+| `patches` | `excise_patches` / `excise_rois` — pixel patches from HDF5 |
+| `gating` | `merging/gating`'s background-significance split |
+| `native` | JIT-building the native `.stream` parser extension |
 
 ## Quick Start
+
+Two ways in, depending on who indexed the data.
+
+**From probixi** (a DuckDB run — one row per frame, reflections keyed by frame):
 
 ```python
 from torchsx import SFXStream
 
-# Load data
-stream = SFXStream.from_stream("data.stream", spacegroup="P 1")
-stream = stream.filter_resolution(d_min=2.0).filter_cell(tolerance=0.1)
-
-# Merge with EM (heteroscedastic noise model)
-from torchsx.merge import fit_em, EMConfig, ScaleBCorrection
-dist = fit_em(stream, config=EMConfig(), corrections=[ScaleBCorrection()])
-
-# Statistics
-from torchsx.merge import shell_stats
-for s in shell_stats(stream, n_bins=20):
-    print(f"d={s.d_min:.1f}-{s.d_max:.1f}: CC1/2={s.cc_half:.3f}")
+stream = SFXStream.from_duckdb("run.duckdb", spacegroup="P 43 21 2")
 ```
 
-## Package Structure
+**From CrystFEL** (an `indexamajig` `.stream`):
+
+```python
+stream = SFXStream.from_stream("indexed.stream", spacegroup="P 43 21 2",
+                               cache="indexed.sfx")
+```
+
+Then merge, the same either way:
+
+```python
+stream = stream.filter_resolution(d_min=2.0).filter_cell(tolerance=0.1)
+
+loss = stream.make_loss()          # log-space merging loss
+loss.refine()                      # LBFGS
+result = loss.posterior()          # I, sigma_I from one posterior integral
+```
+
+Filtering is immutable — every operation returns a new object, with the join
+keys renumbered onto the surviving rows.
+
+## Package structure
 
 ```
 torchsx/
-├── stream.py          SFXStream — public API (load, filter, merge, save)
-├── _core.py           _SFXStreamCore — stacked-tensor dataclass
-├── geometry.py        Detector geometry (CrystFEL .geom format)
+├── stream.py       SFXStream — public API (load, filter, merge, save)
+├── _core.py        the three-level stacked-tensor container
+├── levels.py       Level / ColumnSpec — the columnar primitive
+├── geometry.py     detector geometry (CrystFEL .geom)
 │
-├── io/                I/O: .stream parsing, .sfx safetensors, write-back
-├── merge/             EM-based merging with heteroscedastic noise model
-├── scaling/           Per-crystal scale factors (G, B, partiality)
-├── target/            Scaling loss functions (KL, self-consistent)
-├── partiality/        Partiality modelling and orientation refinement
-└── forward/           Pixel-level differentiable forward model
+├── merging/        the merge engine (see below)
+├── nn/             amortised per-observation scale network
+├── io/             .stream parsing, .sfx safetensors, DuckDB ingest
+└── cli/            merge, filter_ewald
 ```
 
-## Submodules
+### `torchsx.merging`
 
-### `torchsx.io` — I/O
+Organised as the layers of the generative model:
 
-Parse CrystFEL `.stream` files, save/load `.sfx` binary format (safetensors),
-extract pixel patches from HDF5 frames.
+```
+IntensityPrior → ScaleModel × ScatterModel → Quadrature → DetectionLikelihood
+```
 
-### `torchsx.merge` — Merging
+Each is an `nn.Module` behind a narrow ABC, aggregated by a single `LossState`
+into one scalar for LBFGS. Subpackages: `priors/`, `scale/`, `scatter/`,
+`quadrature/`, `likelihood/`, `targets/`, `regularizers/`, `hkl/`, `gating/`.
 
-EM-based intensity merging under a generalized Gaussian multiplicative noise
-model with Poisson shot noise. The D-step uses exact marginal likelihood via
-adaptive quadrature. Corrections (scale, B-factor, panel gain, partiality)
-are modular and compose via a `CorrectionPipeline`.
+`hkl/` is the reflection-bookkeeping layer — HKL indexing, filtering, shell
+statistics, and the Poisson noise model whose `calibrate_sigma2_of_bg` derives
+detector gain from off-Bragg (predicted-zero-signal) observations via
+Ewald-offset gating. This is the **default** (`gain="auto"`); the alternatives
+are `"stream"` (photon energy × ADU/eV), `"empirical"` (negatives-Mandel, biased
+high) or an explicit float.
 
-### `torchsx.scaling` — Scaling
+### `torchsx.io`
 
-Per-crystal absolute scale (`G`), B-factor, and Ewald-offset partiality as
-differentiable `nn.Module`s. Optimised via Adam on composite lognormal-Gaussian
-loss or the KL scaling target.
+Three formats, three jobs:
 
-### `torchsx.target` — Scaling Targets
+| Format | Role | Entry point |
+|---|---|---|
+| DuckDB | ingest from probixi | `SFXStream.from_duckdb` |
+| `.stream` | ingest from CrystFEL | `SFXStream.from_stream` |
+| `.sfx` | working cache (safetensors + JSON sidecar) | `SFXStream.load` / `.save` |
 
-`KLScalingTarget`: unified log-space NLL with truncated Gaussian for negatives
-and floor penalty to anchor noise to calibrated priors.
+DuckDB is the interchange format and `.sfx` the working one, because probixi's
+schema is fixed DDL while `Level`/`ColumnSpec` takes arbitrary columns —
+timepoints, split labels, derived caches. Load once from the database, then live
+in `.sfx`.
 
-### `torchsx.partiality` — Partiality
+The two key/unit traps in that conversion are documented in `io/_duckdb.py`.
 
-Rank-concordance orientation refinement (model-free, differentiable) and
-generalised Lorentzian partiality profile fitting. The iterative pipeline
-alternates EM merging, orientation refinement, and partiality estimation.
+## Data model
 
-### `torchsx.forward` — Forward Model
+| Level | Count | Key fields |
+|---|---|---|
+| Observations | N_obs | hkl, I, sigma, background, peak, fs, ss, panel_id, crystal_id |
+| Crystals | N_crystals | astar, bstar, cstar, cell, profile_rad, resolution, n_refl, image_id |
+| Images | N_images | beam_energy, det_shift_x, det_shift_y, n_peaks, camera_length |
 
-Pixel-level differentiable forward model: predicts pixel intensities from
-crystal parameters through a fully differentiable path for joint refinement.
-
-## Data Model
-
-TorchSX uses a three-level stacked-tensor representation:
-
-| Level | Count | Key Fields |
-|-------|-------|------------|
-| Observations | N_obs | hkl, I, sigma, background, crystal_id |
-| Crystals | N_crystals | astar, bstar, cstar, cell, image_id |
-| Images | N_images | beam_energy, det_shift_x, det_shift_y |
-
-Join keys: `crystal_id` (obs -> crystal), `image_id` (crystal -> image).
-
-All filtering operations return new immutable objects.
+Join keys: `crystal_id` (obs → crystal), `image_id` (crystal → image). These are
+**dense row positions**, not identities — they are rewritten on every filter so
+gather/scatter stays a plain index op. A probixi `frame_id` is preserved
+separately in `metadata["crystal"]["frame_id"]`, since that is the key any
+write-back must use.
 
 ## Tests
 
 ```bash
-# Fast tests (no data files needed)
-python -m pytest tests/ -m "not slow" -v
-
-# Full suite (needs merged_368.stream)
-python -m pytest tests/ -v
+python -m pytest tests/ -m "not slow" -v      # no data files needed
+python -m pytest tests/ -v                    # full suite (needs merged_368.stream)
 ```
 
-## Experiments
+Note `tests/test_consistency_loss.py::test_recovers_scale_width` is very slow
+and not yet marked `slow`; deselect it for a quick run.
 
-Exploratory scripts, benchmarks, and one-off analyses live in `experiments/`.
-These are not part of the installable package.
+## Docs
+
+`docs/` holds the design and measurement record: `amortized_scale_plan.md`
+(design), `optimize_integration.md` (measured integration state),
+`specsheet.md`, `scaling_merging.md`, `fully_integrated_model.md`,
+`sparse_poisson_loss.md`, `implementation_plan_stream_class.md`.
