@@ -122,6 +122,8 @@ class ScaleHeads(nn.Module):
         predict_width: bool = True,
         predict_shape: bool = True,
         predict_skew: bool = False,
+        global_skew: bool = False,
+        unity_k: bool = False,
     ) -> None:
         super().__init__()
         if not (beta_min < beta_init < beta_max):
@@ -142,12 +144,22 @@ class ScaleHeads(nn.Module):
         #: starting point.  Partiality scatter is one-sided (long lower tail, hard
         #: upper edge), which the symmetric family absorbs by mislocating its centre.
         self.predict_skew = bool(predict_skew)
+        #: One global skew scalar instead of a head — the two-width family with
+        #: no per-observation content.  Exclusive with ``predict_skew``.
+        self.global_skew = bool(global_skew)
+        if self.predict_skew and self.global_skew:
+            raise ValueError("predict_skew and global_skew are exclusive")
+        #: ``log K = 0`` for every observation, not a head.  With the width,
+        #: shape and skew global too, nothing reads the embedding and the
+        #: encoder can be skipped entirely (see ``needs_embedding``).
+        self.unity_k = bool(unity_k)
 
         frac = (beta_init - beta_min) / (beta_max - beta_min)
         beta_raw_init = math.log(frac / (1.0 - frac))       # logit
         log_w_init = math.log(w_init)
 
-        self.head_log_K = self._zero_head(d_model, 0.0)
+        if not self.unity_k:
+            self.head_log_K = self._zero_head(d_model, 0.0)
         if predict_width:
             self.head_log_w = self._zero_head(d_model, log_w_init)
         else:
@@ -162,6 +174,8 @@ class ScaleHeads(nn.Module):
             )
         if predict_skew:
             self.head_log_skew = self._zero_head(d_model, 0.0)
+        elif global_skew:
+            self.register_parameter("global_log_skew", nn.Parameter(torch.zeros(())))
 
     @staticmethod
     def _zero_head(d_model: int, bias: float) -> nn.Linear:
@@ -170,8 +184,27 @@ class ScaleHeads(nn.Module):
         nn.init.constant_(head.bias, bias)
         return head
 
+    @property
+    def needs_embedding(self) -> bool:
+        """False when every quantity is a global scalar or a fixed constant.
+
+        The caller may then skip the feature build and the encoder outright and
+        pass an ``(n, 0)`` placeholder — running a 5-layer Deep Sets over
+        hundreds of millions of observations to produce three constants is pure
+        waste, and on the global-fit path it is the whole cost.
+        """
+        return not (
+            self.unity_k
+            and not self.predict_width
+            and not self.predict_shape
+            and not self.predict_skew
+        )
+
     def forward(self, z: Tensor) -> ScalePrediction:
-        log_K = self.head_log_K(z).squeeze(-1)
+        log_K = (
+            z.new_zeros(z.shape[0]) if self.unity_k
+            else self.head_log_K(z).squeeze(-1)
+        )
 
         if self.predict_width:
             log_w = self.head_log_w(z).squeeze(-1)
@@ -185,8 +218,10 @@ class ScaleHeads(nn.Module):
         beta = self.beta_min + self.beta_span * torch.sigmoid(beta_raw)
 
         log_alpha = log_alpha_from_log_width(log_w, beta)
-        if self.predict_skew:
-            half_s = 0.5 * self.head_log_skew(z).squeeze(-1)
+        if self.predict_skew or self.global_skew:
+            s = (self.head_log_skew(z).squeeze(-1) if self.predict_skew
+                 else self.global_log_skew.expand(z.shape[0]))
+            half_s = 0.5 * s
             log_alpha_lo, log_alpha_hi = log_alpha - half_s, log_alpha + half_s
             return ScalePrediction(
                 log_K=log_K, log_w=log_w, beta=beta, log_alpha=log_alpha_lo,

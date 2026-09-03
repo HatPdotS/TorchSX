@@ -140,6 +140,9 @@ class ObsFeatureSpec(nn.Module):
     ) -> None:
         super().__init__()
         self.token_mode = bool(token_mode)
+        #: Recorded so a checkpoint can say which feature set it was fitted
+        #: under; the flag itself is consumed a few lines below.
+        self.include_hkl = bool(include_hkl)
 
         if context_features is None:
             context_features = tuple(self_features) + CONTEXT_ONLY_FEATURES

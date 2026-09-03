@@ -12,6 +12,15 @@ dependencies = [
     "safetensors>=0.4",
 ]
 
+[project.scripts]
+# The venvs put torchsx on PYTHONPATH rather than pip-installing it, so
+# `python -m torchsx.cli.<name>` is the invocation that actually gets used;
+# these exist for an installed copy and are the same entry points.
+torchsx-train = "torchsx.cli.train:main"
+torchsx-merge-nn = "torchsx.cli.merge_nn:main"
+torchsx-merge-global = "torchsx.cli.merge_global:main"
+torchsx-merge = "torchsx.cli.merge:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=6.0", "black>=21.5", "isort>=5.9"]
 

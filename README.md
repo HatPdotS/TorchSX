@@ -29,6 +29,35 @@ single best CC1/2 of any run trained (0.9982) came from a configuration whose
 merged intensities are **not monotone** in `F_model` and whose R_free is the
 worst of the trained set.
 
+## Command line
+
+Three commands cover the amortised-scale workflow end to end.  The integration
+radii are required — CrystFEL does not record them in the stream and the
+background scales with `n_peak` — and everything else a merge must not guess is
+carried in the checkpoint.
+
+```bash
+# stream(s) -> trained network + merged MTZ
+python -m torchsx.cli.train dark.stream --spacegroup "P 1" \
+    --int-radius 7,9,11 --gain 1.0 --dmin 0.9 -o run/
+
+# trained network + data -> MTZ (recipe read from the checkpoint)
+python -m torchsx.cli.merge_nn run/best.pt dark.stream -o merged.mtz
+
+# no weighting at all: K = 1 with one global width / shape / skew fitted
+# to the same evidence -- the reference a trained run has to beat
+python -m torchsx.cli.merge_global dark.stream --spacegroup "P 1" \
+    --int-radius 7,9,11 --gain 1.0 --dmin 0.9 -o unity.mtz
+```
+
+Crystals can be divided into named **splits** (`--split dark=dark.stream
+--split light=1ps.stream`, or `--split-file labels.pt` for one stream): batches
+are then split-pure, each split keeps its own merge target, and one MTZ is
+written per split.  The network never sees the label.
+
+On the SwissFEL small molecule, same model and free set: R_free **0.118**
+(trained) / **0.123** (global fit, no weighting) / 0.147 (partialator).
+
 ## Installation
 
 ```bash

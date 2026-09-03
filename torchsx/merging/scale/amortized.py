@@ -134,6 +134,8 @@ class AmortizedScale(ScaleModel):
         predict_width: bool = True,
         predict_shape: bool = True,
         predict_skew: bool = False,
+        global_skew: bool = False,
+        unity_k: bool = False,
         anchor_log_k: bool = True,
         anchor_stat: str = "median",
         dropout: float = 0.0,
@@ -167,7 +169,15 @@ class AmortizedScale(ScaleModel):
             predict_width=predict_width,
             predict_shape=predict_shape,
             predict_skew=predict_skew,
+            global_skew=global_skew,
+            unity_k=unity_k,
         )
+        if not heads.needs_embedding:
+            # Nothing reads the embedding, so the encoder is inert: freeze it
+            # rather than letting an optimiser carry two dozen dead parameters
+            # that can never receive a gradient.  It is still constructed so the
+            # module tree, and therefore a checkpoint, keeps one shape.
+            enc.requires_grad_(False)
         return cls(
             features, enc, heads,
             n_crystals=prep.obs_info.n_crystals,
@@ -244,6 +254,14 @@ class AmortizedScale(ScaleModel):
         instead is ~52 B per observation, and the 16 are rematerialised one
         chunk at a time in backward.
         """
+        if not self.heads.needs_embedding:
+            # Nothing reads the embedding (unity K, global width/shape/skew),
+            # so the features and the encoder are dead weight -- and on the
+            # global-fit path they would be the entire cost.  The heads only
+            # need the row count, which an (n, 0) placeholder carries.
+            return self.heads(
+                torch.zeros((meta.obs_id.numel(), 0), device=meta.obs_id.device)
+            )
         n_chunk = int(getattr(self, "chunk_crystals", 0) or 0)
         if n_chunk > 0:
             # Chunk in EVERY mode, not only when building a graph.  The
@@ -290,7 +308,7 @@ class AmortizedScale(ScaleModel):
                 "use AmortizedScale.set_encoder_chunking() to set both"
             )
 
-        skew = self.heads.predict_skew
+        skew = self.heads.predict_skew or self.heads.global_skew
 
         def run(xs, xc, ci, xcr):
             z = self.encoder(xs, xc, ci, self.n_crystals, x_crys=xcr)
@@ -329,6 +347,8 @@ class AmortizedScale(ScaleModel):
         the context carries ``obs_scale = n'/I0``, because permuting hkl also
         permutes the *peers'* I0 lookup — which is legitimate use, not leakage.
         """
+        if not self.heads.needs_embedding:
+            return self.predict(meta_self)      # no embedding, nothing to split
         x_self, _, _ = self.features.build(meta_self)
         _, x_ctx, x_crys = self.features.build(meta_ctx)
         z = self.encoder(x_self, x_ctx, meta_ctx.crystal_id, self.n_crystals, x_crys=x_crys)

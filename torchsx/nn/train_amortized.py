@@ -26,6 +26,7 @@ Adam only — no LBFGS anywhere, on the network or elsewhere.
 
 from __future__ import annotations
 
+import math
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -502,6 +503,15 @@ class AmortizedTrainer:
         self._best_state: dict | None = None
         self._best_obj_state: dict | None = None
 
+        #: Free-form provenance a caller (the CLI) stamps on the checkpoint:
+        #: d_min, spacegroup, gain, integration radii.  Not consulted by
+        #: training -- it exists so a later merge rebuilds the same inputs
+        #: instead of re-deriving them from flags that may have drifted.
+        self.data_recipe: dict = {}
+        #: Names of the crystal splits, in split-index order (empty = one
+        #: unnamed split).  Travels to the checkpoint and names the outputs.
+        self.split_names: list[str] = []
+
         # Resolution shell per observation, for the calibration breakdown.
         d = prep.d_spacing[prep.hkl_id]
         rank = d.argsort().argsort().float() / max(d.numel(), 1)
@@ -925,12 +935,16 @@ class AmortizedTrainer:
         (merge statistics, a different split, per-shell breakdowns) meant a
         full re-run.
         """
-        if self._best_state is None:
-            return None
+        # With no held-out set (a two-parameter global fit, say) nothing is ever
+        # scored and there is no "best" -- write the current state rather than
+        # letting a finished run produce no checkpoint at all.
+        state = self._best_state if self._best_state is not None else {
+            k: v.detach().cpu().clone() for k, v in self.scale.state_dict().items()
+        }
         path = Path(path) if path is not None else Path(self.cfg.outdir) / "best.pt"
         torch.save(
             {
-                "state_dict": self._best_state,
+                "state_dict": state,
                 # so a later merge builds the SAME inner integral as training
                 "quadrature": {
                     "kind": type(getattr(self.objective, "quadrature", None)).__name__,
@@ -944,12 +958,37 @@ class AmortizedTrainer:
                               "obs_self_layers", "d_model", "n_layers",
                               "n_crystal_features")
                 },
+                # everything a merge must not have to guess: the likelihood it
+                # was fitted under, the data recipe, and the scale geometry.  A
+                # silent mismatch here has already cost 0.022 in R_free once.
+                "likelihood": {
+                    "kind": type(getattr(self.objective, "likelihood", None)).__name__,
+                    "bg_var_factor": float(getattr(
+                        getattr(self.objective, "likelihood", None),
+                        "bg_var_factor", 0.0) or 0.0),
+                    "bg_var_mode": getattr(
+                        getattr(self.objective, "likelihood", None),
+                        "bg_var_mode", None),
+                },
+                "data": dict(self.data_recipe or {}),
+                "scale": {
+                    "d_model": getattr(self.scale.encoder, "d_model", None),
+                    "n_layers": getattr(self.scale.encoder, "n_layers", None),
+                    "include_hkl": bool(getattr(self.scale.features, "include_hkl", False)),
+                    "predict_width": bool(getattr(self.scale.heads, "predict_width", True)),
+                    "predict_shape": bool(getattr(self.scale.heads, "predict_shape", True)),
+                    "unity_k": bool(getattr(self.scale.heads, "unity_k", False)),
+                    "anchor_log_k": bool(getattr(self.scale, "anchor_log_k", True)),
+                    "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
+                },
+                "splits": list(self.split_names or []),
                 # scatter family and miss component, so a merge rebuilds the
                 # SAME likelihood the network was fitted under
                 "scatter": {
                     "predict_skew": bool(getattr(self.scale.heads, "predict_skew", False)),
+                    "global_skew": bool(getattr(self.scale.heads, "global_skew", False)),
                     "miss_logit": (None if getattr(self.objective, "miss_logit", None) is None
-                                   else float(getattr(self, "_best_obj_state", {}).get(
+                                   else float((getattr(self, "_best_obj_state", None) or {}).get(
                                        "miss_logit", self.objective.miss_logit.detach()))),
                 },
                 "best_step": self.best_step,
@@ -989,6 +1028,171 @@ class AmortizedTrainer:
         if getattr(self, "_best_obj_state", None):
             self.objective.load_state_dict(self._best_obj_state)
         return True
+
+    @torch.no_grad()
+    def merge(
+        self,
+        *,
+        crystals: Tensor | None = None,
+        condition: int | None = None,
+        estimator: str = "posterior",
+    ) -> dict:
+        """Merge a crystal set and return everything an MTZ needs.
+
+        The single merge implementation the CLIs use.  ``_merge_set`` keeps its
+        own shorter path: it feeds CC1/2 and R_split, and those numbers stay on
+        the code they were measured with.
+
+        ``estimator``:
+
+        ``posterior``  Wilson-posterior mean of ``sqrt(I0)`` over the very
+                       weights the merge computed -- what the French-Wilson
+                       tables approximate, evaluated on the actual posterior.
+        ``flat``       the same moment under the measure alone (no Wilson
+                       prior).
+        ``ml``         ``sqrt(I0)`` at the likelihood maximum, prior-free;
+                       sigma from the flat posterior in both cases.
+        ``pooled``     ``sum(n - bg) / sum(K)``, count-weighted, shape-free.
+        ``mean``       equal-weight mean of ``(n - bg) / K``, partialator's
+                       weighting.  ``pooled``/``mean`` return intensities
+                       (``I``, ``I_sd``, ``n_meas``) rather than F: they are
+                       moment estimators and belong on the same French-Wilson
+                       path partialator's own output takes.
+
+        Returns a dict with ``F``/``F_sd`` (or ``I``/``I_sd``/``n_meas``),
+        ``I0``, ``seen`` and the grid diagnostics ``edge_mass``, ``loc_sd``.
+        """
+        if estimator not in ("posterior", "flat", "ml", "pooled", "mean"):
+            raise ValueError(f"unknown estimator {estimator!r}")
+        if condition is not None:
+            if not (0 <= condition < self.n_conditions):
+                raise ValueError(
+                    f"condition {condition} outside 0..{self.n_conditions - 1}"
+                )
+            self._cond = int(condition)
+            in_cond = (self.condition == condition).nonzero(as_tuple=True)[0]
+            crystals = (in_cond if crystals is None
+                        else crystals[torch.isin(crystals.cpu(), in_cond)])
+        elif crystals is None:
+            crystals = torch.arange(self.index.n_crystals)
+        if self.n_conditions > 1 and condition is None:
+            cb = self.condition[crystals.cpu()].unique()
+            if cb.numel() != 1:
+                raise ValueError(
+                    f"merge: crystals span conditions {cb.tolist()}; "
+                    "merge one condition at a time"
+                )
+            self._cond = int(cb[0])
+        self.scale.eval()
+        n_hkl = self.prep.n_valid
+        dev = self.device
+        tgt = self.target
+        batches = lambda: self.index.batches(
+            self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
+        )
+
+        if estimator in ("pooled", "mean"):
+            # Moment estimators on the trained K: no scatter shape, no prior,
+            # no mean/median correction -- a weighted mean of (n - bg)/K
+            # estimates E[I p] whatever the partiality distribution is.
+            I0_ref = tgt.ema_I0.to(dev)
+            bvf = float(getattr(self.objective.likelihood, "bg_var_factor", 0.0) or 0.0)
+            S = {k: torch.zeros(n_hkl, device=dev, dtype=torch.float64)
+                 for k in ("cnt", "r", "r2", "sig", "K", "var")}
+            for _, rows in batches():
+                meta, n_ph, bg, _ = self._batch(rows.to(dev))
+                pred = self.scale.prime(meta)
+                K = pred.log_K.exp().double()
+                sig = (n_ph - bg).double()
+                h = meta.hkl_idx
+                ratio = sig / K
+                var = ((K * I0_ref[h].double()).clamp(min=0)
+                       + bg.double() * (1.0 + bvf))
+                for k, v in (("cnt", torch.ones_like(sig)), ("r", ratio),
+                             ("r2", ratio * ratio), ("sig", sig), ("K", K),
+                             ("var", var)):
+                    S[k].index_add_(0, h, v)
+                self.scale.clear()
+            cnt = S["cnt"].clamp(min=1)
+            if estimator == "mean":
+                I = S["r"] / cnt
+                I_sd = ((S["r2"] / cnt - I * I).clamp(min=0) / cnt).sqrt()
+            else:
+                I = S["sig"] / S["K"].clamp(min=1e-12)
+                I_sd = S["var"].sqrt() / S["K"].clamp(min=1e-12)
+            return {
+                "estimator": estimator,
+                "I": I.float(), "I_sd": I_sd.float(),
+                "n_meas": S["cnt"].long(),
+                "seen": S["cnt"] >= 2,
+                "n_crystals": int(crystals.numel()),
+                "condition": self._cond,
+            }
+
+        # Locate the peak on THIS crystal set, then accumulate the same coarse
+        # curve the loss uses -- additive over observations, hence over batches.
+        if tgt.node_placement == "wilson":
+            v_nodes, log_w_nodes = tgt.nodes()
+            loc_sd = None
+        else:
+            scan = tgt.scan_grid()
+            acc_s = torch.zeros(n_hkl, scan.shape[1], device=dev)
+            for _, rows in batches():
+                meta, n_ph, bg, _ = self._batch(rows.to(dev))
+                pred = self.scale.prime(meta)
+                acc_s = acc_s + tgt.accumulate(
+                    self.objective, self.scale.scatter, self.params, pred,
+                    n_ph, bg, meta.hkl_idx, meta, scan,
+                )
+                self.scale.clear()
+            centre, loc_sd = tgt.peak_from_scan(acc_s)
+            tgt._loc = (centre, loc_sd)
+            v_nodes = centre[:, None] + loc_sd[:, None] * tgt.u_coarse[None, :]
+            log_w_nodes = None
+
+        acc = torch.zeros(n_hkl, v_nodes.shape[1], device=dev)
+        for _, rows in batches():
+            meta, n_ph, bg, _ = self._batch(rows.to(dev))
+            pred = self.scale.prime(meta)
+            acc = acc + tgt.accumulate(
+                self.objective, self.scale.scatter, self.params, pred,
+                n_ph, bg, meta.hkl_idx, meta, v_nodes,
+            )
+            self.scale.clear()
+        _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc, v_nodes, log_w_nodes)
+
+        # F as a posterior moment of sqrt(I0) on the same weights, not the
+        # plug-in sqrt(E[I]) -- they differ exactly where the relative
+        # posterior width is large, i.e. in the weak outer shells.
+        rootI = v.exp().clamp(min=0).sqrt()
+        F = (w_post * rootI).sum(1)
+        F_sd = ((w_post * (rootI - F[:, None]) ** 2).sum(1)).clamp(min=0).sqrt()
+        if estimator in ("flat", "ml"):
+            # Same nodes, same accumulated curve, weighted by the measure alone
+            # (dI0 = I0 dv): the prior-free estimate and a sigma that carries no
+            # prior shrinkage.
+            S_fine = tgt._interp(acc)
+            du = float(2 * tgt.n_sigma / (tgt.m_fine - 1))
+            _, sig_h = tgt._loc
+            lw = (sig_h * du).log()[:, None].expand_as(v).clone() + v
+            lw[:, 0] -= math.log(2.0)
+            lw[:, -1] -= math.log(2.0)
+            w_flat = torch.softmax(S_fine + lw, dim=1)
+            F_flat = (w_flat * rootI).sum(1)
+            F_sd = ((w_flat * (rootI - F_flat[:, None]) ** 2).sum(1)).clamp(min=0).sqrt()
+            F = (F_flat if estimator == "flat"
+                 else rootI.gather(1, S_fine.argmax(1, keepdim=True)).squeeze(1))
+        return {
+            "estimator": estimator,
+            "F": F, "F_sd": F_sd, "I0": I0, "I0_sd": I0_sd,
+            "seen": acc.abs().sum(1) > 0,
+            "edge_mass": edge,
+            "edge_low": w_post[:, 0], "edge_high": w_post[:, -1],
+            "loc_sd": loc_sd,
+            "scan_halfwidth": tgt.scan_halfwidth,
+            "n_crystals": int(crystals.numel()),
+            "condition": self._cond,
+        }
 
     @torch.no_grad()
     def _merge_set(self, crystals: Tensor) -> tuple[Tensor, Tensor]:
