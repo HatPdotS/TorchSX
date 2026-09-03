@@ -1,8 +1,6 @@
 """Tests for split-half comparison metrics.
 
-Exercises the live ``torchsx.merging.hkl.stats`` implementation (the
-deprecated ``merge._stats`` copy is retained for frozen ``deprecated``
-subpackages; see ``torchsx.deprecated``).
+Exercises ``torchsx.merging.hkl.stats``.
 """
 
 import math

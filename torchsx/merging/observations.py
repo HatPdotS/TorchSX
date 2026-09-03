@@ -351,8 +351,9 @@ class PreparedObs:
     # Per-observation likelihood weight (sorted), or None.
     # Multiplies ``log p`` per observation in the data NLL; the default
     # ``None`` recovers the unweighted ``-Σ log p`` sum (bit-for-bit).
-    # Used by the time-binned merge to apply a Gaussian-over-crystal-rank
-    # weighting (see :mod:`torchsx.merging.time_binned`).
+    # Was used by the time-binned merge to apply a Gaussian-over-crystal-rank
+    # weighting; that module is gone, but the hook is kept for any weighting
+    # scheme (the ``timepoint`` metadata it keyed off still exists).
     obs_weights: Tensor | None = None
 
     def to(self, device) -> "PreparedObs":

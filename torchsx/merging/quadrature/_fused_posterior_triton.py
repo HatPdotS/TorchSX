@@ -36,7 +36,8 @@ hidden by occupancy rather than by ILP within an iteration, so *small* tiles
 win: measured at M = 1.05e6, K = 2001, C = 21, BLOCK_M = 16 with 4 warps runs
 1.22x the per-column path while BLOCK_M = 32 with 4 warps runs 0.91x -- slower
 than what it replaces.  BLOCK_M = 256 collapses to 0.06x.  Do not change the
-default without re-running ``experiments/optimize_integration/fused_tune.py``.
+default without re-running an equivalent tile sweep -- the numbers above and
+the measurement traps behind them are in ``docs/optimize_integration.md``.
 """
 from __future__ import annotations
 

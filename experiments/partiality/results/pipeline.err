@@ -1,2 +1,0 @@
-/das/work/units/LBR-FEL/p17490/Peter/torchsx/torchsx/stream.py:664: UserWarning: TorchRef auto-configured 4 threads. Set TORCHREF_NUM_THREADS to override.
-  from torchref.symmetry import canonicalize_hkl

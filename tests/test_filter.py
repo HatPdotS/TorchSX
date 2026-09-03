@@ -1,8 +1,6 @@
 """Tests for filtering operations.
 
-Exercises the live ``torchsx.merging.hkl.filter`` implementation (the
-deprecated ``merge._filter`` copy is retained for frozen ``deprecated``
-subpackages; see ``torchsx.deprecated``).
+Exercises ``torchsx.merging.hkl.filter``.
 """
 
 import torch

@@ -24,7 +24,7 @@ def __getattr__(name):
     if name == "write_stream_reconstruct":
         from torchsx.io import _writeback
         return _writeback.write_stream_reconstruct
-    if name == "FrameStore":
-        from torchsx.io._frame_store import FrameStore
-        return FrameStore
+    if name == "load_duckdb":
+        from torchsx.io._duckdb import load_duckdb
+        return load_duckdb
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

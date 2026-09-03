@@ -105,8 +105,9 @@ def _sx_joins_with_peaks() -> list[JoinSpec]:
 
     The ``peak`` level holds one row per spot found by the peak finder (indexed or
     not) and joins straight to ``image`` (peaks are an image-level product, not a
-    crystal one). Used by :func:`~torchsx.datareduction.to_stream.build_stream`;
-    the two-join default is kept for peak-less streams (parsed/legacy).
+    crystal one). Used by any reduction front-end that carries the peak search
+    through (probixi's ``peaks`` table, say); the two-join default is kept for
+    peak-less streams (parsed/legacy).
     """
     return _default_sx_joins() + [JoinSpec("peak", "peak_image_id", "image")]
 

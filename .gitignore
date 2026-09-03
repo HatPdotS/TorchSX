@@ -9,50 +9,25 @@ __pycache__/
 
 # SLURM / job output
 slurm-*.out
-
-# Experiment outputs (data / figures / logs — scripts and READMEs are kept)
-experiments/**/*.pt
-experiments/**/*.png
-experiments/**/*.out
-experiments/**/*.csv
-experiments/**/*.h5
-experiments/**/*.sfx
-experiments/**/*.sfx.json
-experiments/**/*.stream
-experiments/**/*.hkl
-experiments/**/*.hkl1
-experiments/**/*.hkl2
-experiments/**/*.safetensors
-experiments/**/*.blosc2
-experiments/**/*.split
-experiments/**/*.npy
-experiments/**/*.npz
-experiments/**/*.pkl
-experiments/**/*.tar
-experiments/**/*.tar.gz
-experiments/**/*.zip
-experiments/**/convert_logs/
-experiments/**/partialator/
-experiments/**/rois/
-experiments/**/neural_correction/
-experiments/**/data/
-experiments/**/frames*/
-experiments/**/*.mtz
-experiments/**/*.svg
-experiments/**/*.pdb
-experiments/**/*.cif
-experiments/**/*.mrc
+*.err
 
 # Test output figures / fixtures
 tests/**/*.png
 tests/**/*.svg
 tests/**/*.pt
 
-# Other artefacts
-experiments/**/*.pdf
-experiments/**/*.log
-experiments/**/*.json
-
-# compiled python
-__pycache__/
-*.pyc
+# Data / run outputs, wherever they land
+*.sfx
+*.sfx.json
+*.stream
+*.duckdb
+*.h5
+*.mtz
+*.hkl
+*.hkl1
+*.hkl2
+*.safetensors
+*.blosc2
+*.npy
+*.npz
+*.pkl

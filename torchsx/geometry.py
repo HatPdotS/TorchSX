@@ -649,8 +649,8 @@ class Geometry:
 
         Cached ``(total_ss, total_fs)`` float32 tensor; a thin torch view over
         :meth:`angle_map` (see there for why this is the pixel-frame radial angle,
-        not the lab azimuth). Used to orient the anisotropic spot kernel in
-        :func:`~torchsx.datareduction.peakfinder.find_peaks_bayes`.
+        not the lab azimuth). Orients an anisotropic spot kernel in a
+        pixel-level peak finder.
         """
         return torch.from_numpy(self.angle_map())
 

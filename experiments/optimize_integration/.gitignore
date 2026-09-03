@@ -1,6 +1,0 @@
-# run artefacts: logs, fitted problems and result dumps are reproducible
-*.out
-*.json
-*.png
-*.pt
-*.jsonl

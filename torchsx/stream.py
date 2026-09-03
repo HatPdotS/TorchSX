@@ -143,6 +143,51 @@ class SFXStream:
             stream._core.fixed_pattern = fixed_pattern
         return stream
 
+    @classmethod
+    def from_duckdb(
+        cls,
+        path: str | Path,
+        spacegroup: str | None = None,
+        merge_friedel: bool = True,
+        geometry=None,
+    ) -> SFXStream:
+        """Load a probixi DuckDB run (its ``.duckdb`` output).
+
+        The database is the ingest boundary: probixi owns it, this reads it
+        once into stacked tensors. See :mod:`torchsx.io._duckdb` for the
+        column/unit mapping and why the crystal order is fixed to
+        ``(filename, event)``.
+
+        Parameters
+        ----------
+        path : the ``.duckdb`` written by probixi.
+        spacegroup : space group of the run. probixi's schema records lattice
+            type and centering but no space group, so it cannot be recovered
+            from the database.
+        merge_friedel : if True, canonicalize HKL to merge Friedel mates.
+        geometry : optional :class:`~torchsx.geometry.Geometry`; by default the
+            ``geometry_file`` recorded in the database is loaded if still present.
+        """
+        import warnings
+        from torchsx.io._duckdb import load_duckdb
+
+        if spacegroup is None:
+            warnings.warn(
+                f"SFXStream.from_duckdb({path!s}): spacegroup not set, "
+                f"falling back to 'P 1'. Centric detection and symmetry "
+                f"equivalents will be incorrect for any non-triclinic "
+                f"crystal. Pass spacegroup='P 63' (or similar) explicitly.",
+                stacklevel=2,
+            )
+            spacegroup = "P 1"
+
+        stream = cls(load_duckdb(path, spacegroup=spacegroup, geometry=geometry))
+        if merge_friedel:
+            stream = stream.symmetrize()
+        else:
+            stream = cls(stream._core.replace(friedel_merged=False))
+        return stream
+
     def save(self, path: str | Path):
         """Save to .sfx (safetensors) format."""
         from torchsx.io._safetensors import save_sfx

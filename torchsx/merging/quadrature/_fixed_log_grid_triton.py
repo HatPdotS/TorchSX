@@ -21,8 +21,9 @@ them.  The gates read ``requires_grad``, so no caller has to opt in.
 Tuning is read from ``_fixed_log_grid_tuning.json`` (in-package),
 keyed by GPU name and K bucket. On unknown GPUs we fall back to the
 A100 winners with a one-time warning. To extend the cache for a new
-GPU, run a tuning sweep externally (see
-``experiments/optimize_integration``) and add the entry.
+GPU, run a tuning sweep externally and add the entry; the measured
+state and the traps to avoid are in ``docs/optimize_integration.md``
+(the sweep scripts themselves are no longer in the repo).
 """
 from __future__ import annotations
 
@@ -292,8 +293,8 @@ class _MarginalizeSignalTriton(torch.autograd.Function):
     """Per-obs ``log_p`` with analytic backward through the four scatter /
     likelihood inputs. The (M, K) integrand never touches HBM.
 
-    Gradient formulas (verified against autograd in
-    ``experiments/optimize_integration/verify.py``):
+    Gradient formulas (verified against autograd; see
+    ``docs/optimize_integration.md``):
 
         d log_p / d log_mean      = +β · S1
         d log_p / d bg            = +S2
