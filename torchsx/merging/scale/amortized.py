@@ -133,6 +133,7 @@ class AmortizedScale(ScaleModel):
         beta_init: float = 2.0,
         predict_width: bool = True,
         predict_shape: bool = True,
+        predict_skew: bool = False,
         anchor_log_k: bool = True,
         anchor_stat: str = "median",
         dropout: float = 0.0,
@@ -165,6 +166,7 @@ class AmortizedScale(ScaleModel):
             beta_init=beta_init,
             predict_width=predict_width,
             predict_shape=predict_shape,
+            predict_skew=predict_skew,
         )
         return cls(
             features, enc, heads,
@@ -265,6 +267,7 @@ class AmortizedScale(ScaleModel):
                 beta=pred.beta,
                 log_alpha=pred.log_alpha,
                 log_e_s=pred.log_e_s,
+                log_alpha_hi=pred.log_alpha_hi,
             )
         return pred
 
@@ -287,10 +290,13 @@ class AmortizedScale(ScaleModel):
                 "use AmortizedScale.set_encoder_chunking() to set both"
             )
 
+        skew = self.heads.predict_skew
+
         def run(xs, xc, ci, xcr):
             z = self.encoder(xs, xc, ci, self.n_crystals, x_crys=xcr)
             p = self.heads(z)
-            return p.log_K, p.log_w, p.beta, p.log_alpha, p.log_e_s
+            out = (p.log_K, p.log_w, p.beta, p.log_alpha, p.log_e_s)
+            return out + ((p.log_alpha_hi,) if skew else ())
 
         ckpt = torch.is_grad_enabled() and self.training
         parts = [
@@ -308,6 +314,7 @@ class AmortizedScale(ScaleModel):
             pred = ScalePrediction(
                 log_K=pred.log_K - loc, log_w=pred.log_w, beta=pred.beta,
                 log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
+                log_alpha_hi=pred.log_alpha_hi,
             )
         return pred
 
@@ -334,6 +341,7 @@ class AmortizedScale(ScaleModel):
             pred = ScalePrediction(
                 log_K=pred.log_K - loc, log_w=pred.log_w, beta=pred.beta,
                 log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
+                log_alpha_hi=pred.log_alpha_hi,
             )
         return pred
 
@@ -346,7 +354,7 @@ class AmortizedScale(ScaleModel):
         """
         pred = self.predict(meta)
         self.scatter.set_prediction(
-            meta.obs_id, pred.log_alpha, torch.log(pred.beta)
+            meta.obs_id, pred.log_alpha, torch.log(pred.beta), pred.log_alpha_hi
         )
         self._cached_obs_id = meta.obs_id
         self._cached_pred = pred

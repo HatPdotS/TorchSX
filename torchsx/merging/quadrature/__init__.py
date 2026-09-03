@@ -12,6 +12,7 @@ from torchsx.merging.quadrature.laplace_saddle import LaplaceSaddleGrid
 from torchsx.merging.quadrature.hierarchical_mc import HierarchicalImportanceQuadrature
 from torchsx.merging.quadrature.wide_log_grid import WideLogGrid
 from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
+from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.quadrature.precomputed import (
     PrecomputedGridQuadrature, PrecomputedGridSpec,
 )
@@ -20,6 +21,6 @@ __all__ = [
     "Quadrature", "TrapezoidalLogGrid", "MixedDeltaTrapezoidal",
     "MomentMatchedQuadrature", "DeltaAtESQuadrature", "HybridLogGrid",
     "AdaptiveHybridLogGrid", "AdaptiveSignifSplit", "LaplaceSaddleGrid",
-    "HierarchicalImportanceQuadrature", "WideLogGrid", "FixedLogGrid",
+    "HierarchicalImportanceQuadrature", "WideLogGrid", "FixedLogGrid", "SplitLogGrid",
     "PrecomputedGridQuadrature", "PrecomputedGridSpec",
 ]

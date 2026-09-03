@@ -39,6 +39,11 @@ class ScatterModel(nn.Module):
         h = meta.hkl_idx
         return params.log_alpha[h], params.log_beta[h]
 
+    def log_alpha_hi_obs(self, params: Parameters, meta: ObsInfo) -> Tensor | None:
+        """Per-observation upper-side ``log α`` for the two-width (asymmetric)
+        GenGauss, or ``None`` for the symmetric family.  Default: symmetric."""
+        return None
+
     @abstractmethod
     def log_prob(
         self,

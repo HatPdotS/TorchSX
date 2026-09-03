@@ -149,6 +149,7 @@ class PosteriorMergeTarget(nn.Module):
         scan_points: int = 9,
         scan_halfwidth: float = 8.0,
         use_fused: bool = False,
+        max_halfwidth: float = 12.0,
     ) -> None:
         super().__init__()
         if prior not in ("flat_I0", "flat_log", "wilson"):
@@ -168,6 +169,17 @@ class PosteriorMergeTarget(nn.Module):
         self.ema_decay, self.floor = float(ema_decay), float(floor)
         self.sigma_bounds = sigma_bounds
         self.scan_points, self.scan_halfwidth = int(scan_points), float(scan_halfwidth)
+        # Cap on the outer grid HALF-WIDTH in nats.  ``n_sigma`` was raised to
+        # 24 to stop truncating sharp posteriors whose Laplace width is
+        # underestimated; applied to a BROAD width it does the opposite damage.
+        # A weak reflection's curve is flat below and a cliff above, the
+        # parabola reads a width of several nats, and 24 x 4 nats puts the 31
+        # coarse nodes 6.4 nats apart -- the cliff is then linearly interpolated
+        # over 6 nats and the posterior mean lands nats too high.  Measured on
+        # the SACLA dark merge: 27 % of reflections sat on such a grid; R_free
+        # 0.351 against partialator's 0.322.  The Wilson prior removes all mass
+        # more than ~12 nats from the centre, so nothing beyond needs nodes.
+        self.max_halfwidth = float(max_halfwidth)
         # Recompute each outer node in backward instead of holding all C graphs.
         # OFF by default: it roughly doubles the accumulate's compute, which is
         # not worth paying on a data set that already fits.  Turn it on when the
@@ -306,7 +318,32 @@ class PosteriorMergeTarget(nn.Module):
         v_star = trust * v_meas + (1.0 - trust) * centre
         sd = torch.where(peaked, sd_meas, torch.full_like(sd_meas, self.scan_halfwidth / 2))
         sd = trust * sd + (1.0 - trust) * (self.scan_halfwidth / 2)
-        return v_star, sd.clamp(min=1e-3, max=self.scan_halfwidth)
+
+        # One-sided curves.  A weak reflection's likelihood is flat below some
+        # bound and a cliff above it: no peak, so the parabola width is
+        # meaningless (several nats) and ``n_sigma`` times that is a grid of
+        # +-96 nats whose 31 coarse nodes straddle the cliff 6.4 nats apart.
+        # Linear interpolation across the cliff then cut the posterior off
+        # nats below the true bound -- 27 % of the SACLA dark reflections came
+        # out collapsed to ~0 and R_free was 0.351 against 0.322 for
+        # partialator.  Anchor these on the plateau EDGE instead: the last scan
+        # node within 2 nats of the maximum is the knee, and the Wilson prior
+        # (density ~ e^v below its mode) leaves no mass more than ~10 nats
+        # below it, so the support is [knee - 0.75 H, knee + 0.25 H] with
+        # H = max_halfwidth (the knee itself is known only to the 2-nat scan
+        # spacing, hence the margin above it).  That is a centre shift plus a width, so the
+        # shared u axis and the coarse->fine interpolation are unchanged.
+        H = self.max_halfwidth
+        sd_max = min(self.scan_halfwidth, H / self.n_sigma)
+        plateau = S >= (S.max(dim=1, keepdim=True).values - 2.0)
+        k_knee = (plateau * torch.arange(self.scan_points, device=S.device)).max(dim=1).values
+        v_knee = centre + u[k_knee]
+        # a plateau that reaches the top of the scan is uninformative on the
+        # high side too: keep the blended fallback for those (rare)
+        one_sided = (sd > sd_max) & (k_knee < self.scan_points - 1)
+        v_star = torch.where(one_sided, v_knee - 0.25 * H, v_star)
+        sd = torch.where(one_sided, torch.full_like(sd, 0.5 * H / self.n_sigma), sd)
+        return v_star, sd.clamp(min=1e-3, max=sd_max)
 
     @torch.no_grad()
     def _centre_sigma(self) -> tuple[Tensor, Tensor]:
@@ -511,12 +548,21 @@ class PosteriorMergeTarget(nn.Module):
         logits = S_fine + log_w
         log_Z = torch.logsumexp(logits, dim=1)
         w_post = torch.softmax(logits, dim=1)
-        I = v.exp()
-        I0_mean = (w_post * I).sum(dim=1)
+        # Moments in LOG space.  With n_sigma = 24 and the flat-curve fallback
+        # width (scan_halfwidth / 2 = 4) the top node sits ~96 nats above the
+        # centre, where ``v.exp()`` overflows float32 to inf; its posterior
+        # weight is exactly 0 there, and 0 * inf = NaN.  Measured on the SACLA
+        # light merge: 28 k of 67 k reflections NaN, and one NaN is enough to
+        # take CC1/2 with it.  E[I] = exp(logsumexp(logits + v) - log Z) never
+        # forms the overflowing value.
+        I0_mean = (torch.logsumexp(logits + v, dim=1) - log_Z).exp()
         # sigI falls out of the same integral -- no separate error model, and
         # it is the posterior width rather than a propagated Laplace guess.
+        # Nodes carrying no weight are clamped to a finite value so the
+        # (I - mean)^2 term stays finite; where the clamp bites, w_post is 0.
+        v_safe = v.clamp(max=(I0_mean.clamp(min=1e-30).log() + 20.0)[:, None])
         I0_sd = (
-            (w_post * (I - I0_mean[:, None]) ** 2).sum(dim=1).clamp(min=0)
+            (w_post * (v_safe.exp() - I0_mean[:, None]) ** 2).sum(dim=1).clamp(min=0)
         ).sqrt()
         n_edge = max(1, int(round(0.05 * logits.shape[1])))
         edge_mass = (

@@ -54,13 +54,15 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
         self._sort_perm: Tensor | None = None
         self._log_alpha: Tensor | None = None
         self._log_beta: Tensor | None = None
+        self._log_alpha_hi: Tensor | None = None
 
     # ── prediction plumbing ────────────────────────────────────────────
 
     def set_prediction(
-        self, obs_id: Tensor, log_alpha: Tensor, log_beta: Tensor
+        self, obs_id: Tensor, log_alpha: Tensor, log_beta: Tensor,
+        log_alpha_hi: Tensor | None = None,
     ) -> None:
-        """Install the current batch's per-observation (log α, log β)."""
+        """Install the current batch's per-observation (log α, log β[, log α_hi])."""
         if not (obs_id.shape == log_alpha.shape == log_beta.shape):
             raise ValueError(
                 f"shape mismatch: obs_id={tuple(obs_id.shape)} "
@@ -71,10 +73,11 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
         self._sort_perm = perm
         self._log_alpha = log_alpha
         self._log_beta = log_beta
+        self._log_alpha_hi = log_alpha_hi
 
     def clear_prediction(self) -> None:
         self._sorted_ids = self._sort_perm = None
-        self._log_alpha = self._log_beta = None
+        self._log_alpha = self._log_beta = self._log_alpha_hi = None
 
     @property
     def has_prediction(self) -> bool:
@@ -112,3 +115,8 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
             )
         pos = self._positions(meta.obs_id)
         return self._log_alpha[pos], self._log_beta[pos]
+
+    def log_alpha_hi_obs(self, params: Parameters, meta: ObsInfo) -> Tensor | None:
+        if self._log_alpha_hi is None:
+            return None
+        return self._log_alpha_hi[self._positions(meta.obs_id)]

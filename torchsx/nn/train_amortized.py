@@ -59,7 +59,9 @@ class CrystalIndex:
     offsets.
     """
 
-    def __init__(self, crystal_id: Tensor, n_crystals: int) -> None:
+    def __init__(
+        self, crystal_id: Tensor, n_crystals: int, condition: Tensor | None = None,
+    ) -> None:
         order = crystal_id.argsort(stable=True)
         counts = torch.bincount(crystal_id, minlength=n_crystals)
         offsets = torch.zeros(n_crystals + 1, dtype=torch.long)
@@ -69,6 +71,28 @@ class CrystalIndex:
         self.offsets = offsets
         self.n_crystals = int(n_crystals)
         self.nonempty = torch.nonzero(counts > 0, as_tuple=True)[0]
+        # Per-crystal condition (light/dark, delay bin).  Batches are then
+        # drawn from ONE condition each: the in-batch merge target for a
+        # reflection must never pool dark and light, or the difference between
+        # them is averaged away before the loss ever sees it.  The label is
+        # ``ObsInfo.delay_bin_idx``, i.e. the stream's image-level timepoint.
+        if condition is not None:
+            condition = condition.detach().to(torch.long).cpu()
+            if condition.shape[0] != self.n_crystals:
+                raise ValueError(
+                    f"condition must have one entry per crystal "
+                    f"({self.n_crystals}), got {tuple(condition.shape)}"
+                )
+            if bool((condition[self.nonempty] < 0).any()):
+                n_bad = int((condition[self.nonempty] < 0).sum())
+                raise ValueError(
+                    f"{n_bad} crystals carry condition -1 (unlabelled image). "
+                    "Drop them from the stream before training, or do not label it."
+                )
+        self.condition = condition
+        self.n_conditions = (
+            int(condition.max()) + 1 if condition is not None and condition.numel() else 1
+        )
 
     def rows(self, crystals: Tensor) -> Tensor:
         """All observation rows of the given crystals, as a flat index.
@@ -92,21 +116,39 @@ class CrystalIndex:
         self, max_obs: int, *, generator: torch.Generator | None = None,
         crystals: Tensor | None = None, shuffle: bool = True,
     ):
-        """Yield ``(crystal_sel, obs_rows)`` with at most ``max_obs`` rows each."""
+        """Yield ``(crystal_sel, obs_rows)`` with at most ``max_obs`` rows each.
+
+        With a condition label every batch holds crystals of ONE condition: the
+        (shuffled) pool is split per condition, each part is filled greedily
+        as before, and the resulting batches are then shuffled as a list so
+        the conditions alternate rather than run dark-then-light.  Without a
+        label (or with a single condition) this is bit-identical to the
+        unconditioned batcher for the same generator state.
+        """
         pool = self.nonempty if crystals is None else crystals
         if shuffle:
             pool = pool[torch.randperm(pool.numel(), generator=generator)]
-        c = self.counts[pool]
-        start, running = 0, 0
-        for i in range(pool.numel()):
-            ci = int(c[i])
-            if running + ci > max_obs and i > start:
-                sel = pool[start:i]
-                yield sel, self.rows(sel)
-                start, running = i, 0
-            running += ci
-        if start < pool.numel():
-            sel = pool[start:]
+        pools = [pool]
+        if self.condition is not None and self.n_conditions > 1:
+            cb = self.condition[pool]
+            pools = [pool[cb == b] for b in range(self.n_conditions)]
+            pools = [q for q in pools if q.numel()]
+        sels: list[Tensor] = []
+        for q in pools:
+            c = self.counts[q]
+            start, running = 0, 0
+            for i in range(q.numel()):
+                ci = int(c[i])
+                if running + ci > max_obs and i > start:
+                    sels.append(q[start:i])
+                    start, running = i, 0
+                running += ci
+            if start < q.numel():
+                sels.append(q[start:])
+        if shuffle and len(pools) > 1:
+            order = torch.randperm(len(sels), generator=generator).tolist()
+            sels = [sels[i] for i in order]
+        for sel in sels:
             yield sel, self.rows(sel)
 
 
@@ -204,6 +246,8 @@ class TrainConfig:
     posterior_m_fine: int = 257
     posterior_n_sigma: float = 8.0
     posterior_prior: str = "flat_I0"
+    #: Outer grid half-width cap in nats (see PosteriorMergeTarget.max_halfwidth).
+    posterior_max_halfwidth: float = 12.0
     lam_spread: float = 0.0
     #: Halflife of the spread penalty in steps; ``0`` disables the ramp and
     #: holds ``lam_spread`` constant for the whole run.
@@ -211,6 +255,13 @@ class TrainConfig:
     log_every: int = 10
     eval_lam: float = 0.0
     heldout_frac: float = 0.05
+    #: Condition (``ObsInfo.delay_bin_idx`` value) the held-out crystals and
+    #: the split-half merge sets are drawn from, so every validation number is
+    #: a same-condition statistic.  Bins are sorted by timepoint, so 0 is the
+    #: earliest label -- the dark set when dark is labelled with a negative
+    #: delay.  ``None`` pools all conditions and is only allowed when the
+    #: data carries a single one.
+    heldout_condition: int | None = 0
     #: Crystals scored from the TRAINING set under the same conditions as the
     #: held-out set (eval_lam, no spread penalty).  Without this the logged
     #: train and heldout numbers differ in both the penalty and lambda, so
@@ -251,10 +302,31 @@ class AmortizedTrainer:
         self.scale = scale.to(self.device)
         self.objective = objective
         self.params = params
-        self.is_light = is_light
 
         oi = prep.obs_info
-        self.index = CrystalIndex(oi.crystal_id.cpu(), oi.n_crystals)
+        # Condition per crystal from the stream's image-level timepoint label;
+        # a stream that was never labelled is one condition.
+        self.condition = (
+            oi.delay_bin_idx.detach().to(torch.long).cpu()
+            if oi.delay_bin_idx is not None
+            else torch.zeros(oi.n_crystals, dtype=torch.long)
+        )
+        self.index = CrystalIndex(oi.crystal_id.cpu(), oi.n_crystals,
+                                  condition=self.condition)
+        self.n_conditions = self.index.n_conditions
+        self._cond = 0                      # condition of the batch in flight
+        if is_light is None and self.n_conditions > 1:
+            is_light = self.condition != 0
+        self.is_light = None if is_light is None else is_light.to(self.device)
+        # Batches are condition-pure, so an in-batch condition AUC is
+        # undefined; keep a subsample of log K from the latest batch of every
+        # condition and score across them.
+        self._auc_pool: list = [None] * self.n_conditions
+        if self.n_conditions > 1:
+            n_per = torch.bincount(self.condition[self.index.nonempty],
+                                   minlength=self.n_conditions).tolist()
+            print(f"  [condition] {self.n_conditions} conditions, crystals per "
+                  f"condition {n_per}; batches are condition-pure", flush=True)
         if self.cfg.target_redundancy is not None:
             want = int(round(self.cfg.target_redundancy * prep.n_valid))
             avail = int(oi.crystal_id.numel())
@@ -276,23 +348,31 @@ class AmortizedTrainer:
             else (self.n_ph + prep.bg.clamp(min=0) + 1.0).sqrt()
         )
         seed_I0 = unity_merge(prep.I_obs, self.sigma, prep.hkl_id, prep.n_valid)
-        if self.cfg.merge_target == "posterior":
-            from torchsx.nn.posterior_target import PosteriorMergeTarget
-            self.target = PosteriorMergeTarget(
-                seed_I0,
-                k_coarse=self.cfg.posterior_k_coarse,
-                m_fine=self.cfg.posterior_m_fine,
-                n_sigma=self.cfg.posterior_n_sigma,
-                prior=self.cfg.posterior_prior,
-            ).to(self.device)
-            self.target.checkpoint_nodes = bool(
-                self.cfg.posterior_checkpoint_nodes)
-        elif self.cfg.merge_target == "loo":
-            self.target = LOOInBatchTarget(seed_I0, lam=self.cfg.lam0).to(self.device)
-        else:
-            raise ValueError(
-                f"merge_target must be 'loo' or 'posterior', got {self.cfg.merge_target!r}"
-            )
+        # One merge target PER CONDITION: separate EMA centre, grid width and
+        # Wilson Sigma, so dark and light each converge to their own merge
+        # while the network is shared.  All are seeded from the pooled unity
+        # merge -- the EMA moves within a few steps and ``locate`` rescans
+        # +-8 nats around it, so a per-condition seed buys nothing.
+        self.targets: list = []
+        for _ in range(self.n_conditions):
+            if self.cfg.merge_target == "posterior":
+                from torchsx.nn.posterior_target import PosteriorMergeTarget
+                t = PosteriorMergeTarget(
+                    seed_I0,
+                    k_coarse=self.cfg.posterior_k_coarse,
+                    m_fine=self.cfg.posterior_m_fine,
+                    n_sigma=self.cfg.posterior_n_sigma,
+                    prior=self.cfg.posterior_prior,
+                    max_halfwidth=self.cfg.posterior_max_halfwidth,
+                ).to(self.device)
+                t.checkpoint_nodes = bool(self.cfg.posterior_checkpoint_nodes)
+            elif self.cfg.merge_target == "loo":
+                t = LOOInBatchTarget(seed_I0, lam=self.cfg.lam0).to(self.device)
+            else:
+                raise ValueError(
+                    f"merge_target must be 'loo' or 'posterior', got {self.cfg.merge_target!r}"
+                )
+            self.targets.append(t)
         if self.cfg.loss == "evidence" and self.cfg.merge_target != "posterior":
             raise ValueError("loss='evidence' requires merge_target='posterior'")
         if self.cfg.merge_estimator not in ("posterior", "wls"):
@@ -301,20 +381,24 @@ class AmortizedTrainer:
                 f"{self.cfg.merge_estimator!r}"
             )
         # Scoring estimator, deliberately independent of the training target.
+        self._score_alias = False
+        self._score_targets: list | None = None
         if self.cfg.merge_estimator == "posterior":
             if self.cfg.merge_target == "posterior":
-                self.score_target = self.target      # share state, don't duplicate
+                self._score_alias = True             # share state, don't duplicate
             else:
                 from torchsx.nn.posterior_target import PosteriorMergeTarget
-                self.score_target = PosteriorMergeTarget(
-                    seed_I0,
-                    k_coarse=self.cfg.posterior_k_coarse,
-                    m_fine=self.cfg.posterior_m_fine,
-                    n_sigma=self.cfg.posterior_n_sigma,
-                    prior=self.cfg.posterior_prior,
-                ).to(self.device)
-        else:
-            self.score_target = None
+                self._score_targets = [
+                    PosteriorMergeTarget(
+                        seed_I0,
+                        k_coarse=self.cfg.posterior_k_coarse,
+                        m_fine=self.cfg.posterior_m_fine,
+                        n_sigma=self.cfg.posterior_n_sigma,
+                        prior=self.cfg.posterior_prior,
+                        max_halfwidth=self.cfg.posterior_max_halfwidth,
+                    ).to(self.device)
+                    for _ in range(self.n_conditions)
+                ]
         # obs_scale = n'/I0 needs a reference merge.  Seed it from the same
         # unity merge (linear, all observations) rather than exp(mu_init),
         # which is a log-space MLE over positives only and biased high.
@@ -324,27 +408,53 @@ class AmortizedTrainer:
 
         self.gen = torch.Generator().manual_seed(self.cfg.seed)
         pool = self.index.nonempty
-        perm = pool[torch.randperm(pool.numel(), generator=self.gen)]
+        # Held-out crystals come from ONE condition (cfg.heldout_condition), so
+        # the held-out NLL and every split-half statistic below are
+        # same-condition numbers.  Training gets the rest of that condition
+        # plus every crystal of the others.
+        hc = self.cfg.heldout_condition
+        if hc is None:
+            if self.n_conditions > 1:
+                raise ValueError(
+                    "heldout_condition=None pools conditions in the validation "
+                    f"set; the data carries {self.n_conditions}. Pick one."
+                )
+            ref_pool, other = pool, pool[:0]
+        else:
+            if not 0 <= hc < self.n_conditions:
+                raise ValueError(
+                    f"heldout_condition={hc} but the data has "
+                    f"{self.n_conditions} condition(s)"
+                )
+            in_ref = self.condition[pool] == hc
+            ref_pool, other = pool[in_ref], pool[~in_ref]
+        perm = ref_pool[torch.randperm(ref_pool.numel(), generator=self.gen)]
         n_held = int(self.cfg.heldout_frac * perm.numel())
         self.heldout_crystals = perm[:n_held]
-        self.train_crystals = perm[n_held:]
+        ref_train = perm[n_held:]
+        self.train_crystals = torch.cat([ref_train, other])
 
         decay, no_decay = [], []
         for name, prm in self.scale.named_parameters():
             if not prm.requires_grad:
                 continue
             (no_decay if prm.ndim <= 1 else decay).append(prm)
+        # the objective may carry its own scalars (the miss fraction); they are
+        # fitted with the network, undecayed
+        for prm in self.objective.parameters():
+            if prm.requires_grad:
+                no_decay.append(prm)
         # Merge-quality quartets, at MATCHED crystal count.  Merge statistics
         # depend strongly on multiplicity, so comparing a 66,822-crystal train
         # merge against a 3,516-crystal validation merge would measure the
         # count, not the model.  Both sets are subsampled to the same size and
         # each is split in half, giving CC1/2 within seen crystals and within
         # unseen crystals on equal footing.
-        n_match = min(self.train_crystals.numel(), self.heldout_crystals.numel())
+        n_match = min(ref_train.numel(), self.heldout_crystals.numel())
         n_match -= n_match % 2
         gq = torch.Generator().manual_seed(self.cfg.seed + 991)
-        tr_sub = self.train_crystals[
-            torch.randperm(self.train_crystals.numel(), generator=gq)[:n_match]
+        tr_sub = ref_train[
+            torch.randperm(ref_train.numel(), generator=gq)[:n_match]
         ]
         va_sub = self.heldout_crystals[
             torch.randperm(self.heldout_crystals.numel(), generator=gq)[:n_match]
@@ -364,18 +474,14 @@ class AmortizedTrainer:
         # merge statistics depend strongly on multiplicity -- so those numbers
         # are NOT comparable to the literature and only their train-vs-val
         # difference is meaningful.
-        allc = self.index.nonempty[
-            torch.randperm(self.index.nonempty.numel(), generator=gq)
-        ]
+        allc = ref_pool[torch.randperm(ref_pool.numel(), generator=gq)]
         half = allc.numel() // 2
         self.merge_sets["full_A"] = allc[:half]
         self.merge_sets["full_B"] = allc[half:]
         # A second, independent split of the same data: comparing the two gives
         # the scatter of the statistic itself, so we know which differences
         # between runs are real.
-        allc2 = self.index.nonempty[
-            torch.randperm(self.index.nonempty.numel(), generator=gq)
-        ]
+        allc2 = ref_pool[torch.randperm(ref_pool.numel(), generator=gq)]
         self.merge_sets["rep_A"] = allc2[:half]
         self.merge_sets["rep_B"] = allc2[half:]
 
@@ -394,6 +500,7 @@ class AmortizedTrainer:
         self.best_heldout = float("inf")
         self.best_step = -1
         self._best_state: dict | None = None
+        self._best_obj_state: dict | None = None
 
         # Resolution shell per observation, for the calibration breakdown.
         d = prep.d_spacing[prep.hkl_id]
@@ -401,6 +508,24 @@ class AmortizedTrainer:
         self.shell_of_obs = (rank * self.cfg.shell_bins).long().clamp(
             max=self.cfg.shell_bins - 1
         )
+
+    # ── condition-indexed state ────────────────────────────────────────
+
+    @property
+    def target(self):
+        """Merge target of the condition currently in flight."""
+        return self.targets[self._cond]
+
+    @property
+    def score_target(self):
+        if self._score_alias:
+            return self.target
+        if self._score_targets is None:
+            return None
+        return self._score_targets[self._cond]
+
+    def _all_targets(self) -> list:
+        return [*self.targets, *(self._score_targets or [])]
 
     # ── schedule ───────────────────────────────────────────────────────
 
@@ -434,6 +559,13 @@ class AmortizedTrainer:
         only the gathered rows cross the bus; otherwise this is the plain
         indexing it replaces, so the two paths give identical tensors.
         """
+        if self.n_conditions > 1 and rows.numel():
+            # The batch is condition-pure (CrystalIndex guarantees it), so the
+            # first row names the condition for the whole batch.  This is the
+            # one choke point every forward, evaluate, merge and diagnostic
+            # path passes through, which is what keeps ``self.target`` right.
+            cid = self.prep.obs_info.crystal_id
+            self._cond = int(self.condition[int(cid[rows[0].to(cid.device)])])
         if not self.cfg.stream_batches:
             return (self.prep.obs_info.gather(rows), self.n_ph[rows],
                     self.prep.bg[rows], self.sigma[rows])
@@ -530,12 +662,14 @@ class AmortizedTrainer:
         number to read for "is the model actually improving".
         """
         self.scale.eval()
-        sched = self.target.lam
-        self.target.lam = self.cfg.eval_lam
+        sched = [t.lam for t in self.targets]
+        for t in self.targets:
+            t.lam = self.cfg.eval_lam
         try:
             _, _, tgt, nll, *_ = self._forward(rows, grad=False)
         finally:
-            self.target.lam = sched
+            for t, lam in zip(self.targets, sched):
+                t.lam = lam
             self.scale.train()
         self.scale.clear()
         return float(nll.item()) / max(int(tgt.valid.sum()), 1)
@@ -701,9 +835,20 @@ class AmortizedTrainer:
             if meta.ewald_offset is not None else float("nan")
         )
         if self.is_light is not None:
-            out["condition_auc"] = condition_auc(
-                pred.log_K, self.is_light[meta.crystal_id]
-            )
+            if self.n_conditions == 1:
+                out["condition_auc"] = condition_auc(
+                    pred.log_K, self.is_light[meta.crystal_id]
+                )
+            else:
+                lk = pred.log_K.detach()
+                take = torch.randperm(lk.numel(), device=lk.device)[:4096]
+                self._auc_pool[self._cond] = lk[take]
+                if all(v is not None for v in self._auc_pool):
+                    labels = torch.cat([
+                        torch.full((v.numel(),), c != 0, dtype=torch.bool, device=lk.device)
+                        for c, v in enumerate(self._auc_pool)
+                    ])
+                    out["condition_auc"] = condition_auc(torch.cat(self._auc_pool), labels)
         return out
 
     @torch.no_grad()
@@ -721,12 +866,13 @@ class AmortizedTrainer:
         alone.  Pinning λ here makes the held-out curve an actual yardstick.
         """
         self.scale.eval()
-        sched_lam = self.target.lam
+        sched_lam = [t.lam for t in self.targets]
+        for t in self.targets:
+            t.lam = self.cfg.eval_lam
         tot, n_tot, n_hkl, recs = 0.0, 0, 0, []
         for sel, rows in self.index.batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         ):
-            self.target.lam = self.cfg.eval_lam
             meta, pred, tgt, nll, *_ = self._forward(rows, grad=False)
             n_used = int(tgt.valid.sum())
             tot += float(nll.item())
@@ -736,7 +882,8 @@ class AmortizedTrainer:
                 calibration_metrics(torch.where(tgt.valid, tgt.z, torch.nan))
             )
             self.scale.clear()
-        self.target.lam = sched_lam
+        for t, lam in zip(self.targets, sched_lam):
+            t.lam = lam
         rec = {
             "step": self.step_i, "phase": phase,
             "nll_per_obs": tot / max(n_tot, 1),
@@ -762,6 +909,10 @@ class AmortizedTrainer:
             self._best_state = {
                 k: v.detach().clone() for k, v in self.scale.state_dict().items()
             }
+            # the objective's own scalars (miss fraction) belong to the same snapshot
+            self._best_obj_state = {
+                k: v.detach().clone() for k, v in self.objective.state_dict().items()
+            }
         rec["best_heldout"] = self.best_heldout
         self.logger.log(rec)
         return rec
@@ -780,6 +931,12 @@ class AmortizedTrainer:
         torch.save(
             {
                 "state_dict": self._best_state,
+                # so a later merge builds the SAME inner integral as training
+                "quadrature": {
+                    "kind": type(getattr(self.objective, "quadrature", None)).__name__,
+                    "n_points": getattr(getattr(self.objective, "quadrature", None),
+                                        "n_points", None),
+                },
                 # so a later merge builds the SAME forward, not the default one
                 "encoder": {
                     k: getattr(self.scale.encoder, k, None)
@@ -787,11 +944,36 @@ class AmortizedTrainer:
                               "obs_self_layers", "d_model", "n_layers",
                               "n_crystal_features")
                 },
+                # scatter family and miss component, so a merge rebuilds the
+                # SAME likelihood the network was fitted under
+                "scatter": {
+                    "predict_skew": bool(getattr(self.scale.heads, "predict_skew", False)),
+                    "miss_logit": (None if getattr(self.objective, "miss_logit", None) is None
+                                   else float(getattr(self, "_best_obj_state", {}).get(
+                                       "miss_logit", self.objective.miss_logit.detach()))),
+                },
                 "best_step": self.best_step,
                 "best_heldout": self.best_heldout,
                 "n_crystals": self.index.n_crystals,
                 "n_hkl": self.prep.n_valid,
-                "ema_I0": self.target.ema_I0.detach().cpu(),
+                # one running merge per condition; (n_hkl,) when there is one
+                # condition so single-condition consumers are unchanged
+                "ema_I0": (
+                    self.targets[0].ema_I0.detach().cpu() if self.n_conditions == 1
+                    else torch.stack([t.ema_I0.detach().cpu() for t in self.targets])
+                ),
+                "n_conditions": self.n_conditions,
+                # outer-grid geometry, so a later merge integrates on the SAME grid
+                "posterior_grid": {
+                    "k_coarse": self.cfg.posterior_k_coarse, "m_fine": self.cfg.posterior_m_fine,
+                    "n_sigma": self.cfg.posterior_n_sigma, "max_halfwidth": self.cfg.posterior_max_halfwidth,
+                    "prior": self.cfg.posterior_prior,
+                },
+                "timepoints": (
+                    None if self.prep.obs_info.unique_timepoints is None
+                    else self.prep.obs_info.unique_timepoints.detach().cpu().tolist()
+                ),
+                "heldout_condition": self.cfg.heldout_condition,
                 "heldout_crystals": self.heldout_crystals.cpu(),
                 "train_crystals": self.train_crystals.cpu(),
             },
@@ -804,6 +986,8 @@ class AmortizedTrainer:
         if self._best_state is None:
             return False
         self.scale.load_state_dict(self._best_state)
+        if getattr(self, "_best_obj_state", None):
+            self.objective.load_state_dict(self._best_obj_state)
         return True
 
     @torch.no_grad()
@@ -821,6 +1005,17 @@ class AmortizedTrainer:
         the same inverse-variance sums that target is built from.
         """
         n_hkl = self.prep.n_valid
+        if self.n_conditions > 1:
+            # A merge is a same-condition quantity; pin the target BEFORE
+            # reading it, since the last training batch may have been the
+            # other condition.
+            cb = self.condition[crystals.cpu()].unique()
+            if cb.numel() != 1:
+                raise ValueError(
+                    f"_merge_set: crystals span conditions {cb.tolist()}; "
+                    "merge one condition at a time"
+                )
+            self._cond = int(cb[0])
         posterior = self.score_target is not None
         tgt = self.score_target
         if posterior:
@@ -1000,8 +1195,8 @@ class AmortizedTrainer:
 
     def _refresh_wilson_sigma(self) -> None:
         """Keep the Wilson Sigma on the shell mean of the running merge."""
-        for t in (self.target, self.score_target):
-            if t is None or not hasattr(t, "set_wilson_sigma"):
+        for t in self._all_targets():
+            if not hasattr(t, "set_wilson_sigma"):
                 continue
             sid = self.prep.shell_id_fw.to(self.device)
             t.set_wilson_sigma(sid, int(sid.max().item()) + 1)
@@ -1014,9 +1209,12 @@ class AmortizedTrainer:
 
     def _refresh_feature_reference(self) -> None:
         """Roll the obs_scale reference forward with the running merge."""
+        # ONE reference for every condition (the first): ``obs_scale`` is an
+        # input feature, and a per-condition reference would let the network
+        # read the condition off it.
         feats = getattr(self.scale, "features", None)
         if feats is not None and hasattr(feats, "set_reference_I0"):
-            feats.set_reference_I0(self.target.ema_I0)
+            feats.set_reference_I0(self.targets[0].ema_I0)
 
     def run(self) -> None:
         for epoch in range(self.cfg.epochs):

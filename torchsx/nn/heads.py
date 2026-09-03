@@ -56,8 +56,9 @@ class ScalePrediction:
     log_K: Tensor        # (n,)
     log_w: Tensor        # (n,)  log SD of the log-scatter
     beta: Tensor         # (n,)  shape
-    log_alpha: Tensor    # (n,)  GenGauss α, derived from (w, β)
+    log_alpha: Tensor    # (n,)  GenGauss α, derived from (w, β); the LOWER width when asymmetric
     log_e_s: Tensor      # (n,)  log E[exp(ε)] — the mean/median correction
+    log_alpha_hi: Tensor | None = None   # (n,) upper-side width (two-width family), None = symmetric
 
     @property
     def log_mean_shift(self) -> Tensor:
@@ -76,6 +77,7 @@ class ScalePrediction:
         return ScalePrediction(
             self.log_K.detach(), self.log_w.detach(),
             self.beta.detach(), self.log_alpha.detach(), self.log_e_s.detach(),
+            None if self.log_alpha_hi is None else self.log_alpha_hi.detach(),
         )
 
 
@@ -119,6 +121,7 @@ class ScaleHeads(nn.Module):
         beta_max: float = 4.0,
         predict_width: bool = True,
         predict_shape: bool = True,
+        predict_skew: bool = False,
     ) -> None:
         super().__init__()
         if not (beta_min < beta_init < beta_max):
@@ -133,6 +136,12 @@ class ScaleHeads(nn.Module):
         self.beta_span = float(beta_max - beta_min)
         self.predict_width = bool(predict_width)
         self.predict_shape = bool(predict_shape)
+        #: Two-width (asymmetric) scatter: a head predicts s = log(alpha_hi / alpha_lo)
+        #: and the two widths are alpha * exp(-s/2), alpha * exp(+s/2), so log w
+        #: stays the mean log width.  Zero-initialised: the symmetric model is the
+        #: starting point.  Partiality scatter is one-sided (long lower tail, hard
+        #: upper edge), which the symmetric family absorbs by mislocating its centre.
+        self.predict_skew = bool(predict_skew)
 
         frac = (beta_init - beta_min) / (beta_max - beta_min)
         beta_raw_init = math.log(frac / (1.0 - frac))       # logit
@@ -151,6 +160,8 @@ class ScaleHeads(nn.Module):
             self.register_parameter(
                 "global_beta_raw", nn.Parameter(torch.tensor(beta_raw_init))
             )
+        if predict_skew:
+            self.head_log_skew = self._zero_head(d_model, 0.0)
 
     @staticmethod
     def _zero_head(d_model: int, bias: float) -> nn.Linear:
@@ -174,6 +185,14 @@ class ScaleHeads(nn.Module):
         beta = self.beta_min + self.beta_span * torch.sigmoid(beta_raw)
 
         log_alpha = log_alpha_from_log_width(log_w, beta)
+        if self.predict_skew:
+            half_s = 0.5 * self.head_log_skew(z).squeeze(-1)
+            log_alpha_lo, log_alpha_hi = log_alpha - half_s, log_alpha + half_s
+            return ScalePrediction(
+                log_K=log_K, log_w=log_w, beta=beta, log_alpha=log_alpha_lo,
+                log_e_s=log_e_s_gengauss(log_alpha_lo, beta, log_alpha_hi=log_alpha_hi),
+                log_alpha_hi=log_alpha_hi,
+            )
         return ScalePrediction(
             log_K=log_K,
             log_w=log_w,

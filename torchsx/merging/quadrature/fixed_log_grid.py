@@ -198,6 +198,8 @@ class FixedLogGrid(Quadrature):
         # Single seam for per-observation (α, β): the default gathers per-HKL
         # parameters, a PredictedGenGaussScatter returns network outputs.
         log_alpha_obs, log_beta_obs = scatter.log_alpha_beta_obs(params, meta)
+        if scatter.log_alpha_hi_obs(params, meta) is not None:
+            raise NotImplementedError("FixedLogGrid has no two-width scatter path; use SplitLogGrid")
 
         if self._can_use_triton(scatter, likelihood, log_mean):
             log_w = self._trap_log_w(self.log_S_grid, K)

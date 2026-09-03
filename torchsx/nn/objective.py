@@ -182,7 +182,7 @@ class MarginalNLL(nn.Module):
     def __init__(
         self, quadrature, likelihood, *,
         chunk_size: int | None = None, renormalize: bool = False,
-        checkpoint_chunks: bool = True,
+        checkpoint_chunks: bool = True, miss_frac: float = 0.0,
     ) -> None:
         super().__init__()
         self.quadrature = quadrature
@@ -191,6 +191,44 @@ class MarginalNLL(nn.Module):
         self.checkpoint_chunks = bool(checkpoint_chunks)
         self.renormalize = bool(renormalize)
         self.last_grid_mass: Tensor | None = None
+        #: Miss component.  A predicted reflection that recorded no signal at
+        #: all -- masked pixels, a mis-prediction, a spot that never formed --
+        #: is not a partial observation, but the scatter has to stretch its
+        #: lower tail to cover it, and on strong predictions that costs the
+        #: width its calibration (measured: 7 % of rhodopsin's >200-photon
+        #: predictions had n <= bg).  With ``miss_frac > 0`` the likelihood is
+        #: the mixture ``(1 - pi) p(n | S, scatter) + pi p(n | S = 0)``, with
+        #: ``pi`` a learnable global scalar started at ``miss_frac``.  The
+        #: second term does not depend on the reflection intensity, so on the
+        #: posterior grid it is an additive per-observation constant and needs
+        #: no quadrature.  0 disables it exactly.
+        self.miss_logit: nn.Parameter | None = None
+        if miss_frac > 0.0:
+            if not (0.0 < miss_frac < 1.0):
+                raise ValueError(f"miss_frac must be in (0, 1), got {miss_frac}")
+            self.miss_logit = nn.Parameter(torch.tensor(math.log(miss_frac / (1.0 - miss_frac))))
+
+    def _log_miss(self, n_ph: Tensor, bg: Tensor) -> Tensor:
+        """``log p(n | S = 0)`` on the kernel's scale (Poisson about its peak,
+        with the background-variance term when the likelihood carries one)."""
+        n = n_ph.to(bg.dtype)
+        lam0 = bg.clamp(min=1e-6)
+        bvf = float(getattr(self.likelihood, "bg_var_factor", 0.0) or 0.0)
+        s2 = bvf * bg.clamp(min=0.0)
+        nn_ = n.clamp(min=1e-12)
+        A0 = torch.where(n > 0, nn_ * torch.log(lam0 / nn_) - (lam0 - nn_), -lam0)
+        iphi = lam0 / (lam0 + s2)
+        n64 = n.double()
+        logpeak = torch.where(n > 0, (n64 * n64.clamp(min=1e-300).log() - n64
+                                      - torch.lgamma(n64 + 1)).to(n.dtype), torch.zeros_like(n))
+        return A0 * iphi + 0.5 * iphi.log() + logpeak
+
+    def _mix_miss(self, lp: Tensor, n_ph: Tensor, bg: Tensor) -> Tensor:
+        if self.miss_logit is None:
+            return lp
+        log_pi = torch.nn.functional.logsigmoid(self.miss_logit)
+        log_1m = torch.nn.functional.logsigmoid(-self.miss_logit)
+        return torch.logaddexp(log_1m + lp, log_pi + self._log_miss(n_ph, bg))
 
     def _grid_bounds(self) -> tuple[float, float] | None:
         g = getattr(self.quadrature, "log_S_grid", None)
@@ -220,7 +258,8 @@ class MarginalNLL(nn.Module):
                 scatter, self.likelihood, log_mean, n_ph, bg, params, meta,
                 obs_range=(0, n),
             )
-            return self._renorm(lp, scatter, params, meta, log_mean) if self.renormalize else lp
+            lp = self._renorm(lp, scatter, params, meta, log_mean) if self.renormalize else lp
+            return self._mix_miss(lp, n_ph, bg)
         parts = []
         for s in range(0, n, cs):
             e = min(s + cs, n)
@@ -233,7 +272,7 @@ class MarginalNLL(nn.Module):
                 )
                 if self.renormalize:
                     lp = self._renorm(lp, scatter, params, _sub, lm)
-                return lp
+                return self._mix_miss(lp, nn, bb)
 
             args = (log_mean[s:e], n_ph[s:e], bg[s:e])
             if self.checkpoint_chunks and torch.is_grad_enabled():
