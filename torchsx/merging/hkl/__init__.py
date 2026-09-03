@@ -3,7 +3,7 @@ noise model, adjacency.
 
 Used by ``stream.py`` and by ``observations.prepare_observations``.  This is the
 HKL/reflection bookkeeping layer of the merge engine — *not* crystallographic
-lattice indexing (that lives in ``torchsx.datareduction.indexing``).
+lattice indexing, which happens upstream in probixi or CrystFEL.
 """
 
 from torchsx.merging.hkl.hkl import (
