@@ -46,7 +46,8 @@ def production(prob, *, likelihood="poisson", k_coarse=21, m_fine=129,
                n_sigma=6.0, scan_points=9,
                scan_halfwidth=8.0, prior="wilson", node_placement="laplace",
                inner_points=2001, inner_half=34.5, dtype=torch.float32,
-               eager=False, grad=True, use_fused=True):
+               eager=False, grad=True, use_fused=True,
+               quadrature="fixed", split_kw=None):
     """One forward of ``PosteriorMergeTarget`` on the synthetic problem."""
     from torchsx.merging.likelihood import Poisson
     from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
@@ -101,11 +102,14 @@ def production(prob, *, likelihood="poisson", k_coarse=21, m_fine=129,
             var_const=0.0, var_linear=1.0, var_quadratic=0.0,
             bg_var_factor=149.0 / 128.0,
         )
-    obj = MarginalNLL(
-        FixedLogGrid(S_min=math.exp(-inner_half), S_max=math.exp(inner_half),
-                     n_points=inner_points).to(dev).to(dtype),
-        lik,
-    )
+    if quadrature == "split":
+        # analytic-tail + data-window grid; inner_points / inner_half unused
+        from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
+        quad = SplitLogGrid(**(split_kw or {})).to(dev)
+    else:
+        quad = FixedLogGrid(S_min=math.exp(-inner_half), S_max=math.exp(inner_half),
+                            n_points=inner_points).to(dev).to(dtype)
+    obj = MarginalNLL(quad, lik)
     scatter = _make_scatter(la, lb)
     sigma = torch.maximum(n_ph, bg).clamp(min=1e-6).sqrt()
 
@@ -143,7 +147,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--reps", type=int, default=5)
-    ap.add_argument("--mode", choices=("survey", "pareto", "nodes", "accuracy"),
+    ap.add_argument("--mode", choices=("survey", "pareto", "nodes", "accuracy", "split"),
                     default="survey")
     ap.add_argument("--real-like", action="store_true",
                     help="generative parameters fitted to the real dark batch "
@@ -297,6 +301,29 @@ def main() -> None:
                 configs.append((f"{tag} k{k} inner={n}",
                                 {**ACC, "inner_half": 34.5, "k_coarse": k,
                                  "inner_points": n}))
+
+    if args.mode == "split":
+        # SplitLogGrid against the shipped k31 x 1355 fixed grid, same outer
+        # settings (k31, m129, n_sigma 6, scan 9) as bench/fold22.py.
+        CUR = dict(k_coarse=31, m_fine=129, n_sigma=6.0, scan_points=9,
+                   inner_points=1355)
+        configs = [("fixed k31 i1355", CUR),
+                   ("fixed k31 i2001", {**CUR, "inner_points": 2001})]
+        for K in (128, 160, 192, 256, 384):
+            configs.append((f"split K{K}", {**CUR, "quadrature": "split",
+                                             "split_kw": dict(n_points=K)}))
+        configs += [(f"split K192 tau{t:g}", {**CUR, "quadrature": "split",
+                                               "split_kw": dict(n_points=192, tau=t)})
+                    for t in (1e-3, 1e-5)]
+        configs += [(f"split K192 cap{c:g}", {**CUR, "quadrature": "split",
+                                               "split_kw": dict(n_points=192, delta_cap=c)})
+                    for c in (10.0, 18.0)]
+        configs += [(f"split K192 lhi{c:g}", {**CUR, "quadrature": "split",
+                                               "split_kw": dict(n_points=192, lam_hi=c)})
+                    for c in (20.0, 80.0)]
+        configs += [(f"split K192 k{k}", {**CUR, "quadrature": "split", "k_coarse": k,
+                                          "split_kw": dict(n_points=192)})
+                    for k in (41, 51)]
 
     hdr = (f"{'config':<20} {'log Z':>10} {'I0_mean':>10} {'/sd':>9} "
            f"{'I0_sd':>10} | {'1-cos b':>10} {'1-cos a':>10} {'1-cos B':>10} | "
