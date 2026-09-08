@@ -304,7 +304,11 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         if int((labels < 0).sum()):
             raise SystemExit(f"--split-file: {int((labels < 0).sum()):,} unlabelled "
                              "crystals (-1); every crystal must belong to a split")
-        n_splits = int(labels.max()) + 1
+        # A custom-split file defines the datasets; a label tensor only implies
+        # them.  After --crystals-file some datasets may hold no crystal at all
+        # (a dark-only subset of a light/dark file), which --min-split-crystals
+        # then drops below -- the count must not be read off the labels present.
+        n_splits = len(names) if names else int(labels.max()) + 1
         if args.split_names:
             names = [n.strip() for n in args.split_names.split(",")]
         elif not names:

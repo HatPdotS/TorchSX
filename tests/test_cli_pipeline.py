@@ -360,6 +360,17 @@ def test_custom_split_file_labels_every_crystal(tmp_path):
     with pytest.raises(SystemExit, match="unlabelled"):
         P.load_prep(_DataArgs(stream=[cache], split_file=partial), verbose=False)
 
+    # A crystal mask that empties a dataset (a dark-only subset of a light/dark
+    # file): the file still defines the datasets, and --min-split-crystals
+    # drops the empty ones rather than the count check refusing the file.
+    mask = tmp_path / "alpha_only.pt"
+    torch.save(labels == 0, mask)
+    sub = P.load_prep(_DataArgs(stream=[cache], split_file=split, crystals_file=mask,
+                                min_split_crystals=1), verbose=False)
+    assert sub.split_names == ["alpha"]
+    assert sub.prep.obs_info.n_crystals == int((labels == 0).sum())
+    assert set(sub.prep.obs_info.delay_bin_idx.tolist()) == {0}
+
 
 def test_stream_batches_keeps_the_observations_off_the_device(tmp_path):
     """``--stream-batches`` must leave ``prep`` exactly where it was.
