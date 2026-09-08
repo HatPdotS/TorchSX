@@ -27,6 +27,20 @@ partialator + French–Wilson on the same model, cell and free set, with the
 weak-end compression slope at 1.02 / 0.95 where the uncompensated merge gives
 0.16 / 0.18.
 
+The likelihood is exactly invariant under `K(h) -> K(h) g(h)`, `I0 -> I0 / g(h)`
+for any smooth function `g` of reciprocal space, and the encoder sees resolution,
+so without a pin the merged fall-off random-walks along that direction as
+training proceeds (measured on BR: a bend of 1.6 log units against partialator
+after ~900 steps, costing 0.01-0.03 in R_free). Two things now hold it. The
+Wilson prior's `Sigma(h)` is a smooth symmetry-adapted surface (Chebyshev in
+`s^2` plus the point-group-invariant anisotropy tensor, fitted by Wilson maximum
+likelihood; `--wilson-basis smooth`, the default) instead of resolution shells,
+and the scale model projects out the smooth common mode of `log K` in the same
+basis after fitting a per-crystal constant, so genuine per-crystal scale survives
+(`--gauge-anchor basis`, the default). `--wilson-basis shells --gauge-anchor
+median` recovers the previous behaviour; checkpoints written before these
+options existed are rebuilt as they were trained.
+
 That the two must be checked separately is not a formality here: the single best
 CC1/2 of any run trained (0.9982) came from a configuration whose merged
 intensities are **not monotone** in `F_model` and whose R_free is the worst of

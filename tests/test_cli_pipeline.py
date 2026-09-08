@@ -616,7 +616,8 @@ def test_smooth_basis_flags_round_trip_through_the_checkpoint(tmp_path):
 
 
 def test_shells_checkpoint_rebuilds_without_a_basis(tmp_path):
-    """A checkpoint written in the default mode carries no basis and rebuilds as before."""
+    """A checkpoint written before the smooth basis existed rebuilds in shells / median mode,
+    whatever today's defaults are."""
     from torchsx.cli import _pipeline as P
     from torchsx.cli.merge_nn import _build_parser as merge_parser
     from torchsx.cli.train import _build_parser as train_parser
@@ -624,7 +625,8 @@ def test_shells_checkpoint_rebuilds_without_a_basis(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
     bundle = P.PrepBundle(prep, recipe, [], 0.1)
-    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"])
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64",
+                                       "--wilson-basis", "shells", "--gauge-anchor", "median"])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
     assert S["basis"] is None and S["wilson_basis"] == "shells" and scale.anchor_stat == "median"
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
@@ -632,8 +634,20 @@ def test_shells_checkpoint_rebuilds_without_a_basis(tmp_path):
     tr.data_recipe = dict(recipe)
     ck = torch.load(tr.save_best(tmp_path / "shells.pt"), weights_only=False)
     del ck["posterior_grid"]["wilson_basis"], ck["posterior_grid"]["wilson_degree"]   # pre-basis writer
+    del ck["scale"]["anchor_stat"]
     margs = merge_parser().parse_args(
         ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu", "--inner-points", "64"])
     _p, _q, rebuilt, _o, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
     assert S2["basis"] is None and rebuilt.anchor_stat == "median"
     rebuilt.load_state_dict(ck["state_dict"])
+
+
+def test_defaults_are_smooth_prior_and_basis_anchor(tmp_path):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser as train_parser
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"])
+    _p, _q, scale, _o, S = P.build_stack(bundle, targs, verbose=False)
+    assert S["wilson_basis"] == "smooth" and S["basis"] is not None and scale.anchor_stat == "basis"
+    assert TrainConfig().wilson_basis == "smooth"

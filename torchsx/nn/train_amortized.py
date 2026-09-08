@@ -252,7 +252,7 @@ class TrainConfig:
     #: symmetry-adapted surface on a reciprocal-space basis, see
     #: ``set_reciprocal_basis``).  Recorded in the checkpoint; the basis itself
     #: is installed by the CLI after construction.
-    wilson_basis: str = "shells"
+    wilson_basis: str = "smooth"
     wilson_degree: int = 4
     #: Outer grid half-width cap in nats (see PosteriorMergeTarget.max_halfwidth).
     posterior_max_halfwidth: float = 12.0

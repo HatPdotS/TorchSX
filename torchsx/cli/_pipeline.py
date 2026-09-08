@@ -597,7 +597,7 @@ DEFAULTS = dict(
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
     obs_self_layers=2, skew=True, miss=0.03, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
-    wilson_basis="shells", wilson_degree=4, gauge_anchor="median",
+    wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
 )
 
 
@@ -719,7 +719,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             predict_width=bool(sc.get("predict_width", True)),
             unity_k=bool(sc.get("unity_k", False)),
             anchor_log_k=bool(sc.get("anchor_log_k", True)),
-            anchor_stat=args.gauge_anchor or sc.get("anchor_stat", DEFAULTS["gauge_anchor"]),
+            anchor_stat=args.gauge_anchor or sc.get(
+                "anchor_stat", "median" if ck else DEFAULTS["gauge_anchor"]),
             global_skew=bool(scat.get("global_skew", False)),
             predict_skew=bool(skew) and not scat.get("global_skew", False),
         )
@@ -753,7 +754,12 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # that has been scored was merged at 24 / 63 / 257, so that is the default
     # and the checkpoint's training grid is reported, not applied.
     grid = dict(ck.get("posterior_grid") or {})
-    wilson_basis = args.wilson_basis or grid.get("wilson_basis", DEFAULTS["wilson_basis"])
+    # A checkpoint decides its own prior and anchor; one written before the
+    # smooth basis existed (no "wilson_basis" key) is rebuilt as it was trained,
+    # in shells / median mode, not with today's defaults.
+    legacy_ckpt = bool(ck) and "wilson_basis" not in grid
+    wilson_basis = args.wilson_basis or grid.get(
+        "wilson_basis", "shells" if legacy_ckpt else DEFAULTS["wilson_basis"])
     wilson_degree = int(args.wilson_degree or grid.get("wilson_degree", DEFAULTS["wilson_degree"]))
     # One smooth reciprocal-space basis for the prior's Sigma(h) and the scale's
     # gauge pin, built from the prepared reflections, the median cell and the
