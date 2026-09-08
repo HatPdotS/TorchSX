@@ -717,3 +717,99 @@ def test_state_dict_refuses_a_different_encoder_architecture():
     # pre-arch checkpoints were leave-one-out at full depth: they still load there
     sd = {k: v for k, v in loo.state_dict().items() if not k.endswith("_arch")}
     loo.load_state_dict(sd)
+
+
+# ── basis gauge anchor ─────────────────────────────────────────────────
+
+
+def _basis_scale(prep, degree=2):
+    from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
+
+    basis = ReciprocalBasis.from_hkl(prep.hkl_valid.long(), prep.median_cell, "P 1",
+                                     degree=degree, aniso=False)
+    torch.manual_seed(3)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_stat="basis")
+    for p in scale.parameters():
+        if p.dim() > 1:
+            torch.nn.init.normal_(p, std=0.3)
+    scale.set_gauge_basis(basis.phi)
+    return scale, basis
+
+
+def test_basis_anchor_requires_a_basis():
+    prep = _toy_prep()
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_stat="basis")
+    with pytest.raises(RuntimeError):
+        scale.predict(prep.obs_info)
+
+
+def test_basis_anchor_removes_a_planted_common_mode_exactly():
+    prep = _toy_prep()
+    scale, basis = _basis_scale(prep)
+    meta = prep.obs_info
+    pred = scale.predict(meta)
+    phi_b = basis.phi[meta.hkl_idx]
+    c = torch.tensor([0.7, -2.0, 1.3])
+    from torchsx.nn.heads import ScalePrediction
+    planted = ScalePrediction(
+        log_K=pred.log_K + phi_b @ c, log_w=pred.log_w, beta=pred.beta,
+        log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
+    )
+    torch.testing.assert_close(scale._anchor(planted, meta).log_K, pred.log_K, rtol=0, atol=1e-5)
+    # The pin includes the scalar gauge: the batch mean of the anchored log K is zero.
+    assert abs(float(pred.log_K.mean())) < 1e-5
+
+
+def test_basis_anchor_keeps_per_crystal_differences():
+    prep = _toy_prep()
+    scale, basis = _basis_scale(prep)
+    meta = prep.obs_info
+    base = scale.predict(meta).log_K
+    torch.manual_seed(5)
+    offsets = torch.randn(prep.obs_info.n_crystals)[meta.crystal_id]
+    from torchsx.nn.heads import ScalePrediction
+    pred = scale.predict(meta)
+    shifted = scale._anchor(ScalePrediction(
+        log_K=pred.log_K + offsets, log_w=pred.log_w, beta=pred.beta,
+        log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
+    ), meta).log_K
+    # Two observations of the same reflection share a basis row, so their
+    # difference is untouched by the projection: it changes by the crystal offsets alone.
+    hid = meta.hkl_idx
+    for h in hid.unique():
+        idx = (hid == h).nonzero().squeeze(-1)
+        if idx.numel() < 2:
+            continue
+        i, j = idx[0], idx[1]
+        expected = (base[i] - base[j]) + (offsets[i] - offsets[j])
+        torch.testing.assert_close(shifted[i] - shifted[j], expected, rtol=0, atol=1e-5)
+
+
+def test_basis_anchor_is_chunk_invariant():
+    prep = _toy_prep()
+    scale, _ = _basis_scale(prep)
+    # Chunking needs crystal-grouped observations, as CrystalIndex.rows() delivers them.
+    rows = prep.obs_info.crystal_id.argsort(stable=True)
+    meta = prep.obs_info.gather(rows)
+    whole = scale.predict(meta).log_K.detach().clone()
+    scale.set_encoder_chunking(3)
+    chunked = scale.predict(meta).log_K.detach()
+    torch.testing.assert_close(chunked, whole, rtol=0, atol=1e-5)
+
+
+def test_basis_anchor_gradient_ignores_the_common_mode():
+    """The projection stays in the graph: a loss on the anchored log K has zero
+    gradient with respect to a common-mode shift of the raw predictions."""
+    prep = _toy_prep()
+    scale, basis = _basis_scale(prep)
+    meta = prep.obs_info
+    c = torch.zeros(basis.p, requires_grad=True)
+    pred = scale.predict(meta)
+    from torchsx.nn.heads import ScalePrediction
+    planted = ScalePrediction(
+        log_K=pred.log_K.detach() + basis.phi[meta.hkl_idx] @ c, log_w=pred.log_w, beta=pred.beta,
+        log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
+    )
+    loss = (scale._anchor(planted, meta).log_K ** 2).sum()
+    loss.backward()
+    assert c.grad.abs().max() < 1e-4

@@ -64,7 +64,11 @@ class AmortizedScale(ScaleModel):
         mean anchor those outliers contribute ≈ +1.0 to the mean and drag the
         other 98.5 % down by ≈ 1.0 — the bulk median came out at −2.4.  A small
         runaway subset thereby corrupts the scale of every other observation.
-        The median cannot be hijacked that way.
+        The median cannot be hijacked that way.  ``"basis"`` subtracts the
+        least-squares projection of ``log K`` onto a smooth reciprocal-space
+        basis (see :meth:`set_gauge_basis`): the scalar gauge and every smooth
+        resolution-dependent common mode go at once, so the merged intensities
+        keep the average crystal's fall-off instead of an arbitrary one.
     """
 
     def __init__(
@@ -82,13 +86,21 @@ class AmortizedScale(ScaleModel):
         self.encoder = encoder
         self.heads = heads
         self.n_crystals = int(n_crystals)
+        # Basis gauge pin (anchor_stat == "basis"): per-reflection rows of a
+        # smooth reciprocal-space basis, installed by set_gauge_basis().  The
+        # ensemble-mean component of log K in its span is projected out of every
+        # prediction -- the rank-p generalisation of the scalar anchor, removing
+        # the K(h) -> K(h) g(h), I0 -> I0 / g(h) freedom for every smooth g.
+        self.register_buffer("gauge_phi", torch.zeros(0, 0))
         #: Crystals per encoder chunk; 0 runs the whole batch in one shot.
         #: See :meth:`predict` -- the encoder is separable across crystals, so
         #: chunking is exact and moves the checkpoint boundary off the blocks.
         self.chunk_crystals = 0
         self.anchor_log_k = bool(anchor_log_k)
-        if anchor_stat not in ("median", "mean"):
-            raise ValueError(f"anchor_stat must be 'median' or 'mean', got {anchor_stat!r}")
+        if anchor_stat not in ("median", "mean", "basis"):
+            raise ValueError(
+                f"anchor_stat must be 'median', 'mean' or 'basis', got {anchor_stat!r}"
+            )
         self.anchor_stat = anchor_stat
         self.scatter = PredictedGenGaussScatter()
         self._cached_obs_id: Tensor | None = None
@@ -274,20 +286,7 @@ class AmortizedScale(ScaleModel):
         x_self, x_ctx, x_crys = self.features.build(meta)
         z = self.encoder(x_self, x_ctx, meta.crystal_id, self.n_crystals, x_crys=x_crys)
         pred = self.heads(z)
-        if self.anchor_log_k:
-            loc = (
-                pred.log_K.median() if self.anchor_stat == "median"
-                else pred.log_K.mean()
-            )
-            pred = ScalePrediction(
-                log_K=pred.log_K - loc,
-                log_w=pred.log_w,
-                beta=pred.beta,
-                log_alpha=pred.log_alpha,
-                log_e_s=pred.log_e_s,
-                log_alpha_hi=pred.log_alpha_hi,
-            )
-        return pred
+        return self._anchor(pred, meta)
 
     def _predict_chunked(self, meta: ObsInfo, per_chunk: int) -> ScalePrediction:
         # Features are built once and persist: they are (M, ~10), i.e. 40 B per
@@ -326,15 +325,7 @@ class AmortizedScale(ScaleModel):
         ]
 
         pred = ScalePrediction(*[torch.cat(t) for t in zip(*parts)])
-        if self.anchor_log_k:
-            loc = (pred.log_K.median() if self.anchor_stat == "median"
-                   else pred.log_K.mean())
-            pred = ScalePrediction(
-                log_K=pred.log_K - loc, log_w=pred.log_w, beta=pred.beta,
-                log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
-                log_alpha_hi=pred.log_alpha_hi,
-            )
-        return pred
+        return self._anchor(pred, meta)
 
     def predict_split(
         self, meta_self: ObsInfo, meta_ctx: ObsInfo
@@ -353,17 +344,50 @@ class AmortizedScale(ScaleModel):
         _, x_ctx, x_crys = self.features.build(meta_ctx)
         z = self.encoder(x_self, x_ctx, meta_ctx.crystal_id, self.n_crystals, x_crys=x_crys)
         pred = self.heads(z)
-        if self.anchor_log_k:
-            loc = (
-                pred.log_K.median() if self.anchor_stat == "median"
-                else pred.log_K.mean()
+        return self._anchor(pred, meta_self)
+
+    @torch.no_grad()
+    def set_gauge_basis(self, phi: Tensor) -> None:
+        """Install the per-reflection basis rows (``n_hkl x p``) for the ``basis`` anchor."""
+        self.gauge_phi = phi.detach().to(torch.float32).clone()
+
+    def _anchor(self, pred: ScalePrediction, meta: ObsInfo) -> ScalePrediction:
+        """Pin the gauge of ``log K`` for one batch.
+
+        ``K -> cK, I0 -> I0/c`` (scalar) and ``K(h) -> K(h) g(h), I0 -> I0/g(h)``
+        (any function of reciprocal space the encoder can express through its
+        resolution inputs) both leave the likelihood exactly invariant.  The
+        scalar modes subtract a location statistic; ``basis`` subtracts the
+        observation-weighted least-squares projection of ``log K`` onto
+        ``gauge_phi[hkl_idx]``, whose first column is the constant, so it
+        contains the scalar pin and removes the smooth common mode with it.
+        The projection is linear and stays in the graph: the gradient of the
+        removed component is then exactly zero, so the network cannot drift
+        along it.  Per-crystal differences (scale, B) are untouched -- only the
+        mean over the batch of each basis component goes.
+        """
+        if not self.anchor_log_k:
+            return pred
+        if self.anchor_stat == "basis":
+            if self.gauge_phi.numel() == 0:
+                raise RuntimeError(
+                    "anchor_stat='basis' needs set_gauge_basis() before predicting"
+                )
+            phi = self.gauge_phi.index_select(0, meta.hkl_idx).to(pred.log_K.dtype)
+            gram = phi.T @ phi
+            gram = gram + 1e-6 * gram.diagonal().mean() * torch.eye(
+                gram.shape[0], device=gram.device, dtype=gram.dtype
             )
-            pred = ScalePrediction(
-                log_K=pred.log_K - loc, log_w=pred.log_w, beta=pred.beta,
-                log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
-                log_alpha_hi=pred.log_alpha_hi,
-            )
-        return pred
+            beta = torch.linalg.solve(gram, phi.T @ pred.log_K)
+            log_K = pred.log_K - phi @ beta
+        else:
+            loc = pred.log_K.median() if self.anchor_stat == "median" else pred.log_K.mean()
+            log_K = pred.log_K - loc
+        return ScalePrediction(
+            log_K=log_K, log_w=pred.log_w, beta=pred.beta,
+            log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
+            log_alpha_hi=pred.log_alpha_hi,
+        )
 
     def prime(self, meta: ObsInfo) -> ScalePrediction:
         """Predict, install into the scatter, and cache for :meth:`log_k`.
