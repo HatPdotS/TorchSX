@@ -70,6 +70,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unity", action="store_true",
                    help="ignore the trained weights and merge at K = 1 -- the "
                         "reference every trained run has to beat")
+    p.add_argument('--feature-reference', choices=('exact', 'legacy', 'ema'),
+                   default='exact', help='Versioned checkpoint-context experiment')
     return p
 
 
@@ -109,15 +111,13 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(f"checkpoint is missing {len(missing)} parameters, "
                              f"first {missing[:3]}")
         scale.load_state_dict(have)
-        ema = ckpt.get("ema_I0")
-        if ema is not None:
-            ema = ema.to(S["device"])
-            for k, t in enumerate(tr.targets):
-                t.ema_I0.copy_(ema if ema.dim() == 1 else ema[min(k, ema.shape[0] - 1)])
+        from torchsx.nn.checkpoint_context import load_checkpoint_context
+        load_checkpoint_context(tr, ckpt, args.feature_reference)
     else:
         print("  --unity: merging at K = 1 with the untrained (zero-init) heads",
               flush=True)
-    tr._refresh_wilson_sigma()
+    if args.unity or args.feature_reference != 'exact':
+        tr._refresh_wilson_sigma()
     scale.eval()
 
     names = ckpt.get("splits") or bundle.split_names or [""]

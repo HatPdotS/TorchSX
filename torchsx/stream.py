@@ -828,11 +828,11 @@ class SFXStream:
         """
         import dataclasses
 
-        from torchref.symmetry import canonicalize_hkl
+        from torchref.symmetry import SpaceGroup
 
         sg = spacegroup or self._core.spacegroup
-        canonical_hkl, _, _, sort_indices = canonicalize_hkl(
-            self._core.hkl.int(), sg, include_friedel=True,
+        canonical_hkl, _, _, sort_indices = SpaceGroup(sg).canonicalize_hkl(
+            self._core.hkl.int(), include_friedel=True,
         )
         # canonicalize_hkl returns sorted output; invert to restore original order
         inv = torch.empty_like(sort_indices)

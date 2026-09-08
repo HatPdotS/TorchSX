@@ -954,6 +954,8 @@ class AmortizedTrainer:
             self._best_obj_state = {
                 k: v.detach().clone() for k, v in self.objective.state_dict().items()
             }
+            from torchsx.nn.checkpoint_context import capture_context
+            self._best_context = capture_context(self)
         rec["best_heldout"] = self.best_heldout
         self.logger.log(rec)
         return rec
@@ -973,9 +975,12 @@ class AmortizedTrainer:
             k: v.detach().cpu().clone() for k, v in self.scale.state_dict().items()
         }
         path = Path(path) if path is not None else Path(self.cfg.outdir) / "best.pt"
+        from torchsx.nn.checkpoint_context import capture_context
+        context = getattr(self, '_best_context', None) or capture_context(self)
         torch.save(
             {
                 "state_dict": state,
+                "inference_context": context,
                 # so a later merge builds the SAME inner integral as training
                 "quadrature": {
                     "kind": type(getattr(self.objective, "quadrature", None)).__name__,
@@ -1029,8 +1034,8 @@ class AmortizedTrainer:
                 # one running merge per condition; (n_hkl,) when there is one
                 # condition so single-condition consumers are unchanged
                 "ema_I0": (
-                    self.targets[0].ema_I0.detach().cpu() if self.n_conditions == 1
-                    else torch.stack([t.ema_I0.detach().cpu() for t in self.targets])
+                    context['targets'][0]['ema_I0'] if self.n_conditions == 1
+                    else torch.stack([t['ema_I0'] for t in context['targets']])
                 ),
                 "n_conditions": self.n_conditions,
                 # outer-grid geometry, so a later merge integrates on the SAME grid
@@ -1058,6 +1063,9 @@ class AmortizedTrainer:
         self.scale.load_state_dict(self._best_state)
         if getattr(self, "_best_obj_state", None):
             self.objective.load_state_dict(self._best_obj_state)
+        if getattr(self, '_best_context', None):
+            from torchsx.nn.checkpoint_context import restore_context
+            restore_context(self, self._best_context)
         return True
 
     @torch.no_grad()
@@ -1067,6 +1075,7 @@ class AmortizedTrainer:
         crystals: Tensor | None = None,
         condition: int | None = None,
         estimator: str = "posterior",
+        return_likelihood: bool = False,
     ) -> dict:
         """Merge a crystal set and return everything an MTZ needs.
 
@@ -1277,7 +1286,7 @@ class AmortizedTrainer:
             F_sd = ((w_flat * (rootI - F_flat[:, None]) ** 2).sum(1)).clamp(min=0).sqrt()
             F = (F_flat if estimator == "flat"
                  else rootI.gather(1, S_fine.argmax(1, keepdim=True)).squeeze(1))
-        return {
+        result = {
             "estimator": estimator,
             "F": F, "F_sd": F_sd, "I0": I0, "I0_sd": I0_sd,
             "seen": acc.abs().sum(1) > 0,
@@ -1289,6 +1298,14 @@ class AmortizedTrainer:
             "n_crystals": int(crystals.numel()),
             "condition": self._cond,
         }
+        if return_likelihood:
+            if log_w_nodes is not None:
+                raise ValueError('Likelihood export requires Laplace node placement')
+            result['log_likelihood'] = tgt._interp(acc).detach().cpu()
+            result['log_intensity_grid'] = v.detach().cpu()
+            result['wilson_sigma'] = tgt.wilson_sigma.detach().cpu().clone()
+            result['centric'] = tgt.is_centric.detach().cpu().clone()
+        return result
 
     @torch.no_grad()
     def _merge_set(self, crystals: Tensor) -> tuple[Tensor, Tensor]:

@@ -111,6 +111,8 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                    help="bool mask over crystals (after the d_min filter) to keep")
     p.add_argument("--max-crystals", type=int, default=None,
                    help="parse only a subset of the stream (testing)")
+    p.add_argument('--experiment-partition', type=Path, default=None)
+    p.add_argument('--experiment-half', type=int, choices=(0, 1), default=None)
 
 
 def parse_radii(spec: str) -> tuple[float, float, float]:
@@ -218,8 +220,9 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                   f"({blob['prep'].n_valid:,} reflections, "
                   f"{blob['prep'].I_obs.numel():,} obs, "
                   f"{len(blob.get('split_names', []))} splits)", flush=True)
-        return PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
-                          blob["bg_var_factor"])
+        from torchsx.nn.experiment_subset import maybe_subset
+        return maybe_subset(PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
+                                       blob["bg_var_factor"]), args)
 
     parts = []
     for name, path in splits:
@@ -379,7 +382,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         if verbose:
             print(f"  prep cached -> {cache} "
                   f"({cache.stat().st_size / 2**30:.1f} GiB)", flush=True)
-    return bundle
+    from torchsx.nn.experiment_subset import maybe_subset
+    return maybe_subset(bundle, args)
 
 
 # ── free flags ─────────────────────────────────────────────────────────

@@ -86,7 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         "the merge grid (--k-coarse/--m-fine/--n-sigma, "
                         "63/257/24) regardless: a training grid may be cheaper "
                         "than a merge should be, and at n_sigma 6 a quarter of "
-                        "reflections put >1 % of their posterior against the "
+                        "reflections put >1 %% of their posterior against the "
                         "grid edge in a full merge.")
     p.add_argument("--split-half-every", type=int, default=0,
                    help="run the CC1/2 / R_split merge every N epochs")

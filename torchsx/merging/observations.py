@@ -626,7 +626,7 @@ def prepare_observations(
         rank_valid.float() / max(n_valid, 1) * config.fw_n_shells
     ).long().clamp(max=config.fw_n_shells - 1)
     import warnings
-    from torchref.base.french_wilson import is_centric_from_hkl
+    from torchref.symmetry import SpaceGroup
     sg = getattr(stream, "spacegroup", None)
     if not sg or sg == "P 1":
         warnings.warn(
@@ -638,7 +638,7 @@ def prepare_observations(
         is_centric = torch.zeros(n_valid, dtype=torch.bool)
     else:
         try:
-            is_centric = is_centric_from_hkl(hkl_valid.long(), space_group=sg)
+            is_centric = SpaceGroup(sg).is_centric(hkl_valid.long())
         except Exception as exc:  # noqa: BLE001 — surface the fallback
             print(f"  [FW] centric detection failed ({exc!r}); treating all as acentric")
             is_centric = torch.zeros(n_valid, dtype=torch.bool)

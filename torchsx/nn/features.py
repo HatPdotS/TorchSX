@@ -360,8 +360,8 @@ class ReflectionDataset:
         is_centric = torch.zeros(n_unique, dtype=torch.bool)
         if sg and sg != "P 1":
             try:
-                from torchref.base.french_wilson import is_centric_from_hkl
-                is_centric = is_centric_from_hkl(unique_hkl.long(), space_group=sg)
+                from torchref.symmetry import SpaceGroup
+                is_centric = SpaceGroup(sg).is_centric(unique_hkl.long())
             except Exception:  # noqa: BLE001 — fall back to acentric
                 pass
         self._wilson[sidx] = (shell_id + shell_offset, is_centric)
