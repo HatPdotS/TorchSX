@@ -79,6 +79,9 @@ def main(argv: list[str] | None = None) -> None:
         log_every=10**9, merge_target="posterior", loss="evidence",
         posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
         posterior_n_sigma=S["n_sigma"], posterior_max_halfwidth=S["max_halfwidth"],
+        stream_batches=args.stream_batches,
+        locate_windows=tuple(float(x) for x in args.locate_windows.split(","))
+        if args.locate_windows else (8.0, 1.0, 0.125),
         posterior_prior=S["prior"], heldout_frac=0.0,
         device=S["device"], outdir=str(args.out.parent),
     )
@@ -130,6 +133,10 @@ def main(argv: list[str] | None = None) -> None:
         out = (args.out if len(wanted) == 1
                else args.out.with_name(f"{args.out.stem}_{label}{args.out.suffix}"))
         print(f"\nmerge [{label or 'all'}]: {res['n_crystals']:,} crystals", flush=True)
+        if not res["n_crystals"] or not int(res["seen"].sum()):
+            P.report_merge(res)
+            print("  nothing written for this split", flush=True)
+            continue
         P.report_merge(res)
         seen = res["seen"].cpu().numpy()
         if args.estimator in ("pooled", "mean"):

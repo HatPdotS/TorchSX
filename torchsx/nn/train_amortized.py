@@ -277,6 +277,11 @@ class TrainConfig:
     #: Run the split-half merge every N epochs (0 disables).  Costs one
     #: no-grad pass over the whole dataset.
     split_half_every: int = 20
+    #: Scan half-widths for the merge's locating passes, one full data pass
+    #: each.  A single wide round mis-centres the grid by ~0.59 nats whatever
+    #: the multiplicity (see ``merge``); shrinking the window squares that
+    #: away.  Set to a single value to recover the old one-pass behaviour.
+    locate_windows: tuple[float, ...] = (8.0, 1.0, 0.125)
     seed: int = 0
     outdir: str = "."
     device: str = "cuda"
@@ -300,6 +305,8 @@ class AmortizedTrainer:
         self.cfg = config or TrainConfig()
         self.device = torch.device(self.cfg.device)
         self.prep = prep
+        #: Updates dropped for being non-finite (see ``step``).
+        self.n_skipped_steps = 0
         self.scale = scale.to(self.device)
         self.objective = objective
         self.params = params
@@ -540,7 +547,16 @@ class AmortizedTrainer:
     # ── schedule ───────────────────────────────────────────────────────
 
     def _lam(self) -> float:
-        hl = max(self.cfg.lam_halflife_steps, 1)
+        hl = self.cfg.lam_halflife_steps
+        if hl <= 0:
+            # No decay -- the same convention ``_lam_spread`` uses, and what
+            # every caller passing 0 has meant by it.  ``max(hl, 1)`` made 0
+            # mean "halve at EVERY step", so lam0=10 was under 1e-9 by step 30
+            # and the in-batch merge target ran with no prior at all.  Harmless
+            # on one big condition; on the 55-split full set it left the small
+            # conditions' targets unsupported, and one such batch produced a
+            # NaN that poisoned the weights for the rest of the run.
+            return self.cfg.lam0
         return self.cfg.lam_min + (self.cfg.lam0 - self.cfg.lam_min) * (
             0.5 ** (self.step_i / hl)
         )
@@ -702,12 +718,25 @@ class AmortizedTrainer:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = grad_norms(self.scale)
-        total_norm = torch.nn.utils.clip_grad_norm_(
-            self.scale.parameters(), self.cfg.grad_clip
-        )
+        # A single non-finite batch must not end the run.  Applying an update
+        # from NaN gradients makes every later batch NaN -- the whole model is
+        # poisoned, n_used goes to 0 and the remaining epochs compute nothing.
+        # One batch's worth of gradient is not worth that, so drop it and carry
+        # on from the last good weights.  Counted, never silent.
+        skipped = bool(gn.get("n_nonfinite_grads", 0)) or not bool(
+            torch.isfinite(loss.detach()))
+        if skipped:
+            self.n_skipped_steps += 1
+            self.opt.zero_grad(set_to_none=True)
+            total_norm = torch.tensor(float("nan"))
+        else:
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                self.scale.parameters(), self.cfg.grad_clip
+            )
+            self.opt.step()
         gn["gradnorm_total"] = float(total_norm)          # pre-clip global norm
         gn["grad_was_clipped"] = bool(float(total_norm) > self.cfg.grad_clip)
-        self.opt.step()
+        gn["step_skipped"] = skipped
         self.scale.clear()
 
         rec = {
@@ -805,9 +834,10 @@ class AmortizedTrainer:
         _m_, _n_, _b_, _s_ = self._batch(rows)
         ios = (_n_ - _b_) / _s_
         # shell_of_obs is prep-derived and stays on the host under
-        # stream_batches, while z comes off the device.
+        # stream_batches, while ``rows`` and z come off the device -- so the
+        # index has to go to the table, not the table to the index.
         out.update(calibration_metrics(
-            z, shell_id=self.shell_of_obs[rows].to(z.device),
+            z, shell_id=self.shell_of_obs[rows.to(self.shell_of_obs.device)].to(z.device),
             n_shells=self.cfg.shell_bins, i_over_sigma=ios,
         ))
         # Is the width head actually using its per-observation freedom?  var_z
@@ -837,7 +867,8 @@ class AmortizedTrainer:
                 "s_sq": meta.s_sq,
                 "ewald_offset": meta.ewald_offset,
                 # prep-derived, so host-resident under stream_batches
-                "d_rank": self.shell_of_obs[rows].float().to(pred.log_K.device),
+                "d_rank": self.shell_of_obs[
+                    rows.to(self.shell_of_obs.device)].float().to(pred.log_K.device),
             },
         ))
         out["spearman_log_w_ewald"] = (
@@ -1131,33 +1162,97 @@ class AmortizedTrainer:
 
         # Locate the peak on THIS crystal set, then accumulate the same coarse
         # curve the loss uses -- additive over observations, hence over batches.
+        n_bad_loc = 0
         if tgt.node_placement == "wilson":
             v_nodes, log_w_nodes = tgt.nodes()
             loc_sd = None
         else:
-            scan = tgt.scan_grid()
-            acc_s = torch.zeros(n_hkl, scan.shape[1], device=dev)
-            for _, rows in batches():
-                meta, n_ph, bg, _ = self._batch(rows.to(dev))
-                pred = self.scale.prime(meta)
-                acc_s = acc_s + tgt.accumulate(
-                    self.objective, self.scale.scatter, self.params, pred,
-                    n_ph, bg, meta.hkl_idx, meta, scan,
-                )
-                self.scale.clear()
-            centre, loc_sd = tgt.peak_from_scan(acc_s)
+            # Locating rounds, each a full pass: anchor on the previous
+            # estimate and shrink the scan window.
+            #
+            # One round is not enough at this data's multiplicity.  The scan is
+            # 9 nodes over +-scan_halfwidth (2-nat spacing by default) and the
+            # peak is read off a parabola through three of them, but the
+            # accumulated log-likelihood is ``A v - B e^v`` -- exponential above
+            # the peak, linear below -- so the fitted vertex carries a bias of
+            # ~0.59 nats that does NOT shrink with multiplicity (both the
+            # y-differences and the curvature scale with A, so the vertex does
+            # not move).  Meanwhile the grid built around it is n_sigma * sd
+            # wide with sd ~ 1/sqrt(A).  The two cross between 1e3 and 1e4
+            # counts per reflection: below that the grid still covers the peak,
+            # above it every reflection puts all its mass on the grid edge.
+            # Measured on the full SwissFEL set, one round per split: edge_mass
+            # median 3e-13 at 41 k crystals, 0.30 at 195 k, and all-NaN F at
+            # 422 k.  The vertex bias is O(h^2), so each round of a shrinking
+            # window squares it away: 0.374 -> 0.004 -> 0.0002 nats, covered at
+            # every multiplicity from 1e2 to 5e5 counts.
+            hw0 = tgt.scan_halfwidth
+            ema0 = tgt.ema_I0
+            loc_sd = None
+            try:
+                for hw in self.cfg.locate_windows or (hw0,):
+                    tgt.scan_halfwidth = float(hw)
+                    scan = tgt.scan_grid()
+                    acc_s = torch.zeros(n_hkl, scan.shape[1], device=dev)
+                    for _, rows in batches():
+                        meta, n_ph, bg, _ = self._batch(rows.to(dev))
+                        pred = self.scale.prime(meta)
+                        c = tgt.accumulate(
+                            self.objective, self.scale.scatter, self.params, pred,
+                            n_ph, bg, meta.hkl_idx, meta, scan,
+                        )
+                        bad = ~torch.isfinite(c)
+                        if bool(bad.any()):
+                            n_bad_loc += int(bad.any(1).sum())
+                            c = c.masked_fill(bad, 0.0)
+                        acc_s = acc_s + c
+                        self.scale.clear()
+                    centre, sd_r = tgt.peak_from_scan(acc_s)
+                    if loc_sd is None:
+                        # WIDTH comes from the wide round only.  Its trust /
+                        # one-sided / sd_max logic is scaled to the wide scan:
+                        # at a 0.125-nat window the returned sd is a local
+                        # curvature, which for a weak one-sided reflection is
+                        # tiny and yields a grid far too narrow.  Measured on
+                        # the scored 50 k-crystal baseline, refining the width
+                        # too put 3 % of reflections on the grid edge and moved
+                        # their F by up to 80 %.  The wide round's width is
+                        # already good (it tracks 1/sqrt(A) to ~25 %); only the
+                        # CENTRE carries the parabola bias, so only the centre
+                        # is refined.
+                        loc_sd = sd_r
+                    # the next round scans around this estimate; the EMA itself
+                    # is restored below so the target is left as training left it
+                    tgt.ema_I0 = centre.exp()
+            finally:
+                tgt.scan_halfwidth, tgt.ema_I0 = hw0, ema0
             tgt._loc = (centre, loc_sd)
             v_nodes = centre[:, None] + loc_sd[:, None] * tgt.u_coarse[None, :]
             log_w_nodes = None
 
+        # A non-finite contribution is dropped where it is non-finite, not
+        # summed in.  ``accumulate`` is additive over observations, so a NaN
+        # from one batch otherwise propagates to every reflection that batch
+        # touched -- and since ``seen`` is ``acc.abs().sum(1) > 0`` and
+        # ``NaN > 0`` is False, the whole split comes back empty.  Two splits
+        # of the full SwissFEL set died that way, one of them the largest
+        # (422 k crystals), at the same ~0.2 % rate of non-finite batches
+        # training already drops.  Losing those reflections' share of one
+        # batch is worth far less than the split.
         acc = torch.zeros(n_hkl, v_nodes.shape[1], device=dev)
+        n_bad_acc = 0
         for _, rows in batches():
             meta, n_ph, bg, _ = self._batch(rows.to(dev))
             pred = self.scale.prime(meta)
-            acc = acc + tgt.accumulate(
+            c = tgt.accumulate(
                 self.objective, self.scale.scatter, self.params, pred,
                 n_ph, bg, meta.hkl_idx, meta, v_nodes,
             )
+            bad = ~torch.isfinite(c)
+            if bool(bad.any()):
+                n_bad_acc += int(bad.any(1).sum())
+                c = c.masked_fill(bad, 0.0)
+            acc = acc + c
             self.scale.clear()
         _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc, v_nodes, log_w_nodes)
 
@@ -1190,6 +1285,7 @@ class AmortizedTrainer:
             "edge_low": w_post[:, 0], "edge_high": w_post[:, -1],
             "loc_sd": loc_sd,
             "scan_halfwidth": tgt.scan_halfwidth,
+            "n_nonfinite_rows": n_bad_loc + n_bad_acc,
             "n_crystals": int(crystals.numel()),
             "condition": self._cond,
         }

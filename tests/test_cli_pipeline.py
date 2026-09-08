@@ -152,6 +152,11 @@ def test_merge_matches_the_inline_bench_loop(tmp_path, skew):
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
     scale, obj, tr = _stack(prep, params, tmp_path, skew=skew)
     scale.eval()
+    # One locating window, because that is what the inline loop does.  The
+    # shipped default refines over three (see
+    # test_merge_locating_survives_high_multiplicity); this test is about the
+    # rest of the machinery matching the bench, not about the placement.
+    tr.cfg.locate_windows = (tr.target.scan_halfwidth,)
     res = tr.merge()
     F, F_sd, I0, edge = _inline_merge(tr, scale, obj, params, prep)
     assert torch.allclose(res["F"], F, rtol=1e-5, atol=1e-6)
@@ -299,3 +304,241 @@ def test_build_stack_rebuilds_a_checkpoint_geometry(tmp_path):
         # strict: every trained weight must land, and nothing may be left at init
         rebuilt.load_state_dict(ck["state_dict"])
         assert rebuilt.heads.needs_embedding is not global_scale
+
+
+# ── custom splits ──────────────────────────────────────────────────────
+
+
+class _DataArgs:
+    """The data half of the CLI namespace, with everything defaulted."""
+
+    def __init__(self, **kw):
+        self.stream, self.split, self.split_file, self.split_names = [], [], None, None
+        self.min_split_crystals = 0
+        self.spacegroup, self.int_radius, self.gain = "P 1", "7,9,11", 1.0
+        self.dmin, self.dmax = 2.0, 999.0
+        self.cache_prep = self.sfx_cache = self.crystals_file = None
+        self.n_workers, self.merge_friedel, self.max_crystals = 1, True, None
+        self.__dict__.update(kw)
+
+
+def test_custom_split_file_labels_every_crystal(tmp_path):
+    """A partialator ``--custom-split`` file is a valid ``--split-file``.
+
+    The unit in that file is a frame, so the label reaches a crystal through
+    its image -- and the labels must line up with the crystal order
+    ``prepare_observations`` ends up with, which is only true after the
+    resolution filter has reindexed the image table.
+    """
+    from torchsx.cli import _pipeline as P
+    from torchsx.stream import SFXStream
+
+    from tests.conftest import STREAM_PATH
+
+    cache = tmp_path / "s.sfx"
+    s = SFXStream.from_stream(STREAM_PATH, spacegroup="P 1", cache=cache)
+    names = ["beta", "alpha"]            # deliberately NOT sorted
+    split = tmp_path / "custom.split"
+    with open(split, "w") as fh:
+        for i, (f, e) in enumerate(zip(s.filenames, s.events)):
+            fh.write(f"{f} {e} {names[i % 2]}\n")
+
+    b = P.load_prep(_DataArgs(stream=[cache], split_file=split), verbose=False)
+    labels = b.prep.obs_info.delay_bin_idx
+    # names come back sorted, so "alpha" is split 0 and takes the odd images
+    assert b.split_names == ["alpha", "beta"]
+    assert labels.numel() == b.prep.obs_info.n_crystals
+    assert int(labels.min()) == 0 and int(labels.max()) == 1
+    assert set(labels.tolist()) == {0, 1}
+
+    # a frame the split file does not mention is refused, not silently pooled
+    partial = tmp_path / "partial.split"
+    with open(partial, "w") as fh:
+        half = list(zip(s.filenames, s.events))[: max(1, len(s.filenames) // 2)]
+        for f, e in half:
+            fh.write(f"{f} {e} alpha\n")
+    with pytest.raises(SystemExit, match="unlabelled"):
+        P.load_prep(_DataArgs(stream=[cache], split_file=partial), verbose=False)
+
+
+def test_stream_batches_keeps_the_observations_off_the_device(tmp_path):
+    """``--stream-batches`` must leave ``prep`` exactly where it was.
+
+    The trainer decides host-vs-device per batch by reading
+    ``self.prep.bg.device``, so a ``prep.to(device)`` in the builder turns the
+    flag into a device-to-device copy -- invisible on data that fit the card,
+    and an out-of-memory before the first step on 794 M observations.
+    """
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+
+    prep, _params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0,
+                                 "radii": [7.0, 9.0, 11.0]}, [], 0.1)
+    base = ["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"]
+
+    streamed, *_ = P.build_stack(
+        bundle, _build_parser().parse_args(base + ["--stream-batches"]), verbose=False)
+    assert streamed is bundle.prep
+
+    moved, *_ = P.build_stack(bundle, _build_parser().parse_args(base), verbose=False)
+    assert moved is not bundle.prep
+
+
+def test_min_split_crystals_drops_the_split_from_the_data(tmp_path):
+    """A split under the threshold leaves the data set, not just the merge.
+
+    A handful of crystals still gets its own in-batch merge target during
+    training, and a target with no per-reflection support is what produced the
+    non-finite batch that killed a full run.  So the crystals go, the surviving
+    labels renumber contiguously, and the names follow.
+    """
+    from torchsx.cli import _pipeline as P
+    from torchsx.stream import SFXStream
+
+    from tests.conftest import STREAM_PATH
+
+    cache = tmp_path / "s.sfx"
+    s = SFXStream.from_stream(STREAM_PATH, spacegroup="P 1", cache=cache)
+    n_img = len(s.filenames)
+    tiny = max(1, n_img // 20)
+    split = tmp_path / "custom.split"
+    with open(split, "w") as fh:
+        for i, (f, e) in enumerate(zip(s.filenames, s.events)):
+            fh.write(f"{f} {e} {'tiny' if i < tiny else 'big'}\n")
+
+    kept = P.load_prep(_DataArgs(stream=[cache], split_file=split), verbose=False)
+    assert kept.split_names == ["big", "tiny"]
+    n_all = kept.prep.obs_info.n_crystals
+
+    cut = int(torch.bincount(kept.prep.obs_info.delay_bin_idx)[1]) + 1
+    b = P.load_prep(_DataArgs(stream=[cache], split_file=split,
+                              min_split_crystals=cut), verbose=False)
+    assert b.split_names == ["big"]
+    labels = b.prep.obs_info.delay_bin_idx
+    assert int(labels.max()) == 0
+    assert b.prep.obs_info.n_crystals < n_all
+
+
+def test_train_defaults_match_the_scored_recipe():
+    """The CLI's training knobs are the ones bench/asym.py was scored with.
+
+    R_free 0.1182 came out of a specific config; a CLI that quietly trains on
+    a different one is not the same method.  lam_spread is the exception and
+    stays 0: the scored run passed -0.25, which ``_lam_spread`` gates out at
+    ``<= 0``, so it never applied a penalty.
+    """
+    from torchsx.cli.train import _build_parser
+
+    a = _build_parser().parse_args(["x.sfx", "-o", "out"])
+    assert (a.lr, a.max_obs, a.epochs and True) == (1e-3, 1_500_000, True)
+    assert a.lam0 == 10.0 and a.lam_halflife == 400 and a.warmup == 100
+    assert (a.train_k_coarse, a.train_m_fine, a.train_n_sigma) == (31, 129, 6.0)
+    assert a.heldout_frac == 0.05
+
+
+def test_lam_holds_when_the_halflife_is_zero(tmp_path):
+    """``lam_halflife_steps <= 0`` means no decay, as the help says.
+
+    It used to mean ``max(hl, 1)`` -- halve at EVERY step -- so lam0=10 was
+    below 1e-9 by step 30 and the in-batch target ran with no prior at all.
+    """
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    _scale, _obj, tr = _stack(prep, params, tmp_path)
+
+    tr.cfg.lam0, tr.cfg.lam_min = 10.0, 0.0
+    tr.cfg.lam_halflife_steps = 0
+    for tr.step_i in (0, 30, 5000):
+        assert tr._lam() == 10.0
+    tr.cfg.lam_halflife_steps = 400
+    tr.step_i = 0
+    assert tr._lam() == 10.0
+    tr.step_i = 400
+    assert abs(tr._lam() - 5.0) < 1e-9
+
+
+def test_merge_locating_survives_high_multiplicity():
+    """The merge grid must still cover the peak at 1e5 counts per reflection.
+
+    The locating scan reads the peak off a parabola through three nodes 2 nats
+    apart, but the accumulated log-likelihood ``A v - B e^v`` is exponential
+    above the peak and linear below, so the fitted vertex carries a bias that
+    does NOT shrink with A -- while the grid built around it is ``n_sigma * sd``
+    wide with ``sd ~ 1/sqrt(A)``.  Past ~1e4 counts the grid misses the peak
+    entirely (measured: all-NaN F on a 422 k-crystal split).  Shrinking windows
+    square the bias away.
+    """
+    from torchsx.nn.posterior_target import PosteriorMergeTarget
+
+    A, v_true = 1e5, 0.0
+    B = A * math.exp(-v_true)
+
+    def locate(windows):
+        t = PosteriorMergeTarget(torch.tensor([math.exp(v_true + 0.5)]),
+                                 k_coarse=63, m_fine=257, n_sigma=24.0,
+                                 max_halfwidth=12.0, prior="flat_log")
+        for hw in windows:
+            t.scan_halfwidth = hw
+            nodes = t.scan_grid().double()
+            v, sd = t.peak_from_scan((A * nodes - B * nodes.exp()).float())
+            t.ema_I0 = v.exp()
+        return abs(float(v) - v_true), float(sd)
+
+    one_err, one_sd = locate((8.0,))
+    ref_err, ref_sd = locate((8.0, 1.0, 0.125))
+
+    # one round: mis-centred by far more than the grid it then builds
+    assert one_err > 0.3 and one_err > 24.0 * one_sd
+    # refined: inside the grid with room to spare
+    assert ref_err < 0.01 and ref_err < 0.1 * (24.0 * ref_sd)
+
+
+def test_every_cli_can_stream_batches(tmp_path):
+    """All three commands need --stream-batches, not just the trainer.
+
+    A merge holds the same prepared observations a training run does, so a data
+    set that does not fit the card cannot be merged without it either -- the
+    flag being train-only killed a 38-split re-merge at argument parsing.
+    """
+    from torchsx.cli.merge_global import _build_parser as global_parser
+    from torchsx.cli.merge_nn import _build_parser as nn_parser
+    from torchsx.cli.train import _build_parser as train_parser
+
+    for build, argv in (
+        (train_parser, ["x.sfx", "-o", str(tmp_path)]),
+        (nn_parser, ["ck.pt", "x.sfx", "-o", str(tmp_path / "m.mtz")]),
+        (global_parser, ["x.sfx", "-o", str(tmp_path / "g.mtz")]),
+    ):
+        assert build().parse_args(argv).stream_batches is False
+        assert build().parse_args(argv + ["--stream-batches"]).stream_batches is True
+
+
+def test_merge_survives_a_non_finite_batch(tmp_path):
+    """One non-finite batch must not empty a whole split.
+
+    ``accumulate`` is additive over observations, so a NaN from one batch
+    reaches every reflection that batch touched; ``seen`` is
+    ``acc.abs().sum(1) > 0`` and ``NaN > 0`` is False, so the merge returns
+    nothing at all.  Two splits of the full SwissFEL set were lost that way,
+    one of them the largest.
+    """
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    good = tr.merge()
+    assert bool(good["seen"].all()) and not good["n_nonfinite_rows"]
+
+    # poison one batch's contribution, exactly as a bad observation would
+    real, calls = tr.target.accumulate, {"n": 0}
+
+    def poisoned(*a, **kw):
+        out = real(*a, **kw)
+        calls["n"] += 1
+        return out * float("nan") if calls["n"] == 1 else out
+
+    tr.target.accumulate = poisoned
+    res = tr.merge()
+    tr.target.accumulate = real
+
+    assert res["n_nonfinite_rows"] > 0          # reported, not hidden
+    assert int(res["seen"].sum()) > 0           # and the split survives

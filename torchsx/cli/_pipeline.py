@@ -67,8 +67,21 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                         "in-batch merge target.  No physical meaning is "
                         "assumed -- the name is just a label.")
     p.add_argument("--split-file", type=Path, default=None,
-                   help="int64 label per crystal (after the d_min filter) for "
-                        "a single stream; -1 is not allowed")
+                   help="crystal splits for a single stream, either a "
+                        "CrystFEL custom-split file (three whitespace columns, "
+                        "'filename event dataset', the same file partialator "
+                        "takes as --custom-split) or a .pt int64 label per "
+                        "crystal after the d_min filter.  Every crystal must "
+                        "be labelled.")
+    p.add_argument("--min-split-crystals", type=int, default=0, metavar="N",
+                   help="drop any split with fewer than N crystals, from the "
+                        "DATA and not just from the merge.  A split of a few "
+                        "hundred crystals cannot support a merge worth making "
+                        "(this project's own scan measured the signal peaking "
+                        "at ~10 k crystals per bin), and it still gets its own "
+                        "in-batch merge target during training, where the "
+                        "per-reflection support is what keeps the target "
+                        "finite.  0 keeps everything.")
     p.add_argument("--split-names", default=None,
                    help="comma-separated names for --split-file labels, in "
                         "label order (default: 0, 1, ...)")
@@ -164,17 +177,50 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     if d_min is None:
         raise SystemExit("--dmin is required")
 
+    splits = _splits_from_args(args)
+
+    # Everything that changes what prepare_observations returns.  A cache is
+    # only reusable when all of it matches: the blob carries the split labels
+    # baked into obs_info, so a cache built from a different --split-file would
+    # silently merge the wrong crystals together.
+    def _stamp(path):
+        if path is None:
+            return None
+        st = Path(path).stat()
+        return [str(path), st.st_size, int(st.st_mtime)]
+
+    signature = {
+        "splits": [[n, str(q)] for n, q in splits],
+        "d_min": float(d_min), "d_max": float(args.dmax),
+        "spacegroup": spacegroup, "gain": gain, "radii": list(radii),
+        "merge_friedel": bool(args.merge_friedel),
+        "split_file": _stamp(args.split_file),
+        "split_names": args.split_names,
+        "min_split_crystals": int(args.min_split_crystals),
+        "crystals_file": _stamp(args.crystals_file),
+        "max_crystals": args.max_crystals,
+    }
+
     cache = args.cache_prep
     if cache is not None and cache.exists():
         blob = torch.load(cache, weights_only=False)
+        got = blob.get("signature")
+        if got != signature:
+            differ = sorted(
+                k for k in set(signature) | set(got or {})
+                if (got or {}).get(k) != signature.get(k))
+            raise SystemExit(
+                f"--cache-prep {cache} was built with different settings "
+                f"({', '.join(differ) if differ else 'no signature recorded'}); "
+                f"delete it or point --cache-prep somewhere else.")
         if verbose:
             print(f"prep from cache {cache} "
                   f"({blob['prep'].n_valid:,} reflections, "
-                  f"{blob['prep'].I_obs.numel():,} obs)", flush=True)
+                  f"{blob['prep'].I_obs.numel():,} obs, "
+                  f"{len(blob.get('split_names', []))} splits)", flush=True)
         return PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
                           blob["bg_var_factor"])
 
-    splits = _splits_from_args(args)
     parts = []
     for name, path in splits:
         if str(path).endswith(".sfx"):
@@ -211,25 +257,55 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
             print(f"  crystals: {int(mask.sum()):,} of {int(mask.numel()):,} kept",
                   flush=True)
 
-    noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2],
-                              gain=(gain if isinstance(gain, float) else 1.0))
-    prep = prepare_observations(stream, MergeConfig(gain=gain), poisson_noise=noise)
-    bvf = noise.n_peak / noise.n_bg
-
     # ── splits → the per-crystal label the trainer already consumes ──
     names: list[str] = []
     if args.split_file is not None:
-        labels = torch.load(args.split_file).long().reshape(-1)
-        if labels.numel() != prep.obs_info.n_crystals:
+        if str(args.split_file).endswith((".pt", ".pth")):
+            labels = torch.load(args.split_file).long().reshape(-1)
+        else:
+            # CrystFEL custom-split file: "filename event dataset", the unit
+            # being a frame, not a crystal -- multi-crystal frames put all
+            # their crystals in the same split, which is what partialator
+            # does with the same file.
+            lookup = {}
+            for raw in open(args.split_file):
+                line = raw.split("#", 1)[0].split()
+                if not line:
+                    continue
+                if len(line) < 3:
+                    raise SystemExit(
+                        f"{args.split_file}: expected 'filename event dataset', "
+                        f"got {raw.rstrip()!r}")
+                lookup[(line[0], line[1])] = line[2]
+            names = sorted(set(lookup.values()))
+            index = {n: i for i, n in enumerate(names)}
+            fnames, evts = stream.filenames, stream.events
+            if not fnames or not evts:
+                raise SystemExit(
+                    "the stream carries no image filename/event metadata, so a "
+                    "custom-split file cannot be matched to it; re-parse from "
+                    "the .stream, or pass a .pt label tensor")
+            per_image = torch.tensor(
+                [index.get(lookup.get((f, e), None), -1)
+                 for f, e in zip(fnames, evts)], dtype=torch.long)
+            labels = per_image[stream.image_id.long()]
+            if verbose:
+                miss = int((labels < 0).sum())
+                print(f"  custom split {args.split_file.name}: {len(lookup):,} "
+                      f"frames, {len(names)} datasets, {miss:,} crystals "
+                      f"unmatched", flush=True)
+        if labels.numel() != stream.n_crystals:
             raise SystemExit(
                 f"--split-file has {labels.numel():,} labels but the data has "
-                f"{prep.obs_info.n_crystals:,} crystals (after --dmin/--crystals-file)")
+                f"{stream.n_crystals:,} crystals (after --dmin/--crystals-file)")
         if int((labels < 0).sum()):
             raise SystemExit(f"--split-file: {int((labels < 0).sum()):,} unlabelled "
                              "crystals (-1); every crystal must belong to a split")
         n_splits = int(labels.max()) + 1
-        names = ([n.strip() for n in args.split_names.split(",")]
-                 if args.split_names else [str(i) for i in range(n_splits)])
+        if args.split_names:
+            names = [n.strip() for n in args.split_names.split(",")]
+        elif not names:
+            names = [str(i) for i in range(n_splits)]
         if len(names) != n_splits:
             raise SystemExit(f"--split-names has {len(names)} names for {n_splits} labels")
     elif len(splits) > 1:
@@ -239,7 +315,43 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     else:
         labels = None
 
+    # ── drop splits too small to merge ─────────────────────────────────
+    if labels is not None and args.min_split_crystals > 0:
+        counts = torch.bincount(labels, minlength=len(names))
+        keep_split = counts >= args.min_split_crystals
+        if not bool(keep_split.any()):
+            raise SystemExit(
+                f"--min-split-crystals {args.min_split_crystals:,} drops every "
+                f"split; largest has {int(counts.max()):,} crystals")
+        if not bool(keep_split.all()):
+            gone = [(names[i], int(counts[i]))
+                    for i in range(len(names)) if not keep_split[i]]
+            keep_obs = keep_split[labels]
+            if verbose:
+                print(f"  dropping {len(gone)} split(s) under "
+                      f"{args.min_split_crystals:,} crystals "
+                      f"({int((~keep_obs).sum()):,} crystals): "
+                      + ", ".join(f"{n} ({c:,})" for n, c in gone), flush=True)
+            # Out of the DATA, not merely out of the merge: a split of a few
+            # hundred crystals also gets its own in-batch merge target, and a
+            # target with no support per reflection is what produced the
+            # non-finite batch that killed a full run.
+            stream = SFXStream(filter_crystals(stream._core, keep_obs))
+            renumber = torch.cumsum(keep_split.long(), 0) - 1
+            labels = renumber[labels[keep_obs]]
+            names = [n for n, k in zip(names, keep_split.tolist()) if k]
+
+    noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2],
+                              gain=(gain if isinstance(gain, float) else 1.0))
+    prep = prepare_observations(stream, MergeConfig(gain=gain), poisson_noise=noise)
+    bvf = noise.n_peak / noise.n_bg
+
+
     if labels is not None:
+        if labels.numel() != prep.obs_info.n_crystals:
+            raise SystemExit(
+                f"{labels.numel():,} split labels but prepare_observations kept "
+                f"{prep.obs_info.n_crystals:,} crystals")
         prep.obs_info.delay_bin_idx = labels
         prep.obs_info.unique_timepoints = torch.arange(len(names), dtype=torch.float64)
         if verbose:
@@ -257,10 +369,16 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
               f"{100 * float(prep.is_centric.float().mean()):.1f} % centric", flush=True)
     bundle = PrepBundle(prep, recipe, names, bvf)
     if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(cache.suffix + ".partial")
         torch.save({"prep": prep, "recipe": recipe, "split_names": names,
-                    "bg_var_factor": bvf}, cache)
+                    "bg_var_factor": bvf, "signature": signature}, tmp)
+        # rename only once the write completed, so an interrupted run cannot
+        # leave a truncated blob that the next one would load as valid
+        tmp.replace(cache)
         if verbose:
-            print(f"  prep cached -> {cache}", flush=True)
+            print(f"  prep cached -> {cache} "
+                  f"({cache.stat().st_size / 2**30:.1f} GiB)", flush=True)
     return bundle
 
 
@@ -268,6 +386,20 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
 
 def add_free_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--stream-batches", action="store_true",
+                   help="keep the prepared observations on the host and copy "
+                        "only each batch's rows to the device.  Required for "
+                        "any data set that does not fit the card: 794 M "
+                        "observations is ~38 GB before a single step.  Merging "
+                        "needs it exactly as much as training does.")
+    p.add_argument("--locate-windows", default=None, metavar="W1,W2,...",
+                   help="scan half-widths (nats) for the merge's locating "
+                        "passes, one data pass each.  Default 8,1,0.125: a "
+                        "single wide pass mis-centres the outer grid by ~0.59 "
+                        "nats at any multiplicity, which is harmless below "
+                        "~1e3 counts per reflection and fatal above ~1e4 "
+                        "(all-NaN F on a 422 k-crystal split).  Pass a single "
+                        "value for the old one-pass behaviour.")
     p.add_argument("--free-from", type=Path, default=None,
                    help="take the free set from an existing .mtz (FreeR_flag / "
                         "R-free-flags) or a .pkl of {(h,k,l): flag} on the "
@@ -400,6 +532,14 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
         return
     q = lambda t, p: float(t.quantile(torch.tensor(p, dtype=t.dtype, device=t.device)))
     seen = res["seen"]
+    if not int(seen.sum()):
+        # Nothing survived the merge.  Say so and return: quantile() on an
+        # empty tensor raises, and a split whose grid missed every reflection
+        # once took a whole run's remaining merges down with it.
+        print(f"  estimator {res['estimator']}: NO reflections merged "
+              f"({res['n_crystals']:,} crystals) -- the outer grid found no "
+              f"support; check edge_mass and the locating rounds", flush=True)
+        return
     if res["estimator"] in ("pooled", "mean"):
         I, sd = res["I"][seen], res["I_sd"][seen]
         ratio = I / sd.clamp(min=1e-12)
@@ -407,6 +547,9 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
               f"median I/sig {float(ratio.median()):.2f}, "
               f"negative {100 * float((I < 0).float().mean()):.1f} %", flush=True)
         return
+    if res.get("n_nonfinite_rows"):
+        print(f"  NOTE {res['n_nonfinite_rows']:,} reflection-batch rows were "
+              f"non-finite and were dropped from the accumulation", flush=True)
     F, S, E = res["F"][seen], res["F_sd"][seen], res["edge_mass"][seen]
     ratio = F / S.clamp(min=1e-12)
     # MEDIAN of the per-reflection ratio: F is heavily right-skewed, so
@@ -509,7 +652,14 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
 
     ck = ckpt or {}
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    prep = bundle.prep.to(dev)
+    # --stream-batches means the per-observation state STAYS ON THE HOST and
+    # only a batch's gathered rows cross the bus; the trainer's ``_batch``
+    # reads ``self.prep.bg.device`` to decide that, so moving prep here made
+    # the flag a no-op that copied device-to-device.  Harmless while the data
+    # fit the card, fatal at 794 M observations: the move alone asks for ~38 GB
+    # before a single step.  The per-reflection parameters still go to the
+    # device -- they are what the optimiser touches.
+    prep = bundle.prep if getattr(args, "stream_batches", False) else bundle.prep.to(dev)
     params = Parameters(
         log_I0_init=prep.mu_init.clone(),
         scatter_shape=FreePerHKLShape(prep.alpha_init.log(), prep.beta_perhkl.log()),

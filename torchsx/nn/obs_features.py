@@ -216,14 +216,24 @@ class ObsFeatureSpec(nn.Module):
             oi.sigma.float() if oi.sigma is not None
             else (I.abs() + bg.clamp(min=0) + 1.0).sqrt()   # Poisson fallback
         )
-        self.register_buffer("_I", I)
-        self.register_buffer("_bg", bg)
-        self.register_buffer("_sigma", sigma.clamp(min=1e-6))
-        self.register_buffer("_hkl", prep.hkl_valid.float())
+        # persistent=False on every buffer that is a COPY OF THE DATA.  They
+        # are rebuilt from the prep at construction, so saving them puts the
+        # data set in the checkpoint: three per-observation arrays, 429 MB on a
+        # 35 M-observation probe and ~10 GB on the full 794 M-observation set,
+        # rewritten at every epoch's save_best.  Worse, a strict load would then
+        # demand that a *different* data set have the same number of rows.  The
+        # standardisation statistics below stay persistent: those are fitted,
+        # and a merge that recomputed them would be standardising on its own
+        # subset.
+        self.register_buffer("_I", I, persistent=False)
+        self.register_buffer("_bg", bg, persistent=False)
+        self.register_buffer("_sigma", sigma.clamp(min=1e-6), persistent=False)
+        self.register_buffer("_hkl", prep.hkl_valid.float(), persistent=False)
         self.has_supplied_sigma = oi.sigma is not None
         # Reference merged intensity per reflection, used to form obs_scale.
         # Always detached: it is a lookup, never a gradient path.
-        self.register_buffer("_I0_ref", prep.mu_init.exp().clamp(min=1e-3).float())
+        self.register_buffer("_I0_ref", prep.mu_init.exp().clamp(min=1e-3).float(),
+                             persistent=False)
 
         # Normalisation stats over the FULL dataset (never per batch — that
         # would leak batch composition into the features).
@@ -250,7 +260,7 @@ class ObsFeatureSpec(nn.Module):
                 )
         else:
             raw = torch.zeros(oi.n_crystals, 0)
-        self.register_buffer("_crys_raw", raw)
+        self.register_buffer("_crys_raw", raw, persistent=False)
         self.register_buffer("_crys_mean", torch.zeros(n_cf))
         self.register_buffer("_crys_std", torch.ones(n_cf))
         self.register_buffer("_crys_const", torch.zeros(n_cf, dtype=torch.bool))

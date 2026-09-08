@@ -30,6 +30,7 @@ Examples
 
 from __future__ import annotations
 
+import math
 import argparse
 import time
 from pathlib import Path
@@ -67,15 +68,26 @@ def _build_parser() -> argparse.ArgumentParser:
                         "exact; 400 is what makes redundancy 200 fit on 40 GB.")
     p.add_argument("--node-ckpt", action="store_true",
                    help="recompute outer quadrature nodes in backward")
-    p.add_argument("--stream-batches", action="store_true",
-                   help="keep the prepared observations on the host and copy "
-                        "only each batch's rows to the device")
     p.add_argument("--lam0", type=float, default=10.0,
                    help="EMA prior strength on the in-batch merge target")
-    p.add_argument("--lam-halflife", type=int, default=0,
-                   help="steps for lam0 to halve; 0 = no decay (the safe "
-                        "default: rhodopsin's in-batch target has I/sigma ~2 "
-                        "even at redundancy 200 and cannot carry itself)")
+    p.add_argument("--lam-halflife", type=int, default=400,
+                   help="steps for lam0 to halve; 0 = no decay.  400 is what "
+                        "the scored SwissFEL run used (bench/asym.py), so it "
+                        "is the default: the prior carries the in-batch target "
+                        "through the early steps and is gone by the time the "
+                        "model can stand on its own.")
+    p.add_argument("--warmup", type=int, default=100,
+                   help="linear LR warmup steps (100 in the scored run)")
+    p.add_argument("--train-k-coarse", type=int, default=31)
+    p.add_argument("--train-m-fine", type=int, default=129)
+    p.add_argument("--train-n-sigma", type=float, default=6.0,
+                   help="outer quadrature grid used WHILE TRAINING (31/129/6 "
+                        "is the scored recipe).  The final merge is done on "
+                        "the merge grid (--k-coarse/--m-fine/--n-sigma, "
+                        "63/257/24) regardless: a training grid may be cheaper "
+                        "than a merge should be, and at n_sigma 6 a quarter of "
+                        "reflections put >1 % of their posterior against the "
+                        "grid edge in a full merge.")
     p.add_argument("--split-half-every", type=int, default=0,
                    help="run the CC1/2 / R_split merge every N epochs")
     p.add_argument("--log-every", type=int, default=10)
@@ -103,10 +115,13 @@ def main(argv: list[str] | None = None) -> None:
         target_redundancy=args.redundancy,
         epochs=args.epochs, lr=args.lr,
         lam0=args.lam0, lam_halflife_steps=args.lam_halflife,
-        warmup_steps=50, grad_clip=20.0, log_every=args.log_every,
+        warmup_steps=args.warmup, grad_clip=20.0, log_every=args.log_every,
         merge_target="posterior", loss="evidence",
-        posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
-        posterior_n_sigma=S["n_sigma"], posterior_max_halfwidth=S["max_halfwidth"],
+        posterior_k_coarse=args.train_k_coarse, posterior_m_fine=args.train_m_fine,
+        posterior_n_sigma=args.train_n_sigma,
+        posterior_max_halfwidth=S["max_halfwidth"],
+        locate_windows=tuple(float(x) for x in args.locate_windows.split(","))
+        if args.locate_windows else (8.0, 1.0, 0.125),
         posterior_prior=S["prior"],
         posterior_checkpoint_nodes=args.node_ckpt,
         encoder_chunk_crystals=args.chunk_crystals,
@@ -123,6 +138,23 @@ def main(argv: list[str] | None = None) -> None:
           + (f", {tr.n_conditions} splits {bundle.split_names}"
              if tr.n_conditions > 1 else ""), flush=True)
 
+    # Same-condition TRAINING crystals, scored exactly as the held-out set is
+    # (fixed eval_lam, no penalty).  Without it the only comparison available
+    # is the running train loss against held-out, and those differ in lambda,
+    # in the penalty, and in multiplicity -- 106 observations per reflection in
+    # a 1.5 M batch against 74 in the held-out set -- so their gap is
+    # bookkeeping, not generalisation.  This pair is like for like: if it opens,
+    # the model is overfitting; if it does not, the model is fine and the other
+    # gap was the normaliser.
+    same = tr.train_crystals[
+        tr.condition[tr.train_crystals.cpu()] == (cfg.heldout_condition or 0)]
+    g = torch.Generator().manual_seed(cfg.seed)
+    train_eval = same[torch.randperm(same.numel(), generator=g)[
+        : min(cfg.train_eval_crystals, same.numel())]]
+    print(f"train-eval set: {train_eval.numel():,} crystals from split "
+          f"{bundle.split_names[cfg.heldout_condition or 0] if bundle.split_names else 0!r}, "
+          f"held-out {tr.heldout_crystals.numel():,} from the same split", flush=True)
+
     base = tr.evaluate(tr.heldout_crystals, phase="heldout_init")
     print(f"  epoch -   heldout nll/obs {base['nll_per_obs']:.5f}  "
           f"var_z {base['var_z']:.3f}", flush=True)
@@ -132,22 +164,30 @@ def main(argv: list[str] | None = None) -> None:
         tr._refresh_wilson_sigma()
         loss_sum = n_used = 0.0
         aucs = []
+        skipped0 = tr.n_skipped_steps
         for _, rows in tr.index.batches(cfg.max_obs_per_batch, generator=tr.gen,
                                         crystals=tr.train_crystals):
             r = tr.step(rows.to(S["device"]))
             # weight by n_used: a plain mean of per-obs RATIOS is not the
-            # epoch's per-observation NLL when the batches differ in size
-            loss_sum += r["nll_per_obs"] * r["n_used"]
-            n_used += r["n_used"]
+            # epoch's per-observation NLL when the batches differ in size.
+            # A dropped batch contributes nothing rather than turning the
+            # epoch's mean into NaN.
+            if r["n_used"] and math.isfinite(r["nll_per_obs"]):
+                loss_sum += r["nll_per_obs"] * r["n_used"]
+                n_used += r["n_used"]
             if "condition_auc" in r:
                 aucs.append(r["condition_auc"])
         h = tr.evaluate(tr.heldout_crystals)
+        te = tr.evaluate(train_eval, phase="train_eval")
         tr.save_best()
         auc = f"  auc {sum(aucs) / len(aucs):.3f}" if aucs else ""
+        dropped = tr.n_skipped_steps - skipped0
+        skip = f"  [{dropped} non-finite batches dropped]" if dropped else ""
         print(f"  epoch {ep:<3d} train {loss_sum / max(n_used, 1):.5f}  "
-              f"heldout {h['nll_per_obs']:.5f}  "
+              f"heldout {h['nll_per_obs']:.5f} (train-eval "
+              f"{te['nll_per_obs']:.5f}, gap {h['nll_per_obs'] - te['nll_per_obs']:+.5f})  "
               f"ev/hkl {h['evidence_per_hkl']:.4f}  var_z {h['var_z']:.3f}"
-              f"{auc}  [{time.time() - t1:.1f}s]", flush=True)
+              f"{auc}  [{time.time() - t1:.1f}s]{skip}", flush=True)
         if args.split_half_every and (ep + 1) % args.split_half_every == 0:
             sh = tr.split_half_metrics()
             print(f"    [merge] CC1/2 full {sh['cc_half_full']:.4f}  "
@@ -175,11 +215,31 @@ def main(argv: list[str] | None = None) -> None:
     if S["device"].startswith("cuda"):
         torch.cuda.empty_cache()
 
+    # Merge on the MERGE grid, not the (cheaper) grid the run trained on.
+    # The targets carry their placement as plain attributes read at call time,
+    # so this re-grids them in place and keeps each condition's EMA.
+    if (args.train_k_coarse, args.train_m_fine, args.train_n_sigma) != (
+            S["k_coarse"], S["m_fine"], S["n_sigma"]):
+        print(f"\nre-grid for the merge: {args.train_k_coarse}/"
+              f"{args.train_m_fine} n_sigma {args.train_n_sigma:g} -> "
+              f"{S['k_coarse']}/{S['m_fine']} n_sigma {S['n_sigma']:g}", flush=True)
+        for t in tr.targets:
+            t.k_coarse, t.m_fine = S["k_coarse"], S["m_fine"]
+            t.n_sigma, t.max_halfwidth = S["n_sigma"], S["max_halfwidth"]
+
     names = bundle.split_names or [""]
     for k, name in enumerate(names):
         res = tr.merge(condition=(k if tr.n_conditions > 1 else None),
                        estimator=args.estimator)
         print(f"\nmerge [{name or 'all'}]: {res['n_crystals']:,} crystals", flush=True)
+        if not res["n_crystals"] or not int(res["seen"].sum()):
+            # A split can be empty -- a subset of the data, or a split file with
+            # a dataset none of the surviving crystals belong to -- and a merge
+            # can come back with nothing usable.  Neither is a reason to throw
+            # away the other merges after hours of training.
+            P.report_merge(res)
+            print("  nothing written for this split", flush=True)
+            continue
         P.report_merge(res)
         _write(args, prep, res, bundle,
                args.out / (f"merged_{name}.mtz" if name else "merged.mtz"))

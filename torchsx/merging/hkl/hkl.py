@@ -30,7 +30,29 @@ def compute_hkl_index(hkl: torch.Tensor) -> HKLIndex:
     each observation an index into that set.  Unique HKLs are sorted
     lexicographically (h, then k, then l).
     """
-    unique, inverse = torch.unique(hkl.long(), dim=0, sorted=True, return_inverse=True)
+    # torch.unique(dim=0) sorts (N_obs, 3) rows lexicographically and is by far
+    # the most expensive step in prepare_observations -- 84 % of it at 794 M
+    # observations, where the .long() cast alone materialises 19 GB.  Miller
+    # indices span a few hundred values at most, so pack them into ONE int64
+    # key.  The encoding is positional with h most significant, so ordering by
+    # key is exactly ordering lexicographically by (h, k, l): the returned
+    # unique_hkl and hkl_id are identical to the dim=0 path, just far cheaper.
+    lo = torch.stack([hkl[:, i].min() for i in range(3)]).long()
+    hi = torch.stack([hkl[:, i].max() for i in range(3)]).long()
+    span = (hi - lo + 1)
+    if int(span.prod()) > 2 ** 62 or bool((span <= 0).any()):
+        unique, inverse = torch.unique(hkl.long(), dim=0, sorted=True,
+                                       return_inverse=True)
+    else:
+        key = (hkl[:, 0].long() - lo[0]) * span[1] + (hkl[:, 1].long() - lo[1])
+        key = key * span[2] + (hkl[:, 2].long() - lo[2])
+        uniq_key, inverse = torch.unique(key, sorted=True, return_inverse=True)
+        del key
+        l = uniq_key % span[2]
+        rest = uniq_key.div(span[2], rounding_mode="floor")
+        k = rest % span[1]
+        h = rest.div(span[1], rounding_mode="floor")
+        unique = torch.stack([h + lo[0], k + lo[1], l + lo[2]], dim=1)
     return HKLIndex(
         unique_hkl=unique.to(torch.int16),
         hkl_id=inverse.to(torch.int64),

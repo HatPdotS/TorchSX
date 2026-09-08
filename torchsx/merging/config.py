@@ -17,6 +17,13 @@ class MergeConfig:
     min_obs: int = 0
     n_shells: int = 20
     snr_thresh: float = 3.0
+    #: Cap on the observations pooled per resolution shell for the GenGauss β
+    #: fit.  Pooling every observation is ~4.5 min of the full-data prep; a 2 M
+    #: cap cuts that to ~1 min.  OFF by default (0) because it does move β --
+    #: max |Δβ| 0.007 and α_init 0.5 % on a 159 M-observation subset -- and
+    #: every scored baseline was measured uncapped.  Opt in for exploratory
+    #: runs where prep time matters more than reproducing an old number.
+    beta_pool_cap: int = 0
 
     # ── Dirichlet smoothing over ±1 Miller graph (per-HKL α, β, I₀) ─────
     # λ ≈ 0.4 · N_h_max keeps per-HKL data pull ≤ 10% from neighbour mean;

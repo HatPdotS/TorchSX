@@ -408,10 +408,25 @@ def prepare_observations(
     core_I = core.I
     core_background = core.background
 
+    # Phase timing, off unless TORCHSX_PREP_TIMING is set: this function is the
+    # 50-minute front end of every merge and the cost is not where one guesses.
+    import os as _os
+    import time as _time
+    _t_prev = _time.perf_counter()
+    _timing = bool(_os.environ.get("TORCHSX_PREP_TIMING"))
+
+    def _lap(what: str):
+        nonlocal _t_prev
+        now = _time.perf_counter()
+        if _timing:
+            print(f"  [prep] {what:<28s} {now - _t_prev:8.1f} s", flush=True)
+        _t_prev = now
+
     # Per-observation signed Ewald sphere offset (Å⁻¹). Used by the σ²(bg)
     # gain calibration to gate to off-Bragg (predicted-zero-signal) obs,
     # and propagated to ObsInfo for downstream use.
     ewald_offset_core, q_dir_core = _ewald_offset(core, return_q=True)
+    _lap("ewald offset")
 
     # ── Detector gain (ADU / photon) ──
     gain_cfg = config.gain
@@ -449,6 +464,7 @@ def prepare_observations(
     core_I = core_I / gain
     core_background = core_background / gain
     hkl_idx = compute_hkl_index(core.hkl)
+    _lap("hkl index")
     hkl_id_raw = hkl_idx.hkl_id
     unique_hkl = hkl_idx.unique_hkl
     n_unique = hkl_idx.n_unique
@@ -459,6 +475,7 @@ def prepare_observations(
     counts = torch.bincount(hkl_id_raw, minlength=n_unique)
     order = hkl_id_raw.argsort()
     groups_I = I_obs_stream[order].split(counts.tolist())
+    _lap("argsort + group split")
 
     mean_I = torch.zeros(n_unique)
     var_I = torch.zeros(n_unique)
@@ -472,6 +489,7 @@ def prepare_observations(
             var_I[h] = gI.var(correction=1)
 
     snr = mean_I.abs() * mult.float().clamp(min=1).sqrt() / var_I.clamp(min=1e-6).sqrt()
+    _lap("per-HKL mean/var loop")
     d_spacing_all = get_d_spacing(unique_hkl.float(), median_cell)
 
     # ── Shell β estimation (pooled GenGauss+Gauss mixture) ──
@@ -486,15 +504,28 @@ def prepare_observations(
         if hm.sum() < 10:
             continue
         hkl_indices = torch.where(hm)[0]
+        if config.beta_pool_cap:
+            # Take an evenly spaced subset rather than the first N: the first N
+            # would be the shell's lowest Miller indices.  A stride keeps the
+            # indices ASCENDING, so the reads into groups_I stay sequential --
+            # a shuffle costs more in lost locality than the cap saves when the
+            # data is small enough that the cap never bites.
+            n_obs_shell = int(counts[hkl_indices].sum())
+            stride = max(1, -(-n_obs_shell // config.beta_pool_cap))
+            hkl_indices = hkl_indices[::stride]
         pooled = []
-        for h_idx in hkl_indices:
-            g = groups_I[int(h_idx.item())]
+        n_pooled = 0
+        for h_idx in hkl_indices.tolist():
+            g = groups_I[h_idx]
             pos = g[g > 0]
             if len(pos) < 5:
                 continue
             mu_h = pos.mean()
             if mu_h > 0:
                 pooled.append(pos / mu_h)
+                n_pooled += pos.numel()
+                if config.beta_pool_cap and n_pooled >= config.beta_pool_cap:
+                    break
         if len(pooled) < 5:
             continue
         pooled_t = torch.cat(pooled)
@@ -517,6 +548,7 @@ def prepare_observations(
         for k, sid in enumerate(sids):
             shell_beta[sid] = float(smoothed[k])
     default_beta = float(np.median(list(shell_beta.values()))) if shell_beta else 1.5
+    _lap("shell beta fit")
 
     # ── Valid-HKL filter (min positive obs) ──
     pos_mask = I_obs_stream > 0
@@ -536,6 +568,7 @@ def prepare_observations(
     keep_all = obs_new_hkl >= 0
     hkl_fit_idx = obs_new_hkl[keep_all]
     sort_all = hkl_fit_idx.argsort()
+    _lap("valid filter + argsort")
 
     I_obs = I_obs_stream[keep_all][sort_all]
     hkl_id = hkl_fit_idx[sort_all]
@@ -544,6 +577,7 @@ def prepare_observations(
 
     bg_per_pixel = core_background[keep_all][sort_all]
     bg = bg_per_pixel * poisson_noise.n_peak
+    _lap("gather I/bg")
 
     # ── Initial log-space MLE for μ and α (positive obs per HKL) ──
     pos_in_sorted = I_obs > 0
@@ -575,6 +609,7 @@ def prepare_observations(
             (beta_i / n_h * r.pow(beta_i).sum()).clamp(min=1e-6).pow(1.0 / beta_i)
         )
     alpha_init.clamp_(min=0.01)
+    _lap("mu/alpha loop")
 
     beta_perhkl = torch.full((n_valid,), default_beta)
     for sid, bval in shell_beta.items():
@@ -610,6 +645,7 @@ def prepare_observations(
 
     # ── Adjacency graph (±1 Miller) ──
     adjacency = build_adjacency(hkl_valid)
+    _lap("adjacency")
 
     # ── Per-obs metadata for corrections ──
     s_sq_per_obs = 1.0 / (4.0 * d_spacing_all[hkl_id_raw].clamp(min=0.1) ** 2)
@@ -658,6 +694,8 @@ def prepare_observations(
         delay_bin_idx=delay_bin_idx,
         unique_timepoints=unique_t_tensor,
     )
+
+    _lap("obs_info gathers")
 
     # ── External partiality (sorted to match) ──
     partiality_sorted = None
