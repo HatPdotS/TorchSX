@@ -146,13 +146,18 @@ def db_path(tmp_path):
         [CLEN, PHOTON_EV, str(tmp_path / "absent.geom")],
     )
     for i, name in enumerate(PANELS):
-        conn.execute("INSERT INTO panels VALUES (?, 0, 1023, ?, ?)", [name, i * 512, (i + 1) * 512 - 1])
+        conn.execute(
+            "INSERT INTO panels VALUES (?, 0, 1023, ?, ?)",
+            [name, i * 512, (i + 1) * 512 - 1],
+        )
     conn.execute(
         "INSERT INTO cell VALUES (79.0, 79.0, 38.0, 90.0, 90.0, 90.0, 237158.0, "
         "'tetragonal', 'P', 'c')"
     )
 
-    for serial, (fn, ev, indexed, n_peaks, n_refl, prof, limit, ax) in enumerate(_FRAMES):
+    for serial, (fn, ev, indexed, n_peaks, n_refl, prof, limit, ax) in enumerate(
+        _FRAMES
+    ):
         fid = _frame_id(fn, ev)
         if not indexed:
             conn.execute(
@@ -166,14 +171,39 @@ def db_path(tmp_path):
             "0.1, ?, 2.0, 30, 0.01, ?, 3.2, ?, "
             "79.0, 79.0, 38.0, 90.0, 90.0, 90.0, "
             "?, 0.0, 0.0, 0.0, ?, 0.0, 0.0, 0.0, ?)",
-            [fid, serial, fn, ev, serial, n_peaks, n_refl, prof, limit, n_refl,
-             ax, ax * 2, ax * 4],
+            [
+                fid,
+                serial,
+                fn,
+                ev,
+                serial,
+                n_peaks,
+                n_refl,
+                prof,
+                limit,
+                n_refl,
+                ax,
+                ax * 2,
+                ax * 4,
+            ],
         )
         for j in range(n_refl):
             conn.execute(
                 "INSERT INTO reflections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [fid, j + 1, -j, 2 * j, 100.0 + j, 10.0 + j, 120.0 + j, 5.0,
-                 10.0 * j, 20.0 * j, PANELS[j % 2], 2.0],
+                [
+                    fid,
+                    j + 1,
+                    -j,
+                    2 * j,
+                    100.0 + j,
+                    10.0 + j,
+                    120.0 + j,
+                    5.0,
+                    10.0 * j,
+                    20.0 * j,
+                    PANELS[j % 2],
+                    2.0,
+                ],
             )
     conn.close()
     return path
@@ -181,16 +211,16 @@ def db_path(tmp_path):
 
 def _indexed_sorted():
     """The indexed frames in the order load_duckdb must assign."""
-    return sorted(
-        [f for f in _FRAMES if f[2]], key=lambda f: (f[0], f[1])
-    )
+    return sorted([f for f in _FRAMES if f[2]], key=lambda f: (f[0], f[1]))
 
 
 def test_levels_and_counts(db_path):
     core = load_duckdb(db_path, spacegroup="P 43 21 2")
     expected = _indexed_sorted()
     assert core.levels["crystal"].n == len(expected) == 2
-    assert core.levels["image"].n == 2, "image level is 1:1 with crystal in probixi's schema"
+    assert (
+        core.levels["image"].n == 2
+    ), "image level is 1:1 with crystal in probixi's schema"
     assert core.levels["obs"].n == sum(f[4] for f in expected) == 5
     assert core.spacegroup == "P 43 21 2"
 
@@ -212,7 +242,9 @@ def test_crystal_order_is_filename_event_not_frame_id(db_path):
     # Guard the guard: this fixture must actually discriminate the two orders,
     # or the assertion above proves nothing.
     by_hash = sorted(expected, key=lambda f: _frame_id(f[0], f[1]))
-    assert by_hash != expected, "fixture no longer distinguishes hash order from (filename, event)"
+    assert (
+        by_hash != expected
+    ), "fixture no longer distinguishes hash order from (filename, event)"
 
 
 def test_reload_is_deterministic(db_path):
@@ -230,7 +262,9 @@ def test_crystal_id_is_dense_and_groups_observations(db_path):
     assert int(cid.min()) == 0
     assert int(cid.max()) == core.levels["crystal"].n - 1
     # every crystal is referenced, and reflections arrive grouped
-    assert torch.equal(cid.unique(), torch.arange(core.levels["crystal"].n, dtype=torch.int32))
+    assert torch.equal(
+        cid.unique(), torch.arange(core.levels["crystal"].n, dtype=torch.int32)
+    )
     assert torch.equal(cid, cid.sort().values)
     counts = torch.bincount(cid.long())
     assert counts.tolist() == [f[4] for f in _indexed_sorted()]
@@ -272,7 +306,9 @@ def test_panel_names_resolve_to_indices(db_path):
 
 def test_run_level_beam_metadata_is_constant(db_path):
     core = load_duckdb(db_path)
-    assert torch.allclose(core.beam_energy, torch.full_like(core.beam_energy, PHOTON_EV))
+    assert torch.allclose(
+        core.beam_energy, torch.full_like(core.beam_energy, PHOTON_EV)
+    )
     assert torch.allclose(core.camera_length, torch.full_like(core.camera_length, CLEN))
     # absent from probixi's schema -> constant, which the scale encoder ignores
     assert torch.count_nonzero(core.det_shift_x) == 0
@@ -288,9 +324,9 @@ def test_no_columns_share_storage(db_path):
             ptr = tensor.data_ptr()
             if tensor.numel() == 0:
                 continue
-            assert ptr not in seen, (
-                f"{level_name}/{col} shares storage with {seen[ptr]}"
-            )
+            assert (
+                ptr not in seen
+            ), f"{level_name}/{col} shares storage with {seen[ptr]}"
             seen[ptr] = f"{level_name}/{col}"
 
 
@@ -307,8 +343,17 @@ def test_sfx_round_trip(db_path, tmp_path):
     a, b = stream._core, back._core
     for col in ("hkl", "crystal_id", "panel_id", "image_id"):
         assert torch.equal(getattr(b, col), getattr(a, col)), col
-    for col in ("I", "sigma", "astar", "bstar", "cstar", "cell",
-                "profile_rad", "resolution", "beam_energy"):
+    for col in (
+        "I",
+        "sigma",
+        "astar",
+        "bstar",
+        "cstar",
+        "cell",
+        "profile_rad",
+        "resolution",
+        "beam_energy",
+    ):
         assert torch.allclose(getattr(b, col), getattr(a, col)), col
     # .sfx absolutizes image filenames, so compare basenames — and rely on
     # frame_id, not the filename, as the durable key back to probixi.
@@ -329,11 +374,14 @@ def test_frame_id_is_carried_verbatim(db_path):
     assert len(set(got)) == len(got), "frame_id must be unique per crystal"
 
 
-def test_feeds_the_merging_stack(db_path):
+@pytest.mark.parametrize("source", ["db_path", "v2_path"])
+def test_feeds_the_merging_stack(source, request):
     """The point of the loader: merging accepts it without a stream file."""
     from torchsx.merging import MergeConfig, prepare_observations
 
-    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2")
+    stream = SFXStream.from_duckdb(
+        request.getfixturevalue(source), spacegroup="P 43 21 2"
+    )
     prepared = prepare_observations(stream, MergeConfig())
     assert prepared is not None
 
@@ -388,7 +436,9 @@ def test_from_duckdb_wraps_and_symmetrizes(db_path):
     assert stream.n_crystals == 2
     assert stream._core.friedel_merged is True
 
-    unmerged = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", merge_friedel=False)
+    unmerged = SFXStream.from_duckdb(
+        db_path, spacegroup="P 43 21 2", merge_friedel=False
+    )
     assert unmerged._core.friedel_merged is False
 
 
@@ -396,9 +446,7 @@ def test_no_indexed_frames_raises(tmp_path):
     path = tmp_path / "empty.duckdb"
     conn = duckdb.connect(str(path))
     conn.execute(_SCHEMA)
-    conn.execute(
-        "INSERT INTO geometry VALUES (0,0,0.1,7.5e-5,1.0,10000.0,1.0,0,'')"
-    )
+    conn.execute("INSERT INTO geometry VALUES (0,0,0.1,7.5e-5,1.0,10000.0,1.0,0,'')")
     conn.close()
     with pytest.raises(ValueError, match="no indexed frames"):
         load_duckdb(path)
@@ -430,6 +478,118 @@ def test_schema_matches_probixi():
     def norm(s: str) -> str:
         return re.sub(r"\s+", " ", s).strip()
 
-    assert norm(m.group(1)) == norm(_SCHEMA), (
-        "probixi's DuckDB schema changed; update _SCHEMA and the _duckdb.py mapping"
+    assert norm(m.group(1)) == norm(
+        _SCHEMA
+    ), "probixi's DuckDB schema changed; update _SCHEMA and the _duckdb.py mapping"
+
+
+@pytest.fixture
+def v2_path(db_path):
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("CREATE TABLE schema_version AS SELECT 2 AS version")
+        conn.execute("""
+            CREATE TABLE crystals AS
+            SELECT frame_id || ':0' AS crystal_id, 0 AS lattice_index, *
+            FROM frames WHERE indexed;
+            ALTER TABLE reflections ADD COLUMN crystal_id VARCHAR;
+            UPDATE reflections SET crystal_id = frame_id || ':0';
+            INSERT INTO crystals
+            SELECT * REPLACE (frame_id || ':1' AS crystal_id, 1 AS lattice_index,
+                              7 AS n_peaks, 2.0 AS astar_x)
+            FROM crystals WHERE filename = 'run_a.h5';
+            INSERT INTO reflections
+            SELECT * REPLACE (frame_id || ':1' AS crystal_id, -12.0 AS intensity)
+            FROM reflections WHERE crystal_id IN (
+                SELECT frame_id || ':0' FROM crystals WHERE lattice_index = 1
+            );
+            CREATE TABLE images AS
+            SELECT frame_id, frame_index, filename, event, indexed, serial,
+                   n_peaks, scale, scale_sigma, num_reflections FROM frames;
+            DROP TABLE frames;
+            ALTER TABLE images RENAME TO frames;
+        """)
+    return db_path
+
+
+def test_v2_levels_and_values(v2_path):
+    core = load_duckdb(v2_path)
+    assert (core.n_images, core.n_crystals, core.n_observations) == (2, 3, 7)
+    assert core.image_id.tolist() == [0, 0, 1]
+    assert core.crystal_in_image.tolist() == [0, 1, 0]
+    assert core.crystal_id.tolist() == [0, 0, 1, 1, 2, 2, 2]
+    assert core.n_refl.tolist() == [2, 2, 3]
+    assert core.n_peaks.tolist() == [90, 140]  # From frames, not peeled crystals.
+    assert core.astar[:, 0].tolist() == pytest.approx([0.05, 0.2, 0.15])
+    assert core.I.tolist() == [100, 101, -12, -12, 100, 101, 102]
+    assert core.sigma.tolist() == [10, 11, 10, 11, 10, 11, 12]
+    assert core.metadata["image"]["frame_index"] == [1, 0]
+    ids = core.metadata["crystal"]["crystal_id"]
+    assert len(set(ids)) == 3
+    assert ids[0].rsplit(":", 1)[0] == ids[1].rsplit(":", 1)[0]
+
+
+def test_v2_filter_concat_and_save(v2_path, tmp_path):
+    from torchsx.merging.hkl.filter import filter_crystals
+
+    core = load_duckdb(v2_path)
+    selected = SFXStream(filter_crystals(core, torch.tensor([False, True, True])))
+    assert selected.image_id.tolist() == [0, 1]
+    assert selected._core.crystal_in_image.tolist() == [1, 0]
+    assert (
+        selected._core.metadata["crystal"]["crystal_id"]
+        == core.metadata["crystal"]["crystal_id"][1:]
     )
+    combined = SFXStream.concat([SFXStream(core), selected])
+    assert combined.image_id.tolist() == [0, 0, 1, 2, 3]
+    assert combined.crystal_id.tolist() == [0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4]
+    out = tmp_path / "v2.sfx"
+    combined.save(out)
+    back = SFXStream.load(out, merge_friedel=False)
+    assert torch.equal(back.image_id, combined.image_id)
+    assert torch.equal(back.crystal_id, combined.crystal_id)
+    for level in ("image", "crystal"):
+        assert (
+            back._core.metadata[level]["frame_id"]
+            == combined._core.metadata[level]["frame_id"]
+        )
+    assert (
+        back._core.metadata["crystal"]["crystal_id"]
+        == combined._core.metadata["crystal"]["crystal_id"]
+    )
+
+
+@pytest.mark.parametrize("version", [[], [3], [2, 2]])
+def test_unsupported_schema(db_path, version):
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("CREATE TABLE schema_version (version INTEGER)")
+        for v in version:
+            conn.execute("INSERT INTO schema_version VALUES (?)", [v])
+    with pytest.raises(ValueError, match="unsupported Probixi schema version"):
+        load_duckdb(db_path)
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_geometry_text_and_legacy_path(db_path, tmp_path, embedded, sample_geometry):
+    text = """photon_energy = 11330
+clen = 0.0938
+res = 13333.3333
+p0/min_fs = 0
+p0/max_fs = 1023
+p0/min_ss = 0
+p0/max_ss = 511
+p0/fs = +1x
+p0/ss = +1y
+p0/corner_x = -512
+p0/corner_y = -256
+"""
+    geom = tmp_path / "detector.geom"
+    geom.write_text(text)
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute(
+            "UPDATE geometry SET geometry_file = ?", [text if embedded else str(geom)]
+        )
+    core = load_duckdb(db_path)
+    assert core.geometry.panels[0].corner_x == -512
+    assert core.geometry.photon_energy_eV == 11330
+    assert load_duckdb(db_path, load_geom_file=False).geometry is None
+    assert load_duckdb(db_path, geometry=sample_geometry).geometry is sample_geometry

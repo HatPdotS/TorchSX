@@ -1,18 +1,12 @@
 """Load a probixi DuckDB run into an :class:`~torchsx._core._SFXStreamCore`.
 
-probixi (``probixi.io.db``) writes one relational database per run: run-level
-``geometry``/``panels``/``cell``, one ``frames`` row per file-event, and the
-integrated ``reflections`` keyed by ``frame_id``. This is the ingest boundary —
-the database is the archive, the stacked-tensor core is the working form.
+Probixi v1 stores one crystal per indexed ``frames`` row. Version 2 separates
+``frames`` and ``crystals`` and keys reflections by ``crystal_id``. Both map to
+the existing observation → crystal → image tensor levels.
 
-Two things make the conversion more than a column rename:
-
-**Keys.** ``frame_id`` is a stable content hash (sha1 of ``filename//event``);
-``crystal_id`` is a *dense row position* into the crystal level, rewritten on
-every filter (see ``_core._SFXStreamCore.filter``). The dense index is assigned
-here, ordered by ``(filename, event)`` — never by ``frame_id`` and never by the
-database's natural order, so that a reload of the same database yields the same
-positions and any split label or checkpoint keyed on them stays valid.
+Database IDs are preserved as metadata. Dense tensor indices are assigned in
+``(filename, event, lattice_index)`` order, independently of insertion order.
+Unindexed images are omitted, as in the legacy reader.
 
 **Units.** The database is mixed, and one column lies by omission:
 
@@ -28,13 +22,8 @@ DuckDB column                unit                torchsx column/unit
 ``astar_x/y/z`` carry no unit suffix but ``probixi.io.db._frame_row`` multiplies
 by ``A_INV_TO_NM_INV``, so they are nm⁻¹ like the rest.
 
-Because probixi keys ``frames`` on one row per file-event, a run holds at most
-one crystal per image; the image level is therefore 1:1 with the crystal level
-and ``crystal_in_image`` is all zeros. ``beam_energy`` and ``camera_length``
-come from the run-level ``geometry`` table (constant across images), and
-``det_shift_x/y`` are absent from the schema and emitted as zeros — see
-``CRYSTAL_FEAT_COLUMNS`` in ``torchsx.merging.observations``, which treats a
-constant feature column as uninformative rather than failing.
+Beam energy and camera length come from run-level geometry. Detector shifts
+are unavailable and are emitted as zero-valued image columns.
 """
 
 from __future__ import annotations
@@ -56,13 +45,23 @@ _NO_RESOLUTION = 999.0
 
 # Per-crystal columns, in the order the reciprocal/cell tensors are built.
 _RECIP_COLS = (
-    "astar_x", "astar_y", "astar_z",
-    "bstar_x", "bstar_y", "bstar_z",
-    "cstar_x", "cstar_y", "cstar_z",
+    "astar_x",
+    "astar_y",
+    "astar_z",
+    "bstar_x",
+    "bstar_y",
+    "bstar_z",
+    "cstar_x",
+    "cstar_y",
+    "cstar_z",
 )
 _CELL_COLS = (
-    "cell_a_A", "cell_b_A", "cell_c_A",
-    "cell_alpha_deg", "cell_beta_deg", "cell_gamma_deg",
+    "cell_a_A",
+    "cell_b_A",
+    "cell_c_A",
+    "cell_alpha_deg",
+    "cell_beta_deg",
+    "cell_gamma_deg",
 )
 
 
@@ -83,8 +82,8 @@ def load_duckdb(
 ) -> _SFXStreamCore:
     """Build a stream core from a probixi DuckDB run.
 
-    Only frames with ``indexed = TRUE`` become crystals; probixi records
-    unindexed file-events as rows with null statistics and no reflections.
+    Read legacy and version-2 databases, omitting unindexed images. Multiple
+    crystals from one image retain a shared image index.
 
     Parameters
     ----------
@@ -94,11 +93,9 @@ def load_duckdb(
         recovered from the database — pass it explicitly or accept ``P 1``.
     geometry : an already-built :class:`~torchsx.geometry.Geometry`. Takes
         precedence over ``load_geom_file``.
-    load_geom_file : when no ``geometry`` is given, try to load the
-        ``geometry.geometry_file`` path recorded in the database. The
-        ``geometry`` table alone cannot reconstruct one (it has no per-panel
-        corner or axis vectors), so this is the only route to real geometry;
-        it is skipped without error when the path no longer exists.
+    load_geom_file : when no ``geometry`` is given, parse the geometry text
+        embedded in ``geometry.geometry_file``. Legacy filename entries are
+        also supported; missing files leave the geometry unset.
 
     Returns
     -------
@@ -117,38 +114,43 @@ def load_duckdb(
         geom_row = _scalar_row(conn, "geometry")
         panel_names = [r[0] for r in conn.execute("SELECT name FROM panels").fetchall()]
 
-        # Dense crystal_id, ordered by (filename, event): stable across reloads.
-        # DuckDB assigns it and drives the reflection join, so neither the id
-        # map nor the sort ever reaches Python.
-        conn.execute(
-            """
-            CREATE TEMP VIEW _ordered AS
-            SELECT frame_id,
-                   row_number() OVER (ORDER BY filename, event) - 1 AS cid
-            FROM frames
-            WHERE indexed
-            """
+        tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
+        versions = (
+            conn.execute("SELECT version FROM schema_version").fetchall()
+            if "schema_version" in tables
+            else [(1,)]
         )
-        crys = conn.execute(
-            f"""
-            SELECT o.cid, f.frame_id, f.filename, f.event,
-                   {', '.join('f.' + c for c in _RECIP_COLS)},
-                   {', '.join('f.' + c for c in _CELL_COLS)},
-                   f.profile_radius_nm_inv, f.diffraction_limit_nm_inv,
-                   f.num_reflections, f.n_peaks
-            FROM frames f JOIN _ordered o USING (frame_id)
-            ORDER BY o.cid
-            """
-        ).fetchnumpy()
-
-        refl = conn.execute(
-            """
+        if versions not in ([(1,)], [(2,)]):
+            raise ValueError(f"{path}: unsupported Probixi schema version {versions}")
+        v2 = versions == [(2,)]
+        source = "crystals" if v2 else "frames"
+        key = "crystal_id" if v2 else "frame_id"
+        lattice = "c.lattice_index" if v2 else "0"
+        conn.execute(f"""
+            CREATE TEMP VIEW _images AS
+            SELECT f.*, row_number() OVER (ORDER BY filename, event) - 1 AS iid
+            FROM frames f WHERE f.indexed AND EXISTS (
+                SELECT 1 FROM {source} c WHERE c.frame_id = f.frame_id AND c.indexed
+            )
+        """)
+        images = conn.execute("SELECT * FROM _images ORDER BY iid").fetchnumpy()
+        conn.execute(f"""
+            CREATE TEMP VIEW _ordered AS
+            SELECT c.*, i.iid, {lattice} AS lattice,
+                   row_number() OVER (
+                       ORDER BY i.iid, {lattice}, c.{key}
+                   ) - 1 AS cid
+            FROM {source} c JOIN _images i USING (frame_id) WHERE c.indexed
+        """)
+        crys = conn.execute("SELECT * FROM _ordered ORDER BY cid").fetchnumpy()
+        refl = conn.execute(f"""
             SELECT r.h, r.k, r.l, r.intensity, r.sigma, r.peak, r.background,
                    r.fs, r.ss, r.panel, o.cid
-            FROM reflections r JOIN _ordered o USING (frame_id)
-            ORDER BY o.cid
-            """
-        ).fetchnumpy()
+            FROM reflections r JOIN _ordered o
+              ON r.{key} = o.{key} AND r.frame_id = o.frame_id
+            ORDER BY o.cid, r.h, r.k, r.l, r.panel, r.fs, r.ss,
+                     r.intensity, r.sigma, r.peak, r.background
+        """).fetchnumpy()
     finally:
         conn.close()
 
@@ -156,18 +158,17 @@ def load_duckdb(
     if n_crystals == 0:
         raise ValueError(f"{path}: no indexed frames (nothing to load)")
 
-    def _c(name: str, fill: float = 0.0) -> torch.Tensor:
-        """Crystal column → float32 tensor with nulls filled."""
-        col = crys[name]
-        if hasattr(col, "filled"):  # numpy masked array (nullable DOUBLE)
-            col = col.filled(fill)
-        return torch.as_tensor(col.astype("float64"), dtype=torch.float32)
-
-    def _o(name: str, dtype=torch.float32, fill: float = 0.0) -> torch.Tensor:
-        col = refl[name]
+    def _tensor(table, name, dtype=torch.float32, fill=0):
+        col = table[name]
         if hasattr(col, "filled"):
             col = col.filled(fill)
-        return torch.as_tensor(col.astype("float64"), dtype=dtype)
+        return torch.as_tensor(col, dtype=dtype)
+
+    def _c(name, dtype=torch.float32):
+        return _tensor(crys, name, dtype)
+
+    def _o(name, dtype=torch.float32):
+        return _tensor(refl, name, dtype)
 
     # --- crystal level ------------------------------------------------
     recip = torch.stack([_c(c) for c in _RECIP_COLS], dim=1) / _NM_INV_PER_A_INV
@@ -182,11 +183,11 @@ def load_duckdb(
         torch.full_like(limit_nm_inv, _NO_RESOLUTION),
     )
 
-    # One crystal per frame in probixi's schema, so image ≡ crystal, 1:1.
-    image_id = torch.arange(n_crystals, dtype=torch.int32)
+    image_id = _c("iid", torch.int32)
+    n_images = len(images["iid"])
 
     # --- observation level --------------------------------------------
-    hkl = torch.stack([_o("h"), _o("k"), _o("l")], dim=1).to(torch.int16)
+    hkl = torch.stack([_o(c, torch.int16) for c in ("h", "k", "l")], dim=1)
     panel_lookup = {name: i for i, name in enumerate(panel_names)}
     panel_col = refl["panel"]
     panel_id = torch.tensor(
@@ -195,8 +196,10 @@ def load_duckdb(
 
     metadata = StreamMetadata()
     metadata["image"] = {
-        "filename": [str(f) for f in crys["filename"]],
-        "event": [int(e) for e in crys["event"]],
+        "filename": [str(f) for f in images["filename"]],
+        "event": [int(e) for e in images["event"]],
+        "frame_id": [str(f) for f in images["frame_id"]],
+        "frame_index": [int(i) for i in images["frame_index"]],
     }
     # frame_id is kept verbatim rather than recomputed from (filename, event):
     # it is the key any write-back to probixi must use, and .sfx rewrites
@@ -207,10 +210,15 @@ def load_duckdb(
         "frame_id": [str(f) for f in crys["frame_id"]],
     }
 
+    if v2:
+        metadata["crystal"]["crystal_id"] = [str(c) for c in crys["crystal_id"]]
+
     if geometry is None and load_geom_file:
-        geom_path = geom_row.get("geometry_file")
-        if geom_path and Path(geom_path).exists():
-            geometry = Geometry.from_geom_file(geom_path)
+        geom = geom_row.get("geometry_file")
+        if geom and ("\n" in geom or "=" in geom):
+            geometry = Geometry._parse_geom_lines(geom.splitlines())
+        elif geom and Path(geom).is_file():
+            geometry = Geometry.from_geom_file(geom)
 
     photon_eV = float(geom_row.get("photon_energy_eV") or 0.0)
     clen = float(geom_row.get("clen") or 0.0)
@@ -231,17 +239,17 @@ def load_duckdb(
         cell=cell,
         profile_rad=profile_rad,
         resolution=resolution,
-        n_refl=_c("num_reflections").to(torch.int32),
+        n_refl=_c("num_reflections", torch.int32),
         image_id=image_id,
-        crystal_in_image=torch.zeros(n_crystals, dtype=torch.int32),
+        crystal_in_image=_c("lattice", torch.int32),
         # Run-level in probixi's schema: constant across images.
-        beam_energy=torch.full((n_crystals,), photon_eV, dtype=torch.float32),
+        beam_energy=torch.full((n_images,), photon_eV, dtype=torch.float32),
         # Not in the schema; a constant column reads as uninformative. Allocated
         # separately -- aliasing two columns onto one storage breaks .sfx saving.
-        det_shift_x=torch.zeros(n_crystals, dtype=torch.float32),
-        det_shift_y=torch.zeros(n_crystals, dtype=torch.float32),
-        n_peaks=_c("n_peaks").to(torch.int32),
-        camera_length=torch.full((n_crystals,), clen, dtype=torch.float32),
+        det_shift_x=torch.zeros(n_images, dtype=torch.float32),
+        det_shift_y=torch.zeros(n_images, dtype=torch.float32),
+        n_peaks=_tensor(images, "n_peaks", torch.int32),
+        camera_length=torch.full((n_images,), clen, dtype=torch.float32),
         geometry=geometry,
         metadata=metadata,
         spacegroup=spacegroup,

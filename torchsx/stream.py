@@ -156,7 +156,8 @@ class SFXStream:
         The database is the ingest boundary: probixi owns it, this reads it
         once into stacked tensors. See :mod:`torchsx.io._duckdb` for the
         column/unit mapping and why the crystal order is fixed to
-        ``(filename, event)``.
+        ``(filename, event, lattice_index)``. Legacy and version-2 databases
+        are supported; multiple crystals retain their shared image identity.
 
         Parameters
         ----------
@@ -166,7 +167,7 @@ class SFXStream:
             from the database.
         merge_friedel : if True, canonicalize HKL to merge Friedel mates.
         geometry : optional :class:`~torchsx.geometry.Geometry`; by default the
-            ``geometry_file`` recorded in the database is loaded if still present.
+            embedded geometry text is parsed, with support for legacy file paths.
         """
         import warnings
         from torchsx.io._duckdb import load_duckdb
