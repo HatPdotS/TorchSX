@@ -357,14 +357,27 @@ class AmortizedScale(ScaleModel):
         ``K -> cK, I0 -> I0/c`` (scalar) and ``K(h) -> K(h) g(h), I0 -> I0/g(h)``
         (any function of reciprocal space the encoder can express through its
         resolution inputs) both leave the likelihood exactly invariant.  The
-        scalar modes subtract a location statistic; ``basis`` subtracts the
-        observation-weighted least-squares projection of ``log K`` onto
-        ``gauge_phi[hkl_idx]``, whose first column is the constant, so it
-        contains the scalar pin and removes the smooth common mode with it.
-        The projection is linear and stays in the graph: the gradient of the
-        removed component is then exactly zero, so the network cannot drift
-        along it.  Per-crystal differences (scale, B) are untouched -- only the
-        mean over the batch of each basis component goes.
+        scalar modes subtract a location statistic.
+
+        ``basis`` fits the two-way additive model
+
+            log K_kh  ~  c_k  +  phi(h) @ beta
+
+        (a constant per crystal plus a smooth function of the reflection) by a
+        few alternating least-squares sweeps and subtracts only the smooth
+        part, then pins the scalar gauge with the median as before.  Fitting
+        ``phi @ beta`` to ``log K`` directly would be wrong: the observations
+        of a given direction or resolution are not an orientation-neutral
+        sample of crystals -- reflections near c* of a plate crystal are seen
+        only edge-on, by the thick, strong crystals; high-resolution
+        reflections come from the well-diffracting ones -- so the mean of a
+        legitimate per-crystal scale over the observations of ``h`` is itself
+        a smooth function of ``h``.  Removing it would push crystal scale into
+        the merged intensities (measured on BR: the c*/ab intensity ratio went
+        from 0.49 to 0.79).  The crystal term absorbs exactly that, and what
+        is left in ``span(phi)`` is the common mode no crystal owns.  The
+        projection is linear and stays in the graph, so the network receives no
+        gradient along the removed direction.
         """
         if not self.anchor_log_k:
             return pred
@@ -373,13 +386,8 @@ class AmortizedScale(ScaleModel):
                 raise RuntimeError(
                     "anchor_stat='basis' needs set_gauge_basis() before predicting"
                 )
-            phi = self.gauge_phi.index_select(0, meta.hkl_idx).to(pred.log_K.dtype)
-            gram = phi.T @ phi
-            gram = gram + 1e-6 * gram.diagonal().mean() * torch.eye(
-                gram.shape[0], device=gram.device, dtype=gram.dtype
-            )
-            beta = torch.linalg.solve(gram, phi.T @ pred.log_K)
-            log_K = pred.log_K - phi @ beta
+            log_K = pred.log_K - self._smooth_common_mode(pred.log_K, meta)
+            log_K = log_K - log_K.median()
         else:
             loc = pred.log_K.median() if self.anchor_stat == "median" else pred.log_K.mean()
             log_K = pred.log_K - loc
@@ -388,6 +396,36 @@ class AmortizedScale(ScaleModel):
             log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
             log_alpha_hi=pred.log_alpha_hi,
         )
+
+    def _smooth_common_mode(self, log_K: Tensor, meta: ObsInfo, sweeps: int = 3) -> Tensor:
+        """``phi(h) @ beta`` from the two-way fit ``log K ~ c_crystal + phi(h) @ beta``.
+
+        Alternating least squares: crystal means of the current residual, then
+        the basis fit of ``log K - c``.  Three sweeps are enough because the
+        crystal effects and the smooth term are nearly orthogonal once the
+        crystals sample reciprocal space broadly; the fit is exact for a pure
+        per-crystal scale (``beta = 0``) and for a pure common mode observed by
+        every crystal alike.
+        """
+        phi = self.gauge_phi.index_select(0, meta.hkl_idx).to(log_K.dtype)
+        cid = meta.crystal_id.long()
+        n_cry = int(meta.n_crystals) if getattr(meta, "n_crystals", None) else int(cid.max()) + 1
+        counts = torch.zeros(n_cry, device=log_K.device, dtype=log_K.dtype).index_add_(
+            0, cid, torch.ones_like(log_K)
+        ).clamp(min=1.0)
+        gram = phi.T @ phi
+        gram = gram + 1e-6 * gram.diagonal().mean() * torch.eye(
+            gram.shape[0], device=gram.device, dtype=gram.dtype
+        )
+        smooth = torch.zeros_like(log_K)
+        for _ in range(sweeps):
+            resid = log_K - smooth
+            c = torch.zeros(n_cry, device=log_K.device, dtype=log_K.dtype).index_add_(
+                0, cid, resid
+            ) / counts
+            beta = torch.linalg.solve(gram, phi.T @ (log_K - c.index_select(0, cid)))
+            smooth = phi @ beta
+        return smooth
 
     def prime(self, meta: ObsInfo) -> ScalePrediction:
         """Predict, install into the scatter, and cache for :meth:`log_k`.

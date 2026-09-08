@@ -755,9 +755,64 @@ def test_basis_anchor_removes_a_planted_common_mode_exactly():
         log_K=pred.log_K + phi_b @ c, log_w=pred.log_w, beta=pred.beta,
         log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
     )
-    torch.testing.assert_close(scale._anchor(planted, meta).log_K, pred.log_K, rtol=0, atol=1e-5)
-    # The pin includes the scalar gauge: the batch mean of the anchored log K is zero.
-    assert abs(float(pred.log_K.mean())) < 1e-5
+    # The toy crystals each see a few reflections only, so the two-way fit separates
+    # crystal effects from the smooth term approximately; on a full-coverage batch
+    # (next test) it is exact.
+    torch.testing.assert_close(scale._anchor(planted, meta).log_K, pred.log_K, rtol=0, atol=0.05)
+    # The pin includes the scalar gauge: the batch median of the anchored log K is zero.
+    assert abs(float(pred.log_K.median())) < 1e-5
+
+
+def _full_coverage_meta(prep, n_cry=6):
+    """Every crystal observes every reflection once (crystal-grouped rows)."""
+    from torchsx.merging.observations import ObsInfo
+    n_hkl = prep.n_valid
+    hkl_idx = torch.arange(n_hkl).repeat(n_cry)
+    cid = torch.arange(n_cry).repeat_interleave(n_hkl)
+    base = prep.obs_info
+    d = prep.d_spacing[hkl_idx]
+    return ObsInfo(
+        crystal_id=cid, s_sq=1 / (4 * d ** 2), hkl_idx=hkl_idx, n_crystals=n_cry,
+        panel_id=torch.zeros_like(cid), fs=torch.rand(len(cid)) * 100, ss=torch.rand(len(cid)) * 100,
+        peak=torch.full((len(cid),), 10.0), background=torch.full((len(cid),), 4.0),
+        ewald_offset=torch.zeros(len(cid)), sigma=torch.full((len(cid),), 3.0),
+        obs_id=torch.arange(len(cid)),
+    )
+
+
+def test_basis_anchor_is_exact_on_full_coverage_and_keeps_crystal_scales():
+    prep = _toy_prep()
+    scale, basis = _basis_scale(prep)
+    meta = _full_coverage_meta(prep)
+    from torchsx.nn.heads import ScalePrediction
+    torch.manual_seed(11)
+    raw = torch.randn(meta.hkl_idx.numel()) * 0.3
+    zeros = torch.zeros_like(raw)
+    def pred_of(x):
+        return ScalePrediction(log_K=x, log_w=zeros, beta=zeros + 1, log_alpha=zeros, log_e_s=zeros, log_alpha_hi=zeros)
+    ref = scale._anchor(pred_of(raw), meta).log_K
+    # (a) a planted common mode phi @ c is removed exactly
+    c = torch.tensor([0.7, -2.0, 1.3])
+    planted = raw + basis.phi[meta.hkl_idx] @ c
+    torch.testing.assert_close(scale._anchor(pred_of(planted), meta).log_K, ref, rtol=0, atol=1e-5)
+    # (b) per-crystal scales survive, even when correlated with what a crystal observes:
+    # crystals 0-2 see only the low-resolution half, 3-5 only the high-resolution half,
+    # and the strong crystals are the high-resolution ones -- the observation mean of
+    # log K is then a smooth function of resolution that is NOT a gauge mode.
+    order = prep.d_spacing.argsort(descending=True)
+    low = torch.zeros(prep.n_valid, dtype=torch.bool); low[order[: prep.n_valid // 2]] = True
+    keep = torch.where(meta.crystal_id < 3, low[meta.hkl_idx], ~low[meta.hkl_idx])
+    sub = meta.gather(keep.nonzero().squeeze(-1))
+    offsets = torch.tensor([0.0, 0.1, -0.1, 1.5, 1.6, 1.4])[sub.crystal_id]
+    x0 = raw[keep]
+    a0 = scale._anchor(pred_of(x0), sub).log_K
+    a1 = scale._anchor(pred_of(x0 + offsets), sub).log_K
+    delta = a1 - a0
+    # every observation of a crystal moved by that crystal's offset (up to the common median)
+    per_cry = torch.zeros(6).index_add_(0, sub.crystal_id, delta) / torch.bincount(sub.crystal_id, minlength=6).clamp(min=1)
+    torch.testing.assert_close(delta, per_cry[sub.crystal_id], rtol=0, atol=1e-4)
+    spread = per_cry - per_cry.mean()
+    torch.testing.assert_close(spread, torch.tensor([0.0, 0.1, -0.1, 1.5, 1.6, 1.4]) - 0.75, rtol=0, atol=1e-4)
 
 
 def test_basis_anchor_keeps_per_crystal_differences():
@@ -802,13 +857,15 @@ def test_basis_anchor_gradient_ignores_the_common_mode():
     gradient with respect to a common-mode shift of the raw predictions."""
     prep = _toy_prep()
     scale, basis = _basis_scale(prep)
-    meta = prep.obs_info
+    meta = _full_coverage_meta(prep)        # exact separation of crystal and smooth terms
     c = torch.zeros(basis.p, requires_grad=True)
-    pred = scale.predict(meta)
     from torchsx.nn.heads import ScalePrediction
+    torch.manual_seed(13)
+    raw = torch.randn(meta.hkl_idx.numel()) * 0.3
+    zeros = torch.zeros_like(raw)
     planted = ScalePrediction(
-        log_K=pred.log_K.detach() + basis.phi[meta.hkl_idx] @ c, log_w=pred.log_w, beta=pred.beta,
-        log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
+        log_K=raw + basis.phi[meta.hkl_idx] @ c, log_w=zeros, beta=zeros + 1,
+        log_alpha=zeros, log_e_s=zeros, log_alpha_hi=zeros,
     )
     loss = (scale._anchor(planted, meta).log_K ** 2).sum()
     loss.backward()
