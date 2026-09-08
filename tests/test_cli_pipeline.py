@@ -190,6 +190,29 @@ def test_merge_estimators(tmp_path):
     ref = torch.zeros(prep.n_valid).index_add_(0, prep.obs_info.hkl_idx,
                                                prep.I_obs) / prep.obs_counts
     assert torch.allclose(pooled["I"], ref, rtol=1e-4, atol=1e-4)
+    # The pooled sigma must cover the crystal-to-crystal scatter, not just the
+    # counting variance: with K == 1 the empirical term is the plain standard
+    # error of the mean, sqrt(sum (I_i - I)^2 / (n (n - 1))), and the reported
+    # sigma is at least that (and at least the counting floor).
+    dev = (prep.I_obs - ref[prep.obs_info.hkl_idx]) ** 2
+    ss = torch.zeros(prep.n_valid).index_add_(0, prep.obs_info.hkl_idx, dev)
+    n = prep.obs_counts.double()
+    se = (ss.double() / (n * (n - 1).clamp(min=1))).sqrt().float()
+    assert (pooled["I_sd"] >= se * (1 - 1e-4)).all()
+    assert (pooled["I_sd"] > 0).all()
+    # ``mean`` uses the equal-weight standard error of the same ratios, so with
+    # K == 1 the two sigmas agree wherever the empirical term dominates.
+    both = pooled["I_sd"] > 1.01 * se
+    # ``wls``: inverse-variance mean with the model's per-observation variance.
+    # Same reflections, finite, positive sigma at least the model variance,
+    # and every estimate inside the range of its own observations.
+    wls = tr.merge(estimator="wls")
+    assert torch.equal(wls["n_meas"], pooled["n_meas"]) and torch.isfinite(wls["I"]).all()
+    assert (wls["I_sd"] > 0).all()
+    lo = torch.full((prep.n_valid,), float("inf")).scatter_reduce(0, prep.obs_info.hkl_idx, prep.I_obs, "amin")
+    hi = torch.full((prep.n_valid,), -float("inf")).scatter_reduce(0, prep.obs_info.hkl_idx, prep.I_obs, "amax")
+    assert ((wls["I"] >= lo - 1e-4) & (wls["I"] <= hi + 1e-4)).all()
+    assert torch.allclose(pooled["I_sd"][~both], mean["I_sd"][~both] * (n[~both] / (n[~both] - 1)).sqrt().float(), rtol=1e-3, atol=1e-5)
 
 
 def test_merge_refuses_to_pool_splits_and_honours_one(tmp_path):

@@ -1104,7 +1104,15 @@ class AmortizedTrainer:
                        sigma from the flat posterior in both cases.
         ``pooled``     ``sum(n - bg) / sum(K)``, count-weighted, shape-free.
         ``mean``       equal-weight mean of ``(n - bg) / K``, partialator's
-                       weighting.  ``pooled``/``mean`` return intensities
+                       weighting.
+        ``wls``        inverse-variance mean of ``(n - bg) / K`` with the
+                       variance the trained scale model predicts for each
+                       observation -- counting variance plus the multiplicative
+                       scatter ``(K I0)^2 expm1(w^2)`` from the width head --
+                       i.e. the same weights ``_merge_set`` uses for the
+                       split-half metrics.  Unbiased for the mean like
+                       ``pooled`` but uses the learned scale uncertainty.
+                       ``pooled``/``mean``/``wls`` return intensities
                        (``I``, ``I_sd``, ``n_meas``) rather than F: they are
                        moment estimators and belong on the same French-Wilson
                        path partialator's own output takes.
@@ -1112,7 +1120,7 @@ class AmortizedTrainer:
         Returns a dict with ``F``/``F_sd`` (or ``I``/``I_sd``/``n_meas``),
         ``I0``, ``seen`` and the grid diagnostics ``edge_mass``, ``loc_sd``.
         """
-        if estimator not in ("posterior", "flat", "ml", "pooled", "mean"):
+        if estimator not in ("posterior", "flat", "ml", "pooled", "mean", "wls"):
             raise ValueError(f"unknown estimator {estimator!r}")
         if condition is not None:
             if not (0 <= condition < self.n_conditions):
@@ -1141,14 +1149,16 @@ class AmortizedTrainer:
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         )
 
-        if estimator in ("pooled", "mean"):
+        if estimator in ("pooled", "mean", "wls"):
             # Moment estimators on the trained K: no scatter shape, no prior,
             # no mean/median correction -- a weighted mean of (n - bg)/K
             # estimates E[I p] whatever the partiality distribution is.
             I0_ref = tgt.ema_I0.to(dev)
+            floor = float(getattr(tgt, "floor", 1e-6) or 1e-6)
             bvf = float(getattr(self.objective.likelihood, "bg_var_factor", 0.0) or 0.0)
             S = {k: torch.zeros(n_hkl, device=dev, dtype=torch.float64)
-                 for k in ("cnt", "r", "r2", "sig", "K", "var")}
+                 for k in ("cnt", "r", "r2", "sig", "K", "var", "sig2", "sigK", "K2",
+                           "num", "den", "A", "B", "C")}
             for _, rows in batches():
                 meta, n_ph, bg, _ = self._batch(rows.to(dev))
                 pred = self.scale.prime(meta)
@@ -1158,18 +1168,61 @@ class AmortizedTrainer:
                 ratio = sig / K
                 var = ((K * I0_ref[h].double()).clamp(min=0)
                        + bg.double() * (1.0 + bvf))
+                # per-observation variance of (n - bg) under the trained model:
+                # counting term plus the multiplicative log-scatter of width w.
+                # The counting term is the MODEL's (K I0_ref + bg), not the
+                # observation's own sigma: a weight that depends on the observed
+                # count biases the weighted mean low (low counts get high
+                # weights), by an amount that depends on multiplicity -- on the
+                # small molecule that cost 2 points of R_free and forged a
+                # light-vs-dark difference (map excess 2.3 from bias alone).
+                # Floors: I0_ref at the target's floor (ema_I0 of a weak
+                # reflection can be ~0 or negative) and the counting term at one
+                # count -- without them a zero-background observation gets a
+                # near-infinite weight and one such observation owns the mean.
+                w2 = (pred.log_w.exp().double() ** 2).clamp(max=20.0)
+                mu = K * I0_ref[h].double().clamp(min=floor)
+                V = ((mu + bg.double() * (1.0 + bvf)).clamp(min=1.0)
+                     + mu * mu * torch.expm1(w2))
+                g = K / V                     # weight on (n - bg) for the WLS mean
                 for k, v in (("cnt", torch.ones_like(sig)), ("r", ratio),
                              ("r2", ratio * ratio), ("sig", sig), ("K", K),
-                             ("var", var)):
+                             ("var", var), ("sig2", sig * sig),
+                             ("sigK", sig * K), ("K2", K * K),
+                             ("num", g * sig), ("den", g * K),
+                             ("A", g * g * sig * sig), ("B", g * g * sig * K),
+                             ("C", g * g * K * K)):
                     S[k].index_add_(0, h, v)
                 self.scale.clear()
             cnt = S["cnt"].clamp(min=1)
-            if estimator == "mean":
+            if estimator == "wls":
+                den = S["den"].clamp(min=1e-300)
+                I = S["num"] / den
+                # model variance 1 / sum(K^2 / V), and the sandwich variance of
+                # the same weighted mean; report the larger (see ``pooled``).
+                var_model = 1.0 / den
+                ss = (S["A"] - 2.0 * I * S["B"] + I * I * S["C"]).clamp(min=0)
+                bessel = cnt / (cnt - 1).clamp(min=1)
+                I_sd = torch.maximum(var_model, ss * bessel / (den * den)).sqrt()
+            elif estimator == "mean":
                 I = S["r"] / cnt
                 I_sd = ((S["r2"] / cnt - I * I).clamp(min=0) / cnt).sqrt()
             else:
-                I = S["sig"] / S["K"].clamp(min=1e-12)
-                I_sd = S["var"].sqrt() / S["K"].clamp(min=1e-12)
+                sumK = S["K"].clamp(min=1e-12)
+                I = S["sig"] / sumK
+                # Counting variance alone understates the error of a merge whose
+                # observations also scatter crystal-to-crystal (partiality,
+                # residual scale error): on the small molecule it claimed
+                # I/sigma ~ 1300 where the half-sets supported ~16.  Add the
+                # count-weighted empirical (sandwich) variance of the ratios,
+                # sum K^2 (r - I)^2 / (sum K)^2 with an n/(n-1) correction, and
+                # report the larger of the two -- the empirical term is noisy
+                # at low multiplicity, the counting term is a floor.
+                var_pois = S["var"] / (sumK * sumK)
+                ss = (S["sig2"] - 2.0 * I * S["sigK"] + I * I * S["K2"]).clamp(min=0)
+                bessel = cnt / (cnt - 1).clamp(min=1)
+                var_emp = ss * bessel / (sumK * sumK)
+                I_sd = torch.maximum(var_pois, var_emp).sqrt()
             return {
                 "estimator": estimator,
                 "I": I.float(), "I_sd": I_sd.float(),
