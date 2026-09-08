@@ -511,6 +511,31 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
                   f"({int((fr == 0).sum()):,} of {len(fr):,})", flush=True)
 
 
+def write_intensity_mtz(path: Path, hkl: np.ndarray, I, I_sd, *, cell, spacegroup: str,
+                        keep: np.ndarray, verbose: bool = True) -> None:
+    """Write merged intensities as ``I-obs`` / ``SIGI-obs`` (no free flags).
+
+    For the moment estimators, whose product is an intensity: French-Wilson
+    happens downstream, on the same path a CrystFEL ``.hkl`` takes.
+    """
+    import gemmi
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    I = np.asarray(I.detach().cpu().numpy() if hasattr(I, "detach") else I, dtype=np.float64)
+    I_sd = np.asarray(I_sd.detach().cpu().numpy() if hasattr(I_sd, "detach") else I_sd, dtype=np.float64)
+    keep = np.asarray(keep, dtype=bool) & np.isfinite(I) & np.isfinite(I_sd) & (I_sd > 0)
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.SpaceGroup(spacegroup)
+    mtz.set_cell_for_all(gemmi.UnitCell(*[float(c) for c in cell]))
+    mtz.add_dataset("merged")
+    mtz.add_column("I-obs", "J")
+    mtz.add_column("SIGI-obs", "Q")
+    mtz.set_data(np.column_stack([hkl[keep], I[keep], I_sd[keep]]).astype(np.float32))
+    mtz.write_to_file(str(path))
+    if verbose:
+        print(f"wrote {path}\n  reflections {int(keep.sum()):,}  columns {mtz.column_labels()}", flush=True)
+
+
 def write_hkl(path: Path, hkl: np.ndarray, I, I_sd, n_meas, keep: np.ndarray,
               *, point_group: str = "-1", verbose: bool = True) -> None:
     """CrystFEL reflection list, for the identical French-Wilson path

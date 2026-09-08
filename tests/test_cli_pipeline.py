@@ -674,3 +674,72 @@ def test_defaults_are_smooth_prior_and_basis_anchor(tmp_path):
     _p, _q, scale, _o, S = P.build_stack(bundle, targs, verbose=False)
     assert S["wilson_basis"] == "smooth" and S["basis"] is not None and scale.anchor_stat == "basis"
     assert TrainConfig().wilson_basis == "smooth"
+
+
+# ── merge_nn products ──────────────────────────────────────────────────
+
+
+def test_merge_nn_writes_three_products_with_one_surface(tmp_path):
+    """Default run: scaled posterior, raw posterior and pooled per split and half, one
+    calibration surface fitted on all splits; --no-scale-calibration reproduces the raw
+    posterior as the only product."""
+    import json
+    import gemmi
+    import numpy as np
+    from torchsx.cli import merge_nn
+    from torchsx.cli.merge_nn import _build_parser
+    from torchsx.merging.calibrate import ChebyshevScaleSurface
+
+    prep, params, *_ = _synthetic(n_hkl=60, n_xtal=40, per=20, n_cond=2)
+    scale, _obj, tr = _stack(prep, params, tmp_path, n_cond=2)
+    scale.eval()
+    names, wanted = ["dark", "light"], [0, 1]
+    out = tmp_path / "a" / "m.mtz"
+    args = _build_parser().parse_args(
+        ["ck.pt", "x.sfx", "-o", str(out), "--device", "cpu", "--all-splits", "--calib-degree", "2,2"])
+    summary = merge_nn.merge_products(tr, prep, args, names, wanted, spacegroup="P 1", verbose=False)
+    assert set(summary) == set(names)
+
+    d = prep.d_spacing.numpy()
+    for k, lab in enumerate(names):
+        side = json.loads((out.parent / f"m_{lab}.calibration.json").read_text())
+        assert side["fitted_on"] == names and side["calibration"]["nx"] == 2
+        assert len(side["calibration"]["beta"]) == 9 and side["shell_check"]
+        surf = ChebyshevScaleSurface.from_dict(side["calibration"])
+        for half in ("", "_half1", "_half2"):
+            scaled = gemmi.read_mtz_file(str(out.parent / f"m_{lab}{half}.mtz"))
+            raw = gemmi.read_mtz_file(str(out.parent / f"m_{lab}{half}_posterior.mtz"))
+            pooled = gemmi.read_mtz_file(str(out.parent / f"m_{lab}{half}_pooled.mtz"))
+            assert "F-obs" in scaled.column_labels() and "F-obs" in raw.column_labels()
+            assert [c.type for c in pooled.columns if c.label in ("I-obs", "SIGI-obs")] == ["J", "Q"]
+            assert not any(c.type == "F" for c in pooled.columns)
+            a, b = np.array(scaled, copy=False), np.array(raw, copy=False)
+            assert a.shape == b.shape and np.array_equal(a[:, :3], b[:, :3])
+            ca, cb = {l: i for i, l in enumerate(scaled.column_labels())}, {l: i for i, l in enumerate(raw.column_labels())}
+            ratio = (a[:, ca["F-obs"]] / b[:, cb["F-obs"]]) ** 2
+            assert (ratio >= surf.f_min - 1e-4).all() and (ratio <= surf.f_max + 1e-4).all()
+            # the sigma carries the same factor
+            np.testing.assert_allclose(a[:, ca["SIGF-obs"]] / b[:, cb["SIGF-obs"]], np.sqrt(ratio), rtol=1e-4)
+        # the factor is the surface evaluated at the raw posterior of THIS split
+        res = tr.merge(condition=k, estimator="posterior")
+        seen = res["seen"].numpy()
+        f = surf.factor(d[seen], res["I0"].numpy()[seen])
+        full = gemmi.read_mtz_file(str(out.parent / f"m_{lab}.mtz")); fr = gemmi.read_mtz_file(str(out.parent / f"m_{lab}_posterior.mtz"))
+        a, b = np.array(full, copy=False), np.array(fr, copy=False)
+        ca = {l: i for i, l in enumerate(full.column_labels())}
+        key = {tuple(int(v) for v in row[:3]): i for i, row in enumerate(a)}
+        pairs = [(key[t], j) for j, h in enumerate(prep.hkl_valid.numpy()[seen]) for t in [tuple(int(v) for v in h)] if t in key]
+        rows, js = zip(*pairs)
+        got = (a[list(rows), ca["F-obs"]] / b[list(rows), ca["F-obs"]]) ** 2
+        np.testing.assert_allclose(got, f[list(js)], rtol=2e-3)
+
+    # the opt-out reproduces the raw posterior as the only product, bit-exactly
+    out2 = tmp_path / "b" / "m.mtz"
+    args2 = _build_parser().parse_args(
+        ["ck.pt", "x.sfx", "-o", str(out2), "--device", "cpu", "--all-splits", "--no-scale-calibration"])
+    merge_nn.merge_products(tr, prep, args2, names, wanted, spacegroup="P 1", verbose=False)
+    for lab in names:
+        assert not (out2.parent / f"m_{lab}_pooled.mtz").exists() and not (out2.parent / f"m_{lab}.calibration.json").exists()
+        x = np.array(gemmi.read_mtz_file(str(out2.parent / f"m_{lab}.mtz")), copy=False)
+        y = np.array(gemmi.read_mtz_file(str(out.parent / f"m_{lab}_posterior.mtz")), copy=False)
+        np.testing.assert_array_equal(x, y)

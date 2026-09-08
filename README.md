@@ -69,8 +69,20 @@ python -m torchsx.cli.merge_global dark.stream --spacegroup "P 1" \
 
 Crystals can be divided into named **splits** (`--split dark=dark.stream
 --split light=1ps.stream`, or `--split-file labels.pt` for one stream): batches
-are then split-pure, each split keeps its own merge target, and one MTZ is
-written per split.  The network never sees the label.
+are then split-pure, each split keeps its own merge target, and one set of
+files is written per split.  The network never sees the label.
+
+`merge_nn` writes three products per split and per half-set: `<stem>.mtz`,
+the **scaled posterior** (F/SIGF) used for refinement and difference maps;
+`<stem>_posterior.mtz`, the raw posterior; and `<stem>_pooled.mtz`, the
+shape-free pooled intensities (I/SIGI, French-Wilson downstream).  The
+posterior is the most precise readout, but the shape likelihood locates a
+skewed observation distribution rather than estimating its mean, which is
+what refinement compares against; the scaled posterior maps it onto the pooled
+scale with one smooth Chebyshev surface in resolution and intensity, fitted on
+all merged splits jointly (`torchsx/merging/calibrate.py`, recorded in a
+`.calibration.json` sidecar).  `--no-scale-calibration` writes the raw
+posterior only.
 
 On the SwissFEL small molecule, same model and free set: R_free **0.118**
 (trained) / **0.123** (global fit, no weighting) / 0.147 (partialator).

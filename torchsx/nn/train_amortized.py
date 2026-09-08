@@ -1107,11 +1107,12 @@ class AmortizedTrainer:
                        weighting.
         ``wls``        inverse-variance mean of ``(n - bg) / K`` with the
                        variance the trained scale model predicts for each
-                       observation -- counting variance plus the multiplicative
-                       scatter ``(K I0)^2 expm1(w^2)`` from the width head --
-                       i.e. the same weights ``_merge_set`` uses for the
-                       split-half metrics.  Unbiased for the mean like
-                       ``pooled`` but uses the learned scale uncertainty.
+                       observation: counting variance plus the multiplicative
+                       scatter ``(K I0)^2 expm1(w^2)`` from the width head,
+                       the weights ``_merge_set`` uses for the split-half
+                       metrics.  The width is fitted by the shape likelihood,
+                       so this readout inherits that likelihood's location
+                       bias; it is kept as a diagnostic, not a product.
                        ``pooled``/``mean``/``wls`` return intensities
                        (``I``, ``I_sd``, ``n_meas``) rather than F: they are
                        moment estimators and belong on the same French-Wilson
@@ -1170,16 +1171,13 @@ class AmortizedTrainer:
                        + bg.double() * (1.0 + bvf))
                 # per-observation variance of (n - bg) under the trained model:
                 # counting term plus the multiplicative log-scatter of width w.
-                # The counting term is the MODEL's (K I0_ref + bg), not the
+                # The counting term is the model's (K I0_ref + bg), not the
                 # observation's own sigma: a weight that depends on the observed
-                # count biases the weighted mean low (low counts get high
-                # weights), by an amount that depends on multiplicity -- on the
-                # small molecule that cost 2 points of R_free and forged a
-                # light-vs-dark difference (map excess 2.3 from bias alone).
-                # Floors: I0_ref at the target's floor (ema_I0 of a weak
-                # reflection can be ~0 or negative) and the counting term at one
-                # count -- without them a zero-background observation gets a
-                # near-infinite weight and one such observation owns the mean.
+                # count biases the weighted mean low, by an amount that depends
+                # on multiplicity.  Floors: I0_ref at the target's floor (the
+                # EMA of a weak reflection can be zero or negative) and the
+                # counting term at one count, so no single zero-background
+                # observation can dominate a reflection.
                 w2 = (pred.log_w.exp().double() ** 2).clamp(max=20.0)
                 mu = K * I0_ref[h].double().clamp(min=floor)
                 V = ((mu + bg.double() * (1.0 + bvf)).clamp(min=1.0)
@@ -1212,12 +1210,11 @@ class AmortizedTrainer:
                 I = S["sig"] / sumK
                 # Counting variance alone understates the error of a merge whose
                 # observations also scatter crystal-to-crystal (partiality,
-                # residual scale error): on the small molecule it claimed
-                # I/sigma ~ 1300 where the half-sets supported ~16.  Add the
-                # count-weighted empirical (sandwich) variance of the ratios,
-                # sum K^2 (r - I)^2 / (sum K)^2 with an n/(n-1) correction, and
-                # report the larger of the two -- the empirical term is noisy
-                # at low multiplicity, the counting term is a floor.
+                # residual scale error).  Add the count-weighted empirical
+                # (sandwich) variance of the ratios, sum K^2 (r - I)^2 / (sum K)^2
+                # with an n/(n-1) correction, and report the larger of the two:
+                # the empirical term is noisy at low multiplicity, the counting
+                # term is a floor.
                 var_pois = S["var"] / (sumK * sumK)
                 ss = (S["sig2"] - 2.0 * I * S["sigK"] + I * I * S["K2"]).clamp(min=0)
                 bessel = cnt / (cnt - 1).clamp(min=1)
