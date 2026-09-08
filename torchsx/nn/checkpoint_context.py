@@ -3,7 +3,7 @@ import torch
 
 TARGET_BUFFERS = (
     'ema_I0', 'ema_den', '_den_seeded', 'ema_log_sigma', '_sigma_seeded',
-    'wilson_sigma', 'is_centric',
+    'wilson_sigma', 'is_centric', 'wilson_phi', 'wilson_coef',
 )
 
 
@@ -70,7 +70,15 @@ def restore_context(trainer, context):
         for name, value in buffers.items():
             if name not in TARGET_BUFFERS:
                 raise ValueError(f'Unexpected target buffer: {name}')
-            getattr(target, name).copy_(value)
+            current = getattr(target, name)
+            if current.shape != value.shape:
+                if name in ('wilson_phi', 'wilson_coef'):
+                    # Basis-mode buffers are empty until a basis is installed.
+                    setattr(target, name, value.to(current.device).clone())
+                    continue
+                raise ValueError(f'Checkpoint context buffer {name} has shape '
+                                 f'{tuple(value.shape)}, expected {tuple(current.shape)}')
+            current.copy_(value)
     trainer.scale.clear()
 
 

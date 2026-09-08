@@ -957,6 +957,7 @@ class AmortizedTrainer:
             from torchsx.nn.checkpoint_context import capture_context
             self._best_context = capture_context(self)
         rec["best_heldout"] = self.best_heldout
+        rec.update(self.wilson_fit_info())
         self.logger.log(rec)
         return rec
 
@@ -1510,8 +1511,42 @@ class AmortizedTrainer:
 
     # ── driver ─────────────────────────────────────────────────────────
 
+    def set_reciprocal_basis(self, basis) -> None:
+        """Install one smooth reciprocal-space basis on the prior and the gauge pin.
+
+        ``basis`` is a :class:`~torchsx.merging.priors.reciprocal_basis.ReciprocalBasis`
+        over ``prep.hkl_valid``.  Every posterior target fits its Wilson Sigma on
+        it from now on, the scale model (when in ``basis`` anchor mode) projects
+        the ensemble-mean component of ``log K`` in its span out, and Sigma is
+        refreshed at once so epoch 0 already runs on the smooth prior.
+        """
+        phi = basis.phi.to(self.device)
+        if phi.shape[0] != self.prep.n_valid:
+            raise ValueError(f"basis rows {phi.shape[0]} != n_valid {self.prep.n_valid}")
+        self.reciprocal_basis = basis
+        for t in self._all_targets():
+            if hasattr(t, "set_basis"):
+                t.set_basis(phi)
+        if hasattr(self.scale, "set_gauge_basis"):
+            self.scale.set_gauge_basis(phi)
+        self._refresh_wilson_sigma()
+
+    def wilson_fit_info(self) -> dict:
+        """Diagnostics of the smooth Sigma fit on the first target (empty in shells mode)."""
+        t = self.targets[0]
+        if not getattr(t, "has_basis", False) or getattr(self, "reciprocal_basis", None) is None:
+            return {}
+        from torchsx.merging.priors.reciprocal_basis import wilson_b_equivalent
+        b = self.reciprocal_basis
+        coef = t.wilson_coef.detach().cpu()
+        info = {"wilson_B": wilson_b_equivalent(b.to(coef.device), coef),
+                "wilson_fit_iters": int(t.wilson_fit_iters)}
+        for i in range(b.n_aniso):
+            info[f"wilson_aniso_{i}"] = float(coef[b.degree + 1 + i])
+        return info
+
     def _refresh_wilson_sigma(self) -> None:
-        """Keep the Wilson Sigma on the shell mean of the running merge."""
+        """Keep the Wilson Sigma on the running merge (shell means, or the smooth fit)."""
         for t in self._all_targets():
             if not hasattr(t, "set_wilson_sigma"):
                 continue

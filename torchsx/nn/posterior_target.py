@@ -217,6 +217,13 @@ class PosteriorMergeTarget(nn.Module):
         # merge is unchanged bit-for-bit.
         self.register_buffer("is_centric",
                              torch.zeros_like(self.wilson_sigma, dtype=torch.bool))
+        # Smooth Sigma(h): when a reciprocal-space basis is installed through
+        # set_basis(), set_wilson_sigma() fits log Sigma = phi @ coef by Wilson
+        # maximum likelihood instead of taking equal-count shell means.  Both
+        # buffers stay empty in shells mode so old checkpoints load unchanged.
+        self.register_buffer("wilson_phi", torch.zeros(0, 0))
+        self.register_buffer("wilson_coef", torch.zeros(0))
+        self.wilson_fit_iters = 0
 
         u_c = torch.linspace(-n_sigma, n_sigma, k_coarse)
         u_f = torch.linspace(-n_sigma, n_sigma, m_fine)
@@ -357,9 +364,40 @@ class PosteriorMergeTarget(nn.Module):
             self._sigma_seeded.fill_(True)
         return I0.log(), self.ema_log_sigma.exp().clamp(*self.sigma_bounds)
 
+    @property
+    def has_basis(self) -> bool:
+        return self.wilson_phi.numel() > 0
+
+    @torch.no_grad()
+    def set_basis(self, phi: Tensor) -> None:
+        """Install the smooth basis ``phi`` (``n_hkl x p``); Sigma is fitted on it from now on."""
+        if phi.shape[0] != self.n_hkl:
+            raise ValueError(f"basis has {phi.shape[0]} rows for {self.n_hkl} reflections")
+        self.wilson_phi = phi.detach().to(self.ema_I0.device, torch.float32).clone()
+        self.wilson_coef = torch.zeros(phi.shape[1], device=self.ema_I0.device)
+        self.wilson_fit_iters = 0
+
     @torch.no_grad()
     def set_wilson_sigma(self, shell_id: Tensor, n_shells: int) -> None:
-        """Set ``Sigma`` to the shell mean of the current running merge."""
+        """Refresh ``Sigma`` from the running merge.
+
+        Shells mode: the equal-count shell mean of ``ema_I0`` (``shell_id`` /
+        ``n_shells``).  With a basis installed the arguments are ignored and
+        ``log Sigma = phi @ coef`` is refitted by Wilson maximum likelihood,
+        warm-started from the previous coefficients.
+        """
+        if self.has_basis:
+            from torchsx.merging.priors.reciprocal_basis import fit_wilson_log_sigma
+            coef0 = self.wilson_coef if bool(self.wilson_coef.abs().sum() > 0) else None
+            coef, used = fit_wilson_log_sigma(
+                self.wilson_phi, self.ema_I0.clamp(min=self.floor), self.is_centric, coef0,
+            )
+            self.wilson_coef.copy_(coef)
+            self.wilson_fit_iters = int(used)
+            self.wilson_sigma.copy_(
+                (self.wilson_phi.double() @ coef.double()).exp().float().clamp(min=self.floor)
+            )
+            return
         m = torch.zeros(n_shells, device=self.ema_I0.device)
         c = torch.zeros(n_shells, device=self.ema_I0.device)
         m.index_add_(0, shell_id, self.ema_I0)
