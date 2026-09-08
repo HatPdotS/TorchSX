@@ -593,6 +593,7 @@ DEFAULTS = dict(
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
     obs_self_layers=2, skew=True, miss=0.03, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
+    wilson_basis="shells", wilson_degree=4, gauge_anchor="median",
 )
 
 
@@ -617,6 +618,18 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--posterior-prior", default=None,
                    choices=("wilson", "flat_I0"),
                    help="prior on the outer (signal) integral [default wilson]")
+    p.add_argument("--wilson-basis", default=None, choices=("shells", "smooth"),
+                   help="Wilson prior Sigma: equal-count resolution shells, or a smooth "
+                        "symmetry-adapted surface (Chebyshev in s^2 + invariant "
+                        "anisotropy tensor) fitted by Wilson maximum likelihood "
+                        f"[default {DEFAULTS['wilson_basis']}]")
+    p.add_argument("--wilson-degree", type=int, default=None,
+                   help=f"Chebyshev degree of the smooth surface [default {DEFAULTS['wilson_degree']}]")
+    p.add_argument("--gauge-anchor", default=None, choices=("median", "mean", "basis"),
+                   help="how log K is pinned per batch: a location statistic, or the "
+                        "projection onto the same smooth basis, which removes every "
+                        "smooth resolution-dependent common mode from the scale "
+                        f"[default {DEFAULTS['gauge_anchor']}]")
     p.add_argument("--bg-var-factor", type=float, default=None,
                    help="background-estimate variance coefficient; default "
                         "n_peak/n_bg from --int-radius")
@@ -702,7 +715,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             predict_width=bool(sc.get("predict_width", True)),
             unity_k=bool(sc.get("unity_k", False)),
             anchor_log_k=bool(sc.get("anchor_log_k", True)),
-            anchor_stat=sc.get("anchor_stat", "median"),
+            anchor_stat=args.gauge_anchor or sc.get("anchor_stat", DEFAULTS["gauge_anchor"]),
             global_skew=bool(scat.get("global_skew", False)),
             predict_skew=bool(skew) and not scat.get("global_skew", False),
         )
@@ -736,6 +749,17 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # that has been scored was merged at 24 / 63 / 257, so that is the default
     # and the checkpoint's training grid is reported, not applied.
     grid = dict(ck.get("posterior_grid") or {})
+    wilson_basis = args.wilson_basis or grid.get("wilson_basis", DEFAULTS["wilson_basis"])
+    wilson_degree = int(args.wilson_degree or grid.get("wilson_degree", DEFAULTS["wilson_degree"]))
+    # One smooth reciprocal-space basis for the prior's Sigma(h) and the scale's
+    # gauge pin, built from the prepared reflections, the median cell and the
+    # space group -- so a merge rebuilds exactly the basis the network trained on.
+    basis = None
+    if wilson_basis == "smooth" or getattr(scale, "anchor_stat", None) == "basis":
+        from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
+        basis = ReciprocalBasis.from_hkl(
+            prep.hkl_valid.long(), prep.median_cell, bundle.spacegroup, degree=wilson_degree,
+        )
     settings = dict(
         device=dev,
         k_coarse=int(args.k_coarse or DEFAULTS["k_coarse"]),
@@ -745,6 +769,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         prior=args.posterior_prior or "wilson",
         bg_var_factor=float(bvf), bg_var_mode=mode, inner_points=int(n_points),
         skew=bool(skew), miss=float(miss),
+        wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
     )
     if verbose:
         print(f"stack: {'global (K=1)' if global_scale else 'amortised'} scale, "
@@ -753,6 +778,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
               f"outer {settings['k_coarse']}/{settings['m_fine']} "
               f"n_sigma {settings['n_sigma']:g}, "
               f"Poisson(bg_var={bvf:.4f}, {mode}), device {dev}", flush=True)
+        if basis is not None:
+            print(f"  smooth reciprocal basis: Chebyshev degree {wilson_degree} + "
+                  f"{basis.n_aniso} invariant anisotropy tensor(s) ({bundle.spacegroup}), "
+                  f"p = {basis.p}; prior Sigma {wilson_basis}, log K anchor "
+                  f"{getattr(scale, 'anchor_stat', None)}", flush=True)
         if grid:
             print(f"  (checkpoint trained on outer grid "
                   f"{grid.get('k_coarse')}/{grid.get('m_fine')} "

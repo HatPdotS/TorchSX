@@ -247,6 +247,13 @@ class TrainConfig:
     posterior_m_fine: int = 257
     posterior_n_sigma: float = 8.0
     posterior_prior: str = "flat_I0"
+    #: How the Wilson prior's Sigma is estimated from the running merge:
+    #: ``"shells"`` (equal-count resolution shells) or ``"smooth"`` (a
+    #: symmetry-adapted surface on a reciprocal-space basis, see
+    #: ``set_reciprocal_basis``).  Recorded in the checkpoint; the basis itself
+    #: is installed by the CLI after construction.
+    wilson_basis: str = "shells"
+    wilson_degree: int = 4
     #: Outer grid half-width cap in nats (see PosteriorMergeTarget.max_halfwidth).
     posterior_max_halfwidth: float = 12.0
     lam_spread: float = 0.0
@@ -1044,6 +1051,8 @@ class AmortizedTrainer:
                     "k_coarse": self.cfg.posterior_k_coarse, "m_fine": self.cfg.posterior_m_fine,
                     "n_sigma": self.cfg.posterior_n_sigma, "max_halfwidth": self.cfg.posterior_max_halfwidth,
                     "prior": self.cfg.posterior_prior,
+                    "wilson_basis": self.cfg.wilson_basis,
+                    "wilson_degree": self.cfg.wilson_degree,
                 },
                 "timepoints": (
                     None if self.prep.obs_info.unique_timepoints is None
@@ -1511,7 +1520,7 @@ class AmortizedTrainer:
 
     # ── driver ─────────────────────────────────────────────────────────
 
-    def set_reciprocal_basis(self, basis) -> None:
+    def set_reciprocal_basis(self, basis, *, smooth_prior: bool = True) -> None:
         """Install one smooth reciprocal-space basis on the prior and the gauge pin.
 
         ``basis`` is a :class:`~torchsx.merging.priors.reciprocal_basis.ReciprocalBasis`
@@ -1524,9 +1533,10 @@ class AmortizedTrainer:
         if phi.shape[0] != self.prep.n_valid:
             raise ValueError(f"basis rows {phi.shape[0]} != n_valid {self.prep.n_valid}")
         self.reciprocal_basis = basis
-        for t in self._all_targets():
-            if hasattr(t, "set_basis"):
-                t.set_basis(phi)
+        if smooth_prior:
+            for t in self._all_targets():
+                if hasattr(t, "set_basis"):
+                    t.set_basis(phi)
         if hasattr(self.scale, "set_gauge_basis"):
             self.scale.set_gauge_basis(phi)
         self._refresh_wilson_sigma()

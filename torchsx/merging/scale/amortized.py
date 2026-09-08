@@ -91,7 +91,7 @@ class AmortizedScale(ScaleModel):
         # ensemble-mean component of log K in its span is projected out of every
         # prediction -- the rank-p generalisation of the scalar anchor, removing
         # the K(h) -> K(h) g(h), I0 -> I0 / g(h) freedom for every smooth g.
-        self.register_buffer("gauge_phi", torch.zeros(0, 0))
+        self.register_buffer("gauge_phi", torch.zeros(0, 0), persistent=False)
         #: Crystals per encoder chunk; 0 runs the whole batch in one shot.
         #: See :meth:`predict` -- the encoder is separable across crystals, so
         #: chunking is exact and moves the checkpoint boundary off the blocks.

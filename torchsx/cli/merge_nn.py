@@ -96,9 +96,12 @@ def main(argv: list[str] | None = None) -> None:
         locate_windows=tuple(float(x) for x in args.locate_windows.split(","))
         if args.locate_windows else (8.0, 1.0, 0.125),
         posterior_prior=S["prior"],
+        wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
         heldout_frac=0.05, device=S["device"], outdir=str(args.out.parent),
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
+    if S.get("basis") is not None:
+        tr.set_reciprocal_basis(S["basis"], smooth_prior=S["wilson_basis"] == "smooth")
     if not args.unity:
         # Checkpoints written before the data buffers were made non-persistent
         # carry the training set's own _I/_bg/_sigma, whose length is that data
