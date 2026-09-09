@@ -172,6 +172,10 @@ class TrainConfig:
     target_redundancy: float | None = None
     epochs: int = 10
     lr: float = 1e-3
+    #: Learning-rate multiplier for the mixture conditioner's parameters: its
+    #: outputs enter the likelihood through a softmax and a mean correction
+    #: whose gradients are small near the initial state.
+    mixture_lr_mult: float = 1.0
     #: Linear LR warmup.  Matters once the encoder is a deep stack of exchange
     #: blocks: the zero-initialised output projections make every block start
     #: as the identity, so all early gradient lands on the heads (measured
@@ -449,9 +453,12 @@ class AmortizedTrainer:
         ref_train = perm[n_held:]
         self.train_crystals = torch.cat([ref_train, other])
 
-        decay, no_decay = [], []
+        decay, no_decay, mixture = [], [], []
         for name, prm in self.scale.named_parameters():
             if not prm.requires_grad:
+                continue
+            if name.startswith("heads.mixture.") and self.cfg.mixture_lr_mult != 1.0:
+                mixture.append(prm)
                 continue
             (no_decay if prm.ndim <= 1 else decay).append(prm)
         # the objective may carry its own scalars (the miss fraction); they are
@@ -500,13 +507,15 @@ class AmortizedTrainer:
         self.merge_sets["rep_A"] = allc2[:half]
         self.merge_sets["rep_B"] = allc2[half:]
 
-        self.opt = torch.optim.AdamW(
-            [
-                {"params": decay, "weight_decay": self.cfg.weight_decay},
-                {"params": no_decay, "weight_decay": 0.0},
-            ],
-            lr=self.cfg.lr,
-        )
+        groups = [
+            {"params": decay, "weight_decay": self.cfg.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+        if mixture:
+            groups.append({"params": mixture, "weight_decay": 0.0,
+                           "lr": self.cfg.lr * self.cfg.mixture_lr_mult,
+                           "lr_mult": float(self.cfg.mixture_lr_mult)})
+        self.opt = torch.optim.AdamW(groups, lr=self.cfg.lr)
         self.n_decayed = sum(p.numel() for p in decay)
         self.n_undecayed = sum(p.numel() for p in no_decay)
         self._base_lr = self.cfg.lr
@@ -712,7 +721,7 @@ class AmortizedTrainer:
         if self.cfg.warmup_steps > 0:
             scale_lr = min(1.0, (self.step_i + 1) / self.cfg.warmup_steps)
             for grp in self.opt.param_groups:
-                grp["lr"] = self._base_lr * scale_lr
+                grp["lr"] = self._base_lr * scale_lr * grp.get("lr_mult", 1.0)
         t0 = time.time()
         meta, pred, tgt, nll, n_ph, bg, sigma = self._forward(rows, grad=True)
 

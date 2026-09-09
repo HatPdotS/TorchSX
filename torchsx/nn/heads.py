@@ -98,9 +98,10 @@ class MixtureConditioner(nn.Module):
     but only narrower above it, because the mean multiplicative factor of a
     heavy-tailed component that is wide on the upper side is not finite, and
     the mixture is centred on that mean.  The output layer is zero-initialised,
-    so the first forward returns the biases: component 0 carries almost all the
-    weight and the others sit at small weight with distinct offsets and widths
-    so they can separate during fitting.
+    so the first forward returns the biases: component 0 carries most of the
+    weight and the others start at a small but non-negligible weight with
+    distinct offsets and widths, large enough that their weight logits receive
+    usable gradients from the start.
     """
 
     def __init__(self, n_components: int, hidden: int = 8, *, log_w_ref: float = 0.5) -> None:
@@ -127,7 +128,7 @@ class MixtureConditioner(nn.Module):
         lo_pattern = [0.5, -0.5, 0.8, -0.8, 1.0, -1.0]
         hi_narrow = [0.5, 0.5, 0.8, 0.8, 1.0, 1.0]
         for k in range(1, K):
-            logits[k] = -6.0
+            logits[k] = -3.0
             offsets[k] = off_pattern[(k - 1) % len(off_pattern)]
             d_lo[k] = lo_pattern[(k - 1) % len(lo_pattern)]
             raw_hi[k] = math.log(math.expm1(hi_narrow[(k - 1) % len(hi_narrow)]))

@@ -52,6 +52,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="output directory: best.pt, metrics.jsonl, merged*.mtz")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--mixture-lr-mult", type=float, default=1.0,
+                   help="learning-rate multiplier for the mixture scatter conditioner")
     p.add_argument("--redundancy", type=float, default=None,
                    help="observations per reflection in a batch.  Prefer this "
                         "over --max-obs: the in-batch merge target is built "
@@ -113,7 +115,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = TrainConfig(
         max_obs_per_batch=args.max_obs,
         target_redundancy=args.redundancy,
-        epochs=args.epochs, lr=args.lr,
+        epochs=args.epochs, lr=args.lr, mixture_lr_mult=args.mixture_lr_mult,
         lam0=args.lam0, lam_halflife_steps=args.lam_halflife,
         warmup_steps=args.warmup, grad_clip=20.0, log_every=args.log_every,
         merge_target="posterior", loss="evidence",

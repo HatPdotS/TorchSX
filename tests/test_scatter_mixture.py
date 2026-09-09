@@ -155,12 +155,13 @@ def test_mixture_heads_start_at_the_single_family_and_expose_components():
     assert p.mix is not None and p.mix.shape == (64, 12) and heads.n_components == 3
     log_pi, offset, la_lo, la_hi = split_mix(p.mix, 3)
     torch.testing.assert_close(log_pi.exp().sum(1), torch.ones(64), atol=1e-5, rtol=0)
-    assert (log_pi[:, 0] > math.log(0.99)).all()                   # component 0 carries the mass at init
+    assert (log_pi[:, 0] > math.log(0.85)).all()                   # component 0 carries most of the mass at init
     torch.testing.assert_close(la_lo[:, 0], base.log_alpha); torch.testing.assert_close(la_hi[:, 0], base.log_alpha_hi)
     torch.testing.assert_close(p.log_alpha, base.log_alpha); torch.testing.assert_close(p.log_alpha_hi, base.log_alpha_hi)
-    # mean correction and reported width within a few thousandths of the single family
-    assert (p.log_e_s - base.log_e_s).abs().max() < 5e-3
-    assert (p.log_w - base.log_w).abs().max() < 2e-2
+    # the extra components carry ~9 % of the weight at init: the mean correction and
+    # the reported width stay close to the single family but are not identical
+    assert (p.log_e_s - base.log_e_s).abs().max() < 0.3
+    assert (p.log_w - base.log_w).abs().max() < 0.2
     # zero-init conditioner: the raw output is exactly the bias, independent of the input
     cond = MixtureConditioner(3)
     logits, offset, d_lo, d_hi = cond(torch.randn(10), torch.rand(10) + 1, torch.randn(10))
@@ -350,3 +351,24 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path):
     _a, _b, old, _c, S3 = P.build_stack(bundle, margs, ckpt=ck0, verbose=False)
     assert S3["scatter_family"] == "gengauss" and old.heads.scatter_family == "gengauss"
     old.load_state_dict(ck0["state_dict"])
+
+
+def test_mixture_lr_multiplier_makes_its_own_param_group(tmp_path):
+    from tests.test_amortized_training import _synthetic
+    from torchsx.merging.likelihood import Poisson
+    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
+    from torchsx.merging.scale import AmortizedScale
+    from torchsx.nn.objective import MarginalNLL
+    from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, predict_shape=False,
+                                     beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture", n_components=3)
+    obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
+    cfg = TrainConfig(max_obs_per_batch=6000, epochs=0, lr=1e-3, mixture_lr_mult=10.0, merge_target="posterior", loss="evidence",
+                      posterior_k_coarse=9, posterior_m_fine=33, device="cpu", heldout_frac=0.0, outdir=str(tmp_path), warmup_steps=5)
+    tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
+    grps = tr.opt.param_groups
+    mix_ids = {id(p) for p in scale.heads.mixture.parameters()}
+    mg = [g for g in grps if g.get("lr_mult") == 10.0]
+    assert len(mg) == 1 and {id(p) for p in mg[0]["params"]} == mix_ids and abs(mg[0]["lr"] - 1e-2) < 1e-12
+    assert all(id(p) not in mix_ids for g in grps if "lr_mult" not in g for p in g["params"])
