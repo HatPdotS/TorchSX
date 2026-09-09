@@ -27,6 +27,7 @@ from torch import Tensor
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
 from torchsx.merging.scale.base import ScaleModel
+from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 from torchsx.nn.deepsets import DeepSetsEncoder, ScaleEncoder
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
@@ -102,7 +103,9 @@ class AmortizedScale(ScaleModel):
                 f"anchor_stat must be 'median', 'mean' or 'basis', got {anchor_stat!r}"
             )
         self.anchor_stat = anchor_stat
-        self.scatter = PredictedGenGaussScatter()
+        fam = getattr(heads, "scatter_family", "gengauss")
+        self.scatter = (PredictedMixtureScatter(heads.n_components) if fam == "mixture"
+                        else PredictedGenGaussScatter())
         self._cached_obs_id: Tensor | None = None
         self._cached_pred: ScalePrediction | None = None
 
@@ -151,6 +154,9 @@ class AmortizedScale(ScaleModel):
         anchor_log_k: bool = True,
         anchor_stat: str = "median",
         dropout: float = 0.0,
+        scatter_family: str = "gengauss",
+        n_components: int = 3,
+        conditioner_hidden: int = 8,
     ) -> "AmortizedScale":
         if encoder not in ("deepsets", "attention"):
             raise ValueError(f"encoder must be 'deepsets' or 'attention', got {encoder!r}")
@@ -183,6 +189,9 @@ class AmortizedScale(ScaleModel):
             predict_skew=predict_skew,
             global_skew=global_skew,
             unity_k=unity_k,
+            scatter_family=scatter_family,
+            n_components=n_components,
+            conditioner_hidden=conditioner_hidden,
         )
         if not heads.needs_embedding:
             # Nothing reads the embedding, so the encoder is inert: freeze it
@@ -308,12 +317,17 @@ class AmortizedScale(ScaleModel):
             )
 
         skew = self.heads.predict_skew or self.heads.global_skew
+        mixture = getattr(self.heads, "scatter_family", "gengauss") == "mixture"
+        names = ["log_K", "log_w", "beta", "log_alpha", "log_e_s"]
+        if skew or mixture:
+            names.append("log_alpha_hi")
+        if mixture:
+            names.append("mix")
 
         def run(xs, xc, ci, xcr):
             z = self.encoder(xs, xc, ci, self.n_crystals, x_crys=xcr)
             p = self.heads(z)
-            out = (p.log_K, p.log_w, p.beta, p.log_alpha, p.log_e_s)
-            return out + ((p.log_alpha_hi,) if skew else ())
+            return tuple(getattr(p, name) for name in names)
 
         ckpt = torch.is_grad_enabled() and self.training
         parts = [
@@ -324,7 +338,7 @@ class AmortizedScale(ScaleModel):
             for a, b in spans
         ]
 
-        pred = ScalePrediction(*[torch.cat(t) for t in zip(*parts)])
+        pred = ScalePrediction(**{name: torch.cat(t) for name, t in zip(names, zip(*parts))})
         return self._anchor(pred, meta)
 
     def predict_split(
@@ -394,7 +408,7 @@ class AmortizedScale(ScaleModel):
         return ScalePrediction(
             log_K=log_K, log_w=pred.log_w, beta=pred.beta,
             log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
-            log_alpha_hi=pred.log_alpha_hi,
+            log_alpha_hi=pred.log_alpha_hi, mix=pred.mix,
         )
 
     def _smooth_common_mode(self, log_K: Tensor, meta: ObsInfo, sweeps: int = 3) -> Tensor:
@@ -435,9 +449,12 @@ class AmortizedScale(ScaleModel):
         stale prediction.
         """
         pred = self.predict(meta)
-        self.scatter.set_prediction(
-            meta.obs_id, pred.log_alpha, torch.log(pred.beta), pred.log_alpha_hi
-        )
+        if pred.mix is not None:
+            self.scatter.set_prediction(meta.obs_id, torch.log(pred.beta), pred.mix)
+        else:
+            self.scatter.set_prediction(
+                meta.obs_id, pred.log_alpha, torch.log(pred.beta), pred.log_alpha_hi
+            )
         self._cached_obs_id = meta.obs_id
         self._cached_pred = pred
         return pred

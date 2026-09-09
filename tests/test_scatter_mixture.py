@@ -138,3 +138,65 @@ def test_addressing_dominant_component_and_split():
     assert not sc.has_prediction and not comps[0][2].has_prediction
     with pytest.raises(ValueError):
         split_mix(mix, 2)
+
+
+# ---------------------------------------------------------------- heads and scale model
+
+def test_mixture_heads_start_at_the_single_family_and_expose_components():
+    from torchsx.nn.heads import MixtureConditioner, ScaleHeads
+    torch.manual_seed(2)
+    z = torch.randn(64, 16)
+    base = ScaleHeads(16, w_init=1.65, beta_init=1.0, predict_skew=True)(z)
+    heads = ScaleHeads(16, w_init=1.65, beta_init=1.0, predict_skew=True, scatter_family="mixture", n_components=3)
+    p = heads(z)
+    assert p.mix is not None and p.mix.shape == (64, 12) and heads.n_components == 3
+    log_pi, offset, la_lo, la_hi = split_mix(p.mix, 3)
+    torch.testing.assert_close(log_pi.exp().sum(1), torch.ones(64), atol=1e-5, rtol=0)
+    assert (log_pi[:, 0] > math.log(0.99)).all()                   # component 0 carries the mass at init
+    torch.testing.assert_close(la_lo[:, 0], base.log_alpha); torch.testing.assert_close(la_hi[:, 0], base.log_alpha_hi)
+    torch.testing.assert_close(p.log_alpha, base.log_alpha); torch.testing.assert_close(p.log_alpha_hi, base.log_alpha_hi)
+    # mean correction and reported width within a few thousandths of the single family
+    assert (p.log_e_s - base.log_e_s).abs().max() < 5e-3
+    assert (p.log_w - base.log_w).abs().max() < 2e-2
+    # zero-init conditioner: the raw output is exactly the bias, independent of the input
+    cond = MixtureConditioner(3)
+    logits, offset, d_lo, d_hi = cond(torch.randn(10), torch.rand(10) + 1, torch.randn(10))
+    bias = MixtureConditioner.init_bias(3)
+    torch.testing.assert_close(logits, bias[:3].expand(10, -1)); torch.testing.assert_close(offset, bias[3:6].expand(10, -1))
+    torch.testing.assert_close(d_lo, bias[6:9].expand(10, -1))
+    assert (d_hi[:, 0] == 0).all() and (d_hi[:, 1:] < 0).all()      # extra components only narrow the upper side
+    # the single family is untouched by the new field
+    assert base.mix is None and base.detach().mix is None and p.detach().mix is not None
+
+
+def test_mixture_scale_model_primes_the_mixture_scatter_and_chunks_exactly():
+    from tests.test_amortized_training import _synthetic
+    from torchsx.merging.scale import AmortizedScale
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=12)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, predict_shape=False,
+                                     beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture", n_components=3)
+    assert isinstance(scale.scatter, PredictedMixtureScatter) and scale.scatter.n_components == 3
+    # break the zero init so chunking has something non-trivial to reproduce
+    with torch.no_grad():
+        for prm in scale.parameters():
+            prm.add_(0.05 * torch.randn_like(prm))
+    # the trainer feeds crystal-grouped rows and chunking requires that order
+    order = torch.argsort(prep.obs_info.crystal_id, stable=True)
+    meta = prep.obs_info.gather(order)
+    pred = scale.prime(meta)
+    assert scale.scatter.has_prediction and pred.mix is not None
+    comps = scale.scatter.components(meta)
+    assert len(comps) == 3 and all(v.has_prediction for _, _, v in comps)
+    torch.testing.assert_close(comps[0][0], split_mix(pred.mix, 3)[0][:, 0])
+    scale.clear()
+    assert not scale.scatter.has_prediction
+    full = scale.predict(meta)
+    scale.set_encoder_chunking(5)
+    chunked = scale.predict(meta)
+    for name in ("log_K", "log_w", "beta", "log_alpha", "log_e_s", "log_alpha_hi", "mix"):
+        torch.testing.assert_close(getattr(chunked, name), getattr(full, name), atol=1e-5, rtol=1e-5)
+    # gradients reach the conditioner
+    scale.set_encoder_chunking(0)
+    out = scale.predict(meta)
+    (out.log_e_s.sum() + out.mix.sum()).backward()
+    assert scale.heads.mixture.l2.weight.grad is not None and scale.heads.mixture.l2.weight.grad.abs().sum() > 0
