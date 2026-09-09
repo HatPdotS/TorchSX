@@ -623,7 +623,7 @@ DEFAULTS = dict(
     obs_self_layers=2, skew=True, miss=0.03, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
-    scatter_family="gengauss", scatter_components=3, scatter_hidden=8,
+    scatter_family="gengauss", scatter_components=3, scatter_hidden=8, scatter_shape="shared",
 )
 
 
@@ -646,6 +646,9 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
                    help=f"mixture components [default {DEFAULTS['scatter_components']}]")
     p.add_argument("--scatter-hidden", type=int, default=None,
                    help=f"hidden units of the mixture conditioner [default {DEFAULTS['scatter_hidden']}]")
+    p.add_argument("--scatter-shape", default=None, choices=("shared", "gaussian", "free"),
+                   help="component shapes of the mixture: the base beta for all, Gaussian (beta 2) for all, "
+                        f"or one beta per component [default {DEFAULTS['scatter_shape']}]")
     p.add_argument("--inner-points", type=int, default=None,
                    help="SplitLogGrid nodes for the inner integral")
     p.add_argument("--k-coarse", type=int, default=None)
@@ -735,6 +738,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                     else int(scat.get("n_components") or DEFAULTS["scatter_components"]))
     scatter_hidden = (args.scatter_hidden if args.scatter_hidden is not None
                       else int(scat.get("conditioner_hidden") or DEFAULTS["scatter_hidden"]))
+    scatter_shape = (args.scatter_shape if args.scatter_shape is not None
+                     else str(scat.get("component_shape") or DEFAULTS["scatter_shape"]))
     beta_init = (args.beta_init if args.beta_init is not None
                  else sc.get("beta_init", DEFAULTS["beta_init"]))
     kw = dict(
@@ -747,6 +752,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         obs_context_layers=enc.get("obs_context_layers", DEFAULTS["obs_context_layers"]),
         obs_self_layers=enc.get("obs_self_layers", DEFAULTS["obs_self_layers"]),
         scatter_family=scatter_family, n_components=n_components, conditioner_hidden=scatter_hidden,
+        component_shape=scatter_shape,
     )
     if global_scale:
         # No per-observation content at all: K == 1 and one global scalar each
@@ -823,12 +829,12 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         bg_var_factor=float(bvf), bg_var_mode=mode, inner_points=int(n_points),
         skew=bool(skew), miss=float(miss),
         wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
-        scatter_family=scatter_family, scatter_components=int(n_components),
+        scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
     )
     if verbose:
         print(f"stack: {'global (K=1)' if global_scale else 'amortised'} scale, "
               f"{'two-width' if skew else 'symmetric'} "
-              f"{f'{n_components}-component mixture ' if scatter_family == 'mixture' else ''}scatter, "
+              f"{f'{n_components}-component {scatter_shape}-shape mixture ' if scatter_family == 'mixture' else ''}scatter, "
               f"miss {miss:.3f}, SplitLogGrid({n_points}), "
               f"outer {settings['k_coarse']}/{settings['m_fine']} "
               f"n_sigma {settings['n_sigma']:g}, "

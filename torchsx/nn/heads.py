@@ -60,8 +60,8 @@ class ScalePrediction:
     log_alpha: Tensor    # (n,)  GenGauss α, derived from (w, β); the LOWER width when asymmetric
     log_e_s: Tensor      # (n,)  log E[exp(ε)] — the mean/median correction
     log_alpha_hi: Tensor | None = None   # (n,) upper-side width (two-width family), None = symmetric
-    #: (n, 4K) mixture parameters when the scatter family is a mixture:
-    #: normalised log weights, offsets, lower and upper log widths per component
+    #: (n, 5K) mixture parameters when the scatter family is a mixture:
+    #: normalised log weights, offsets, lower and upper log widths and log shape per component
     #: (see ``torchsx.merging.scatter.mixture.split_mix``); None = single family
     mix: Tensor | None = None
 
@@ -104,26 +104,39 @@ class MixtureConditioner(nn.Module):
     usable gradients from the start.
     """
 
-    def __init__(self, n_components: int, hidden: int = 8, *, log_w_ref: float = 0.5) -> None:
+    SHAPES = ("shared", "gaussian", "free")
+
+    def __init__(self, n_components: int, hidden: int = 8, *, log_w_ref: float = 0.5,
+                 shape: str = "shared") -> None:
         super().__init__()
         if n_components < 1:
             raise ValueError("n_components must be positive")
+        if shape not in self.SHAPES:
+            raise ValueError(f"shape must be one of {self.SHAPES}, got {shape!r}")
         self.n_components = int(n_components)
         self.hidden = int(hidden)
+        #: Component shapes: ``"shared"`` -- every component takes the base
+        #: beta; ``"gaussian"`` -- every component is Gaussian in log space
+        #: (beta = 2), so the mixture is smooth and its mean is finite for any
+        #: widths; ``"free"`` -- each component has its own beta, offset from
+        #: the base beta on the logit scale.
+        self.shape = shape
         self.register_buffer("_in_loc", torch.tensor([log_w_ref, 2.0, 0.0]))
         self.register_buffer("_in_scale", torch.tensor([0.5, 1.0, 0.5]))
         self.l1 = nn.Linear(3, self.hidden)
-        self.l2 = nn.Linear(self.hidden, 4 * self.n_components)
+        self.l2 = nn.Linear(self.hidden, 5 * self.n_components)
         nn.init.zeros_(self.l2.weight)
         with torch.no_grad():
             self.l2.bias.copy_(self.init_bias(self.n_components))
 
     @staticmethod
     def init_bias(n_components: int) -> Tensor:
-        """Raw biases: logits, offsets, lower deltas, and the pre-softplus upper
-        narrowing (``d_hi = -softplus(raw)``) per component."""
+        """Raw biases: logits, offsets, lower deltas, the pre-softplus upper
+        narrowing (``d_hi = -softplus(raw)``) and the shape-logit deltas per
+        component."""
         K = n_components
         logits = torch.zeros(K); offsets = torch.zeros(K); d_lo = torch.zeros(K); raw_hi = torch.zeros(K)
+        d_beta = torch.zeros(K)
         off_pattern = [-1.0, 0.3, -2.0, 0.6, -3.0, 0.9]
         lo_pattern = [0.5, -0.5, 0.8, -0.8, 1.0, -1.0]
         hi_narrow = [0.5, 0.5, 0.8, 0.8, 1.0, 1.0]
@@ -132,10 +145,12 @@ class MixtureConditioner(nn.Module):
             offsets[k] = off_pattern[(k - 1) % len(off_pattern)]
             d_lo[k] = lo_pattern[(k - 1) % len(lo_pattern)]
             raw_hi[k] = math.log(math.expm1(hi_narrow[(k - 1) % len(hi_narrow)]))
-        return torch.cat([logits, offsets, d_lo, raw_hi])
+        return torch.cat([logits, offsets, d_lo, raw_hi, d_beta])
 
-    def forward(self, log_w: Tensor, beta: Tensor, s: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """``(logits, offset, d_lo, d_hi)``, each ``(n, K)``; component 0 has zero offset and deltas."""
+    def forward(self, log_w: Tensor, beta: Tensor, s: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """``(logits, offset, d_lo, d_hi, d_beta)``, each ``(n, K)``; component 0 has
+        zero offset and width deltas.  ``d_beta`` is the per-component shape-logit
+        offset (used by the ``"free"`` shape mode; zero for component 0)."""
         x = (torch.stack([log_w, beta, s], dim=1) - self._in_loc) / self._in_scale
         raw = self.l2(torch.nn.functional.silu(self.l1(x)))
         K = self.n_components
@@ -143,8 +158,9 @@ class MixtureConditioner(nn.Module):
         logits = raw[:, :K]
         offset = raw[:, K:2 * K] * keep
         d_lo = raw[:, 2 * K:3 * K] * keep
-        d_hi = -torch.nn.functional.softplus(raw[:, 3 * K:]) * keep
-        return logits, offset, d_lo, d_hi
+        d_hi = -torch.nn.functional.softplus(raw[:, 3 * K:4 * K]) * keep
+        d_beta = raw[:, 4 * K:] * keep
+        return logits, offset, d_lo, d_hi, d_beta
 
 
 class ScaleHeads(nn.Module):
@@ -193,6 +209,7 @@ class ScaleHeads(nn.Module):
         scatter_family: str = "gengauss",
         n_components: int = 3,
         conditioner_hidden: int = 8,
+        component_shape: str = "shared",
     ) -> None:
         super().__init__()
         if scatter_family not in ("gengauss", "mixture"):
@@ -253,7 +270,8 @@ class ScaleHeads(nn.Module):
         self.scatter_family = scatter_family
         self.n_components = int(n_components) if scatter_family == "mixture" else 1
         if scatter_family == "mixture":
-            self.mixture = MixtureConditioner(self.n_components, conditioner_hidden, log_w_ref=log_w_init)
+            self.mixture = MixtureConditioner(self.n_components, conditioner_hidden, log_w_ref=log_w_init,
+                                              shape=component_shape)
 
     @staticmethod
     def _zero_head(d_model: int, bias: float) -> nn.Linear:
@@ -306,7 +324,7 @@ class ScaleHeads(nn.Module):
             s = torch.zeros_like(log_w)
             log_alpha_lo, log_alpha_hi = log_alpha, None
         if self.scatter_family == "mixture":
-            return self._mixture_prediction(log_K, log_w, beta, s, log_alpha_lo,
+            return self._mixture_prediction(log_K, log_w, beta, beta_raw, s, log_alpha_lo,
                                             log_alpha if log_alpha_hi is None else log_alpha_hi)
         if skew:
             return ScalePrediction(
@@ -322,18 +340,29 @@ class ScaleHeads(nn.Module):
             log_e_s=log_e_s_gengauss(log_alpha, beta),
         )
 
-    def _mixture_prediction(self, log_K, log_w, beta, s, log_alpha_lo, log_alpha_hi) -> ScalePrediction:
-        logits, offset, d_lo, d_hi = self.mixture(log_w, beta, s)
+    def _mixture_prediction(self, log_K, log_w, beta, beta_raw, s, log_alpha_lo, log_alpha_hi) -> ScalePrediction:
+        logits, offset, d_lo, d_hi, d_beta = self.mixture(log_w, beta, s)
         log_pi = torch.log_softmax(logits, dim=1)
-        la_lo = log_alpha_lo[:, None] + d_lo
-        la_hi = log_alpha_hi[:, None] + d_hi
-        mix = torch.cat([log_pi, offset, la_lo, la_hi], dim=1)
+        K = self.n_components
+        if self.mixture.shape == "gaussian":
+            beta_k = torch.full_like(log_pi, 2.0)
+        elif self.mixture.shape == "free":
+            beta_k = self.beta_min + self.beta_span * torch.sigmoid(beta_raw[:, None] + d_beta)
+        else:
+            beta_k = beta[:, None].expand(-1, K)
+        # widths: the base component's alpha follows from (w, beta) of the base; a
+        # component with a different beta keeps the same SD unless its deltas say otherwise
+        base_lo = log_alpha_from_log_width(log_w[:, None], beta_k) + (log_alpha_lo - log_alpha_from_log_width(log_w, beta))[:, None]
+        base_hi = log_alpha_from_log_width(log_w[:, None], beta_k) + (log_alpha_hi - log_alpha_from_log_width(log_w, beta))[:, None]
+        la_lo = base_lo + d_lo
+        la_hi = base_hi + d_hi
+        mix = torch.cat([log_pi, offset, la_lo, la_hi, beta_k.log()], dim=1)
         return ScalePrediction(
             log_K=log_K,
-            log_w=mixture_log_sd(log_pi, offset, la_lo, la_hi, beta),
-            beta=beta,
+            log_w=mixture_log_sd(log_pi, offset, la_lo, la_hi, beta_k),
+            beta=beta_k[:, 0],
             log_alpha=la_lo[:, 0],
-            log_e_s=mixture_log_e_s(log_pi, offset, la_lo, la_hi, beta),
+            log_e_s=mixture_log_e_s(log_pi, offset, la_lo, la_hi, beta_k),
             log_alpha_hi=la_hi[:, 0],
             mix=mix,
         )

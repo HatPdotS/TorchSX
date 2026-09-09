@@ -157,6 +157,7 @@ class AmortizedScale(ScaleModel):
         scatter_family: str = "gengauss",
         n_components: int = 3,
         conditioner_hidden: int = 8,
+        component_shape: str = "shared",
     ) -> "AmortizedScale":
         if encoder not in ("deepsets", "attention"):
             raise ValueError(f"encoder must be 'deepsets' or 'attention', got {encoder!r}")
@@ -192,6 +193,7 @@ class AmortizedScale(ScaleModel):
             scatter_family=scatter_family,
             n_components=n_components,
             conditioner_hidden=conditioner_hidden,
+            component_shape=component_shape,
         )
         if not heads.needs_embedding:
             # Nothing reads the embedding, so the encoder is inert: freeze it
@@ -450,7 +452,7 @@ class AmortizedScale(ScaleModel):
         """
         pred = self.predict(meta)
         if pred.mix is not None:
-            self.scatter.set_prediction(meta.obs_id, torch.log(pred.beta), pred.mix)
+            self.scatter.set_prediction(meta.obs_id, pred.mix)
         else:
             self.scatter.set_prediction(
                 meta.obs_id, pred.log_alpha, torch.log(pred.beta), pred.log_alpha_hi

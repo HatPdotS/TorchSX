@@ -38,16 +38,19 @@ from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 
 __all__ = [
     "PredictedMixtureScatter", "split_mix", "mixture_log_e_s",
-    "two_width_moments", "mixture_log_sd",
+    "two_width_moments", "mixture_log_sd", "N_BLOCKS",
 ]
 
 
-def split_mix(mix: Tensor, n_components: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """``(n, 4K) -> (log_pi, offset, log_alpha_lo, log_alpha_hi)``, each ``(n, K)``."""
+N_BLOCKS = 5
+
+
+def split_mix(mix: Tensor, n_components: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """``(n, 5K) -> (log_pi, offset, log_alpha_lo, log_alpha_hi, log_beta)``, each ``(n, K)``."""
     K = int(n_components)
-    if mix.shape[-1] != 4 * K:
-        raise ValueError(f"mix has {mix.shape[-1]} columns, expected 4 * {K}")
-    return mix[:, :K], mix[:, K:2 * K], mix[:, 2 * K:3 * K], mix[:, 3 * K:]
+    if mix.shape[-1] != N_BLOCKS * K:
+        raise ValueError(f"mix has {mix.shape[-1]} columns, expected {N_BLOCKS} * {K}")
+    return tuple(mix[:, i * K:(i + 1) * K] for i in range(N_BLOCKS))
 
 
 def mixture_log_e_s(
@@ -56,11 +59,13 @@ def mixture_log_e_s(
     """``log E[exp(eps)]`` of the mixture, per observation.
 
     ``E[exp(eps)] = sum_k pi_k exp(offset_k) E_k[exp(eps_k)]`` with the
-    per-component expectation from :func:`log_e_s_gengauss`.
+    per-component expectation from :func:`log_e_s_gengauss`.  ``beta`` is
+    ``(n, K)`` per component or ``(n,)`` shared.
     """
     terms = [
         log_pi[:, k] + offset[:, k]
-        + log_e_s_gengauss(log_alpha_lo[:, k], beta, log_alpha_hi=log_alpha_hi[:, k])
+        + log_e_s_gengauss(log_alpha_lo[:, k], beta[:, k] if beta.dim() == 2 else beta,
+                           log_alpha_hi=log_alpha_hi[:, k])
         for k in range(log_pi.shape[1])
     ]
     return torch.logsumexp(torch.stack(terms, dim=1), dim=1)
@@ -90,7 +95,7 @@ def mixture_log_sd(
 ) -> Tensor:
     """Log standard deviation of the mixture in log space, per observation."""
     pi = log_pi.exp()
-    b = beta[:, None].expand_as(log_alpha_lo)
+    b = beta if beta.dim() == 2 else beta[:, None].expand_as(log_alpha_lo)
     m1, m2 = two_width_moments(log_alpha_lo, log_alpha_hi, b)
     mean_k = m1 + offset
     var_k = m2 - m1 * m1
@@ -102,12 +107,12 @@ def mixture_log_sd(
 class PredictedMixtureScatter(ScatterModel):
     """Per-observation mixture of two-width GenGauss components.
 
-    ``set_prediction(obs_id, log_beta, mix)`` installs the batch: ``mix`` is
-    ``(n, 4K)`` with normalised ``log_pi``, ``offset``, ``log_alpha_lo`` and
-    ``log_alpha_hi`` blocks (see :func:`split_mix`); ``log_beta`` is shared by
-    the components.  ``components(meta)`` yields, per component, the weight and
-    offset gathered for ``meta`` and a child ``PredictedGenGaussScatter`` view
-    that any GenGauss-only quadrature accepts.
+    ``set_prediction(obs_id, mix)`` installs the batch: ``mix`` is ``(n, 5K)``
+    with normalised ``log_pi``, ``offset``, ``log_alpha_lo``, ``log_alpha_hi``
+    and ``log_beta`` blocks (see :func:`split_mix`), so every component has
+    its own two widths and shape.  ``components(meta)`` yields, per component,
+    the weight and offset gathered for ``meta`` and a child
+    ``PredictedGenGaussScatter`` view that any GenGauss-only quadrature accepts.
     """
 
     def __init__(self, n_components: int, *, strict: bool = True) -> None:
@@ -129,15 +134,12 @@ class PredictedMixtureScatter(ScatterModel):
 
     # ── prediction plumbing ────────────────────────────────────────────
 
-    def set_prediction(self, obs_id: Tensor, log_beta: Tensor, mix: Tensor) -> None:
-        log_pi, offset, la_lo, la_hi = split_mix(mix, self.n_components)
-        if not (obs_id.shape == log_beta.shape == log_pi.shape[:1]):
-            raise ValueError(
-                f"shape mismatch: obs_id={tuple(obs_id.shape)} log_beta={tuple(log_beta.shape)} "
-                f"mix={tuple(mix.shape)}"
-            )
+    def set_prediction(self, obs_id: Tensor, mix: Tensor) -> None:
+        log_pi, offset, la_lo, la_hi, log_beta = split_mix(mix, self.n_components)
+        if obs_id.shape != log_pi.shape[:1]:
+            raise ValueError(f"shape mismatch: obs_id={tuple(obs_id.shape)} mix={tuple(mix.shape)}")
         for k, view in enumerate(self.views):
-            view.set_prediction(obs_id, la_lo[:, k], log_beta, la_hi[:, k])
+            view.set_prediction(obs_id, la_lo[:, k], log_beta[:, k], la_hi[:, k])
         sorted_ids, perm = torch.sort(obs_id)
         self._sorted_ids, self._sort_perm = sorted_ids, perm
         self._log_pi, self._offset = log_pi, offset
@@ -158,7 +160,7 @@ class PredictedMixtureScatter(ScatterModel):
         if self._sorted_ids is None or self._sort_perm is None:
             raise RuntimeError(
                 "PredictedMixtureScatter has no prediction installed; call "
-                "set_prediction(obs_id, log_beta, mix) first."
+                "set_prediction(obs_id, mix) first."
             )
         loc = torch.searchsorted(self._sorted_ids, obs_id)
         loc = loc.clamp(max=self._sorted_ids.numel() - 1)
@@ -190,7 +192,7 @@ class PredictedMixtureScatter(ScatterModel):
 
     def log_alpha_beta_obs(self, params: Parameters, meta: ObsInfo) -> tuple[Tensor, Tensor]:
         pos, k = self._dominant(meta)
-        return self._log_alpha_lo[pos, k], self._log_beta[pos]
+        return self._log_alpha_lo[pos, k], self._log_beta[pos, k]
 
     def log_alpha_hi_obs(self, params: Parameters, meta: ObsInfo) -> Tensor | None:
         pos, k = self._dominant(meta)
@@ -199,12 +201,11 @@ class PredictedMixtureScatter(ScatterModel):
     def log_prob(self, eps: Tensor, params: Parameters, meta: ObsInfo) -> Tensor:
         """Mixture log-density at ``eps`` ``(M, K_grid)`` for the observations in ``meta``."""
         pos = self._positions(meta.obs_id)
-        lb = self._log_beta[pos]
         terms = []
         for k in range(self.n_components):
             lp = gengauss_log_prob_from_obs(
                 eps - self._offset[pos, k][:, None],
-                self._log_alpha_lo[pos, k], lb, self._log_alpha_hi[pos, k],
+                self._log_alpha_lo[pos, k], self._log_beta[pos, k], self._log_alpha_hi[pos, k],
             )
             terms.append(self._log_pi[pos, k][:, None] + lp)
         return torch.logsumexp(torch.stack(terms, dim=0), dim=0)
