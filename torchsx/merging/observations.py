@@ -272,39 +272,57 @@ def _ewald_offset(core, return_q: bool = False):
 
     Physically-motivated proxy for predicted partiality: large ``|r|`` →
     predicted off-Bragg → signal ≈ 0.  Used by the σ²(bg) calibration to
-    select a clean noise-dominated sample.  Pure-tensor port of
-    ``compute_excitation_error`` from
-    ``torchsx/deprecated/merge/_neural_model.py``.
+    select a clean noise-dominated sample and fed to the scale model as a
+    feature.  Evaluated over the symmetry images of a canonicalised index,
+    see below.
 
     Wavelength is taken as the stream-median (per-image variation at
     LCLS/EuXFEL is < 0.01 %, well below the |r| binning resolution).
     """
     wavelength = 12398.4 / float(core.beam_energy.float().median().item())
-    h = core.hkl[:, 0].float()
-    k = core.hkl[:, 1].float()
-    l = core.hkl[:, 2].float()
-    cid = core.crystal_id.long()
-    q_lab = (h.unsqueeze(1) * core.astar[cid]
-             + k.unsqueeze(1) * core.bstar[cid]
-             + l.unsqueeze(1) * core.cstar[cid])
     k0 = 1.0 / wavelength
-    s0 = torch.zeros_like(q_lab)
-    s0[:, 2] = k0
-    offset = (q_lab + s0).norm(dim=1) - k0
+    cid = core.crystal_id.long()
+    hkl = core.hkl.float()
+    # ``symmetrize()`` replaces each observed Miller index by its ASU
+    # representative: a symmetry mate of the reflection that was measured.  The
+    # excitation error of a mate is not the one that was recorded -- the other
+    # mates sit of order a reciprocal lattice spacing away from the sphere --
+    # so evaluate every point-group image (and its Friedel partner) and keep
+    # the one nearest the sphere.  Only one image can be near diffracting
+    # condition, which makes the choice unambiguous.  For a stream that was
+    # not symmetrised the observed index is the right one and only the
+    # identity is tried.
     if bool(getattr(core, "friedel_merged", True)):
-        # ``symmetrize()`` replaces each observed Miller index by its ASU
-        # representative, which NEGATES it for about half the observations.
-        # The excitation error of ``-q`` is not the one that was measured: it
-        # lands 0.4-0.9 Å⁻¹ away, which is where the bimodal |offset|
-        # distribution comes from (q50 = 0.007, q75 = 0.43 on the dark stream)
-        # and why the off-Bragg gate at |r| > 0.25 selected 36 % of
-        # observations whose mean I was 68 photons -- Bragg peaks, not
-        # background.  Only one mate of a Friedel pair can be near diffracting
-        # condition, so take whichever it is.
-        offset_flip = (s0 - q_lab).norm(dim=1) - k0
-        flip = offset_flip.abs() < offset.abs()
-        offset = torch.where(flip, offset_flip, offset)
-        q_lab = torch.where(flip[:, None], -q_lab, q_lab)
+        from torchsx.merging.priors.reciprocal_basis import _hkl_rotations
+        ops = _hkl_rotations(getattr(core, "spacegroup", None)).to(hkl.dtype)
+        ops = torch.cat([ops, -ops], dim=0)
+    else:
+        ops = torch.eye(3, dtype=hkl.dtype)[None]
+    best_offset = None
+    best_q = None
+    chunk = 8_000_000
+    parts_offset, parts_q = [], []
+    for start in range(0, hkl.shape[0], chunk):
+        h_c = hkl[start:start + chunk]
+        c_c = cid[start:start + chunk]
+        A, Bv, Cv = core.astar[c_c], core.bstar[c_c], core.cstar[c_c]
+        best_offset = best_q = None
+        for R in ops:
+            h_op = h_c @ R                                         # (M, 3), row convention h' = h @ R
+            q = h_op[:, 0:1] * A + h_op[:, 1:2] * Bv + h_op[:, 2:3] * Cv
+            q_plus = q.clone()
+            q_plus[:, 2] += k0
+            off = q_plus.norm(dim=1) - k0
+            if best_offset is None:
+                best_offset, best_q = off, q
+            else:
+                better = off.abs() < best_offset.abs()
+                best_offset = torch.where(better, off, best_offset)
+                best_q = torch.where(better[:, None], q, best_q)
+        parts_offset.append(best_offset)
+        parts_q.append(best_q)
+    offset = torch.cat(parts_offset)
+    q_lab = torch.cat(parts_q)
     if return_q:
         return offset, q_lab / q_lab.norm(dim=1, keepdim=True).clamp(min=1e-12)
     return offset
