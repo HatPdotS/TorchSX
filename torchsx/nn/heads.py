@@ -104,7 +104,7 @@ class MixtureConditioner(nn.Module):
     usable gradients from the start.
     """
 
-    SHAPES = ("shared", "gaussian", "free")
+    SHAPES = ("shared", "gaussian", "free", "partiality")
 
     def __init__(self, n_components: int, hidden: int = 8, *, log_w_ref: float = 0.5,
                  shape: str = "shared") -> None:
@@ -119,24 +119,35 @@ class MixtureConditioner(nn.Module):
         #: beta; ``"gaussian"`` -- every component is Gaussian in log space
         #: (beta = 2), so the mixture is smooth and its mean is finite for any
         #: widths; ``"free"`` -- each component has its own beta, offset from
-        #: the base beta on the logit scale.
+        #: the base beta on the logit scale; ``"partiality"`` -- eps = log p + eta
+        #: with log p on a fixed grid of K support points from 0 downward (a hard
+        #: edge at p = 1) whose extent is predicted, every component sharing the
+        #: base width as the Gaussian residual eta, and the weights describing
+        #: the distribution of the partial fraction.
         self.shape = shape
+        self.register_buffer("_grid", torch.linspace(0.0, 1.0, self.n_components))
         self.register_buffer("_in_loc", torch.tensor([log_w_ref, 2.0, 0.0]))
         self.register_buffer("_in_scale", torch.tensor([0.5, 1.0, 0.5]))
         self.l1 = nn.Linear(3, self.hidden)
         self.l2 = nn.Linear(self.hidden, 5 * self.n_components)
         nn.init.zeros_(self.l2.weight)
+        #: pre-softplus grid extent of the partiality support (softplus(raw) nats at init)
+        self.lambda_init_raw = math.log(math.expm1(3.0))
         with torch.no_grad():
-            self.l2.bias.copy_(self.init_bias(self.n_components))
+            self.l2.bias.copy_(self.init_bias(self.n_components, shape))
 
     @staticmethod
-    def init_bias(n_components: int) -> Tensor:
+    def init_bias(n_components: int, shape: str = "shared") -> Tensor:
         """Raw biases: logits, offsets, lower deltas, the pre-softplus upper
         narrowing (``d_hi = -softplus(raw)``) and the shape-logit deltas per
-        component."""
+        component.  The partiality mode starts with weights decreasing away from
+        the edge and its offsets unused apart from the grid extent."""
         K = n_components
         logits = torch.zeros(K); offsets = torch.zeros(K); d_lo = torch.zeros(K); raw_hi = torch.zeros(K)
         d_beta = torch.zeros(K)
+        if shape == "partiality":
+            logits = -0.5 * torch.arange(K, dtype=torch.float32)
+            return torch.cat([logits, offsets, d_lo, raw_hi, d_beta])
         off_pattern = [-1.0, 0.3, -2.0, 0.6, -3.0, 0.9]
         lo_pattern = [0.5, -0.5, 0.8, -0.8, 1.0, -1.0]
         hi_narrow = [0.5, 0.5, 0.8, 0.8, 1.0, 1.0]
@@ -344,6 +355,24 @@ class ScaleHeads(nn.Module):
         logits, offset, d_lo, d_hi, d_beta = self.mixture(log_w, beta, s)
         log_pi = torch.log_softmax(logits, dim=1)
         K = self.n_components
+        if self.mixture.shape == "partiality":
+            # support points of log p: 0, -Lambda/(K-1), ..., -Lambda; Lambda from the
+            # first offset output (component 0 stays at the edge); one Gaussian
+            # residual width for all components, taken from the base width
+            lam = torch.nn.functional.softplus(offset[:, 1:2] + self.mixture.lambda_init_raw) if K > 1 else offset[:, :1]
+            offset = -lam * self.mixture._grid[None, :]
+            beta_k = torch.full_like(log_pi, 2.0)
+            la = log_alpha_from_log_width(log_w, beta_k[:, 0])[:, None].expand(-1, K)
+            mix = torch.cat([log_pi, offset, la, la, beta_k.log()], dim=1)
+            return ScalePrediction(
+                log_K=log_K,
+                log_w=mixture_log_sd(log_pi, offset, la, la, beta_k),
+                beta=beta_k[:, 0],
+                log_alpha=la[:, 0],
+                log_e_s=mixture_log_e_s(log_pi, offset, la, la, beta_k),
+                log_alpha_hi=la[:, 0],
+                mix=mix,
+            )
         if self.mixture.shape == "gaussian":
             beta_k = torch.full_like(log_pi, 2.0)
         elif self.mixture.shape == "free":

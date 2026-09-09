@@ -410,3 +410,30 @@ def test_component_shape_modes():
         heads.mixture.l2.bias[12:] += torch.tensor([0.0, 2.0, -2.0])
     lb = split_mix(heads(z).mix, 3)[4].exp()
     assert torch.allclose(lb[:, 0], heads(z).beta) and (lb[:, 1] > lb[:, 0]).all() and (lb[:, 2] < lb[:, 0]).all()
+
+
+def test_partiality_shape_is_a_gridded_edge_family():
+    from torchsx.nn.heads import ScaleHeads
+    torch.manual_seed(4)
+    z = torch.randn(30, 16); K = 6
+    heads = ScaleHeads(16, w_init=0.5, beta_init=1.0, predict_skew=True, scatter_family="mixture", n_components=K,
+                       component_shape="partiality")
+    p = heads(z)
+    log_pi, offset, la_lo, la_hi, lb = split_mix(p.mix, K)
+    assert (offset[:, 0] == 0).all() and (offset[:, 1:] < 0).all()            # hard edge at p = 1, support below it
+    torch.testing.assert_close(offset[:, -1], torch.full((30,), -3.0), atol=1e-4, rtol=0)   # grid extent at init
+    torch.testing.assert_close(offset[:, 1] * (K - 1), offset[:, -1])          # equally spaced grid
+    torch.testing.assert_close(la_lo, la_hi); torch.testing.assert_close(la_lo, la_lo[:, :1].expand(-1, K))   # one residual width
+    torch.testing.assert_close(lb.exp(), torch.full((30, K), 2.0))
+    w = log_pi.exp()
+    assert (w[:, :-1] > w[:, 1:]).all()                                       # weights decrease away from the edge at init
+    sc = PredictedMixtureScatter(K); ids = torch.arange(30); sc.set_prediction(ids, p.mix.detach())
+    eps = torch.linspace(-25, 25, 40001, dtype=torch.float64)
+    lp = sc.log_prob(eps[None, :].expand(30, -1).float(), None, _Meta(ids)).double(); d = float(eps[1] - eps[0])
+    torch.testing.assert_close(torch.logsumexp(lp, 1).exp() * d, torch.ones(30, dtype=torch.float64), atol=3e-3, rtol=0)
+    brute = torch.logsumexp(lp + eps[None, :], dim=1) + math.log(d)
+    torch.testing.assert_close(brute, p.log_e_s.detach().double(), atol=5e-3, rtol=0)
+    # the extent responds to the conditioner
+    with torch.no_grad():
+        heads.mixture.l2.bias[K + 1] += 1.0
+    assert (split_mix(heads(z).mix, K)[1][:, -1] < -3.5).all()

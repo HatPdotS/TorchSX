@@ -646,9 +646,10 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
                    help=f"mixture components [default {DEFAULTS['scatter_components']}]")
     p.add_argument("--scatter-hidden", type=int, default=None,
                    help=f"hidden units of the mixture conditioner [default {DEFAULTS['scatter_hidden']}]")
-    p.add_argument("--scatter-shape", default=None, choices=("shared", "gaussian", "free"),
+    p.add_argument("--scatter-shape", default=None, choices=("shared", "gaussian", "free", "partiality"),
                    help="component shapes of the mixture: the base beta for all, Gaussian (beta 2) for all, "
-                        f"or one beta per component [default {DEFAULTS['scatter_shape']}]")
+                        "one beta per component, or a partiality grid (Gaussian components at fixed support "
+                        f"points of log p below the edge, one residual width) [default {DEFAULTS['scatter_shape']}]")
     p.add_argument("--inner-points", type=int, default=None,
                    help="SplitLogGrid nodes for the inner integral")
     p.add_argument("--k-coarse", type=int, default=None)
