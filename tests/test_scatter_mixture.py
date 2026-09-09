@@ -14,6 +14,9 @@ class _Meta:
     def __init__(self, obs_id):
         self.obs_id = obs_id
 
+    def slice(self, s, e):
+        return _Meta(self.obs_id[s:e])
+
 
 def _params(n, K, seed=0, spread=True):
     g = torch.Generator().manual_seed(seed)
@@ -200,3 +203,150 @@ def test_mixture_scale_model_primes_the_mixture_scatter_and_chunks_exactly():
     out = scale.predict(meta)
     (out.log_e_s.sum() + out.mix.sum()).backward()
     assert scale.heads.mixture.l2.weight.grad is not None and scale.heads.mixture.l2.weight.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------- objective
+
+def _split_grid_setup(n, K, seed):
+    from torchsx.merging.likelihood import Poisson
+    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
+    from torchsx.nn.objective import MarginalNLL
+    from tests.test_split_log_grid import _batch
+    n_ph, bg, la, lb, _mu = _batch("cpu", seed=seed, M=n)[:5]
+    log_pi, offset, la_lo, la_hi, _ = _params(n, K, seed=seed)
+    la_lo = la[:, None] + 0.3 * torch.randn(n, K, generator=torch.Generator().manual_seed(seed + 1))
+    la_hi = la_lo - 0.4 * torch.rand(n, K, generator=torch.Generator().manual_seed(seed + 2))
+    obj = MarginalNLL(SplitLogGrid(96), Poisson(bg_var_factor=0.2), miss_frac=0.03)
+    return obj, n_ph, bg, lb, (log_pi, offset, la_lo, la_hi)
+
+
+def test_objective_mixture_marginal_reduces_and_combines():
+    import torchsx.merging.quadrature.split_log_grid as slg
+    from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
+    slg._DISABLE_TRITON = True
+    try:
+        n, K = 512, 3
+        obj, n_ph, bg, lb, (log_pi, offset, la_lo, la_hi) = _split_grid_setup(n, K, seed=4)
+        ids = torch.arange(n); meta = _Meta(ids)
+        log_mean = torch.log(n_ph.clamp(min=1.0)) + 0.2 * torch.randn(n, generator=torch.Generator().manual_seed(9))
+        mix_sc = PredictedMixtureScatter(K)
+        # one component at full weight: identical to the single two-width family shifted by its offset
+        one = torch.log_softmax(torch.tensor([[0.0, -60.0, -60.0]]).expand(n, K), dim=1)
+        mix_sc.set_prediction(ids, lb, _mix(one, offset, la_lo, la_hi))
+        got = obj.log_prob(mix_sc, None, log_mean, n_ph, bg, meta)
+        single = PredictedGenGaussScatter(); single.set_prediction(ids, la_lo[:, 0], lb, la_hi[:, 0])
+        ref = obj.log_prob(single, None, log_mean + offset[:, 0], n_ph, bg, meta)
+        torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-5)
+        # general weights: the mixture marginal is the weighted combination of per-component marginals
+        mix_sc.set_prediction(ids, lb, _mix(log_pi, offset, la_lo, la_hi))
+        got = obj.log_prob(mix_sc, None, log_mean, n_ph, bg, meta)
+        parts = []
+        for k in range(K):
+            sk = PredictedGenGaussScatter(); sk.set_prediction(ids, la_lo[:, k], lb, la_hi[:, k])
+            lp_k = obj._marginal(sk, None, log_mean + offset[:, k], n_ph, bg, meta, (0, n))
+            parts.append(log_pi[:, k] + lp_k)
+        ref = obj._mix_miss(torch.logsumexp(torch.stack(parts), dim=0), n_ph, bg)
+        torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-6)
+        assert torch.isfinite(got).all()
+        # chunked evaluation agrees
+        obj.chunk_size = 100
+        torch.testing.assert_close(obj.log_prob(mix_sc, None, log_mean, n_ph, bg, meta), ref, atol=1e-5, rtol=1e-6)
+    finally:
+        slg._DISABLE_TRITON = False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton path needs CUDA")
+def test_objective_mixture_triton_matches_eager():
+    import torchsx.merging.quadrature.split_log_grid as slg
+    n, K = 2048, 3
+    obj, n_ph, bg, lb, (log_pi, offset, la_lo, la_hi) = _split_grid_setup(n, K, seed=5)
+    dev = torch.device("cuda")
+    ids = torch.arange(n, device=dev); meta = _Meta(ids)
+    log_mean = (torch.log(n_ph.clamp(min=1.0)) + 0.1).to(dev)
+    sc = PredictedMixtureScatter(K)
+    mix = _mix(log_pi, offset, la_lo, la_hi).to(dev).requires_grad_(True)
+    sc.set_prediction(ids, lb.to(dev), mix)
+    obj = obj.to(dev)
+    fast = obj.log_prob(sc, None, log_mean, n_ph.to(dev), bg.to(dev), meta)
+    g_fast, = torch.autograd.grad(fast.sum(), mix)
+    slg._DISABLE_TRITON = True
+    try:
+        sc.set_prediction(ids, lb.to(dev), mix)
+        slow = obj.log_prob(sc, None, log_mean, n_ph.to(dev), bg.to(dev), meta)
+        g_slow, = torch.autograd.grad(slow.sum(), mix)
+    finally:
+        slg._DISABLE_TRITON = False
+    torch.testing.assert_close(fast, slow, atol=3e-2, rtol=2e-3)
+    torch.testing.assert_close(g_fast, g_slow, atol=5e-2, rtol=5e-2)
+
+
+def test_mixture_trainer_step_runs_and_trains_the_conditioner(tmp_path):
+    from tests.test_amortized_training import _synthetic
+    from torchsx.merging.likelihood import Poisson
+    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
+    from torchsx.merging.scale import AmortizedScale
+    from torchsx.nn.objective import MarginalNLL
+    from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
+    torch.manual_seed(0)
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=16)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, predict_shape=False,
+                                     beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture", n_components=3)
+    obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1), miss_frac=0.03)
+    cfg = TrainConfig(max_obs_per_batch=6000, epochs=1, lr=1e-2, lam0=0.0, lam_halflife_steps=0, log_every=10 ** 9,
+                      heldout_frac=0.0, merge_target="posterior", loss="evidence", posterior_k_coarse=9, posterior_m_fine=33,
+                      device="cpu", outdir=str(tmp_path), split_half_every=0)
+    tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
+    before = scale.heads.mixture.l2.weight.detach().clone()
+    tr.run()
+    assert not torch.equal(scale.heads.mixture.l2.weight.detach(), before), "conditioner did not move"
+    res = tr.merge(estimator="posterior")
+    assert torch.isfinite(res["F"]).all() and torch.isfinite(res["I0"]).all()
+    pooled = tr.merge(estimator="pooled")
+    assert torch.isfinite(pooled["I"]).all()
+
+
+# ---------------------------------------------------------------- CLI and checkpoint
+
+def test_scatter_family_round_trips_through_the_checkpoint(tmp_path):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.merge_nn import _build_parser as merge_parser
+    from torchsx.cli.train import _build_parser as train_parser
+    from torchsx.nn.checkpoint_context import load_checkpoint_context, verify_probes
+    from tests.test_amortized_training import _synthetic
+    from tests.test_cli_pipeline import _trainer_from_stack
+
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
+    bundle = P.PrepBundle(prep, recipe, [], 0.1)
+    base = ["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"]
+    # default stays the single family
+    _p, _q, scale0, _o, S0 = P.build_stack(bundle, train_parser().parse_args(base), verbose=False)
+    assert S0["scatter_family"] == "gengauss" and scale0.heads.scatter_family == "gengauss" and not hasattr(scale0.heads, "mixture")
+    # opt in
+    targs = train_parser().parse_args(base + ["--scatter-family", "mixture", "--scatter-components", "2", "--scatter-hidden", "4"])
+    prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
+    assert S["scatter_family"] == "mixture" and S["scatter_components"] == 2
+    assert scale.heads.scatter_family == "mixture" and scale.heads.n_components == 2 and scale.heads.mixture.hidden == 4
+    assert isinstance(scale.scatter, PredictedMixtureScatter)
+    tr = _trainer_from_stack(prep_, params_, scale, obj, S)
+    tr.data_recipe = dict(recipe)
+    ck = torch.load(tr.save_best(tmp_path / "mix.pt"), weights_only=False)
+    assert ck["scatter"]["family"] == "mixture" and ck["scatter"]["n_components"] == 2 and ck["scatter"]["conditioner_hidden"] == 4
+    assert any(k.startswith("heads.mixture.") for k in ck["state_dict"])
+    assert "mix" in ck["inference_context"]["probes"] or any("mix" in str(k) for k in ck["inference_context"]["probes"])
+    # merge side rebuilds the family from the checkpoint with no flags
+    margs = merge_parser().parse_args(["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu", "--inner-points", "64"])
+    p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
+    assert S2["scatter_family"] == "mixture" and rebuilt.heads.n_components == 2 and isinstance(rebuilt.scatter, PredictedMixtureScatter)
+    rebuilt.load_state_dict(ck["state_dict"])
+    tr2 = _trainer_from_stack(p2, q2, rebuilt, o2, S2)
+    load_checkpoint_context(tr2, ck, "exact")
+    verify_probes(tr2, ck["inference_context"])
+    # a checkpoint written before the family existed rebuilds the single family and loads strictly
+    tr0 = _trainer_from_stack(_p, _q, scale0, _o, S0); tr0.data_recipe = dict(recipe)
+    ck0 = torch.load(tr0.save_best(tmp_path / "old.pt"), weights_only=False)
+    for key in ("family", "n_components", "conditioner_hidden"):
+        del ck0["scatter"][key]
+    _a, _b, old, _c, S3 = P.build_stack(bundle, margs, ckpt=ck0, verbose=False)
+    assert S3["scatter_family"] == "gengauss" and old.heads.scatter_family == "gengauss"
+    old.load_state_dict(ck0["state_dict"])

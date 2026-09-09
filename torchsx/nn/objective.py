@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 from torchsx.nn.pooling import group_sum
 
 __all__ = [
@@ -248,17 +249,34 @@ class MarginalNLL(nn.Module):
         self.last_grid_mass = log_mass.detach().exp()
         return log_p - log_mass
 
+    def _marginal(self, scatter, params, log_mean, n_ph, bg, meta, obs_range) -> Tensor:
+        """``log p(n | log_mean)`` with the scatter integrated out.
+
+        A mixture scatter is assembled from per-component calls on its child
+        GenGauss views, each centred at ``log_mean + offset_k``, combined with
+        the component weights; the quadrature itself never sees the mixture.
+        """
+        if isinstance(scatter, PredictedMixtureScatter):
+            terms = [
+                log_pi_k + self.quadrature.marginalize_signal(
+                    view_k, self.likelihood, log_mean + offset_k, n_ph, bg, params, meta,
+                    obs_range=obs_range,
+                )
+                for log_pi_k, offset_k, view_k in scatter.components(meta)
+            ]
+            return torch.logsumexp(torch.stack(terms, dim=0), dim=0)
+        lp = self.quadrature.marginalize_signal(
+            scatter, self.likelihood, log_mean, n_ph, bg, params, meta, obs_range=obs_range,
+        )
+        return self._renorm(lp, scatter, params, meta, log_mean) if self.renormalize else lp
+
     def log_prob(
         self, scatter, params, log_mean: Tensor, n_ph: Tensor, bg: Tensor, meta
     ) -> Tensor:
         n = log_mean.shape[0]
         cs = self.chunk_size or n
         if cs >= n:
-            lp = self.quadrature.marginalize_signal(
-                scatter, self.likelihood, log_mean, n_ph, bg, params, meta,
-                obs_range=(0, n),
-            )
-            lp = self._renorm(lp, scatter, params, meta, log_mean) if self.renormalize else lp
+            lp = self._marginal(scatter, params, log_mean, n_ph, bg, meta, (0, n))
             return self._mix_miss(lp, n_ph, bg)
         parts = []
         for s in range(0, n, cs):
@@ -266,12 +284,7 @@ class MarginalNLL(nn.Module):
             sub = meta.slice(s, e)
 
             def _chunk(lm, nn, bb, _sub=sub, _s=s, _e=e):
-                lp = self.quadrature.marginalize_signal(
-                    scatter, self.likelihood, lm, nn, bb, params, _sub,
-                    obs_range=(_s, _e),
-                )
-                if self.renormalize:
-                    lp = self._renorm(lp, scatter, params, _sub, lm)
+                lp = self._marginal(scatter, params, lm, nn, bb, _sub, (_s, _e))
                 return self._mix_miss(lp, nn, bb)
 
             args = (log_mean[s:e], n_ph[s:e], bg[s:e])
