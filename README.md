@@ -72,6 +72,14 @@ Crystals can be divided into named **splits** (`--split dark=dark.stream
 are then split-pure, each split keeps its own merge target, and one set of
 files is written per split.  The network never sees the label.
 
+The scatter on the scale is a two-width generalised Gaussian in log space by
+default.  `--scatter-family mixture` replaces it with a mixture of such
+components whose weights, offsets and side widths come from a small
+conditioner on the predicted width, shape and skew; the mixture is centred so
+its mean multiplicative factor is one, so `K * I0` is the mean of the
+observation by construction (`torchsx/merging/scatter/mixture.py`).  The
+family is recorded in the checkpoint and rebuilt by `merge_nn` without flags.
+
 `merge_nn` writes three products per split and per half-set: `<stem>.mtz`,
 the **scaled posterior** (F/SIGF) used for refinement and difference maps;
 `<stem>_posterior.mtz`, the raw posterior; and `<stem>_pooled.mtz`, the

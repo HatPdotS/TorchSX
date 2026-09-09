@@ -868,6 +868,20 @@ class AmortizedTrainer:
             if int((dec == d).sum()) > 8 else float("nan")
             for d in range(10)
         ]
+        if pred.mix is not None:
+            from torchsx.merging.scatter.mixture import split_mix
+            K = pred.mix.shape[1] // 4
+            log_pi, offset, la_lo, la_hi = split_mix(pred.mix.detach(), K)
+            out["mix_weight_median"] = [float(v) for v in log_pi.exp().median(dim=0).values]
+            out["mix_offset_median"] = [float(v) for v in offset.median(dim=0).values]
+            out["mix_alpha_lo_median"] = [float(v) for v in la_lo.exp().median(dim=0).values]
+            out["mix_alpha_hi_median"] = [float(v) for v in la_hi.exp().median(dim=0).values]
+            out["mix_log_e_s_median"] = float(pred.log_e_s.median().item())
+            out["mix_weight_median_by_isigma_decile"] = [
+                [float(v) for v in log_pi[dec == d].exp().median(dim=0).values]
+                if int((dec == d).sum()) > 8 else [float("nan")] * K
+                for d in range(10)
+            ]
         out.update(scale_metrics(
             pred.log_K, meta.crystal_id, meta.n_crystals,
             features={
@@ -1031,6 +1045,10 @@ class AmortizedTrainer:
                 "scatter": {
                     "predict_skew": bool(getattr(self.scale.heads, "predict_skew", False)),
                     "global_skew": bool(getattr(self.scale.heads, "global_skew", False)),
+                    "family": getattr(self.scale.heads, "scatter_family", "gengauss"),
+                    "n_components": int(getattr(self.scale.heads, "n_components", 1)),
+                    "conditioner_hidden": (int(self.scale.heads.mixture.hidden)
+                                           if getattr(self.scale.heads, "scatter_family", "gengauss") == "mixture" else None),
                     "miss_logit": (None if getattr(self.objective, "miss_logit", None) is None
                                    else float((getattr(self, "_best_obj_state", None) or {}).get(
                                        "miss_logit", self.objective.miss_logit.detach()))),
