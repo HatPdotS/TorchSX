@@ -12,10 +12,11 @@ from torchsx.merging.scatter.gengauss import (
     log_alpha_from_log_width,
 )
 from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
+from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 from torchsx.merging.scatter.gengauss_recentered import GenGaussLogScatterRecentered
 
 __all__ = [
     "ScatterModel", "GenGaussLogScatter", "GammaLogScatter",
-    "GenGaussLogScatterRecentered", "PredictedGenGaussScatter",
+    "GenGaussLogScatterRecentered", "PredictedGenGaussScatter", "PredictedMixtureScatter",
     "log_alpha_from_log_width",
 ]
