@@ -743,3 +743,31 @@ def test_merge_nn_writes_three_products_with_one_surface(tmp_path):
         x = np.array(gemmi.read_mtz_file(str(out2.parent / f"m_{lab}.mtz")), copy=False)
         y = np.array(gemmi.read_mtz_file(str(out.parent / f"m_{lab}_posterior.mtz")), copy=False)
         np.testing.assert_array_equal(x, y)
+
+
+def test_trust_cache_prep_loads_a_moved_cache(tmp_path):
+    """A prepared cache carries the absolute input paths in its signature, so
+    the same cache copied to another machine is refused unless the caller
+    takes responsibility with ``--trust-cache-prep``; then the inputs need
+    not exist at all."""
+    import pytest
+
+    from torchsx.cli import _pipeline as P
+    from torchsx.stream import SFXStream
+
+    from tests.conftest import STREAM_PATH
+
+    sfx = tmp_path / "s.sfx"
+    SFXStream.from_stream(STREAM_PATH, spacegroup="P 1", cache=sfx)
+    cache = tmp_path / "prep.pt"
+    built = P.load_prep(_DataArgs(split=[f"a={sfx}"], cache_prep=cache), verbose=False)
+    assert cache.exists()
+
+    moved = _DataArgs(split=[f"a={tmp_path / 'elsewhere' / 's.sfx'}"], cache_prep=cache)
+    with pytest.raises(SystemExit):
+        P.load_prep(moved, verbose=False)
+    moved.trust_cache_prep = True
+    b = P.load_prep(moved, verbose=False)
+    assert b.prep.n_valid == built.prep.n_valid
+    assert b.split_names == built.split_names
+    assert b.prep.I_obs.numel() == built.prep.I_obs.numel()

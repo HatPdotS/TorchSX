@@ -102,6 +102,14 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                    help="read the prepared observations from here if the file "
                         "exists, else write them.  prepare_observations is ~10 "
                         "min on 133 M observations; nobody should pay it twice.")
+    p.add_argument("--trust-cache-prep", action="store_true", default=False,
+                   help="load --cache-prep without comparing its recorded "
+                        "settings to the command line.  The signature stamps "
+                        "the absolute stream and split-file paths, so a cache "
+                        "moved to another machine is otherwise refused; the "
+                        "inputs need not be present at all.  The recipe still "
+                        "has to be passed for the network to see the same "
+                        "settings, and it is the caller's job that it matches.")
     p.add_argument("--sfx-cache", type=Path, default=None,
                    help="parsed-stream cache (.sfx) for a .stream input")
     p.add_argument("--n-workers", type=int, default=8, help="stream parser workers")
@@ -181,6 +189,18 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
     splits = _splits_from_args(args)
 
+    cache = args.cache_prep
+    if cache is not None and cache.exists() and getattr(args, "trust_cache_prep", False):
+        blob = torch.load(cache, weights_only=False)
+        if verbose:
+            print(f"prep from cache {cache} (settings not checked): "
+                  f"{blob['prep'].n_valid:,} reflections, "
+                  f"{blob['prep'].I_obs.numel():,} obs, "
+                  f"{len(blob.get('split_names', []))} splits", flush=True)
+        from torchsx.nn.experiment_subset import maybe_subset
+        return maybe_subset(PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
+                                       blob["bg_var_factor"]), args)
+
     # Everything that changes what prepare_observations returns.  A cache is
     # only reusable when all of it matches: the blob carries the split labels
     # baked into obs_info, so a cache built from a different --split-file would
@@ -203,7 +223,6 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         "max_crystals": args.max_crystals,
     }
 
-    cache = args.cache_prep
     if cache is not None and cache.exists():
         blob = torch.load(cache, weights_only=False)
         got = blob.get("signature")
