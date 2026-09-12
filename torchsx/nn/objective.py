@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from torchsx.merging.likelihood.poisson import poisson_log_prob_at_zero_signal
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 from torchsx.nn.pooling import group_sum
 
@@ -211,18 +212,18 @@ class MarginalNLL(nn.Module):
 
     def _log_miss(self, n_ph: Tensor, bg: Tensor) -> Tensor:
         """``log p(n | S = 0)`` on the kernel's scale (Poisson about its peak,
-        with the background-variance term when the likelihood carries one)."""
-        n = n_ph.to(bg.dtype)
-        lam0 = bg.clamp(min=1e-6)
-        bvf = float(getattr(self.likelihood, "bg_var_factor", 0.0) or 0.0)
-        s2 = bvf * bg.clamp(min=0.0)
-        nn_ = n.clamp(min=1e-12)
-        A0 = torch.where(n > 0, nn_ * torch.log(lam0 / nn_) - (lam0 - nn_), -lam0)
-        iphi = lam0 / (lam0 + s2)
-        n64 = n.double()
-        logpeak = torch.where(n > 0, (n64 * n64.clamp(min=1e-300).log() - n64
-                                      - torch.lgamma(n64 + 1)).to(n.dtype), torch.zeros_like(n))
-        return A0 * iphi + 0.5 * iphi.log() + logpeak
+        with the background-variance term when the likelihood carries one).
+
+        Delegated to the quadrature so the miss term and the marginal it is
+        mixed with can never disagree about the detection model's background --
+        ``SplitLogGrid`` hands back the ``log_L0`` it already computed for the
+        analytic tail, at no cost, on the same cached grid.
+        """
+        q = getattr(self, "quadrature", None)
+        if q is not None and hasattr(q, "log_miss"):
+            return q.log_miss(self.likelihood, n_ph, bg)
+        bg_mean, sig_b2 = self.likelihood.detection_params(bg)
+        return poisson_log_prob_at_zero_signal(n_ph, bg_mean, sig_b2)
 
     def _mix_miss(self, lp: Tensor, n_ph: Tensor, bg: Tensor) -> Tensor:
         if self.miss_logit is None:
@@ -252,19 +253,13 @@ class MarginalNLL(nn.Module):
     def _marginal(self, scatter, params, log_mean, n_ph, bg, meta, obs_range) -> Tensor:
         """``log p(n | log_mean)`` with the scatter integrated out.
 
-        A mixture scatter is assembled from per-component calls on its child
-        GenGauss views, each centred at ``log_mean + offset_k``, combined with
-        the component weights; the quadrature itself never sees the mixture.
+        The quadrature owns mixture integration, including any fused path.
         """
         if isinstance(scatter, PredictedMixtureScatter):
-            terms = [
-                log_pi_k + self.quadrature.marginalize_signal(
-                    view_k, self.likelihood, log_mean + offset_k, n_ph, bg, params, meta,
-                    obs_range=obs_range,
-                )
-                for log_pi_k, offset_k, view_k in scatter.components(meta)
-            ]
-            return torch.logsumexp(torch.stack(terms, dim=0), dim=0)
+            return self.quadrature.marginalize_mixture(
+                scatter, self.likelihood, log_mean, n_ph, bg, params, meta,
+                obs_range=obs_range,
+            )
         lp = self.quadrature.marginalize_signal(
             scatter, self.likelihood, log_mean, n_ph, bg, params, meta, obs_range=obs_range,
         )

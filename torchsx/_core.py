@@ -566,25 +566,36 @@ def _subset_metadata(
 
 def _merge_metadata(metas: list[StreamMetadata]) -> StreamMetadata:
     """Concatenate per-level StreamMetadata lists/tensors across cores."""
+    from torchsx.measurement import MEASUREMENT_KEY, MeasurementSpec, combine_measurements
+
     merged = StreamMetadata()
     for meta in metas:
         if not meta:
             continue
         for top_key, sub in meta.items():
+            if top_key == MEASUREMENT_KEY:
+                continue
             if not isinstance(sub, dict):
+                merged.setdefault(top_key, sub)
                 continue
             dst = merged.setdefault(top_key, {})
             for field_name, values in sub.items():
-                bucket = dst.setdefault(field_name, [])
                 if isinstance(values, list):
+                    bucket = dst.setdefault(field_name, [])
                     bucket.extend(values)
                 elif isinstance(values, torch.Tensor):
+                    bucket = dst.setdefault(field_name, [])
                     bucket.append(values)
+                else:
+                    dst.setdefault(field_name, values)
     for top_key, sub in merged.items():
         if isinstance(sub, dict):
             for field_name, values in sub.items():
                 if isinstance(values, list) and values and isinstance(values[0], torch.Tensor):
                     sub[field_name] = torch.cat(values)
+    spec = combine_measurements(MeasurementSpec.from_metadata(m) for m in metas)
+    if spec is not None:
+        merged[MEASUREMENT_KEY] = {"record": spec.to_dict()}
     return merged
 
 

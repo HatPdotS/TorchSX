@@ -64,6 +64,14 @@ def save_sfx(core: BaseStream, path: str | Path):
     if fixed_pattern is not None:
         tensors["_fixed_pattern"] = fixed_pattern.to(torch.float32).contiguous().cpu()
 
+    # Retained source identities may share storage with their working columns.
+    # safetensors requires distinct storage; copy aliases only at serialization.
+    seen = set()
+    for key, tensor in tensors.items():
+        storage = tensor.untyped_storage().data_ptr()
+        if storage in seen:
+            tensors[key] = tensor.clone()
+        seen.add(storage)
     save_file(tensors, str(path))
 
     sidecar = {
@@ -72,6 +80,7 @@ def save_sfx(core: BaseStream, path: str | Path):
         "joins": [[j.child_level, j.key_column, j.parent_level] for j in core.joins],
         "spacegroup": core.spacegroup,
         "source_path": core.source_path,
+        "friedel_merged": core.friedel_merged,
         "metadata_schema": meta_schema,
         "has_detector_mask": detector_mask is not None,
         "has_fixed_pattern": fixed_pattern is not None,
@@ -116,7 +125,9 @@ def load_sfx(path: str | Path) -> BaseStream:
         obj = BaseStream._make(
             levels, joins, geometry, metadata,
             sidecar.get("spacegroup", "P 1"), sidecar.get("source_path", ""),
+            friedel_merged=sidecar.get("friedel_merged", True),
         )
+        obj._legacy_hkl_state = "friedel_merged" not in sidecar
         if "_detector_mask" in all_tensors:
             obj.detector_mask = all_tensors["_detector_mask"].to(torch.bool)
         if "_fixed_pattern" in all_tensors:
@@ -156,4 +167,7 @@ def _load_legacy(all_tensors, sidecar, geometry, metadata) -> _SFXStreamCore:
     kwargs["metadata"] = metadata
     kwargs["spacegroup"] = sidecar.get("spacegroup", "P 1")
     kwargs["source_path"] = sidecar.get("source_path", "")
-    return _SFXStreamCore(**kwargs)
+    kwargs["friedel_merged"] = sidecar.get("friedel_merged", True)
+    obj = _SFXStreamCore(**kwargs)
+    obj._legacy_hkl_state = "friedel_merged" not in sidecar
+    return obj

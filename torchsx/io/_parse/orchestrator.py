@@ -47,6 +47,34 @@ def parse_stream(
     seed: int = 0,
     sequential: bool = False,
 ) -> _SFXStreamCore:
+    """Parse reflections with the existing workers and attach source semantics.
+
+    All full/sampled/native/Python paths converge here. Retaining observed
+    indices shares their tensor until canonicalization replaces ``hkl``.
+    """
+    from torchsx.io._crystfel import read_measurement
+    from torchsx.measurement import MEASUREMENT_KEY
+
+    spec = read_measurement(path)
+    core = _parse_stream(path, spacegroup, n_workers, max_crystals, seed, sequential)
+    # The core is still private to this reader: add columns in place, avoiding
+    # repeated whole-tensor validation passes on very large observation tables.
+    core.levels["obs"]["observed_hkl"] = core.hkl
+    core.levels["crystal"]["source_lattice_index"] = core.crystal_in_image
+    core.metadata[MEASUREMENT_KEY] = {"record": spec.to_dict()}
+    core.metadata.setdefault("image", {})["source_file"] = [str(Path(path).resolve())] * core.n_images
+    core.friedel_merged = False
+    return core
+
+
+def _parse_stream(
+    path: str | Path,
+    spacegroup: str = "P 1",
+    n_workers: int = 1,
+    max_crystals: int | None = None,
+    seed: int = 0,
+    sequential: bool = False,
+) -> _SFXStreamCore:
     """Parse a CrystFEL .stream file into stacked tensors.
 
     Parameters

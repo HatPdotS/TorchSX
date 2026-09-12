@@ -54,7 +54,7 @@ class StreamMetadata(dict):
         result = cls()
 
         for flat_key, entry in schema.items():
-            if entry["type"] == "scalar":
+            if "/" not in flat_key:
                 result[flat_key] = entry["value"]
                 continue
 

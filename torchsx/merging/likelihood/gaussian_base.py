@@ -61,7 +61,11 @@ class GaussianLikelihood(DetectionLikelihood):
         self, n: Tensor, S: Tensor, bg: Tensor,
     ) -> Tensor:                                                  # (M, K)
         var = self.sigma_squared_obs(n, bg).clamp(min=self.var_floor)  # (M,)
-        mu = (S + bg[:, None]).clamp(min=1e-6)                          # (M, K)
+        # Same seam as the Poisson path: the detection mean asks the likelihood
+        # what background it models.  The base returns `bg` unchanged, so this
+        # is an identity for every Gaussian likelihood shipped today.
+        bg_mean, _ = self.detection_params(bg)
+        mu = (S + bg_mean[:, None]).clamp(min=1e-6)                     # (M, K)
         diff = n[:, None] - mu
         return -0.5 * (
             _LOG_2PI + var[:, None].log() + diff * diff / var[:, None]

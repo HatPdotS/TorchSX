@@ -7,6 +7,8 @@ I/O for serial crystallography data. Three formats, three jobs: DuckDB and
 
 | Module | Description |
 |--------|-------------|
+| `sources.py` | `SourceInput`, explicit dispatch and header-only measurement inspection |
+| `_crystfel.py` | Interpret recorded CrystFEL commands and gain declarations |
 | `_duckdb.py` | Read a probixi DuckDB run into a stream core (the key/unit mapping is documented there) |
 | `_parser.py` | Parse CrystFEL `.stream` files into stacked tensors — a facade over `_parse/` |
 | `_parse/` | The parser proper: `indexing` (byte scanning) and `records` (per-record parse) are leaves, `workers` builds on both, `orchestrator` drives all three |
@@ -25,7 +27,8 @@ from torchsx import SFXStream
 
 # Ingest: from probixi, or from CrystFEL
 stream = SFXStream.from_duckdb("run.duckdb", spacegroup="P 43 21 2")
-stream = SFXStream.from_stream("indexed.stream", spacegroup="P 43 21 2")
+stream = SFXStream.read("indexed.stream", spacegroup="P 43 21 2")
+spec = stream.measurement  # torchsx.measurement.MeasurementSpec
 
 # Work: the .sfx cache round-trip
 stream.save("data.sfx")
@@ -41,6 +44,15 @@ stream = SFXStream.load("data.sfx")
   every filter. A probixi `frame_id` is kept verbatim in
   `metadata["crystal"]["frame_id"]` for write-back.
 - `.sfx` = safetensors binary + `.sfx.json` sidecar carrying the column schema
-  and join registry.
+  and join registry, Friedel state, and the versioned measurement record under
+  `metadata["_torchsx_measurement"]["record"]`. Legacy files have no spec.
+- Adapters describe stored values; `prepare_observations` converts them once.
+  `resolve_measurement` applies explicit > checkpoint > source precedence.
+  The supported run has one ring recipe; effective masked apertures are unknown.
+- `observed_hkl` and `source_lattice_index` are ordinary level columns, so the
+  existing tensor transforms preserve them without special filtering code.
+  Per-image `source_file`, `filename` and `event` identify source observations.
+- Probixi and DIALS are reserved dispatcher kinds. Probixi's existing direct
+  reader stays usable; no DIALS parser or dependency is added in this phase.
 - Imports are lazy (`__getattr__`) so heavy or optional modules (duckdb, h5py,
   the native extension) are not loaded until used.

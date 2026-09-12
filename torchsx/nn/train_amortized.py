@@ -51,6 +51,12 @@ from torchsx.nn.metrics import (
 __all__ = ["CrystalIndex", "TrainConfig", "AmortizedTrainer"]
 
 
+def _bg_mean_offset(objective) -> float:
+    """The detection background-mean offset the objective's likelihood carries."""
+    return float(getattr(getattr(objective, "likelihood", None),
+                         "bg_mean_offset", 0.0) or 0.0)
+
+
 class CrystalIndex:
     """Crystal-major view of the hkl-sorted observation list.
 
@@ -681,7 +687,11 @@ class AmortizedTrainer:
                             "bg_var_factor", 0.0) or 0.0)
         var = (sigma**2 + bvf * bg.clamp(min=0.0)
                + var_scatter).clamp(min=1e-12)
-        resid = (n_ph - bg) - K * I0
+        # Same argument for the mean: under a bg_mean_offset the model claims
+        # E[n] = K*I0 + bg + offset, so the residual this metric standardises
+        # has to subtract the same background the loss used.  (~0.01 sigma at
+        # this data's medians -- it keeps the metric honest, it is not a fix.)
+        resid = (n_ph - bg - _bg_mean_offset(self.objective)) - K * I0
         tgt = MergeTargetOut(
             log_I0=I0.clamp(min=1e-12).log(), I0=I0, resid=resid, var=var,
             z=resid / var.sqrt(),
@@ -1016,7 +1026,12 @@ class AmortizedTrainer:
                 "inference_context": context,
                 # so a later merge builds the SAME inner integral as training
                 "quadrature": {
-                    "kind": type(getattr(self.objective, "quadrature", None)).__name__,
+                    # The "+bgmean" suffix is load-bearing: it is the only thing
+                    # that makes a build without bg_mean_offset REFUSE this
+                    # checkpoint (see _pipeline's kind check) instead of merging
+                    # it at the uncorrected background convention.
+                    "kind": type(getattr(self.objective, "quadrature", None)).__name__
+                            + ("+bgmean" if _bg_mean_offset(self.objective) else ""),
                     "n_points": getattr(getattr(self.objective, "quadrature", None),
                                         "n_points", None),
                 },
@@ -1031,13 +1046,15 @@ class AmortizedTrainer:
                 # was fitted under, the data recipe, and the scale geometry.  A
                 # silent mismatch here has already cost 0.022 in R_free once.
                 "likelihood": {
-                    "kind": type(getattr(self.objective, "likelihood", None)).__name__,
+                    "kind": type(getattr(self.objective, "likelihood", None)).__name__
+                            + ("+bgmean" if _bg_mean_offset(self.objective) else ""),
                     "bg_var_factor": float(getattr(
                         getattr(self.objective, "likelihood", None),
                         "bg_var_factor", 0.0) or 0.0),
                     "bg_var_mode": getattr(
                         getattr(self.objective, "likelihood", None),
                         "bg_var_mode", None),
+                    "bg_mean_offset": _bg_mean_offset(self.objective),
                 },
                 "data": dict(self.data_recipe or {}),
                 "scale": {

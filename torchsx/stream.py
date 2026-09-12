@@ -10,6 +10,8 @@ import torch
 from torchsx._core import _SFXStreamCore
 from torchsx.geometry import Geometry
 from torchsx.io._metadata import StreamMetadata
+from torchsx.io.sources import SourceInput
+from torchsx.measurement import MeasurementSpec
 
 
 class SFXStream:
@@ -31,6 +33,17 @@ class SFXStream:
         self._core = core
 
     # --- Construction ---
+
+    @classmethod
+    def read(cls, source: str | Path | SourceInput, **kwargs) -> SFXStream:
+        """Read a path or :class:`torchsx.io.sources.SourceInput`.
+
+        CrystFEL ``.stream`` and TorchSX ``.sfx`` are supported. Named Probixi
+        and DIALS inputs reserve extension points for future adapters.
+        Parser controls are the same as :meth:`from_stream`.
+        """
+        from torchsx.io.sources import read_source
+        return read_source(source, **kwargs)
 
     @classmethod
     def from_stream(
@@ -87,7 +100,7 @@ class SFXStream:
                 if merge_friedel:
                     stream = stream.symmetrize()
                 else:
-                    stream = cls(stream._core.replace(friedel_merged=False))
+                    stream = stream._without_friedel()
                 return stream
 
         core = parse_stream(
@@ -102,7 +115,7 @@ class SFXStream:
         if merge_friedel:
             stream = stream.symmetrize()
         else:
-            stream = cls(stream._core.replace(friedel_merged=False))
+            stream = stream._without_friedel()
         return stream
 
     @classmethod
@@ -134,7 +147,7 @@ class SFXStream:
         if merge_friedel:
             stream = stream.symmetrize()
         else:
-            stream = cls(stream._core.replace(friedel_merged=False))
+            stream = stream._without_friedel()
         # The detector mask is a per-run constant; re-attach it after the
         # symmetrize/replace post-processing (which rebuilds the core).
         if detector_mask is not None:
@@ -285,6 +298,16 @@ class SFXStream:
     @property
     def metadata(self) -> StreamMetadata:
         return self._core.metadata
+
+    @property
+    def measurement(self) -> MeasurementSpec | None:
+        """Immutable source measurement specification, or None for legacy data."""
+        return MeasurementSpec.from_metadata(self.metadata)
+
+    @property
+    def observed_hkl(self) -> torch.Tensor | None:
+        """Miller indices before canonicalization; unavailable in legacy caches."""
+        return self._core.levels["obs"].get("observed_hkl")
 
     @property
     def detector_mask(self) -> torch.Tensor | None:
@@ -816,6 +839,18 @@ class SFXStream:
 
     # --- Symmetry ---
 
+    def _without_friedel(self) -> SFXStream:
+        core = self._core
+        if self.observed_hkl is not None:
+            return SFXStream(core.replace(hkl=self.observed_hkl, friedel_merged=False))
+        if getattr(core, "_legacy_hkl_state", False):
+            import warnings
+            warnings.warn("Legacy .sfx has no recorded HKL state; assuming its indices "
+                          "are unmerged as requested. Re-parse to retain observed HKLs.", stacklevel=2)
+        elif core.friedel_merged:
+            raise ValueError("Cannot undo Friedel merging: observed HKLs were not retained.")
+        return SFXStream(core.replace(friedel_merged=False))
+
     def symmetrize(self, spacegroup: str | None = None) -> SFXStream:
         """Remap HKL to canonical ASU representatives using space group symmetry.
 
@@ -831,7 +866,10 @@ class SFXStream:
 
         from torchref.symmetry import SpaceGroup
 
-        sg = spacegroup or self._core.spacegroup
+        core = self._core
+        if not core.friedel_merged and self.observed_hkl is None:
+            core = core.with_columns("obs", observed_hkl=core.hkl)
+        sg = spacegroup or core.spacegroup
         canonical_hkl, _, _, sort_indices = SpaceGroup(sg).canonicalize_hkl(
             self._core.hkl.int(), include_friedel=True,
         )
@@ -840,7 +878,7 @@ class SFXStream:
         inv[sort_indices] = torch.arange(len(sort_indices))
         canonical_hkl = canonical_hkl[inv]
 
-        new_core = self._core.replace(
+        new_core = core.replace(
             hkl=canonical_hkl.to(torch.int16),
             spacegroup=sg,
             friedel_merged=True,

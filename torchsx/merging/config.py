@@ -122,7 +122,7 @@ class MergeConfig:
     wilson_aniso_init_from_data: bool = True
 
     # ── Detector gain ─────────────────────────────────────────────────
-    #   "stream"    → ``adu_per_eV × photon_energy_eV`` from the stream
+    #   "stream"    → declared adu_per_photon, or adu_per_eV × beam energy
     #   "empirical" → Mandel calibration on negatives
     #   float       → explicit ADU/photon
     gain: str | float = "stream"

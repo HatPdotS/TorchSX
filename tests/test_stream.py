@@ -222,7 +222,7 @@ def test_symmetrize_default_spacegroup(sample_core):
 def test_load_merge_friedel(sample_core, tmp_path):
     """load() with merge_friedel applies symmetrize."""
     hkl = torch.tensor([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [2, 0, 0], [0, 2, 0]], dtype=torch.int16)
-    core = sample_core.replace(hkl=hkl, spacegroup="P -1")
+    core = sample_core.replace(hkl=hkl, spacegroup="P -1", friedel_merged=False)
     stream = SFXStream(core)
     path = tmp_path / "test.sfx"
     stream.save(path)

@@ -127,8 +127,9 @@ stream = SFXStream.from_duckdb("run.duckdb", spacegroup="P 43 21 2")
 **From CrystFEL** (an `indexamajig` `.stream`):
 
 ```python
-stream = SFXStream.from_stream("indexed.stream", spacegroup="P 43 21 2",
-                               cache="indexed.sfx")
+stream = SFXStream.read("indexed.stream", spacegroup="P 43 21 2",
+                        cache="indexed.sfx")
+print(stream.measurement)  # declared units, integration recipe and provenance
 ```
 
 Then merge, the same either way:
@@ -143,6 +144,62 @@ result = loss.posterior()          # I, sigma_I from one posterior integral
 
 Filtering is immutable — every operation returns a new object, with the join
 keys renumbered onto the surviving rows.
+
+## Source measurement contract
+
+CrystFEL ingestion retains raw intensity, background and sigma values. Its
+immutable `MeasurementSpec` records the producer/version, integration method,
+units and definitions, recorded `--int-radius`, gain declarations, unresolved
+fields and their provenance. Both `--option=value` and `--option value` are
+read from the recorded command as text. No command in an input file is executed.
+
+The `train`, `merge_global` and `merge_nn` commands resolve settings in this order: **explicit flags,
+checkpoint recipe, source metadata**. With a recorded ring recipe and gain,
+`--int-radius` and `--gain` can be omitted. Space group and resolution cuts
+remain user choices. `adu_per_photon = 1` means gain 1; `adu_per_eV` is
+multiplied by the mean recorded image energy. Missing or invalid declarations
+require an explicit gain or a requested `auto`/`empirical` calibration. Their
+existing algorithms are unchanged. Photon conversion happens once, in shared
+observation preparation. The resolved numeric gain and its origin are saved
+with the preparation recipe and checkpoint.
+The existing Probixi reader and explicitly requested legacy `gain="stream"`
+recipes retain their geometry-based gain behavior with a warning until their
+source semantics are supplied.
+
+One integration recipe is assumed per run, including named splits. Profile
+integration, gradient backgrounds and other incompatible semantics are rejected
+before training. Unknown integration methods/modifiers require an explicit
+historical ring recipe where compatible. The exact integer ring counts are
+**nominal aperture counts**, not effective counts after masking or clipping.
+This boundary does not introduce a new background-bias correction or calibration
+policy; those remain scientific qualification work.
+
+`stream.observed_hkl` retains indices before canonicalization. Source filenames,
+events and lattice indices survive filtering, concatenation and `.sfx` storage,
+along with the measurement record and Friedel state. Ewald-offset computation
+continues to use the existing symmetry-image calculation. Legacy caches without
+a measurement record need an explicit or checkpoint recipe; `--trust-cache-prep`
+still loads a moved prepared cache without reading the original inputs. An old
+`.sfx` without a recorded HKL state cannot establish whether its indices were
+already canonicalized; `merge_friedel=False` preserves the historical assumption
+with a warning. Re-parsing the source recovers observed indices.
+
+`from_stream`, `from_duckdb` and `load` remain available. `SFXStream.read` accepts
+a path or named files through `SourceInput`:
+
+```python
+from torchsx import SourceInput
+stream = SFXStream.read(SourceInput("crystfel", {"stream": "indexed.stream"}),
+                        spacegroup="P 43 21 2")
+# Reserved descriptors; their measurement adapters are not implemented yet:
+probixi = SourceInput("probixi", {"database": "run.duckdb"})
+dials = SourceInput("dials", {"experiments": "run.expt", "reflections": "run.refl"})
+```
+
+Probixi continues to work through `from_duckdb`; its next step is to supply the
+measurement record. A future DIALS adapter must select and document intensity,
+variance, background and upstream-correction semantics before entering shared
+preparation. Neither requires a second tensor container or a plugin registry.
 
 ## Package structure
 
@@ -174,9 +231,10 @@ into one scalar for LBFGS. Subpackages: `priors/`, `scale/`, `scatter/`,
 `hkl/` is the reflection-bookkeeping layer — HKL indexing, filtering, shell
 statistics, and the Poisson noise model whose `calibrate_sigma2_of_bg` derives
 detector gain from off-Bragg (predicted-zero-signal) observations via
-Ewald-offset gating. This is the **default** (`gain="auto"`); the alternatives
-are `"stream"` (photon energy × ADU/eV), `"empirical"` (negatives-Mandel, biased
-high) or an explicit float.
+Ewald-offset gating when `gain="auto"` is requested. The default is `"stream"`
+(declared ADU/photon, or photon energy × ADU/eV), with a recorded checkpoint
+recipe taking precedence in the CLI. Other explicit choices are `"empirical"`
+(negatives-Mandel, biased high) or a numeric gain.
 
 ### `torchsx.io`
 

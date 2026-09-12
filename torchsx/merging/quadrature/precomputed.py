@@ -498,6 +498,7 @@ class PrecomputedGridQuadrature(Quadrature):
         meta: ObsInfo,
         obs_range: tuple[int, int] | None = None,
     ) -> Tensor:
+        self._reject_unmodelled_bg(likelihood, variance=True)
         h = meta.hkl_idx
         alpha = params.log_alpha[h].exp()
         beta = params.log_beta[h].exp()

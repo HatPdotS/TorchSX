@@ -117,9 +117,12 @@ def compute_poisson_null_score(
             n_ph_slice = data_target.n_ph[s:e]
             bg_slice = data_target.bg[s:e]
 
-            # Pure Poisson NLL (ε = 0)
+            # Pure Poisson NLL (ε = 0).  The background has to be the one the
+            # marginal below uses, or the likelihood ratio compares two
+            # different detection models and the shrinkage weights drift.
             S = log_mean.exp()
-            lam = (S + bg_slice).clamp(min=1e-6)
+            bg_mean, _ = data_target.likelihood.detection_params(bg_slice)
+            lam = (S + bg_mean).clamp(min=1e-6)
             log_p_pois = (
                 n_ph_slice * torch.log(lam)
                 - lam
