@@ -204,22 +204,29 @@ class FixedLogGrid(Quadrature):
         if self._can_use_triton(scatter, likelihood, log_mean):
             log_w = self._trap_log_w(self.log_S_grid, K)
             from torchsx.merging.likelihood import GaussianLikelihood
+            # The kernels reimplement the integrand, so they -- unlike the eager
+            # fallback below, which delegates to `log_prob_given_signal` -- must
+            # ask the likelihood what background its mean uses.  Handing the raw
+            # bg to one and the modelled bg to the other is the double-apply
+            # trap; `test_fixed_eager_matches_triton_under_bg_mean_offset` is
+            # what catches it.
+            bg_mean, sig_b2 = likelihood.detection_params(bg)
             if isinstance(likelihood, GaussianLikelihood):
+                # σ² is the Gaussian's own recipe from the RAW estimate.
                 var = likelihood.sigma_squared_obs(n_ph, bg).clamp(
                     min=likelihood.var_floor,
                 )
                 return marginalize_signal_triton_gaussian(
-                    log_mean, n_ph, bg, var.contiguous(),
+                    log_mean, n_ph, bg_mean, var.contiguous(),
                     log_alpha_obs, log_beta_obs,
                     self.log_S_grid, log_w,
                 )
             # A non-zero bg_var_factor accounts for the background estimate's
             # own variance; 0 (the default) is the plain Poisson.
-            bvf = float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0)
             return marginalize_signal_triton(
-                log_mean, n_ph, bg, log_alpha_obs, log_beta_obs,
+                log_mean, n_ph, bg_mean, log_alpha_obs, log_beta_obs,
                 self.log_S_grid, log_w,
-                sig_b2=(bvf * bg.clamp(min=0.0)) if bvf > 0.0 else None,
+                sig_b2=sig_b2,
                 bg_deviance=getattr(likelihood, "bg_var_mode", "deviance")
                 != "second_order",
             )
@@ -290,6 +297,11 @@ class FixedLogGrid(Quadrature):
             raise NotImplementedError(
                 "REML aux-stat path currently requires Poisson likelihood."
             )
+        # The aux stats below inline the PLAIN Poisson -- no background-estimate
+        # variance, no background-mean offset.  That has always been true of
+        # bg_var_factor and went unsaid; say it now rather than let either be
+        # silently dropped.
+        self._reject_unmodelled_bg(likelihood, variance=True)
 
         from torchsx.merging.scatter.gengauss import gengauss_log_prob_from_obs
 

@@ -109,6 +109,7 @@ class MomentMatchedQuadrature(Quadrature):
         meta: ObsInfo,                     # unused
         obs_range: tuple[int, int] | None = None,
     ) -> Tensor:
+        self._reject_unmodelled_bg(likelihood, variance=True)
         del scatter, likelihood, params, meta, obs_range
         K_I = log_mean.exp()                               # (n_obs,)  K · I
         mu = K_I * self.e_s + bg                            # mean of n

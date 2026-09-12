@@ -55,7 +55,7 @@ import torch
 from torch import Tensor
 
 from torchsx.merging.likelihood.base import DetectionLikelihood
-from torchsx.merging.likelihood.poisson import Poisson
+from torchsx.merging.likelihood.poisson import Poisson, poisson_logpeak
 from torchsx.merging.observations import ObsInfo
 from torchsx.merging.parameters import Parameters
 from torchsx.merging.quadrature.base import Quadrature
@@ -129,25 +129,37 @@ class SplitLogGrid(Quadrature):
     # ── grid geometry: a function of the data only ────────────────────
 
     @torch.no_grad()
-    def grid_params(self, n_ph: Tensor, bg: Tensor, sig_b2: Tensor | None) -> dict:
+    def grid_params(self, n_ph: Tensor, bg: Tensor, sig_b2: Tensor | None,
+                    bg_mean_offset: float = 0.0) -> dict:
         """Per-observation window and dense-zone parameters, plus ``log L(0)``.
 
         Returns float ``(M,)`` tensors ``x_lo, h1, d_lo, h_d, d_hi, h2, log_L0``
         and int32 ``(M,)`` tensors ``n1, n1d`` (``n1d = n1 + n_dense``).  Node
         ``k`` sits at ``x_lo + k h1`` for ``k < n1``, at ``d_lo + (k-n1) h_d``
         for ``n1 <= k < n1d``, and at ``d_hi + (k-n1d+1) h2`` beyond.
+
+        ``bg`` is the RAW stored estimate -- the tensor the cache keys on and
+        pins.  ``bg_mean_offset`` shifts the background the detection model
+        uses; the shifted tensor is derived here, returned as ``bg_model``, and
+        held by the cache, so callers never allocate their own (which would
+        both miss this cache and re-open the address-recycling window it is
+        pinning ``bg`` against).
         """
         # sig_b2 is a fresh tensor on every call; key on its *coefficient*
         bvf = None if sig_b2 is None else float(self._last_bvf)
-        key = (id(n_ph), id(bg), bvf, n_ph.numel())
+        key = (id(n_ph), id(bg), bvf, float(bg_mean_offset), n_ph.numel())
         if self._cache_key == key and self._cache_val is not None:
             return self._cache_val
 
         K = self.n_points
         n = n_ph.to(bg.dtype)
-        lam0 = bg.clamp(min=1e-6)
+        # Everything below -- the window, the dense zone, log L(0) -- is the
+        # geometry of the integrand, so it is built from the background the
+        # detection model actually uses, not from the raw estimate.
+        bg_model = bg + bg_mean_offset if bg_mean_offset else bg
+        lam0 = bg_model.clamp(min=1e-6)
         s2 = sig_b2 if sig_b2 is not None else torch.zeros_like(lam0)
-        s0 = (n - bg).clamp(min=0.0)
+        s0 = (n - bg_model).clamp(min=0.0)
         sig_S = (n.clamp(min=1.0) + s2).sqrt()
 
         # Poisson factor about its own peak, on the kernel's scale
@@ -155,13 +167,7 @@ class SplitLogGrid(Quadrature):
         nn_ = n.clamp(min=1e-12)
         A0 = torch.where(n_pos, nn_ * torch.log(lam0 / nn_) - (lam0 - nn_), -lam0)
         iphi = lam0 / (lam0 + s2)
-        n64 = n.double()
-        logpeak = torch.where(
-            n_pos,
-            (n64 * n64.clamp(min=1e-300).log() - n64
-             - torch.lgamma(n64 + 1)).to(n.dtype),
-            torch.zeros_like(n),
-        )
+        logpeak = poisson_logpeak(n)
         log_L0 = A0 * iphi + 0.5 * iphi.log() + logpeak
 
         # d log L / dS at S = 0 (deviance form; s2 = 0 gives n/bg - 1)
@@ -210,6 +216,7 @@ class SplitLogGrid(Quadrature):
             n1=n1.to(torch.int32).contiguous(),
             n1d=(n1 + nd).to(torch.int32).contiguous(),
             log_L0=log_L0.contiguous(), x_hi=x_hi, logpeak=logpeak, iphi0=iphi,
+            bg_model=bg_model,
         )
         self._cache_key, self._cache_val = key, out
         # keep the keyed tensors alive so their addresses cannot be recycled
@@ -238,7 +245,25 @@ class SplitLogGrid(Quadrature):
     def _sig_b2(self, likelihood: DetectionLikelihood, bg: Tensor) -> Tensor | None:
         bvf = float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0)
         self._last_bvf = bvf
-        return (bvf * bg.clamp(min=0.0)) if bvf > 0.0 else None
+        return likelihood.detection_params(bg)[1]
+
+    def _bg_mean_offset(self, likelihood: DetectionLikelihood) -> float:
+        return float(getattr(likelihood, "bg_mean_offset", 0.0) or 0.0)
+
+    def log_miss(self, likelihood: DetectionLikelihood, n_ph: Tensor,
+                 bg: Tensor) -> Tensor:
+        """``log L(0)`` -- the same one the analytic tail already uses.
+
+        Reuses the cached grid, so the miss component costs nothing on top of
+        the marginal it is mixed with and cannot drift from it.  ``grid_params``
+        is ``no_grad`` and would silently detach a learned background, so that
+        case takes the differentiable base implementation instead (which in turn
+        refuses if the likelihood also carries a background-mean offset).
+        """
+        if bg.requires_grad:
+            return super().log_miss(likelihood, n_ph, bg)
+        return self.grid_params(n_ph, bg, self._sig_b2(likelihood, bg),
+                                self._bg_mean_offset(likelihood))["log_L0"]
 
     def marginalize_signal(
         self,
@@ -261,7 +286,11 @@ class SplitLogGrid(Quadrature):
         log_alpha_obs, log_beta_obs = scatter.log_alpha_beta_obs(params, meta)
         log_alpha_hi_obs = scatter.log_alpha_hi_obs(params, meta)   # None = symmetric
         sig_b2 = self._sig_b2(likelihood, bg)
-        p = self.grid_params(n_ph, bg, sig_b2)
+        # The RAW bg goes down to grid_params -- it is what the cache keys on
+        # and pins; the shifted background comes back as `p["bg_model"]` and is
+        # what the integrand below (and the kernel) must use.
+        p = self.grid_params(n_ph, bg, sig_b2, self._bg_mean_offset(likelihood))
+        bg_model = p["bg_model"]
 
         # analytic tail: L(0) * P(eps <= x_lo - log_mean)
         log_tail = p["log_L0"] + gengauss_log_cdf_from_obs(
@@ -271,7 +300,7 @@ class SplitLogGrid(Quadrature):
         if (HAVE_TRITON and not _DISABLE_TRITON and log_mean.is_cuda
                 and log_mean.dtype == torch.float32):
             log_win = marginalize_signal_split_triton(
-                log_mean, n_ph, bg, log_alpha_obs, log_beta_obs, p, K,
+                log_mean, n_ph, bg_model, log_alpha_obs, log_beta_obs, p, K,
                 sig_b2=sig_b2, log_alpha_hi_obs=log_alpha_hi_obs,
             )
         else:
@@ -284,7 +313,7 @@ class SplitLogGrid(Quadrature):
             # terms in float32 at bright observations (0.2 nats at n = 2e5).
             n = n_ph.to(x.dtype)
             nn_ = n.clamp(min=1e-12)[:, None]
-            lam = (x.exp() + bg[:, None]).clamp(min=1e-6)
+            lam = (x.exp() + bg_model[:, None]).clamp(min=1e-6)
             neg_half_D = torch.where(n[:, None] > 0, nn_ * torch.log(lam / nn_) - (lam - nn_), -lam)
             if sig_b2 is not None:
                 inv_phi = lam / (lam + sig_b2[:, None])

@@ -514,6 +514,11 @@ class PosteriorMergeTarget(nn.Module):
                 # quantity from the one the loss asked for.
                 and not float(getattr(objective.likelihood, "bg_var_factor",
                                       0.0) or 0.0)
+                # Same argument for the background MEAN: the kernel's
+                # `lam = S + bg` is the raw estimate, so a bg_mean_offset would
+                # be dropped here while the loss honours it.
+                and not float(getattr(objective.likelihood, "bg_mean_offset",
+                                      0.0) or 0.0)
             ):
                 la, lb = scatter.log_alpha_beta_obs(params, meta)
                 lp = fused_posterior_logp(

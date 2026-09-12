@@ -21,6 +21,9 @@ class DetectionLikelihood(nn.Module):
     * ``combine_with_marginal(n, bg, log_p_sig_marginal, params, meta)`` —
       post-marginal combining (e.g. mixing in a bg hypothesis).  Default
       implementation just returns the signal marginal unchanged.
+
+    Plus :meth:`detection_params`, describing how the *stored* ``bg`` — an
+    annulus-derived ESTIMATE, not a measurement — enters the detection model.
     """
 
     @abstractmethod
@@ -28,6 +31,27 @@ class DetectionLikelihood(nn.Module):
         self, n: Tensor, S: Tensor, bg: Tensor
     ) -> Tensor:  # (M, K)
         ...
+
+    def detection_params(self, bg: Tensor) -> tuple[Tensor, Tensor | None]:
+        """``(bg_mean, sig_b2)`` for the raw stored estimate ``bg``.
+
+        ``bg_mean`` is the background the detection mean uses; ``sig_b2`` is the
+        estimate's own variance, or ``None`` when it is not modelled.  Identity
+        and ``None`` by default, so a likelihood that does neither is untouched.
+
+        This is **one** call returning both on purpose.  The two fast
+        quadratures (``SplitLogGrid``, ``FixedLogGrid``) and their Triton
+        kernels reimplement the Poisson core instead of calling
+        :meth:`log_prob_given_signal`, so they have to ask for this mapping —
+        and with two separate accessors the plausible-looking
+        ``bg_variance(model_bg(bg))`` silently computes the variance at the
+        shifted background.  Returning the pair makes that unrepresentable.
+
+        Non-likelihood consumers of ``bg`` — the pooled ``(n − bg)/K``
+        estimator, the encoder features, the bg gate, the σ²(bg) calibration —
+        deliberately keep the raw value and must NOT route through this.
+        """
+        return bg, None
 
     def combine_with_marginal(
         self,

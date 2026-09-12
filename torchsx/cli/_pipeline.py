@@ -695,7 +695,45 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
                    help="background-estimate variance coefficient; default "
                         "n_peak/n_bg from --int-radius")
     p.add_argument("--bg-var-mode", choices=("deviance", "second_order"), default=None)
+    p.add_argument("--bg-mean-offset", default=None, metavar="C|auto",
+                   help="add C to the background the DETECTION mean uses, "
+                        "correcting the annulus estimate's bias E[B|A] = bg + "
+                        "n_peak/n_bg; 'auto' uses n_peak/n_bg.  Raw bg still "
+                        "feeds the encoder, the pooled estimator and the "
+                        "calibration.  Default: off, or whatever the "
+                        "checkpoint was trained with")
     p.add_argument("--device", default=None, help="cuda | cpu")
+
+
+# Checkpoint ``kind`` markers for the corrected detection stack.  The first of
+# each pair is what this package writes; the second is the out-of-tree
+# experiment wrapper (``annulus_mean_only_v1``, jobs 205123/205124) whose
+# trained models predate the parameter and are still worth merging.
+_BG_MEAN_QUAD_KINDS = ("SplitLogGrid+bgmean", "AnnulusMeanOnlySplitLogGridV1")
+_BG_MEAN_LIK_KINDS = ("Poisson+bgmean", "AnnulusMeanOnlyPoissonV1")
+
+
+def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
+    """The background-mean offset a checkpoint was trained with.
+
+    Both ``kind`` markers have to agree: a checkpoint carrying one alone is a
+    write we do not know how to interpret, and guessing would merge the model
+    at the wrong background convention -- silently, at exactly the scale that
+    motivated the correction.
+    """
+    qkind = (ck.get("quadrature") or {}).get("kind")
+    lkind = (ck.get("likelihood") or {}).get("kind")
+    corrected = (qkind in _BG_MEAN_QUAD_KINDS, lkind in _BG_MEAN_LIK_KINDS)
+    if any(corrected) and not all(corrected):
+        raise SystemExit(
+            f"checkpoint markers disagree: quadrature {qkind!r} vs likelihood "
+            f"{lkind!r}; one says the background mean was corrected and the "
+            "other does not")
+    stored = (ck.get("likelihood") or {}).get("bg_mean_offset")
+    if stored is not None:
+        return float(stored)
+    # The experiment wrapper recorded no offset; it always used c itself.
+    return float(bvf) if any(corrected) else 0.0
 
 
 def resolve(args, ckpt: dict | None, key: str, *ckpt_path: str):
@@ -799,17 +837,36 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
            else (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor))
     mode = (args.bg_var_mode
             or (ck.get("likelihood") or {}).get("bg_var_mode") or "deviance")
+    # CLI beats the checkpoint beats OFF.  Deliberately NOT bundle-derived:
+    # silence has to mean the legacy detection model, so every checkpoint
+    # written before this parameter re-merges bit-exactly.
+    if args.bg_mean_offset is None:
+        bg_mean_offset = bg_mean_offset_from_ckpt(ck, bvf)
+    elif str(args.bg_mean_offset).lower() == "auto":
+        bg_mean_offset = float(bvf)
+    else:
+        bg_mean_offset = float(args.bg_mean_offset)
+    if bg_mean_offset and global_scale:
+        raise SystemExit("--bg-mean-offset is qualified for the amortised "
+                         "stack only; it has not been run with global scale")
+    if bg_mean_offset and float(bvf) <= 0.0:
+        raise SystemExit(
+            f"--bg-mean-offset {bg_mean_offset:g} needs a non-zero "
+            "--bg-var-factor: both are n_peak/n_bg and describe the same "
+            "annulus estimate, so correcting its mean without its variance is "
+            "worse than correcting neither")
     quad = dict(ck.get("quadrature") or {})
     n_points = (args.inner_points if args.inner_points is not None
                 else quad.get("n_points") or DEFAULTS["inner_points"])
-    if quad and quad.get("kind") not in (None, "SplitLogGrid"):
+    if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS):
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
                          "ship SplitLogGrid only (see bench/to_mtz.py --quadrature)")
     miss = args.miss if args.miss is not None else (
         DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
         else (0.5 if scat.get("miss_logit") is not None else 0.0))
     obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev),
-                      Poisson(bg_var_factor=float(bvf), bg_var_mode=mode),
+                      Poisson(bg_var_factor=float(bvf), bg_var_mode=mode,
+                              bg_mean_offset=bg_mean_offset),
                       miss_frac=float(miss)).to(dev)
     if scat.get("miss_logit") is not None and obj.miss_logit is not None:
         with torch.no_grad():
@@ -846,7 +903,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         n_sigma=float(args.n_sigma or DEFAULTS["n_sigma"]),
         max_halfwidth=float(args.max_halfwidth or DEFAULTS["max_halfwidth"]),
         prior=args.posterior_prior or "wilson",
-        bg_var_factor=float(bvf), bg_var_mode=mode, inner_points=int(n_points),
+        bg_var_factor=float(bvf), bg_var_mode=mode,
+        bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
         skew=bool(skew), miss=float(miss),
         wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
         scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
@@ -858,7 +916,14 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
               f"miss {miss:.3f}, SplitLogGrid({n_points}), "
               f"outer {settings['k_coarse']}/{settings['m_fine']} "
               f"n_sigma {settings['n_sigma']:g}, "
-              f"Poisson(bg_var={bvf:.4f}, {mode}), device {dev}", flush=True)
+              f"Poisson(bg_var={bvf:.4f}, {mode}"
+              + (f", bg_mean+{bg_mean_offset:.4f}" if bg_mean_offset else "")
+              + f"), device {dev}", flush=True)
+        if bg_mean_offset:
+            print(f"  detection background mean is bg+{bg_mean_offset:.4f} "
+                  f"({bg_mean_offset / float(bvf):.3f} x n_peak/n_bg); variance "
+                  f"stays {bvf:.4f}*max(bg,0); raw bg still feeds the encoder, "
+                  "the pooled estimator and the calibration", flush=True)
         if basis is not None:
             print(f"  smooth reciprocal basis: Chebyshev degree {wilson_degree} + "
                   f"{basis.n_aniso} invariant anisotropy tensor(s) ({bundle.spacegroup}), "
