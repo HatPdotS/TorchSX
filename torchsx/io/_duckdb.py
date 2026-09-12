@@ -252,6 +252,7 @@ def load_duckdb(
         camera_length=torch.full((n_images,), clen, dtype=torch.float32),
         geometry=geometry,
         metadata=metadata,
+        friedel_merged=False,
         spacegroup=spacegroup,
         source_path=str(path),
     )

@@ -253,19 +253,13 @@ class MarginalNLL(nn.Module):
     def _marginal(self, scatter, params, log_mean, n_ph, bg, meta, obs_range) -> Tensor:
         """``log p(n | log_mean)`` with the scatter integrated out.
 
-        A mixture scatter is assembled from per-component calls on its child
-        GenGauss views, each centred at ``log_mean + offset_k``, combined with
-        the component weights; the quadrature itself never sees the mixture.
+        The quadrature owns mixture integration, including any fused path.
         """
         if isinstance(scatter, PredictedMixtureScatter):
-            terms = [
-                log_pi_k + self.quadrature.marginalize_signal(
-                    view_k, self.likelihood, log_mean + offset_k, n_ph, bg, params, meta,
-                    obs_range=obs_range,
-                )
-                for log_pi_k, offset_k, view_k in scatter.components(meta)
-            ]
-            return torch.logsumexp(torch.stack(terms, dim=0), dim=0)
+            return self.quadrature.marginalize_mixture(
+                scatter, self.likelihood, log_mean, n_ph, bg, params, meta,
+                obs_range=obs_range,
+            )
         lp = self.quadrature.marginalize_signal(
             scatter, self.likelihood, log_mean, n_ph, bg, params, meta, obs_range=obs_range,
         )

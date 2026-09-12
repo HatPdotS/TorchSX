@@ -104,7 +104,10 @@ class AmortizedScale(ScaleModel):
             )
         self.anchor_stat = anchor_stat
         fam = getattr(heads, "scatter_family", "gengauss")
-        self.scatter = (PredictedMixtureScatter(heads.n_components) if fam == "mixture"
+        self.scatter = (PredictedMixtureScatter(
+                            heads.n_components,
+                            fixed_gaussian=heads.mixture.shape in ("gaussian", "partiality"),
+                        ) if fam == "mixture"
                         else PredictedGenGaussScatter())
         self._cached_obs_id: Tensor | None = None
         self._cached_pred: ScalePrediction | None = None

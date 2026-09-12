@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from torchsx.measurement import ResolvedMeasurement
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.hkl import (
     Adjacency,
@@ -407,6 +408,7 @@ def prepare_observations(
     partiality: Tensor | None = None,
     poisson_noise: PoissonNoiseModel | None = None,
     crystal_weights: Tensor | None = None,
+    resolved_measurement: ResolvedMeasurement | None = None,
 ) -> PreparedObs:
     """Stream → PreparedObs (CPU).  Call ``.to(device)`` afterwards.
 
@@ -418,9 +420,21 @@ def prepare_observations(
     bit-for-bit identical to the unweighted pipeline.
     """
     from torchref.base.reciprocal.hkl import get_d_spacing
+    from torchsx.measurement import (
+        gain_from_measurement, legacy_stream_gain, parse_gain,
+        resolve_measurement, validate_measurement,
+    )
 
+    spec = stream.measurement
+    if resolved_measurement is not None:
+        validate_measurement(spec, explicit_rings=dict(resolved_measurement.provenance)["radii"] != "source")
+    if resolved_measurement is None and spec is not None:
+        radii = (None if poisson_noise is None else
+                 (poisson_noise.r_peak, poisson_noise.r_gap, poisson_noise.r_bg))
+        resolved_measurement = resolve_measurement(spec, radii=radii, gain=config.gain)
     if poisson_noise is None:
-        poisson_noise = PoissonNoiseModel()
+        radii = resolved_measurement.radii if resolved_measurement else (7.0, 9.0, 11.0)
+        poisson_noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2])
 
     core = stream._core
     core_I = core.I
@@ -447,19 +461,14 @@ def prepare_observations(
     _lap("ewald offset")
 
     # ── Detector gain (ADU / photon) ──
-    gain_cfg = config.gain
+    gain_cfg = parse_gain(resolved_measurement.gain if resolved_measurement else config.gain)
     if isinstance(gain_cfg, (int, float)):
         gain = float(gain_cfg)
-        gain_src = "explicit"
+        gain_src = dict(resolved_measurement.provenance)["gain"] if resolved_measurement else "explicit"
     elif gain_cfg == "stream":
-        adu_per_eV = 1.0
-        if core.geometry is not None:
-            adu_per_eV = float(getattr(core.geometry, "adu_per_eV", 1.0) or 1.0)
         mean_eV = float(core.beam_energy.float().mean().item())
-        gain = adu_per_eV * mean_eV
-        if gain <= 0:
-            gain = 1.0
-        gain_src = f"stream (adu_per_eV={adu_per_eV:.6g} × {mean_eV:.1f} eV)"
+        gain = gain_from_measurement(spec, mean_eV) if spec is not None else legacy_stream_gain(core)
+        gain_src = "source measurement declaration" if spec is not None else "legacy geometry (unverified)"
     elif gain_cfg == "empirical":
         g = poisson_noise.calibrate_gain(core_I, core_background)
         gain = float(g) if g and g > 0 else 1.0

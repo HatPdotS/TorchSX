@@ -17,11 +17,13 @@ for the single family.  Component ``k`` is then centred at
 Per-observation parameters are addressed by ``ObsInfo.obs_id`` like the
 single predicted family.  This class deliberately does not subclass
 ``GenGaussLogScatter``: the fast paths that test for that class would treat
-the mixture as one component.  The marginal likelihood is assembled by the
-objective from per-component calls on the child views.
+the mixture as one component. The quadrature can integrate the mixture in a
+single pass; other paths retain per-component calls on the child views.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -113,14 +115,23 @@ class PredictedMixtureScatter(ScatterModel):
     its own two widths and shape.  ``components(meta)`` yields, per component,
     the weight and offset gathered for ``meta`` and a child
     ``PredictedGenGaussScatter`` view that any GenGauss-only quadrature accepts.
+
+    ``fixed_gaussian=True`` declares that beta is fixed at 2, enabling the
+    fused split-grid kernel. It must not be set for a learned shape that
+    merely happens to equal 2 at the current step.
     """
 
-    def __init__(self, n_components: int, *, strict: bool = True) -> None:
+    def __init__(self, n_components: int, *, strict: bool = True,
+                 fixed_gaussian: bool = False) -> None:
         super().__init__()
         if n_components < 1:
             raise ValueError("n_components must be positive")
         self.n_components = int(n_components)
         self.strict = bool(strict)
+        # An explicit model contract, never inferred from the current beta
+        # values: a learned shape can pass through beta=2 during training.
+        self.fixed_gaussian = bool(fixed_gaussian)
+        self._mix: Tensor | None = None
         self.views = nn.ModuleList(
             [PredictedGenGaussScatter(strict=strict) for _ in range(self.n_components)]
         )
@@ -138,6 +149,9 @@ class PredictedMixtureScatter(ScatterModel):
         log_pi, offset, la_lo, la_hi, log_beta = split_mix(mix, self.n_components)
         if obs_id.shape != log_pi.shape[:1]:
             raise ValueError(f"shape mismatch: obs_id={tuple(obs_id.shape)} mix={tuple(mix.shape)}")
+        if self.fixed_gaussian and not bool((log_beta == math.log(2.0)).all()):
+            raise ValueError("fixed_gaussian requires every component beta to be fixed at 2")
+        self._mix = mix
         for k, view in enumerate(self.views):
             view.set_prediction(obs_id, la_lo[:, k], log_beta[:, k], la_hi[:, k])
         sorted_ids, perm = torch.sort(obs_id)
@@ -151,6 +165,7 @@ class PredictedMixtureScatter(ScatterModel):
         self._sorted_ids = self._sort_perm = None
         self._log_pi = self._offset = None
         self._log_alpha_lo = self._log_alpha_hi = self._log_beta = None
+        self._mix = None
 
     @property
     def has_prediction(self) -> bool:
@@ -182,6 +197,13 @@ class PredictedMixtureScatter(ScatterModel):
             (self._log_pi[pos, k], self._offset[pos, k], view)
             for k, view in enumerate(self.views)
         ]
+
+    def mixture_obs(self, meta: ObsInfo) -> Tensor:
+        """Gather all five parameter blocks with one observation lookup."""
+        if meta.obs_id is None:
+            raise ValueError("PredictedMixtureScatter needs ObsInfo.obs_id to address its prediction")
+        pos = self._positions(meta.obs_id)
+        return self._mix.index_select(0, pos)
 
     # ── the base contract: the dominant component stands in for the family ──
 

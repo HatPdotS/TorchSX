@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 
+import torch
 import torch.nn as nn
 from torch import Tensor
 
@@ -37,6 +38,19 @@ class Quadrature(nn.Module):
     # to set up the per-obs μ-coarse scan and is only valid for grids whose
     # node positions are independent of ``log_mean``.
     requires_per_call_posterior: bool = False
+
+    def marginalize_mixture(
+        self, scatter, likelihood, log_mean, n_ph, bg, params, meta, obs_range=None,
+    ) -> Tensor:
+        """Weighted component marginals; quadratures may fuse this operation."""
+        terms = [
+            log_pi + self.marginalize_signal(
+                view, likelihood, log_mean + offset, n_ph, bg, params, meta,
+                obs_range=obs_range,
+            )
+            for log_pi, offset, view in scatter.components(meta)
+        ]
+        return torch.logsumexp(torch.stack(terms, dim=0), dim=0)
 
     def _reject_unmodelled_bg(
         self, likelihood: DetectionLikelihood, *, variance: bool = False,

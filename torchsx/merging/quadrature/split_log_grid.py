@@ -68,6 +68,7 @@ try:
     from torchsx.merging.quadrature._split_log_grid_triton import (
         HAVE_TRITON, marginalize_signal_split_triton,
     )
+    from torchsx.merging.quadrature._split_mixture_triton import marginalize_gaussian_mixture
 except ImportError:                                  # pragma: no cover
     HAVE_TRITON = False
     marginalize_signal_split_triton = None  # type: ignore[assignment]
@@ -241,6 +242,25 @@ class SplitLogGrid(Quadrature):
         return x, w.clamp(min=1e-30).log()
 
     # ── marginal ──────────────────────────────────────────────────────
+
+    def marginalize_mixture(
+        self, scatter, likelihood, log_mean, n_ph, bg, params, meta, obs_range=None,
+    ) -> Tensor:
+        if (HAVE_TRITON and not _DISABLE_TRITON and scatter.fixed_gaussian
+                and 1 <= scatter.n_components <= 8
+                and log_mean.is_cuda and log_mean.dtype == torch.float32
+                and bg.dtype == torch.float32 and not bg.requires_grad
+                and isinstance(likelihood, Poisson)
+                and likelihood.bg_var_mode == "deviance"):
+            mix = scatter.mixture_obs(meta)
+            if mix.dtype == torch.float32:
+                sig_b2 = self._sig_b2(likelihood, bg)
+                p = self.grid_params(n_ph, bg, sig_b2, self._bg_mean_offset(likelihood))
+                return marginalize_gaussian_mixture(log_mean, n_ph, mix, p, self.n_points,
+                                                     sig_b2=sig_b2)
+        return super().marginalize_mixture(
+            scatter, likelihood, log_mean, n_ph, bg, params, meta, obs_range,
+        )
 
     def _sig_b2(self, likelihood: DetectionLikelihood, bg: Tensor) -> Tensor | None:
         bvf = float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0)

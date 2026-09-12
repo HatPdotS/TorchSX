@@ -9,10 +9,10 @@ checkpoint under the default encoder geometry and silently lost 0.022 in R_free.
 
 Two contracts are enforced here rather than left to the caller:
 
-**Integration radii are required.**  CrystFEL does not record them in the
-stream, and ``bg = bg_per_pixel * n_peak`` — running the 7/9/11 default against
-a 1/4/7 integration scales every background by 30x.  Nothing downstream can
-detect that.
+**The measurement recipe must be resolved.** Radii and gain come from explicit
+flags, a checkpoint, or recorded source metadata, in that order. Since
+``bg = bg_per_pixel * n_peak``, substituting a default aperture can silently
+rescale every background. Missing required settings remain explicit.
 
 **No intensity column in an MTZ.**  ``ReflectionData.load`` applies
 French-Wilson whenever an intensity column is present and exposes no flag to
@@ -90,12 +90,12 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                         "used for centric detection.")
     p.add_argument("--int-radius", default=None, metavar="R_PEAK,R_GAP,R_BG",
                    help="indexamajig integration radii in pixels, e.g. 7,9,11. "
-                        "REQUIRED: they are not in the stream, and bg scales "
-                        "with n_peak." + ("" if require_recipe else "  Default: the checkpoint's."))
+                        "Default: checkpoint recipe, then recorded source metadata. "
+                        "Required if neither records a usable ring recipe.")
     p.add_argument("--gain", default=None,
-                   help="ADU/photon: 'stream' (adu_per_eV x beam energy), "
-                        "'auto', 'empirical', or a number.  Default 'stream'; "
-                        "pass 1.0 when the DAQ already wrote photon counts.")
+                   help="ADU/photon: 'stream' (declared adu_per_photon or "
+                        "adu_per_eV x beam energy), 'auto', 'empirical', or a number. "
+                        "Default: checkpoint recipe, then source declaration.")
     p.add_argument("--dmin", type=float, default=None, help="high-resolution cut (A)")
     p.add_argument("--dmax", type=float, default=999.0)
     p.add_argument("--cache-prep", type=Path, default=None,
@@ -123,23 +123,26 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
     p.add_argument('--experiment-half', type=int, choices=(0, 1), default=None)
 
 
-def parse_radii(spec: str) -> tuple[float, float, float]:
-    parts = [float(x) for x in str(spec).replace(":", ",").split(",")]
-    if len(parts) != 3:
-        raise ValueError(f"--int-radius wants three numbers, got {spec!r}")
-    if not parts[0] < parts[1] <= parts[2]:
-        raise ValueError(f"--int-radius must be r_peak < r_gap <= r_bg, got {spec!r}")
-    return parts[0], parts[1], parts[2]
+# Preserve these import names for callers while keeping one resolver.
+from torchsx.measurement import parse_gain, parse_radii
 
 
-def parse_gain(spec) -> str | float:
-    if spec is None:
-        return "stream"
-    if isinstance(spec, (int, float)):
-        return float(spec)
-    if str(spec) in ("stream", "auto", "empirical"):
-        return str(spec)
-    return float(spec)
+def _comparable_prep_signature(signature: dict | None, recipe: dict) -> dict:
+    """Compare effective preparation settings, retaining provenance in storage.
+
+    A checkpoint freezes a previously resolved numeric gain. It can reuse the
+    cache that estimated/read that gain, provided all source/settings checks
+    still match. A new calibration request is not replaced by a cached number.
+    """
+    from copy import deepcopy
+    result = deepcopy(signature or {})
+    measurement = result.get("measurement")
+    if measurement is not None:
+        measurement.pop("resolved", None)  # radii/gain already occur at top level
+        numeric = (recipe.get("measurement") or {}).get("gain_adu_per_photon")
+        if numeric is not None:
+            result["gain"] = numeric
+    return result
 
 
 def _splits_from_args(args) -> list[tuple[str, Path]]:
@@ -172,22 +175,18 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     from torchsx.merging.hkl.noise import PoissonNoiseModel
     from torchsx.merging.observations import prepare_observations
     from torchsx.stream import SFXStream
+    from torchsx.io.sources import inspect_source
+    from torchsx.measurement import combine_measurements, resolve_measurement, validate_measurement
 
     d = dict(recipe_defaults or {})
     d_min = args.dmin if args.dmin is not None else d.get("d_min")
     spacegroup = args.spacegroup or d.get("spacegroup")
-    radii = parse_radii(args.int_radius) if args.int_radius else (
-        tuple(d["radii"]) if d.get("radii") else None)
-    gain = parse_gain(args.gain) if args.gain is not None else d.get("gain", "stream")
-    if radii is None:
-        raise SystemExit(
-            "--int-radius is required (r_peak,r_gap,r_bg from the indexamajig "
-            "run).  They are not recorded in the stream and the background "
-            "scales with n_peak.")
     if d_min is None:
         raise SystemExit("--dmin is required")
 
     splits = _splits_from_args(args)
+    if len(splits) > 1 and args.sfx_cache is not None:
+        raise SystemExit("--sfx-cache accepts one input; use separate .sfx files for named splits.")
 
     cache = args.cache_prep
     if cache is not None and cache.exists() and getattr(args, "trust_cache_prep", False):
@@ -205,16 +204,16 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     # only reusable when all of it matches: the blob carries the split labels
     # baked into obs_info, so a cache built from a different --split-file would
     # silently merge the wrong crystals together.
-    def _stamp(path):
+    def _stamp(path, *, precise=False):
         if path is None:
             return None
         st = Path(path).stat()
-        return [str(path), st.st_size, int(st.st_mtime)]
+        return [str(path), st.st_size, st.st_mtime_ns if precise else int(st.st_mtime)]
 
     signature = {
         "splits": [[n, str(q)] for n, q in splits],
         "d_min": float(d_min), "d_max": float(args.dmax),
-        "spacegroup": spacegroup, "gain": gain, "radii": list(radii),
+        "spacegroup": spacegroup,
         "merge_friedel": bool(args.merge_friedel),
         "split_file": _stamp(args.split_file),
         "split_names": args.split_names,
@@ -223,13 +222,53 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         "max_crystals": args.max_crystals,
     }
 
-    if cache is not None and cache.exists():
-        blob = torch.load(cache, weights_only=False)
+    blob = torch.load(cache, weights_only=False) if cache is not None and cache.exists() else None
+    legacy_cache = blob is not None and "measurement" not in (blob.get("signature") or {})
+    if legacy_cache:
+        # Old caches are reusable with their explicit/recorded recipe, without
+        # pretending that their source semantics were validated retroactively.
+        radii = args.int_radius if args.int_radius is not None else d.get("radii")
+        if radii is None:
+            raise SystemExit("Legacy prepared cache requires --int-radius or a checkpoint recipe.")
+        gain = parse_gain(args.gain if args.gain is not None else d.get("gain"))
+        signature.update(radii=list(parse_radii(radii)), gain=gain)
+    else:
+        sources = [args.sfx_cache if (path.suffix == ".stream" and args.sfx_cache is not None
+                   and args.sfx_cache.exists()) else path for _, path in splits]
+        try:
+            specs = [inspect_source(path) for path in sources]
+            measurement = combine_measurements(specs)
+            resolved = resolve_measurement(measurement, radii=args.int_radius,
+                                           gain=args.gain, defaults=d)
+            explicit_rings = args.int_radius is not None or d.get("radii") is not None
+            for spec in specs:
+                validate_measurement(spec, explicit_rings=explicit_rings)
+            radii, gain = resolved.radii, resolved.gain
+            signature.update(radii=list(radii), gain=gain,
+                             measurement={"source": measurement.to_dict() if measurement else None,
+                                          "resolved": resolved.to_dict()},
+                             source_files=[_stamp(path, precise=True) for _, path in splits])
+            if verbose:
+                origins = dict(resolved.provenance)
+                print(f"  measurement: radii={radii} [{origins['radii']}], "
+                      f"gain={gain} [{origins['gain']}]", flush=True)
+                for override in resolved.overrides:
+                    print(f"    override: {override}", flush=True)
+                if measurement and measurement.unresolved:
+                    print(f"    unresolved source fields: {', '.join(measurement.unresolved)}", flush=True)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"Cannot resolve input measurement: {exc}") from exc
+
+    if blob is not None:
         got = blob.get("signature")
-        if got != signature:
+        comparable_got = _comparable_prep_signature(got, {})
+        comparable_signature = _comparable_prep_signature(signature, {})
+        if isinstance(signature.get("gain"), (float, int)):
+            comparable_got = _comparable_prep_signature(got, blob["recipe"])
+        if comparable_got != comparable_signature:
             differ = sorted(
-                k for k in set(signature) | set(got or {})
-                if (got or {}).get(k) != signature.get(k))
+                k for k in set(comparable_signature) | set(comparable_got)
+                if comparable_got.get(k) != comparable_signature.get(k))
             raise SystemExit(
                 f"--cache-prep {cache} was built with different settings "
                 f"({', '.join(differ) if differ else 'no signature recorded'}); "
@@ -245,14 +284,11 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
     parts = []
     for name, path in splits:
-        if str(path).endswith(".sfx"):
-            s = SFXStream.load(path, merge_friedel=args.merge_friedel)
-        else:
-            s = SFXStream.from_stream(
-                path, spacegroup=spacegroup, cache=args.sfx_cache,
-                n_workers=args.n_workers, merge_friedel=args.merge_friedel,
-                max_crystals=args.max_crystals,
-            )
+        s = SFXStream.read(
+            path, spacegroup=spacegroup, cache=args.sfx_cache,
+            n_workers=args.n_workers, merge_friedel=args.merge_friedel,
+            max_crystals=args.max_crystals,
+        )
         if spacegroup and (s._core.spacegroup or "P 1") != spacegroup:
             # An .sfx cache carries whatever space group it was parsed with, and
             # prepare_observations reads centric reflections off it.  Silently
@@ -369,7 +405,11 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
     noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2],
                               gain=(gain if isinstance(gain, float) else 1.0))
-    prep = prepare_observations(stream, MergeConfig(gain=gain), poisson_noise=noise)
+    try:
+        prep = prepare_observations(stream, MergeConfig(gain=gain), poisson_noise=noise,
+                                    resolved_measurement=resolved)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     bvf = noise.n_peak / noise.n_bg
 
 
@@ -388,7 +428,11 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
               "spacegroup": stream._core.spacegroup or spacegroup or "P 1",
               "gain": gain, "radii": list(radii),
               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
-              "merge_friedel": bool(args.merge_friedel)}
+              "merge_friedel": bool(args.merge_friedel),
+              "measurement": {**resolved.to_dict(), "gain_adu_per_photon": noise.gain,
+                              "n_peak": noise.n_peak, "n_bg": noise.n_bg,
+                              "pixel_count_definition": "nominal_integer_ring_mask",
+                              "source": measurement.to_dict() if measurement else None}}
     if verbose:
         print(f"prepared: {prep.n_valid:,} reflections, {prep.I_obs.numel():,} obs, "
               f"{prep.obs_info.n_crystals:,} crystals, n_peak/n_bg={bvf:.4f}, "
