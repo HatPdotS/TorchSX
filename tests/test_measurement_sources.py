@@ -212,7 +212,7 @@ def test_auto_metadata_matches_explicit_prep_and_posterior(stream_file, python_p
     for bundle in (auto, explicit):
         torch.manual_seed(7)
         params = Parameters.from_prep(bundle.prep)
-        scale, _, trainer = _stack(bundle.prep, params, tmp_path, global_scale=True)
+        scale, _, trainer = _stack(bundle.prep, params, tmp_path)
         scale.eval()
         results.append(trainer.merge())
     for key in ("F", "F_sd", "I0", "I0_sd", "edge_mass"):

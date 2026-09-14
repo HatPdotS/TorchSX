@@ -1060,7 +1060,6 @@ class AmortizedTrainer:
                     "include_hkl": bool(getattr(self.scale.features, "include_hkl", False)),
                     "predict_width": bool(getattr(self.scale.heads, "predict_width", True)),
                     "predict_shape": bool(getattr(self.scale.heads, "predict_shape", True)),
-                    "unity_k": bool(getattr(self.scale.heads, "unity_k", False)),
                     "anchor_log_k": bool(getattr(self.scale, "anchor_log_k", True)),
                     "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
                 },
@@ -1069,7 +1068,6 @@ class AmortizedTrainer:
                 # SAME likelihood the network was fitted under
                 "scatter": {
                     "predict_skew": bool(getattr(self.scale.heads, "predict_skew", False)),
-                    "global_skew": bool(getattr(self.scale.heads, "global_skew", False)),
                     "family": getattr(self.scale.heads, "scatter_family", "gengauss"),
                     "n_components": int(getattr(self.scale.heads, "n_components", 1)),
                     "conditioner_hidden": (int(self.scale.heads.mixture.hidden)

@@ -803,7 +803,7 @@ def resolve(args, ckpt: dict | None, key: str, *ckpt_path: str):
 
 
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
-                global_scale: bool = False, verbose: bool = True):
+                verbose: bool = True):
     """``(prep, params, scale, objective, settings)`` on the compute device.
 
     One builder for all three commands: the *only* difference between the
@@ -835,7 +835,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     sc = dict(ck.get("scale") or {})
     scat = dict(ck.get("scatter") or {})
     skew = resolve(args, ck, "skew") if args.skew is not None else bool(
-        scat.get("predict_skew", scat.get("global_skew", DEFAULTS["skew"]))
+        scat.get("predict_skew", DEFAULTS["skew"])
         if scat else DEFAULTS["skew"])
     w_init = args.w_init if args.w_init is not None else sc.get("w_init", DEFAULTS["w_init"])
     # scatter family: the checkpoint's own family wins over the defaults (a
@@ -862,25 +862,15 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         scatter_family=scatter_family, n_components=n_components, conditioner_hidden=scatter_hidden,
         component_shape=scatter_shape,
     )
-    if global_scale:
-        # No per-observation content at all: K == 1 and one global scalar each
-        # for width, shape and skew.  Nothing reads the embedding, so
-        # AmortizedScale.predict skips the features and the encoder outright.
-        kw.update(predict_width=False, predict_shape=False, anchor_log_k=False,
-                  unity_k=True, predict_skew=False, global_skew=bool(skew))
-    else:
-        # A checkpoint's own head geometry wins over the defaults: rebuilding a
-        # globally-fitted checkpoint with per-observation heads would fail the
-        # state_dict load, and rebuilding it the other way would load a subset.
-        kw.update(
-            predict_width=bool(sc.get("predict_width", True)),
-            unity_k=bool(sc.get("unity_k", False)),
-            anchor_log_k=bool(sc.get("anchor_log_k", True)),
-            anchor_stat=args.gauge_anchor or sc.get(
-                "anchor_stat", "median" if ck else DEFAULTS["gauge_anchor"]),
-            global_skew=bool(scat.get("global_skew", False)),
-            predict_skew=bool(skew) and not scat.get("global_skew", False),
-        )
+    # A checkpoint's own head geometry wins over the defaults: rebuilding it
+    # with different heads would fail the state_dict load, or load a subset.
+    kw.update(
+        predict_width=bool(sc.get("predict_width", True)),
+        anchor_log_k=bool(sc.get("anchor_log_k", True)),
+        anchor_stat=args.gauge_anchor or sc.get(
+            "anchor_stat", "median" if ck else DEFAULTS["gauge_anchor"]),
+        predict_skew=bool(skew),
+    )
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
 
     bvf = (args.bg_var_factor if args.bg_var_factor is not None
@@ -894,9 +884,6 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         bg_mean_offset = float(bvf)
     else:
         bg_mean_offset = float(args.bg_mean_offset)
-    if bg_mean_offset and global_scale:
-        raise SystemExit("--bg-mean-offset is qualified for the amortised "
-                         "stack only; it has not been run with global scale")
     if bg_mean_offset and float(bvf) <= 0.0:
         raise SystemExit(
             f"--bg-mean-offset {bg_mean_offset:g} needs a non-zero "
@@ -958,7 +945,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
     )
     if verbose:
-        print(f"stack: {'global (K=1)' if global_scale else 'amortised'} scale, "
+        print(f"stack: amortised scale, "
               f"{'two-width' if skew else 'symmetric'} "
               f"{f'{n_components}-component {scatter_shape}-shape mixture ' if scatter_family == 'mixture' else ''}scatter, "
               f"miss {miss:.3f}, SplitLogGrid({n_points}), "

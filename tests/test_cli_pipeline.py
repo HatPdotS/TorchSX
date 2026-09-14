@@ -30,14 +30,9 @@ from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 from tests.test_amortized_training import _synthetic
 
 
-def _stack(prep, params, tmp_path, *, global_scale=False, skew=True, n_cond=1):
+def _stack(prep, params, tmp_path, *, skew=True, n_cond=1):
     kw = dict(d_model=32, n_layers=2, include_hkl=False, predict_shape=False,
-              beta_init=1.0, w_init=1.65)
-    if global_scale:
-        kw.update(predict_width=False, predict_shape=False, unity_k=True,
-                  anchor_log_k=False, global_skew=skew)
-    else:
-        kw.update(predict_skew=skew)
+              beta_init=1.0, w_init=1.65, predict_skew=skew)
     scale = AmortizedScale.from_prep(prep, **kw)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
     cfg = TrainConfig(
@@ -50,65 +45,9 @@ def _stack(prep, params, tmp_path, *, global_scale=False, skew=True, n_cond=1):
     return scale, obj, AmortizedTrainer(prep, scale, obj, params, config=cfg)
 
 
-# ── the global scale ───────────────────────────────────────────────────
-
-
-def test_global_heads_are_constant_and_unity():
-    h = ScaleHeads(8, w_init=1.65, beta_init=1.0, predict_width=False,
-                   predict_shape=False, global_skew=True, unity_k=True)
-    assert not h.needs_embedding
-    names = {n for n, _ in h.named_parameters()}
-    assert names == {"global_log_w", "global_beta_raw", "global_log_skew"}, names
-    p = h(torch.zeros(7, 0))
-    assert torch.equal(p.log_K, torch.zeros(7))
-    for t in (p.log_w, p.beta, p.log_alpha, p.log_alpha_hi, p.log_e_s):
-        assert t.shape == (7,)
-        assert torch.allclose(t, t[0].expand(7))
-    assert math.isclose(float(p.log_w[0].detach().exp()), 1.65, rel_tol=1e-5)
-
-
 def test_default_heads_are_unchanged():
     h = ScaleHeads(8)
-    assert h.needs_embedding and not h.global_skew and not h.unity_k
     assert h(torch.zeros(3, 8)).log_alpha_hi is None
-
-
-def test_predict_skew_and_global_skew_are_exclusive():
-    with pytest.raises(ValueError):
-        ScaleHeads(8, predict_skew=True, global_skew=True)
-
-
-def test_global_scale_skips_the_encoder(tmp_path):
-    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
-    scale, _obj, _tr = _stack(prep, params, tmp_path, global_scale=True)
-
-    called = []
-    scale.encoder.forward = lambda *a, **k: called.append(1)      # type: ignore
-    scale.features.build = lambda *a, **k: called.append(1)       # type: ignore
-    pred = scale.predict(prep.obs_info)
-    assert not called, "the encoder ran for a scale with no per-observation content"
-    assert torch.equal(pred.log_K, torch.zeros_like(pred.log_K))
-    assert pred.log_w.std() == 0 and pred.beta.std() == 0
-
-
-def test_global_fit_moves_the_width_and_is_the_only_free_parameter(tmp_path):
-    prep, params, *_ = _synthetic(n_hkl=40, n_xtal=40, per=20)
-    scale, _obj, tr = _stack(prep, params, tmp_path, global_scale=True)
-    trainable = [n for n, p in scale.named_parameters() if p.requires_grad]
-    assert trainable == ["heads.global_log_w", "heads.global_beta_raw",
-                         "heads.global_log_skew"], trainable
-
-    w0 = float(scale.heads.global_log_w.detach().exp())
-    for _ in range(3):
-        for _, rows in tr.index.batches(6000, generator=tr.gen,
-                                        crystals=tr.train_crystals):
-            tr.step(rows)
-    w1 = float(scale.heads.global_log_w.detach().exp())
-    assert w1 != w0 and 0.05 < w1 < 20.0, (w0, w1)
-    # K stays exactly 1: there is no scale model to drift.
-    with torch.no_grad():
-        assert torch.equal(scale.predict(prep.obs_info).log_K,
-                           torch.zeros(prep.n_obs_total))
 
 
 # ── merge() ────────────────────────────────────────────────────────────
@@ -238,9 +177,9 @@ def test_checkpoint_carries_the_recipe(tmp_path):
     ck = torch.load(tr.save_best(tmp_path / "best.pt"), weights_only=False)
     assert ck["data"]["radii"] == [7.0, 9.0, 11.0]
     assert ck["likelihood"]["bg_var_factor"] == pytest.approx(0.1)
-    assert ck["scatter"]["predict_skew"] and not ck["scatter"]["global_skew"]
+    assert ck["scatter"]["predict_skew"]
     assert ck["quadrature"] == {"kind": "SplitLogGrid", "n_points": 64}
-    assert ck["scale"]["predict_shape"] is False and ck["scale"]["unity_k"] is False
+    assert ck["scale"]["predict_shape"] is False
     assert ck["splits"] == ["dark"]
     # no held-out set here: the current state is written rather than nothing
     assert set(ck["state_dict"]) == set(scale.state_dict())
@@ -316,16 +255,12 @@ def test_build_stack_rebuilds_a_checkpoint_geometry(tmp_path):
         ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu",
          "--inner-points", "64"])
 
-    for global_scale in (False, True):
-        scale, _obj, tr = _stack(prep, params, tmp_path, global_scale=global_scale)
-        tr.data_recipe = dict(bundle.recipe)
-        ck = torch.load(tr.save_best(tmp_path / "g.pt"), weights_only=False)
-        assert ck["scale"]["unity_k"] is global_scale
-        assert ck["scatter"]["global_skew"] is global_scale
-        _p, _q, rebuilt, _o, _s = P.build_stack(bundle, args, ckpt=ck, verbose=False)
-        # strict: every trained weight must land, and nothing may be left at init
-        rebuilt.load_state_dict(ck["state_dict"])
-        assert rebuilt.heads.needs_embedding is not global_scale
+    scale, _obj, tr = _stack(prep, params, tmp_path)
+    tr.data_recipe = dict(bundle.recipe)
+    ck = torch.load(tr.save_best(tmp_path / "g.pt"), weights_only=False)
+    _p, _q, rebuilt, _o, _s = P.build_stack(bundle, args, ckpt=ck, verbose=False)
+    # strict: every trained weight must land, and nothing may be left at init
+    rebuilt.load_state_dict(ck["state_dict"])
 
 
 # ── custom splits ──────────────────────────────────────────────────────
