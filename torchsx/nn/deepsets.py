@@ -64,9 +64,8 @@ torchsx already represents observations as flat tensors plus a ``crystal_id``.
 Swapping the encoder
 --------------------
 :class:`ScaleEncoder` is the seam.  Anything with that ``forward`` signature
-drops in — e.g. a transformer over the padded ``(B, L)`` batches
-:class:`~torchsx.nn.batch.StreamBatcher` already emits — without touching the
-heads, the objective, or the merge target.
+drops in — e.g. a transformer over padded ``(B, L)`` batches — without touching
+the heads, the objective, or the merge target.
 """
 
 from __future__ import annotations

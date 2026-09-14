@@ -60,11 +60,6 @@ python -m torchsx.cli.train dark.stream --spacegroup "P 1" \
 
 # trained network + data -> MTZ (recipe read from the checkpoint)
 python -m torchsx.cli.merge_nn run/best.pt dark.stream -o merged.mtz
-
-# no weighting at all: K = 1 with one global width / shape / skew fitted
-# to the same evidence -- the reference a trained run has to beat
-python -m torchsx.cli.merge_global dark.stream --spacegroup "P 1" \
-    --int-radius 7,9,11 --gain 1.0 --dmin 0.9 -o unity.mtz
 ```
 
 Crystals can be divided into named **splits** (`--split dark=dark.stream
@@ -109,7 +104,6 @@ and gemmi. The remaining extras are optional because each is imported lazily:
 |---|---|
 | `duckdb` | `SFXStream.from_duckdb` — read probixi runs |
 | `patches` | `excise_patches` / `excise_rois` — pixel patches from HDF5 |
-| `gating` | `merging/gating`'s background-significance split |
 | `native` | JIT-building the native `.stream` parser extension |
 
 ## Quick Start
@@ -153,7 +147,7 @@ units and definitions, recorded `--int-radius`, gain declarations, unresolved
 fields and their provenance. Both `--option=value` and `--option value` are
 read from the recorded command as text. No command in an input file is executed.
 
-The `train`, `merge_global` and `merge_nn` commands resolve settings in this order: **explicit flags,
+The `train` and `merge_nn` commands resolve settings in this order: **explicit flags,
 checkpoint recipe, source metadata**. With a recorded ring recipe and gain,
 `--int-radius` and `--gain` can be omitted. Space group and resolution cuts
 remain user choices. `adu_per_photon = 1` means gain 1; `adu_per_eV` is
@@ -213,7 +207,7 @@ torchsx/
 ├── merging/        the merge engine (see below)
 ├── nn/             amortised per-observation scale network
 ├── io/             .stream parsing, .sfx safetensors, DuckDB ingest
-└── cli/            merge, filter_ewald
+└── cli/            train, merge_nn
 ```
 
 ### `torchsx.merging`
@@ -226,7 +220,7 @@ IntensityPrior → ScaleModel × ScatterModel → Quadrature → DetectionLikeli
 
 Each is an `nn.Module` behind a narrow ABC, aggregated by a single `LossState`
 into one scalar for LBFGS. Subpackages: `priors/`, `scale/`, `scatter/`,
-`quadrature/`, `likelihood/`, `targets/`, `regularizers/`, `hkl/`, `gating/`.
+`quadrature/`, `likelihood/`, `targets/`, `regularizers/`, `hkl/`.
 
 `hkl/` is the reflection-bookkeeping layer — HKL indexing, filtering, shell
 statistics, and the Poisson noise model whose `calibrate_sigma2_of_bg` derives

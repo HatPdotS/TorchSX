@@ -43,9 +43,7 @@ partialator-style: one shared network, separate merge targets per condition.
 Construction raises if a condition field is requested.
 
 This module works from ``PreparedObs`` / ``ObsInfo`` (the merging pipeline's
-representation).  It is the flat counterpart to
-:class:`~torchsx.nn.features.ReflectionDataset`, which builds padded token
-batches directly from an ``SFXStream`` for the transformer path.
+representation).
 """
 
 from __future__ import annotations

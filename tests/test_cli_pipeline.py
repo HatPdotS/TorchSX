@@ -528,20 +528,17 @@ def test_merge_locating_survives_high_multiplicity():
 
 
 def test_every_cli_can_stream_batches(tmp_path):
-    """All three commands need --stream-batches, not just the trainer.
+    """Both commands need --stream-batches, not just the trainer.
 
     A merge holds the same prepared observations a training run does, so a data
-    set that does not fit the card cannot be merged without it either -- the
-    flag being train-only killed a 38-split re-merge at argument parsing.
+    set that does not fit the card cannot be merged without it either.
     """
-    from torchsx.cli.merge_global import _build_parser as global_parser
     from torchsx.cli.merge_nn import _build_parser as nn_parser
     from torchsx.cli.train import _build_parser as train_parser
 
     for build, argv in (
         (train_parser, ["x.sfx", "-o", str(tmp_path)]),
         (nn_parser, ["ck.pt", "x.sfx", "-o", str(tmp_path / "m.mtz")]),
-        (global_parser, ["x.sfx", "-o", str(tmp_path / "g.mtz")]),
     ):
         assert build().parse_args(argv).stream_batches is False
         assert build().parse_args(argv + ["--stream-batches"]).stream_batches is True

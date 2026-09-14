@@ -10,15 +10,7 @@ itself is :class:`torchsx.merging.scale.AmortizedScale`, because it must be a
 ``ScaleModel`` for the rest of the merging pipeline to consume it.
 """
 
-from torchsx.nn.batch import GroupedBatch, StreamBatcher
-from torchsx.nn.consistency_loss import ScaleConsistencyNLL
 from torchsx.nn.deepsets import DeepSetsEncoder, ResidualFF, ScaleEncoder
-from torchsx.nn.features import (
-    DEFAULT_SCALE_FEATURES,
-    TARGET_FIELDS,
-    ReflectionBatch,
-    ReflectionDataset,
-)
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
 from torchsx.nn.merge_target import LOOInBatchTarget, MergeTargetOut
 from torchsx.nn.metrics import (
@@ -36,10 +28,6 @@ from torchsx.nn.train_amortized import AmortizedTrainer, CrystalIndex, TrainConf
 
 __all__ = [
     "group_offsets_from_counts", "pack", "unpack",
-    "GroupedBatch", "StreamBatcher",
-    "ScaleConsistencyNLL",
-    "ReflectionDataset", "ReflectionBatch",
-    "DEFAULT_SCALE_FEATURES", "TARGET_FIELDS",
     # amortised scale model
     "leave_one_out_mean", "loo_weighted_mean",
     "ScaleEncoder", "ResidualFF", "DeepSetsEncoder",

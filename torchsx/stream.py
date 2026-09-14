@@ -277,8 +277,7 @@ class SFXStream:
         """Whether ``hkl`` has been Friedel-merged (canonicalized to ASU).
 
         Set at load time from the ``merge_friedel`` argument and updated by
-        :meth:`symmetrize` to True.  Drives anomalous-aware MTZ writing in
-        :meth:`torchsx.merging.posterior.Posterior.integrate`.
+        :meth:`symmetrize` to True.  Drives anomalous-aware MTZ writing.
         """
         return bool(getattr(self._core, "friedel_merged", True))
 
@@ -898,91 +897,6 @@ class SFXStream:
             f"n_images={self.n_images})"
         )
 
-    def merge(self):
-        """Merge intensities using the likelihood-random scale assumed model. Returns merged intensities and sigmas by unique HKL."""
-        from torchsx.merging import Merger
-        M = Merger(self)
-        return M.merge()
-
-    # --- Streamlined merging chain ---
-
-    def make_loss(
-        self,
-        *,
-        n_points: int = 513,
-        S_min: float = 1e-3,
-        S_max: float = 1e6,
-        gain: float | str = "auto",
-        min_obs: int = 5,
-        scale: str = "b_per_crystal",
-        scale_reg_weight: float = 1.0,
-        scatter_shape="free",
-        smooth: float = 500.0,
-        wilson_aniso: float = 0.0,
-        wilson_aniso_U_ridge: float = 1.0,
-        wilson_aniso_b_center: float = 1.0,
-        poisson_null_shrinkage: float = 0.0,
-        poisson_null_tau: float | None = None,
-        reml: bool = False,
-        obs_chunk_size: int = 0,
-        device: str | torch.device = "cpu",
-        r_peak: float = 7.0,
-        r_gap: float = 9.0,
-        r_bg: float = 11.0,
-        likelihood: str = "gaussian_polynomial",
-        var_const: float = 0.0,
-        var_linear: float = 1.0,
-        var_quadratic: float = 0.0,
-        trainable_polynomial_var: bool = False,
-        crystal_weights: torch.Tensor | None = None,
-    ):
-        """Build a :class:`LogSpaceLoss` from this stream.
-
-        The returned object is the entry point of the streamlined chain:
-        ``stream.make_loss(...).refine(...).posterior(...).integrate()``.
-        See :class:`torchsx.merging.loss.LogSpaceLoss` for details.
-
-        Parameters
-        ----------
-        n_points :
-            Log-S quadrature grid size (default 513).
-        S_min, S_max :
-            Log-S grid bounds in absolute coordinates.
-        gain :
-            ADU/photon. ``"auto"`` (default) runs the bg-normalised
-            truncated-Gaussian fit on negatives. Pass a float to pin.
-        min_obs :
-            Drop HKLs with fewer than this many positive observations.
-        scale :
-            Scale model name (``"b_per_crystal"`` or ``"panel"``).
-        obs_chunk_size :
-            Memory budget for the per-obs data target. ``0`` = no chunking.
-        device :
-            ``"cpu"`` or ``"cuda"``.
-        """
-        from torchsx.merging.loss import LogSpaceLoss
-        return LogSpaceLoss.from_stream(
-            self,
-            n_points=n_points, S_min=S_min, S_max=S_max,
-            gain=gain, min_obs=min_obs, scale=scale,
-            scale_reg_weight=scale_reg_weight,
-            scatter_shape=scatter_shape,
-            smooth=smooth,
-            wilson_aniso=wilson_aniso,
-            wilson_aniso_U_ridge=wilson_aniso_U_ridge,
-            wilson_aniso_b_center=wilson_aniso_b_center,
-            poisson_null_shrinkage=poisson_null_shrinkage,
-            poisson_null_tau=poisson_null_tau,
-            reml=reml,
-            obs_chunk_size=obs_chunk_size, device=device,
-            r_peak=r_peak, r_gap=r_gap, r_bg=r_bg,
-            likelihood=likelihood,
-            var_const=var_const,
-            var_linear=var_linear,
-            var_quadratic=var_quadratic,
-            trainable_polynomial_var=trainable_polynomial_var,
-            crystal_weights=crystal_weights,
-        )
 
 def _is_numeric_list(lst: list) -> bool:
     """Check if all existing elements in a list are numeric."""
