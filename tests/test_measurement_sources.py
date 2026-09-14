@@ -299,3 +299,20 @@ def test_legacy_sfx_requires_recipe_and_preserves_recorded_hkl_state(sample_core
     sidecar_path.write_text(json.dumps(sidecar))
     with pytest.warns(UserWarning, match="Legacy .sfx"):
         assert not SFXStream.load(path, merge_friedel=False).friedel_merged
+
+
+@pytest.mark.parametrize("trust", [False, True])
+@pytest.mark.parametrize("version", [None, -1])
+def test_prepared_cache_requires_current_observation_filter(stream_file, python_parser, tmp_path, trust, version):
+    cache = tmp_path / "prep.pt"
+    args = _args(stream_file, cache_prep=cache)
+    P.load_prep(args, verbose=False)
+    blob = torch.load(cache, weights_only=False)
+    if version is None:
+        blob["signature"].pop("observation_filter_version")
+    else:
+        blob["signature"]["observation_filter_version"] = version
+    torch.save(blob, cache)
+    args.trust_cache_prep = trust
+    with pytest.raises(SystemExit, match="Rebuild it from the source"):
+        P.load_prep(args, verbose=False)

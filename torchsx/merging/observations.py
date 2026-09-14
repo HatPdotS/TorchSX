@@ -25,6 +25,9 @@ from torchsx.merging.hkl import (
     fit_shell_gengauss_gauss,
 )
 
+# Prepared caches must have passed this policy, even when settings are trusted.
+OBSERVATION_FILTER_VERSION = 1
+
 
 # ── Per-observation metadata ───────────────────────────────────────────
 
@@ -437,6 +440,34 @@ def prepare_observations(
         poisson_noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2])
 
     core = stream._core
+    # Reject unusable measurements before calibration, pooling or feature
+    # construction: one NaN sigma can contaminate every prediction in a crystal.
+    # Negative intensities remain valid measurements. Missing sigma retains the
+    # existing noise-model fallback; supplied sigma must be finite and positive.
+    valid = torch.ones_like(core.I, dtype=torch.bool)
+    rejected = {}
+    for name, values in (("I", core.I), ("background", core.background),
+                         ("sigma", getattr(core, "sigma", None))):
+        if values is None:
+            continue
+        bad = ~torch.isfinite(values)
+        if name == "sigma":
+            bad |= values <= 0
+        rejected[name] = int(bad.sum().item())
+        valid &= ~bad
+    n_rejected = int((~valid).sum().item())
+    if n_rejected:
+        reasons = ", ".join(f"{name}={n:,}" for name, n in rejected.items() if n)
+        print(f"  observation filter: removed {n_rejected:,}/{valid.numel():,} "
+              f"invalid measurements ({reasons}; reason counts may overlap)", flush=True)
+    if not valid.any():
+        raise ValueError("No valid observations remain after measurement filtering")
+    if n_rejected:
+        # Subset all observation columns together, retaining parent IDs/tables
+        # so crystal weights, split labels and timepoints keep their alignment.
+        core = core.select_cascade({"obs": valid})
+        if partiality is not None:
+            partiality = partiality[valid]
     core_I = core.I
     core_background = core.background
 
@@ -684,7 +715,7 @@ def prepare_observations(
         return val[keep_all][sort_all]
 
     cid = core.crystal_id[keep_all][sort_all].long()
-    n_crystals = int(core.crystal_id.max().item()) + 1
+    n_crystals = core.n_crystals
 
     # ── Kinetic-ensemble metadata (only when the stream is labelled) ──
     delay_bin_idx, unique_t_tensor = _build_delay_bins(stream, n_crystals)

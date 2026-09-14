@@ -173,7 +173,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     from torchsx.merging.config import MergeConfig
     from torchsx.merging.hkl.filter import filter_crystals, filter_resolution
     from torchsx.merging.hkl.noise import PoissonNoiseModel
-    from torchsx.merging.observations import prepare_observations
+    from torchsx.merging.observations import OBSERVATION_FILTER_VERSION, prepare_observations
     from torchsx.stream import SFXStream
     from torchsx.io.sources import inspect_source
     from torchsx.measurement import combine_measurements, resolve_measurement, validate_measurement
@@ -189,8 +189,15 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         raise SystemExit("--sfx-cache accepts one input; use separate .sfx files for named splits.")
 
     cache = args.cache_prep
-    if cache is not None and cache.exists() and getattr(args, "trust_cache_prep", False):
-        blob = torch.load(cache, weights_only=False)
+    blob = torch.load(cache, weights_only=False) if cache is not None and cache.exists() else None
+    if blob is not None:
+        if (blob.get("signature") or {}).get("observation_filter_version") != OBSERVATION_FILTER_VERSION:
+            raise SystemExit(
+                f"Prepared cache {cache} uses an incompatible observation filter. "
+                "Rebuild it from the source using a new --cache-prep path; "
+                "--trust-cache-prep cannot bypass measurement filtering."
+            )
+    if blob is not None and getattr(args, "trust_cache_prep", False):
         if verbose:
             print(f"prep from cache {cache} (settings not checked): "
                   f"{blob['prep'].n_valid:,} reflections, "
@@ -211,6 +218,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         return [str(path), st.st_size, st.st_mtime_ns if precise else int(st.st_mtime)]
 
     signature = {
+        "observation_filter_version": OBSERVATION_FILTER_VERSION,
         "splits": [[n, str(q)] for n, q in splits],
         "d_min": float(d_min), "d_max": float(args.dmax),
         "spacegroup": spacegroup,
@@ -222,7 +230,6 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         "max_crystals": args.max_crystals,
     }
 
-    blob = torch.load(cache, weights_only=False) if cache is not None and cache.exists() else None
     legacy_cache = blob is not None and "measurement" not in (blob.get("signature") or {})
     if legacy_cache:
         # Old caches are reusable with their explicit/recorded recipe, without
