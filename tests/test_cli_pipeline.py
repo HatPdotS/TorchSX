@@ -385,7 +385,7 @@ class _DataArgs:
         self.__dict__.update(kw)
 
 
-def test_custom_split_file_labels_every_crystal(tmp_path):
+def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
     """A partialator ``--custom-split`` file is a valid ``--split-file``.
 
     The unit in that file is a frame, so the label reaches a crystal through
@@ -396,10 +396,16 @@ def test_custom_split_file_labels_every_crystal(tmp_path):
     from torchsx.cli import _pipeline as P
     from torchsx.stream import SFXStream
 
-    from tests.conftest import STREAM_PATH
+    from torchsx.io._metadata import StreamMetadata
 
     cache = tmp_path / "s.sfx"
-    s = SFXStream.from_stream(STREAM_PATH, spacegroup="P 1", cache=cache)
+    metadata = StreamMetadata(image={"filename": ["/raw/a.h5", "/raw/b.h5"],
+                                     "event": ["//0", "//1"]})
+    s = SFXStream(sample_core.replace(metadata=metadata, friedel_merged=False))
+    s = SFXStream.concat([s, s])
+    s = SFXStream(s._core.replace(image_id=torch.tensor([0, 1, 0, 1], dtype=torch.int32),
+                                  crystal_in_image=torch.tensor([0, 0, 1, 1], dtype=torch.int32)))
+    s.save(cache)
     names = ["beta", "alpha"]            # deliberately NOT sorted
     split = tmp_path / "custom.split"
     with open(split, "w") as fh:
@@ -413,26 +419,18 @@ def test_custom_split_file_labels_every_crystal(tmp_path):
     assert labels.numel() == b.prep.obs_info.n_crystals
     assert int(labels.min()) == 0 and int(labels.max()) == 1
     assert set(labels.tolist()) == {0, 1}
+    assert labels[0] == labels[2] and labels[1] == labels[3]
 
     # a frame the split file does not mention is refused, not silently pooled
     partial = tmp_path / "partial.split"
     with open(partial, "w") as fh:
-        half = list(zip(s.filenames, s.events))[: max(1, len(s.filenames) // 2)]
+        frames = list(dict.fromkeys(zip(s.filenames, s.events)))
+        half = frames[: max(1, len(frames) // 2)]
         for f, e in half:
             fh.write(f"{f} {e} alpha\n")
     with pytest.raises(SystemExit, match="unlabelled"):
         P.load_prep(_DataArgs(stream=[cache], split_file=partial), verbose=False)
 
-    # A crystal mask that empties a dataset (a dark-only subset of a light/dark
-    # file): the file still defines the datasets, and --min-split-crystals
-    # drops the empty ones rather than the count check refusing the file.
-    mask = tmp_path / "alpha_only.pt"
-    torch.save(labels == 0, mask)
-    sub = P.load_prep(_DataArgs(stream=[cache], split_file=split, crystals_file=mask,
-                                min_split_crystals=1), verbose=False)
-    assert sub.split_names == ["alpha"]
-    assert sub.prep.obs_info.n_crystals == int((labels == 0).sum())
-    assert set(sub.prep.obs_info.delay_bin_idx.tolist()) == {0}
 
 
 

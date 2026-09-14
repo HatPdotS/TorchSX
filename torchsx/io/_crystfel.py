@@ -63,18 +63,25 @@ def read_measurement(path) -> MeasurementSpec:
             if "--int-radius" in options:
                 try:
                     radii = parse_radii(options["--int-radius"])
-                except ValueError:
-                    unresolved.append("radii")
+                except ValueError as exc:
+                    raise ValueError(f"Invalid CrystFEL --int-radius {options['--int-radius']!r}: {exc}") from exc
             if "--integration" in options:
+                if not options["--integration"] or options["--integration"].startswith("--"):
+                    raise ValueError(f"Invalid CrystFEL --integration {options['--integration']!r}: expected an integration method")
                 method, *mods = re.split("[-,]", options["--integration"])
                 modifiers = tuple(mods)
                 # Unknown modifiers stay visible and require an explicit recipe.
                 if any(m not in ("cen", "nocen", "sat", "nosat", "grad", "nograd", "rescut", "norescut") for m in mods):
                     unresolved.append("integration_modifiers")
     if method is None:
-        unresolved.append("integration_method")
+        # indexamajig defaults (im-argparse.c); omission is a normal recipe,
+        # not missing information requiring a user override.
+        method, modifiers = "rings", ("nocen", "nosat", "nograd")
+        provenance.append(("default:integration", "CrystFEL rings-nocen-nosat-nograd"))
     if radii is None:
-        unresolved.append("radii")
+        # indexamajig.c supplies these when --int-radius is omitted.
+        radii = (4.0, 5.0, 7.0)
+        provenance.append(("default:radii", "CrystFEL 4,5,7"))
     if not declarations:
         unresolved.append("gain")
     n_peak = n_bg = None
