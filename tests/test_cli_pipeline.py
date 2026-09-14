@@ -225,6 +225,30 @@ def test_free_flags_are_reproducible_and_copied(tmp_path):
     assert (~w[:50]).all() and w[50:].all()
 
 
+def test_free_flags_never_split_a_bijvoet_pair():
+    """Mates share a flag, and that grouping leaves the merged draw alone."""
+    import numpy as np
+
+    from torchsx.cli import _pipeline as P
+
+    grid = np.stack(np.meshgrid(np.arange(-4, 5), np.arange(-4, 5),
+                                np.arange(0, 5)), -1).reshape(-1, 3)
+    _, first = np.unique(P.canonical_hkl(grid), axis=0, return_index=True)
+    merged = grid[np.sort(first)]
+    n = len(merged)
+
+    # A signed column carries both mates; they must land on the same side.
+    w = P.work_mask(np.concatenate([merged, -merged]), _FreeArgs(), verbose=False)
+    assert (w[:n] == w[n:]).all()
+    assert abs((~w).mean() - 0.05) < 0.02
+
+    # One row per reflection: the draw is what it was before mates could split.
+    g = torch.Generator().manual_seed(_FreeArgs().free_seed)
+    free = torch.zeros(n, dtype=torch.bool)
+    free[torch.randperm(n, generator=g)[: int(round(0.05 * n))]] = True
+    assert (P.work_mask(merged, _FreeArgs(), verbose=False) == (~free).numpy()).all()
+
+
 def test_merge_friedel_flag_and_recipe_resolution():
     """The flag overrides the checkpoint recipe; absent, the recipe decides."""
     import argparse

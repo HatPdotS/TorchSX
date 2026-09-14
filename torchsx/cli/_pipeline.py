@@ -506,17 +506,16 @@ def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | No
                   f"({100 * float((~work).mean()):.2f} %)", flush=True)
         return work
     g = torch.Generator().manual_seed(args.free_seed)
-    # Draw over sign-folded groups, not rows: separated Friedel mates are two
-    # rows sharing one canonical key, and splitting them across work and free
-    # leaks the held-out reflection.  A no-op when mates are merged, the fold
-    # being injective on ASU representatives.
-    _, group_id = np.unique(canonical_hkl(hkl), axis=0, return_inverse=True)
-    group_id = torch.from_numpy(np.asarray(group_id).reshape(-1)).long()
-    n_groups = int(group_id.max()) + 1 if n else 0
-    free_group = torch.zeros(n_groups, dtype=torch.bool)
-    free_group[torch.randperm(n_groups, generator=g)[
-        : int(round(args.free_frac * n_groups))]] = True
-    free = free_group[group_id]
+    free = torch.zeros(n, dtype=torch.bool)
+    free[torch.randperm(n, generator=g)[: int(round(args.free_frac * n))]] = True
+    # Separated Friedel mates are two rows sharing one canonical key, and
+    # splitting them across work and free leaks the held-out reflection.  Let the
+    # first member of each group decide for both.  A no-op when mates are merged,
+    # where the fold is injective and every group is a single row, so the draw is
+    # bit-for-bit what it was before anomalous merging existed.
+    _, first, group_id = np.unique(canonical_hkl(hkl), axis=0,
+                                   return_index=True, return_inverse=True)
+    free = free[torch.from_numpy(first[np.asarray(group_id).reshape(-1)]).long()]
     if verbose:
         print(f"  free set generated (seed {args.free_seed}): "
               f"{int(free.sum()):,} of {n:,} held out", flush=True)
