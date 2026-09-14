@@ -1,5 +1,13 @@
 # Deletion plan
 
+> **Status (branch `worktree-cleanup-chop`).** Stages 1-2 and part of stage 3
+> are done in three commits: 30,454 source lines / 130 modules down to
+> **20,594 / 76**, a 32 % cut, with the test suite at 4 failed / 454 passed
+> (the four need `/das` data absent from this machine; there were 7 failures
+> before the work started). Two claims below were wrong and are corrected in
+> place, marked **[corrected]**. What is left is §5 and §6, and the two
+> decisions in §5.2 and §5.3.
+
 Goal: get `src/torchsx` into a state a reviewer can read end to end.  The
 package is 30,454 lines of source (excluding tests) in 130 modules, plus
 ~9,800 lines of tests.  This plan removes **9,184 lines (30 %) by dead-code
@@ -110,11 +118,17 @@ involved; this is the transitive closure.
 `wide_log_grid.py` (131), `adaptive_signif.py` (128), `moment_matched.py` (124),
 `delta_at_es.py` (97), **`trapezoidal.py` (156)**, and `quadrature/__init__.py` (27).
 
-> `trapezoidal.py` was on the keep list in the earlier audit.  That was wrong:
-> its only importers are `posterior.py` and `merger.py`, both of which go.  The
-> production path uses `SplitLogGrid` (training, via `cli/_pipeline.py:815`) and
-> `FixedLogGrid` (readout, via `nn/objective.py:92` and `nn/posterior_target.py:499`)
-> and nothing else.
+> **[corrected]** `trapezoidal.py` does go, but not as a cascade — the claim
+> that `posterior.py` and `merger.py` were its only importers came from a
+> truncated grep.  `fixed_log_grid.py:34` imported it too: `FixedLogGrid` held a
+> `TrapezoidalLogGrid` instance purely to back `_sig_lo_slice` / `_build_grid`,
+> which its own docstring called legacy and which nothing calls.  Its other
+> import, the signal-floor helper, was used only by `FixedLogGrid.from_prep` —
+> which has no callers either, because production builds the grid through
+> `nn.objective.wide_log_grid`.  Both went with it; the grid `FixedLogGrid`
+> integrates on is unchanged.  The production path uses `SplitLogGrid`
+> (training, `cli/_pipeline.py:815`) and `FixedLogGrid` (readout,
+> `nn/objective.py:92`, `nn/posterior_target.py:499`) and nothing else.
 
 **Priors and regularizers (748 lines).**
 `priors/wilson.py` (120), `priors/wilson_aniso.py` (125), `priors/wilson_match.py` (126),
@@ -129,10 +143,21 @@ used by `nn/posterior_target.py:390` and `nn/train_amortized.py:1647`.
 `scale/fixed.py` (37), `scale/__init__.py` (23);
 `scatter/gengauss_recentered.py` (103), `scatter/gamma.py` (53), `scatter/__init__.py` (23).
 
-**Likelihood variants (342 lines).**
+**Likelihood variants (905 lines). [corrected]**
 `likelihood/gaussian_polynomial.py` (166), `likelihood/poisson_bg_mix.py` (102),
-`likelihood/gaussian_bg_mix.py` (74).  `likelihood/poisson.py`,
-`likelihood/gaussian_base.py` and `likelihood/base.py` survive.
+`likelihood/gaussian_bg_mix.py` (74) — and, which the first pass missed,
+everything else Gaussian.  Once those two concrete subclasses go,
+`GaussianLikelihood` is an ABC with no implementation and nothing can select
+it: `_pipeline.py` constructs `Poisson` unconditionally and there is no
+`--likelihood` flag.  So `likelihood/gaussian_base.py` (73), the Gaussian
+Triton kernel `quadrature/_fixed_log_grid_triton_gaussian.py` (290),
+`tests/test_gaussian_kernel.py` (200) and the `isinstance` branches in
+`fixed_log_grid.py` go as well.  `likelihood/poisson.py` and
+`likelihood/base.py` survive.
+
+> The scatter mixture's `fixed_gaussian` / `shape="gaussian"` path is a
+> different thing entirely — beta pinned at 2, selected by `--scatter-shape
+> gaussian` in 40 recorded runs, served by `_split_mixture_triton`.  It stays.
 
 **Package `__init__` shells (412 lines).**
 `merging/hkl/__init__.py` (76), `nn/__init__.py` (54), `io/__init__.py` (31),
