@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/torchsx-banner-dark.png">
-    <img src="assets/torchsx-banner-light.png" alt="TorchSX" width="420">
+    <img src="assets/torchsx-banner-light.png" alt="TorchSX" width="100%">
   </picture>
 </p>
 
