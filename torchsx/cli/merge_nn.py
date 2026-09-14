@@ -262,7 +262,8 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
                 keep_p = pl["seen"].cpu().numpy() & np.isfinite(pl["I"].cpu().numpy()) & (pl["I_sd"].cpu().numpy() > 0)
                 P.write_intensity_mtz(out.with_name(f"{stem}_pooled{out.suffix}"), hkl, pl["I"], pl["I_sd"],
                                       cell=cell, spacegroup=spacegroup, keep=keep_p,
-                                      merge_friedel=merge_friedel, verbose=False)
+                                      n_meas=pl["n_meas"], merge_friedel=merge_friedel,
+                                      verbose=False)
             else:
                 P.write_mtz(out.with_name(f"{stem}{out.suffix}"), hkl, F, F_sd,
                             cell=cell, spacegroup=spacegroup, work=work, keep=keep,
@@ -332,7 +333,7 @@ def merge_single_estimator(tr, prep, args, names, wanted, *, spacegroup: str,
                             merge_friedel=merge_friedel, verbose=False)
             else:
                 P.write_intensity_mtz(ho.with_suffix(".mtz"), hkl, r["I"], r["I_sd"], cell=cell,
-                                      spacegroup=spacegroup, keep=keep_h,
+                                      spacegroup=spacegroup, keep=keep_h, n_meas=r["n_meas"],
                                       merge_friedel=merge_friedel, verbose=False)
         st = _split_half_stats(halves[0], halves[1], prep.d_spacing.detach().cpu().numpy(),
                                key="I0" if key == "F" else "I")
@@ -344,7 +345,7 @@ def merge_single_estimator(tr, prep, args, names, wanted, *, spacegroup: str,
         if args.estimator in ("pooled", "mean", "wls"):
             P.write_intensity_mtz(out.with_suffix(".mtz"), hkl, res["I"], res["I_sd"],
                                   cell=cell, spacegroup=spacegroup, keep=seen,
-                                  merge_friedel=merge_friedel)
+                                  n_meas=res["n_meas"], merge_friedel=merge_friedel)
         else:
             keep = seen & np.isfinite(res["F"].detach().cpu().numpy())
             if not keep.any():

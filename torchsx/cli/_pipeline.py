@@ -569,27 +569,38 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
 
 
 def write_intensity_mtz(path: Path, hkl: np.ndarray, I, I_sd, *, cell, spacegroup: str,
-                        keep: np.ndarray, merge_friedel: bool = True,
+                        keep: np.ndarray, n_meas=None, merge_friedel: bool = True,
                         verbose: bool = True) -> None:
     """Write merged intensities as ``I-obs`` / ``SIGI-obs`` (no free flags).
 
     For the moment estimators, whose product is an intensity; French-Wilson
-    happens downstream.  With ``merge_friedel=False`` the signed indices are
-    pivoted onto ``I-obs(+)``/``I-obs(-)``, since a negative ASU index in the
-    file is not what a reader takes for a Bijvoet mate.
+    happens downstream.  ``n_meas`` goes out as ``N``, aimless's spelling for the
+    multiplicity.  With ``merge_friedel=False`` the signed indices are pivoted
+    onto ``I-obs(+)``/``I-obs(-)``/``N(+)``/``N(-)``, since a negative ASU index
+    in the file is not what a reader takes for a Bijvoet mate.
     """
     import pandas as pd
     from torchref.io.mtz import write
 
+    def _np(t, dtype=np.float64):
+        return np.asarray(t.detach().cpu().numpy() if hasattr(t, "detach") else t,
+                          dtype=dtype)
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    I = np.asarray(I.detach().cpu().numpy() if hasattr(I, "detach") else I, dtype=np.float64)
-    I_sd = np.asarray(I_sd.detach().cpu().numpy() if hasattr(I_sd, "detach") else I_sd, dtype=np.float64)
+    I, I_sd = _np(I), _np(I_sd)
     keep = np.asarray(keep, dtype=bool) & np.isfinite(I) & np.isfinite(I_sd) & (I_sd > 0)
 
+    cols = {"I-obs": I[keep], "SIGI-obs": I_sd[keep]}
+    if n_meas is not None:
+        cols["N"] = _np(n_meas, np.int32)[keep]
     if merge_friedel:
-        rows, cols = hkl[keep], {"I-obs": I[keep], "SIGI-obs": I_sd[keep]}
+        rows = hkl[keep]
     else:
-        rows, cols = _bijvoet_columns(hkl[keep], I[keep], I_sd[keep], spacegroup)
+        rows, cols = _bijvoet_columns(hkl[keep], cols, spacegroup)
+        # A mate nobody measured has no intensity, but its multiplicity is 0.
+        for name in ("N(+)", "N(-)"):
+            if name in cols:
+                cols[name] = np.nan_to_num(cols[name]).astype(np.int32)
     df = pd.DataFrame({"H": rows[:, 0], "K": rows[:, 1], "L": rows[:, 2], **cols})
     write(df, [float(c) for c in cell], spacegroup, str(path))
     if verbose:
@@ -597,13 +608,13 @@ def write_intensity_mtz(path: Path, hkl: np.ndarray, I, I_sd, *, cell, spacegrou
               f"columns {list(df.columns)}", flush=True)
 
 
-def _bijvoet_columns(hkl: np.ndarray, I: np.ndarray, I_sd: np.ndarray,
+def _bijvoet_columns(hkl: np.ndarray, cols: dict,
                      spacegroup: str) -> tuple[np.ndarray, dict]:
     """Pivot signed ASU indices onto one row per reflection.
 
     A row is the I(-) member exactly when its index is outside the ASU, which is
-    what :meth:`SFXStream.symmetrize` encodes by negating it.  Columns are NaN
-    where a mate was not measured.
+    what :meth:`SFXStream.symmetrize` encodes by negating it.  Each column splits
+    into a ``(+)``/``(-)`` pair, NaN where a mate was not measured.
     """
     import gemmi
 
@@ -613,12 +624,12 @@ def _bijvoet_columns(hkl: np.ndarray, I: np.ndarray, I_sd: np.ndarray,
                               return_inverse=True)
     inverse = np.asarray(inverse).reshape(-1)
 
-    cols = {name: np.full(len(rows), np.nan)
-            for name in ("I-obs(+)", "SIGI-obs(+)", "I-obs(-)", "SIGI-obs(-)")}
+    out = {}
     for sel, suffix in ((plus, "(+)"), (~plus, "(-)")):
-        cols[f"I-obs{suffix}"][inverse[sel]] = I[sel]
-        cols[f"SIGI-obs{suffix}"][inverse[sel]] = I_sd[sel]
-    return rows, cols
+        for name, values in cols.items():
+            col = out.setdefault(f"{name}{suffix}", np.full(len(rows), np.nan))
+            col[inverse[sel]] = values[sel]
+    return rows, out
 
 
 def report_merge(res: dict, *, verbose: bool = True) -> None:

@@ -284,15 +284,28 @@ def test_anomalous_products_unstack_onto_asu_rows(tmp_path):
     assert set(np.unique(flag)) <= {0, 1}          # one flag per ASU row, not per mate
 
     out_i = tmp_path / "anom_i.mtz"
+    counts = torch.arange(n) % 5 + 1
     P.write_intensity_mtz(out_i, signed, val, val * 0.1, cell=cell, spacegroup=sg,
-                          keep=keep, merge_friedel=False, verbose=False)
+                          keep=keep, n_meas=counts, merge_friedel=False, verbose=False)
     mtz_i = gemmi.read_mtz_file(str(out_i))
     labels_i = [c.label for c in mtz_i.columns]
-    assert {"I-obs(+)", "SIGI-obs(+)", "I-obs(-)", "SIGI-obs(-)"} <= set(labels_i)
+    assert {"I-obs(+)", "SIGI-obs(+)", "I-obs(-)", "SIGI-obs(-)",
+            "N(+)", "N(-)"} <= set(labels_i)
+    assert {c.type for c in mtz_i.columns if c.label.startswith("N(")} == {"I"}
     assert mtz_i.nreflections == n_asu
     asu = gemmi.ReciprocalAsu(gemmi.SpaceGroup(sg))
     written = np.array(mtz_i, dtype=float)[:, :3].astype(int)
     assert all(asu.is_in(row.tolist()) for row in written)
+    # Every measurement is filed under exactly one branch, none invented.
+    n_plus = np.array(mtz_i.column_with_label("N(+)"))
+    n_minus = np.array(mtz_i.column_with_label("N(-)"))
+    assert (n_plus + n_minus).sum() == counts.sum()
+
+    out_m = tmp_path / "merged_i.mtz"
+    P.write_intensity_mtz(out_m, np.abs(signed), val, val * 0.1, cell=cell,
+                          spacegroup=sg, keep=keep, n_meas=counts, verbose=False)
+    mtz_m = gemmi.read_mtz_file(str(out_m))
+    assert next(c.type for c in mtz_m.columns if c.label == "N") == "I"
 
 
 def test_radii_and_gain_parsing():

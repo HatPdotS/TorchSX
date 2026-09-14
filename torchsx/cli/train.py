@@ -248,6 +248,7 @@ def _write(args, prep, res: dict, bundle: P.PrepBundle, out: Path) -> None:
     if res["estimator"] in ("pooled", "mean"):
         P.write_intensity_mtz(out, hkl, res["I"], res["I_sd"], cell=cell,
                               spacegroup=bundle.spacegroup, keep=seen,
+                              n_meas=res["n_meas"],
                               merge_friedel=bundle.merge_friedel)
         return
     keep = seen & np.isfinite(res["F"].detach().cpu().numpy())
