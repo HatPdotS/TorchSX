@@ -382,7 +382,7 @@ def test_feeds_the_merging_stack(source, request):
     stream = SFXStream.from_duckdb(
         request.getfixturevalue(source), spacegroup="P 43 21 2"
     )
-    prepared = prepare_observations(stream, MergeConfig())
+    prepared = prepare_observations(stream, MergeConfig(gain="trust_input"))
     assert prepared is not None
 
     from torchsx.merging.hkl import compute_hkl_index, merge_intensities

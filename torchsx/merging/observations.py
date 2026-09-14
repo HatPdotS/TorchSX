@@ -495,27 +495,56 @@ def prepare_observations(
     if isinstance(gain_cfg, (int, float)):
         gain = float(gain_cfg)
         gain_src = dict(resolved_measurement.provenance)["gain"] if resolved_measurement else "explicit"
-    elif gain_cfg == "stream":
+    elif gain_cfg == "trust_input":
         mean_eV = float(core.beam_energy.float().mean().item())
         gain = gain_from_measurement(spec, mean_eV) if spec is not None else legacy_stream_gain(core)
         gain_src = "source measurement declaration" if spec is not None else "legacy geometry (unverified)"
-    elif gain_cfg == "empirical":
-        g = poisson_noise.calibrate_gain(core_I, core_background)
-        gain = float(g) if g and g > 0 else 1.0
-        gain_src = "empirical (negatives-Mandel; biased high)"
-    elif gain_cfg == "auto":
+    elif gain_cfg in ("auto", "calibrate"):
+        import math
+        tolerance = float(config.gain_tolerance)
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("gain_tolerance must be finite and nonnegative")
+        declared, declaration_error = None, None
+        try:
+            declared = gain_from_measurement(spec, float(core.beam_energy.float().mean().item()))
+        except ValueError as exc:
+            declaration_error = str(exc)
+        if declared is not None:
+            poisson_noise.gain = declared
         g, mu_bias, read_var_adu_sq = poisson_noise.calibrate_sigma2_of_bg(
             core_I, core_background, ewald_offset_core,
         )
-        gain = float(g) if g and g > 0 else 1.0
-        gain_src = (
-            f"auto (σ²(bg) off-Bragg, μ_z={mu_bias:+.3f}σ, "
-            f"read_var_ADU²={read_var_adu_sq:.4g})"
-        )
+        calibrated = float(g) if g is not None and math.isfinite(g) and g > 0 else None
+        info = poisson_noise.gain_calibration_info
+        valid_calibration = calibrated is not None and info.get("valid", True)
+        difference = abs(calibrated - declared) / declared if declared is not None and calibrated is not None else None
+        if gain_cfg == "calibrate" and not valid_calibration:
+            raise ValueError(f"Gain calibration unavailable; supply an explicit --gain or use trust_input. {info}")
+        if valid_calibration and (gain_cfg == "calibrate" or declared is None or difference > tolerance):
+            gain = calibrated
+            reason = ("calibration_requested" if gain_cfg == "calibrate" else
+                      "declaration_unavailable" if declared is None else "disagreement_exceeds_tolerance")
+            selected = "calibration"
+        elif declared is not None:
+            gain = declared
+            reason = "within_tolerance" if valid_calibration else "calibration_unavailable"
+            selected = "input"
+        else:
+            raise ValueError("No usable stream gain or gain calibration; supply an explicit --gain. "
+                             f"Stream: {declaration_error}. Calibration: {info}")
+        poisson_noise.gain_selection = dict(mode=gain_cfg, declared_gain=declared,
+            calibrated_gain=calibrated, calibration_valid=bool(valid_calibration),
+            relative_difference=difference, tolerance=tolerance, selected=selected,
+            reason=reason, selected_gain=gain, declaration_error=declaration_error,
+            calibration={**info, "mu_bias": float(mu_bias) if math.isfinite(mu_bias) else None,
+                         "read_var_adu_sq": float(read_var_adu_sq) if math.isfinite(read_var_adu_sq) else None})
+        gain_src = f"{gain_cfg}: {selected}, {reason}; declared={declared}, calibrated={calibrated}"
     else:
         raise ValueError(f"Unknown config.gain: {gain_cfg!r}")
     print(f"  gain = {gain:.4g} ADU/photon  [{gain_src}]", flush=True)
     poisson_noise.gain = gain
+    if gain_cfg not in ("auto", "calibrate"):
+        poisson_noise.gain_selection = dict(mode=gain_cfg, selected_gain=gain, reason=gain_src)
 
     # ADU → photon counts for the Poisson likelihood.
     core_I = core_I / gain

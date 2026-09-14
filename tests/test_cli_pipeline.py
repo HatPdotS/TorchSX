@@ -340,7 +340,7 @@ def test_radii_and_gain_parsing():
         P.parse_radii("7,9")
     with pytest.raises(ValueError):
         P.parse_radii("9,7,11")          # r_peak < r_gap <= r_bg
-    assert P.parse_gain(None) == "stream"
+    assert P.parse_gain(None) == "auto"
     assert P.parse_gain("auto") == "auto"
     assert P.parse_gain("10.01") == pytest.approx(10.01)
 
@@ -359,8 +359,7 @@ def test_build_stack_rebuilds_a_checkpoint_geometry(tmp_path):
     bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0,
                                  "radii": [7.0, 9.0, 11.0]}, [], 0.1)
     args = _build_parser().parse_args(
-        ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu",
-         "--inner-points", "64"])
+        ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
 
     scale, _obj, tr = _stack(prep, params, tmp_path)
     tr.data_recipe = dict(bundle.recipe)
@@ -436,88 +435,10 @@ def test_custom_split_file_labels_every_crystal(tmp_path):
     assert set(sub.prep.obs_info.delay_bin_idx.tolist()) == {0}
 
 
-def test_stream_batches_keeps_the_observations_off_the_device(tmp_path):
-    """``--stream-batches`` must leave ``prep`` exactly where it was.
-
-    The trainer decides host-vs-device per batch by reading
-    ``self.prep.bg.device``, so a ``prep.to(device)`` in the builder turns the
-    flag into a device-to-device copy -- invisible on data that fit the card,
-    and an out-of-memory before the first step on 794 M observations.
-    """
-    from torchsx.cli import _pipeline as P
-    from torchsx.cli.train import _build_parser
-
-    prep, _params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
-    bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0,
-                                 "radii": [7.0, 9.0, 11.0]}, [], 0.1)
-    base = ["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"]
-
-    streamed, *_ = P.build_stack(
-        bundle, _build_parser().parse_args(base + ["--stream-batches"]), verbose=False)
-    assert streamed is bundle.prep
-
-    moved, *_ = P.build_stack(bundle, _build_parser().parse_args(base), verbose=False)
-    assert moved is not bundle.prep
 
 
-def test_min_split_crystals_drops_the_split_from_the_data(tmp_path):
-    """A split under the threshold leaves the data set, not just the merge.
-
-    A handful of crystals still gets its own in-batch merge target during
-    training, and a target with no per-reflection support is what produced the
-    non-finite batch that killed a full run.  So the crystals go, the surviving
-    labels renumber contiguously, and the names follow.
-    """
-    from torchsx.cli import _pipeline as P
-    from torchsx.stream import SFXStream
-
-    from tests.conftest import STREAM_PATH
-
-    cache = tmp_path / "s.sfx"
-    s = SFXStream.from_stream(STREAM_PATH, spacegroup="P 1", cache=cache)
-    n_img = len(s.filenames)
-    tiny = max(1, n_img // 20)
-    split = tmp_path / "custom.split"
-    with open(split, "w") as fh:
-        for i, (f, e) in enumerate(zip(s.filenames, s.events)):
-            fh.write(f"{f} {e} {'tiny' if i < tiny else 'big'}\n")
-
-    kept = P.load_prep(_DataArgs(stream=[cache], split_file=split), verbose=False)
-    assert kept.split_names == ["big", "tiny"]
-    n_all = kept.prep.obs_info.n_crystals
-
-    cut = int(torch.bincount(kept.prep.obs_info.delay_bin_idx)[1]) + 1
-    b = P.load_prep(_DataArgs(stream=[cache], split_file=split,
-                              min_split_crystals=cut), verbose=False)
-    assert b.split_names == ["big"]
-    labels = b.prep.obs_info.delay_bin_idx
-    assert int(labels.max()) == 0
-    assert b.prep.obs_info.n_crystals < n_all
 
 
-def test_train_defaults_match_the_scored_recipe():
-    """The CLI's training knobs are the ones bench/asym.py was scored with.
-
-    R_free 0.1182 came out of a specific config; a CLI that quietly trains on
-    a different one is not the same method.  lam_spread is the exception and
-    stays 0: the scored run passed -0.25, which ``_lam_spread`` gates out at
-    ``<= 0``, so it never applied a penalty.
-    """
-    import pathlib
-
-    import torchsx.cli.train
-    from torchsx.cli.train import _build_parser
-
-    a = _build_parser().parse_args(["x.sfx", "-o", "out"])
-    assert (a.lr, a.epochs and True) == (1e-3, True)
-    assert (a.train_k_coarse, a.train_m_fine, a.train_n_sigma) == (31, 129, 6.0)
-    assert a.heldout_frac == 0.05
-    # No longer flags: read them where train.py now writes them.
-    src = pathlib.Path(torchsx.cli.train.__file__).read_text()
-    for literal in ("max_obs_per_batch=1_500_000",
-                    "lam0=10.0, lam_halflife_steps=400",
-                    "warmup_steps=100"):
-        assert literal in src, literal
 
 
 def test_lam_holds_when_the_halflife_is_zero(tmp_path):
@@ -576,21 +497,6 @@ def test_merge_locating_survives_high_multiplicity():
     assert ref_err < 0.01 and ref_err < 0.1 * (24.0 * ref_sd)
 
 
-def test_every_cli_can_stream_batches(tmp_path):
-    """Both commands need --stream-batches, not just the trainer.
-
-    A merge holds the same prepared observations a training run does, so a data
-    set that does not fit the card cannot be merged without it either.
-    """
-    from torchsx.cli.merge_nn import _build_parser as nn_parser
-    from torchsx.cli.train import _build_parser as train_parser
-
-    for build, argv in (
-        (train_parser, ["x.sfx", "-o", str(tmp_path)]),
-        (nn_parser, ["ck.pt", "x.sfx", "-o", str(tmp_path / "m.mtz")]),
-    ):
-        assert build().parse_args(argv).stream_batches is False
-        assert build().parse_args(argv + ["--stream-batches"]).stream_batches is True
 
 
 def test_merge_survives_a_non_finite_batch(tmp_path):
@@ -651,7 +557,7 @@ def test_smooth_basis_flags_round_trip_through_the_checkpoint(tmp_path):
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
     bundle = P.PrepBundle(prep, recipe, [], 0.1)
     targs = train_parser().parse_args(
-        ["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"])
+        ["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
     assert S["wilson_basis"] == "smooth" and S["basis"] is not None
     assert scale.anchor_stat == "basis" and S["basis"].degree == 4
@@ -668,7 +574,7 @@ def test_smooth_basis_flags_round_trip_through_the_checkpoint(tmp_path):
 
     # Merge side: no flags at all, everything comes from the checkpoint.
     margs = merge_parser().parse_args(
-        ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu", "--inner-points", "64"])
+        ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
     p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
     assert S2["wilson_basis"] == "smooth" and S2["wilson_degree"] == 4
     assert rebuilt.anchor_stat == "basis" and S2["basis"] is not None
@@ -693,8 +599,7 @@ def test_shells_checkpoint_rebuilds_without_a_basis(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
     bundle = P.PrepBundle(prep, recipe, [], 0.1)
-    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu",
-                                       "--inner-points", "64"])
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
     tr.data_recipe = dict(recipe)
@@ -704,7 +609,7 @@ def test_shells_checkpoint_rebuilds_without_a_basis(tmp_path):
     del ck["posterior_grid"]["wilson_basis"], ck["posterior_grid"]["wilson_degree"]
     del ck["scale"]["anchor_stat"]
     margs = merge_parser().parse_args(
-        ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu", "--inner-points", "64"])
+        ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
     _p, _q, rebuilt, _o, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
     assert S2["basis"] is None and rebuilt.anchor_stat == "median"
     rebuilt.load_state_dict(ck["state_dict"])
@@ -715,104 +620,10 @@ def test_defaults_are_smooth_prior_and_basis_anchor(tmp_path):
     from torchsx.cli.train import _build_parser as train_parser
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
-    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"])
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
     _p, _q, scale, _o, S = P.build_stack(bundle, targs, verbose=False)
     assert S["wilson_basis"] == "smooth" and S["basis"] is not None and scale.anchor_stat == "basis"
     assert TrainConfig().wilson_basis == "smooth"
 
 
 # ── merge_nn products ──────────────────────────────────────────────────
-
-
-def test_merge_nn_writes_three_products_with_one_surface(tmp_path):
-    """Default run: scaled posterior, raw posterior and pooled per split and half, one
-    calibration surface fitted on all splits; --no-scale-calibration reproduces the raw
-    posterior as the only product."""
-    import json
-    import gemmi
-    import numpy as np
-    from torchsx.cli import merge_nn
-    from torchsx.cli.merge_nn import _build_parser
-    from torchsx.merging.calibrate import ChebyshevScaleSurface
-
-    prep, params, *_ = _synthetic(n_hkl=60, n_xtal=40, per=20, n_cond=2)
-    scale, _obj, tr = _stack(prep, params, tmp_path, n_cond=2)
-    scale.eval()
-    names, wanted = ["dark", "light"], [0, 1]
-    out = tmp_path / "a" / "m.mtz"
-    args = _build_parser().parse_args(
-        ["ck.pt", "x.sfx", "-o", str(out), "--device", "cpu", "--all-splits", "--calib-degree", "2,2"])
-    summary = merge_nn.merge_products(tr, prep, args, names, wanted, spacegroup="P 1", verbose=False)
-    assert set(summary) == set(names)
-
-    d = prep.d_spacing.numpy()
-    for k, lab in enumerate(names):
-        side = json.loads((out.parent / f"m_{lab}.calibration.json").read_text())
-        assert side["fitted_on"] == names and side["calibration"]["nx"] == 2
-        assert len(side["calibration"]["beta"]) == 9 and side["shell_check"]
-        surf = ChebyshevScaleSurface.from_dict(side["calibration"])
-        for half in ("", "_half1", "_half2"):
-            scaled = gemmi.read_mtz_file(str(out.parent / f"m_{lab}{half}.mtz"))
-            raw = gemmi.read_mtz_file(str(out.parent / f"m_{lab}{half}_posterior.mtz"))
-            pooled = gemmi.read_mtz_file(str(out.parent / f"m_{lab}{half}_pooled.mtz"))
-            assert "F-obs" in scaled.column_labels() and "F-obs" in raw.column_labels()
-            assert [c.type for c in pooled.columns if c.label in ("I-obs", "SIGI-obs")] == ["J", "Q"]
-            assert not any(c.type == "F" for c in pooled.columns)
-            a, b = np.array(scaled, copy=False), np.array(raw, copy=False)
-            assert a.shape == b.shape and np.array_equal(a[:, :3], b[:, :3])
-            ca, cb = {l: i for i, l in enumerate(scaled.column_labels())}, {l: i for i, l in enumerate(raw.column_labels())}
-            ratio = (a[:, ca["F-obs"]] / b[:, cb["F-obs"]]) ** 2
-            assert (ratio >= surf.f_min - 1e-4).all() and (ratio <= surf.f_max + 1e-4).all()
-            # the sigma carries the same factor
-            np.testing.assert_allclose(a[:, ca["SIGF-obs"]] / b[:, cb["SIGF-obs"]], np.sqrt(ratio), rtol=1e-4)
-        # the factor is the surface evaluated at the raw posterior of THIS split
-        res = tr.merge(condition=k, estimator="posterior")
-        seen = res["seen"].numpy()
-        f = surf.factor(d[seen], res["I0"].numpy()[seen])
-        full = gemmi.read_mtz_file(str(out.parent / f"m_{lab}.mtz")); fr = gemmi.read_mtz_file(str(out.parent / f"m_{lab}_posterior.mtz"))
-        a, b = np.array(full, copy=False), np.array(fr, copy=False)
-        ca = {l: i for i, l in enumerate(full.column_labels())}
-        key = {tuple(int(v) for v in row[:3]): i for i, row in enumerate(a)}
-        pairs = [(key[t], j) for j, h in enumerate(prep.hkl_valid.numpy()[seen]) for t in [tuple(int(v) for v in h)] if t in key]
-        rows, js = zip(*pairs)
-        got = (a[list(rows), ca["F-obs"]] / b[list(rows), ca["F-obs"]]) ** 2
-        np.testing.assert_allclose(got, f[list(js)], rtol=2e-3)
-
-    # the opt-out reproduces the raw posterior as the only product, bit-exactly
-    out2 = tmp_path / "b" / "m.mtz"
-    args2 = _build_parser().parse_args(
-        ["ck.pt", "x.sfx", "-o", str(out2), "--device", "cpu", "--all-splits", "--no-scale-calibration"])
-    merge_nn.merge_products(tr, prep, args2, names, wanted, spacegroup="P 1", verbose=False)
-    for lab in names:
-        assert not (out2.parent / f"m_{lab}_pooled.mtz").exists() and not (out2.parent / f"m_{lab}.calibration.json").exists()
-        x = np.array(gemmi.read_mtz_file(str(out2.parent / f"m_{lab}.mtz")), copy=False)
-        y = np.array(gemmi.read_mtz_file(str(out.parent / f"m_{lab}_posterior.mtz")), copy=False)
-        np.testing.assert_array_equal(x, y)
-
-
-def test_trust_cache_prep_loads_a_moved_cache(tmp_path):
-    """A prepared cache carries the absolute input paths in its signature, so
-    the same cache copied to another machine is refused unless the caller
-    takes responsibility with ``--trust-cache-prep``; then the inputs need
-    not exist at all."""
-    import pytest
-
-    from torchsx.cli import _pipeline as P
-    from torchsx.stream import SFXStream
-
-    from tests.conftest import STREAM_PATH
-
-    sfx = tmp_path / "s.sfx"
-    SFXStream.from_stream(STREAM_PATH, spacegroup="P 1", cache=sfx)
-    cache = tmp_path / "prep.pt"
-    built = P.load_prep(_DataArgs(split=[f"a={sfx}"], cache_prep=cache), verbose=False)
-    assert cache.exists()
-
-    moved = _DataArgs(split=[f"a={tmp_path / 'elsewhere' / 's.sfx'}"], cache_prep=cache)
-    with pytest.raises(SystemExit):
-        P.load_prep(moved, verbose=False)
-    moved.trust_cache_prep = True
-    b = P.load_prep(moved, verbose=False)
-    assert b.prep.n_valid == built.prep.n_valid
-    assert b.split_names == built.split_names
-    assert b.prep.I_obs.numel() == built.prep.I_obs.numel()

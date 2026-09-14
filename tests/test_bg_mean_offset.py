@@ -241,7 +241,7 @@ def test_fixed_eager_matches_triton_under_offset(offset):
 # ── end to end through build_stack ────────────────────────────────────
 
 def test_build_stack_and_checkpoint_carry_the_offset(tmp_path):
-    """Flag -> likelihood -> checkpoint -> merge, and the refusal in between.
+    """Measurement -> likelihood -> checkpoint -> merge, and the refusal in between.
 
     The ``+bgmean`` kind marker is the load-bearing part: it is what makes a
     build without this parameter REFUSE the checkpoint rather than merge the
@@ -257,16 +257,10 @@ def test_build_stack_and_checkpoint_carry_the_offset(tmp_path):
     bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0,
                                  "radii": [7.0, 9.0, 11.0]}, [], C)
     base = ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"),
-            "--device", "cpu", "--inner-points", "64"]
+            "--device", "cpu"]
 
-    # off by default
+    # New training derives the correction from the measurement recipe.
     args = _build_parser().parse_args(base)
-    *_, obj, settings = P.build_stack(bundle, args, verbose=False)
-    assert obj.likelihood.bg_mean_offset == 0.0
-    assert settings["bg_mean_offset"] == 0.0
-
-    # 'auto' resolves to n_peak/n_bg
-    args = _build_parser().parse_args(base + ["--bg-mean-offset", "auto"])
     *_, obj, settings = P.build_stack(bundle, args, verbose=False)
     assert obj.likelihood.bg_mean_offset == pytest.approx(C)
     assert settings["bg_mean_offset"] == pytest.approx(C)

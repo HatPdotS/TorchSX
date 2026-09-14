@@ -315,7 +315,7 @@ def test_mixture_trainer_step_runs_and_trains_the_conditioner(tmp_path):
 
 # ---------------------------------------------------------------- CLI and checkpoint
 
-def test_scatter_family_round_trips_through_the_checkpoint(tmp_path):
+def test_scatter_family_round_trips_through_the_checkpoint(tmp_path, monkeypatch):
     from torchsx.cli import _pipeline as P
     from torchsx.cli.merge_nn import _build_parser as merge_parser
     from torchsx.cli.train import _build_parser as train_parser
@@ -326,26 +326,28 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
     bundle = P.PrepBundle(prep, recipe, [], 0.1)
-    base = ["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"]
-    # default stays the single family
-    _p, _q, scale0, _o, S0 = P.build_stack(bundle, train_parser().parse_args(base), verbose=False)
+    base = ["x.sfx", "-o", str(tmp_path), "--device", "cpu"]
+    # Construct an older single-family checkpoint through the internal recipe.
+    with monkeypatch.context() as m:
+        m.setitem(P.DEFAULTS, "scatter_family", "gengauss")
+        _p, _q, scale0, _o, S0 = P.build_stack(bundle, train_parser().parse_args(base), verbose=False)
     assert S0["scatter_family"] == "gengauss" and scale0.heads.scatter_family == "gengauss" and not hasattr(scale0.heads, "mixture")
-    # opt in
-    targs = train_parser().parse_args(base + ["--scatter-family", "mixture", "--scatter-components", "2", "--scatter-hidden", "4"])
+    # The public default is the four-Gaussian production model.
+    targs = train_parser().parse_args(base)
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
-    assert S["scatter_family"] == "mixture" and S["scatter_components"] == 2
-    assert scale.heads.scatter_family == "mixture" and scale.heads.n_components == 2 and scale.heads.mixture.hidden == 4
+    assert S["scatter_family"] == "mixture" and S["scatter_components"] == 4
+    assert scale.heads.scatter_family == "mixture" and scale.heads.n_components == 4 and scale.heads.mixture.hidden == 8
     assert isinstance(scale.scatter, PredictedMixtureScatter)
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
     tr.data_recipe = dict(recipe)
     ck = torch.load(tr.save_best(tmp_path / "mix.pt"), weights_only=False)
-    assert ck["scatter"]["family"] == "mixture" and ck["scatter"]["n_components"] == 2 and ck["scatter"]["conditioner_hidden"] == 4 and ck["scatter"]["component_shape"] == "shared"
+    assert ck["scatter"]["family"] == "mixture" and ck["scatter"]["n_components"] == 4 and ck["scatter"]["conditioner_hidden"] == 8 and ck["scatter"]["component_shape"] == "gaussian"
     assert any(k.startswith("heads.mixture.") for k in ck["state_dict"])
     assert "mix" in ck["inference_context"]["probes"] or any("mix" in str(k) for k in ck["inference_context"]["probes"])
     # merge side rebuilds the family from the checkpoint with no flags
-    margs = merge_parser().parse_args(["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu", "--inner-points", "64"])
+    margs = merge_parser().parse_args(["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
     p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
-    assert S2["scatter_family"] == "mixture" and rebuilt.heads.n_components == 2 and isinstance(rebuilt.scatter, PredictedMixtureScatter)
+    assert S2["scatter_family"] == "mixture" and rebuilt.heads.n_components == 4 and isinstance(rebuilt.scatter, PredictedMixtureScatter)
     rebuilt.load_state_dict(ck["state_dict"])
     tr2 = _trainer_from_stack(p2, q2, rebuilt, o2, S2)
     load_checkpoint_context(tr2, ck, "exact")
