@@ -9,6 +9,7 @@ merge — those read the CLI flags and the checkpoint recipe.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from torchsx.measurement import DEFAULT_GAIN_TOLERANCE
 
 
 @dataclass
@@ -34,9 +35,9 @@ class MergeConfig:
         observation.  A cap shifts the fitted beta slightly, so a run that
         needs to reproduce an uncapped number must leave it at ``0``.
     gain
-        ADU per photon.  ``"stream"`` reads the declared ``adu_per_photon``, or
-        ``adu_per_eV`` times the mean recorded beam energy; ``"empirical"``
-        runs the Mandel calibration on negatives; a float pins it.
+        ADU per photon: auto compares input and calibrated estimates;
+        trust_input uses the declaration; calibrate forces estimation; a number
+        supplies the gain directly. Auto uses a 50% discrepancy threshold.
     fw_n_shells
         Equal-population resolution shells for the French-Wilson prior
         metadata attached to each surviving reflection.
@@ -46,5 +47,6 @@ class MergeConfig:
     n_shells: int = 20
     snr_thresh: float = 3.0
     beta_pool_cap: int = 0
-    gain: str | float = "stream"
+    gain: str | float = "auto"
+    gain_tolerance: float = DEFAULT_GAIN_TOLERANCE
     fw_n_shells: int = 20

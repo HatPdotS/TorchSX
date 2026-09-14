@@ -30,14 +30,14 @@ def test_filter_before_calibration_preserves_alignment(sample_core, monkeypatch,
     keep = torch.tensor([True, False, True, True, True])
     calls = []
 
-    def calibrate(self, I, bg):
+    def calibrate(self, I, bg, ewald):
         assert torch.equal(I, intensity[keep])
         assert torch.isfinite(bg).all()
         calls.append(True)
-        return 2.0
+        return 2.0, 0.0, 0.0
 
-    monkeypatch.setattr(PoissonNoiseModel, "calibrate_gain", calibrate)
-    actual = prepare_observations(SFXStream(core), MergeConfig(gain="empirical"),
+    monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", calibrate)
+    actual = prepare_observations(SFXStream(core), MergeConfig(gain="calibrate"),
                                   partiality=partiality, crystal_weights=weights)
     assert calls == [True]
     assert f"{column}=1" in capsys.readouterr().out
@@ -79,7 +79,7 @@ def test_missing_sigma_retains_noise_fallback(sample_core):
 def test_all_invalid_fails_before_calibration(sample_core, monkeypatch):
     def no_calibration(*args):
         pytest.fail("empty input reached calibration")
-    monkeypatch.setattr(PoissonNoiseModel, "calibrate_gain", no_calibration)
+    monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", no_calibration)
     core = sample_core.replace(sigma=torch.full_like(sample_core.sigma, float("nan")))
     with pytest.raises(ValueError, match="No valid observations"):
-        prepare_observations(SFXStream(core), MergeConfig(gain="empirical"))
+        prepare_observations(SFXStream(core), MergeConfig(gain="calibrate"))

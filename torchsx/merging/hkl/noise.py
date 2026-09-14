@@ -8,7 +8,7 @@ negative-intensity observations.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
@@ -93,6 +93,8 @@ class PoissonNoiseModel:
     # including the bg-ring leakage 1+n_peak/n_bg term).  Set by
     # ``calibrate_sigma2_of_bg`` from the per-bg-bin σ²_z(bg) curve.
     read_var_adu_sq: float = 0.0
+    gain_calibration_info: dict = field(default_factory=dict, init=False, repr=False)
+    gain_selection: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.exact_pixel_counts:
@@ -211,16 +213,21 @@ class PoissonNoiseModel:
 
         neg = (I_obs < 0) & (background > bg_min)
         n_neg = int(neg.sum().item())
+        self.gain_calibration_info = {"method": "negative_truncnorm", "valid": False,
+                                      "n_observations": n_neg}
         if n_neg < 100:
             print(f"  PoissonNoiseModel.truncnorm: only {n_neg} valid negatives, "
-                  f"keeping gain={self.gain:.3f}")
-            return self.gain, 0.0
+                  "gain calibration unavailable")
+            return float("nan"), 0.0
 
         I_neg = I_obs[neg].to(dtype=dtype)
         bg_neg = background[neg].to(dtype=dtype)
         sigma_pred_g1 = (bg_neg * self.n_peak * (1.0 + self.n_peak / self.n_bg)).sqrt()
         z = I_neg / sigma_pred_g1.clamp(min=1e-12)
         z = z[(z > z_min) & (z < 0.0)]
+        if z.numel() < 100:
+            self.gain_calibration_info["n_observations"] = int(z.numel())
+            return float("nan"), 0.0
 
         if z.numel() > max_pool:
             gen = torch.Generator(device=device).manual_seed(seed)
@@ -229,6 +236,8 @@ class PoissonNoiseModel:
 
         sigma_hat, mu_hat = self._fit_truncnorm_z(z, max_iter=max_iter)
         gain = sigma_hat ** 2
+        self.gain_calibration_info.update(valid=math.isfinite(gain) and gain > 0,
+                                          n_observations=int(z.numel()))
         self.gain = gain
         print(
             f"  PoissonNoiseModel.truncnorm: gain={gain:.4f} ADU/photon  "
@@ -301,6 +310,8 @@ class PoissonNoiseModel:
             & torch.isfinite(ewald_offset)
         )
         n_sel = int(mask.sum().item())
+        self.gain_calibration_info = {"method": "off_bragg_variance", "valid": False,
+                                      "n_observations": n_sel}
         if n_sel < 5000:
             print(
                 f"  PoissonNoiseModel.sigma2_of_bg: only {n_sel} off-Bragg "
@@ -308,7 +319,9 @@ class PoissonNoiseModel:
                 f"calibrate_gain_truncnorm.", flush=True,
             )
             gain, mu = self.calibrate_gain_truncnorm(I_obs, background)
+            self.gain_calibration_info["fallback_reason"] = "insufficient off-Bragg observations"
             self.sigma2_bg_slope = 0.0
+            self.read_var_adu_sq = 0.0
             return gain, mu, 0.0
 
         I_off = I_obs[mask].to(dtype=dtype)
@@ -318,6 +331,12 @@ class PoissonNoiseModel:
         keep = z.abs() < z_max
         z = z[keep]
         bg_off = bg_off[keep]
+        if z.numel() < 5000:
+            gain, mu = self.calibrate_gain_truncnorm(I_obs, background)
+            self.gain_calibration_info["fallback_reason"] = "insufficient usable off-Bragg observations"
+            self.sigma2_bg_slope = 0.0
+            self.read_var_adu_sq = 0.0
+            return gain, mu, 0.0
 
         # Quantile-bin in log(bg).  ``torch.quantile`` caps at 2²⁴ elements
         # (int32 internal sort indexing), so do the quantile by sort+gather
@@ -363,6 +382,7 @@ class PoissonNoiseModel:
                 f"back to calibrate_gain_truncnorm.", flush=True,
             )
             gain, mu = self.calibrate_gain_truncnorm(I_obs, background)
+            self.gain_calibration_info["fallback_reason"] = "insufficient background bins"
             self.sigma2_bg_slope = 0.0
             self.read_var_adu_sq = 0.0
             return gain, mu, 0.0
@@ -370,6 +390,7 @@ class PoissonNoiseModel:
         # Bin QC: keep bins where |μ_z| < mu_z_max (rules out residual
         # signal-contaminated bins that slipped through Ewald-gating).
         clean = [i for i, m in enumerate(mu_per_bin) if abs(m) < mu_z_max]
+        clean_enough = len(clean) >= 3
         if len(clean) < 3:
             clean = list(range(len(sigma2_per_bin)))
 
@@ -394,6 +415,8 @@ class PoissonNoiseModel:
         self.gain = g_fit
         self.read_var_adu_sq = c_fit
         self.sigma2_bg_slope = 0.0  # legacy field, unused after refit
+        self.gain_calibration_info.update(valid=clean_enough and math.isfinite(g_fit) and g_fit > 0,
+                                          n_bins=len(sigma2_per_bin), n_clean_bins=sum(abs(m) < mu_z_max for m in mu_per_bin))
 
         for i in range(len(sigma2_per_bin)):
             mark = "*" if i in clean else " "

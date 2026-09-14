@@ -1,258 +1,170 @@
-"""``torchsx-train`` — stream(s) in, trained scale network and merged MTZ out.
-
-The amortised-scale recipe as it stands after the two-width scatter was locked
-in.  One network predicts, per observation, a scale ``K`` and the width, shape
-and skew of the multiplicative scatter around it; the merge integrates the
-signal out against that likelihood rather than averaging corrected intensities.
-
-Measured against partialator on the same free set: SwissFEL small molecule
-R_free 0.119 (partialator 0.147), SACLA rhodopsin 0.276 (partialator 0.275,
-with the low-resolution shell 0.304 vs 0.289 and the high-resolution end ours).
-The outer shells are still behind a shape-free pooled estimator
-(``--estimator pooled``) — that trade is deliberate and documented.
-
-The network never sees an observation's own intensity, and never sees which
-split a crystal belongs to: the scale is a function of geometry and of the
-*other* observations in the crystal.  That is what keeps it from manufacturing
-a difference between splits.
-
-Examples
---------
-::
-
-    torchsx-train dark.stream --spacegroup "P 1" --int-radius 7,9,11 \\
-        --gain 1.0 --dmin 0.9 -o run/
-
-    torchsx-train --split dark=dark.stream --split light=1ps.stream \\
-        --spacegroup "P 2 21 21" --int-radius 1,4,7 --gain 10.01 --dmin 1.9 \\
-        --redundancy 200 --chunk-crystals 400 -o run/
-"""
-
+"""Train one scale network for all supplied states and export raw posterior MTZs."""
 from __future__ import annotations
 
-import math
 import argparse
-import time
+from dataclasses import asdict
+import json
+import math
 from pathlib import Path
+import random
+import time
 
+import numpy as np
 import torch
 
 from torchsx.cli import _pipeline as P
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="torchsx-train",
-        description="Train the amortised scale model and merge to an MTZ.",
-    )
+def _positive(value):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError(f"Expected a positive finite number, got {value!r}")
+    return number
+
+
+def _steps(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"Expected a nonnegative update count, got {value!r}")
+    return number
+
+
+def _build_parser():
+    p = argparse.ArgumentParser(prog="torchsx-train", description=__doc__)
     P.add_data_args(p)
     P.add_model_args(p)
     P.add_free_args(p)
-    p.add_argument("-o", "--out", type=Path, required=True,
-                   help="output directory: best.pt, metrics.jsonl, merged*.mtz")
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--mixture-lr-mult", type=float, default=1.0,
-                   help="learning-rate multiplier for the mixture scatter conditioner")
-    p.add_argument("--redundancy", type=float, default=None,
-                   help="observations per reflection in a batch.  Prefer this "
-                        "over --max-obs: the in-batch merge target is built "
-                        "from ~max_obs/n_hkl observations, so a batch size "
-                        "carried between data sets silently changes the "
-                        "objective (1.5 M obs is 106 obs/reflection on a 14 k "
-                        "cell and 13 on a 114 k one).")
-    p.add_argument("--heldout-frac", type=float, default=0.05)
-    p.add_argument("--chunk-crystals", type=int, default=0,
-                   help="crystals per encoder chunk (0 = whole batch).  The "
-                        "encoder is separable across crystals, so this is "
-                        "exact; 400 is what makes redundancy 200 fit on 40 GB.")
-    p.add_argument("--node-ckpt", action="store_true",
-                   help="recompute outer quadrature nodes in backward")
-    p.add_argument("--train-k-coarse", type=int, default=31)
-    p.add_argument("--train-m-fine", type=int, default=129)
-    p.add_argument("--train-n-sigma", type=float, default=6.0,
-                   help="outer quadrature grid used WHILE TRAINING (31/129/6 "
-                        "is the scored recipe).  The final merge is done on "
-                        "the merge grid (--k-coarse/--m-fine/--n-sigma, "
-                        "63/257/24) regardless: a training grid may be cheaper "
-                        "than a merge should be, and at n_sigma 6 a quarter of "
-                        "reflections put >1 %% of their posterior against the "
-                        "grid edge in a full merge.")
-    p.add_argument("--split-half-every", type=int, default=0,
-                   help="run the CC1/2 / R_split merge every N epochs")
-    p.add_argument("--estimator", default="posterior",
-                   choices=("posterior", "flat", "ml", "pooled", "mean"),
-                   help="estimator for the final merge (see torchsx-merge-nn)")
-    p.add_argument("--no-merge", action="store_true",
-                   help="stop after training; merge later with torchsx-merge-nn")
+    p.add_argument("-o", "--out", type=Path, required=True, help="run directory")
+    p.add_argument("--steps", type=_steps, default=800,
+                   help="total optimizer updates, balanced across states (default 800)")
+    p.add_argument("--redundancy", type=_positive, default=25,
+                   help="target observations per reflection in a batch (default 25)")
+    p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
     return p
 
 
-def main(argv: list[str] | None = None) -> None:
+def _batch(tr):
+    """Sample complete crystals from one state, alternating states per update."""
+    k = tr.step_i % tr.n_conditions
+    pool = tr.train_crystals[tr.condition[tr.train_crystals] == k]
+    if not pool.numel():
+        raise ValueError(f"State {k} has no training crystals after observation filtering")
+    g = torch.Generator().manual_seed(tr.cfg.seed + 1000003 * (tr.step_i // tr.n_conditions))
+    perm = pool[torch.randperm(len(pool), generator=g)]
+    counts = tr.index.counts[perm].cumsum(0)
+    n = max(1, int(torch.searchsorted(counts, tr.cfg.max_obs_per_batch, right=True)))
+    chosen = perm[:n]
+    return k, tr.index.rows(chosen)
+
+
+def _save_current(tr, path):
+    """Save the final/current weights without changing the best-validation snapshot."""
+    keys = ("_best_state", "_best_obj_state", "_best_context", "best_step", "best_heldout")
+    previous = {k: getattr(tr, k, None) for k in keys}
+    try:
+        tr._best_state = tr._best_obj_state = tr._best_context = None
+        tr.best_step, tr.best_heldout = tr.step_i, float("nan")
+        tr.save_best(path)
+    finally:
+        for key, value in previous.items():
+            setattr(tr, key, value)
+
+
+def run_updates(tr, steps):
+    """Run a fixed update budget, with refresh/evaluation cadence per state."""
+    refresh_every, evaluate_every = 25 * tr.n_conditions, 100 * tr.n_conditions
+    updates = [0] * tr.n_conditions
+    has_validation = bool(tr.heldout_crystals.numel())
+    if has_validation:
+        tr.evaluate(tr.heldout_crystals, phase="heldout_init")
+    for _ in range(steps):
+        if tr.step_i % refresh_every == 0:
+            tr._refresh_feature_reference()
+            tr._refresh_wilson_sigma()
+        k, rows = _batch(tr)
+        rec = tr.step(rows.to(tr.device))
+        if rec.get("step_skipped") or not rec.get("n_used"):
+            raise FloatingPointError(f"Update {tr.step_i} for state {k} was unusable; see metrics.jsonl")
+        updates[k] += 1
+        if tr.step_i % 25 == 0 or sum(updates) == steps:
+            print(f"update {tr.step_i}/{steps}: per-state {updates}, "
+                  f"nll/obs {rec['nll_per_obs']:.5f}", flush=True)
+        if tr.step_i % evaluate_every == 0 or sum(updates) == steps:
+            # Checkpoint the exact context used at evaluation/readout.
+            tr._refresh_feature_reference()
+            tr._refresh_wilson_sigma()
+            if has_validation:
+                result = tr.evaluate(tr.heldout_crystals)
+                print(f"  validation state 0: nll/obs {result['nll_per_obs']:.5f}", flush=True)
+            tr.save_best()
+            _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
+    if not steps:
+        tr.save_best()
+        _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
+    return updates
+
+
+def main(argv=None):
     args = _build_parser().parse_args(argv)
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
+    from torchsx.cli.merge_nn import merge_products
 
-    t0 = time.time()
+    args.seed = 0 if args.seed is None else args.seed
+    random.seed(args.seed)
+    np.random.seed(args.seed % 2**32)
+    torch.manual_seed(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
     bundle = P.load_prep(args)
-    prep, params, scale, obj, S = P.build_stack(bundle, args)
-    if args.chunk_crystals > 0:
-        scale.set_encoder_chunking(args.chunk_crystals)
-
+    prep, params, scale, obj, settings = P.build_stack(bundle, args)
+    n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
-        max_obs_per_batch=1_500_000,
-        target_redundancy=args.redundancy,
-        epochs=args.epochs, lr=args.lr, mixture_lr_mult=args.mixture_lr_mult,
-        lam0=10.0, lam_halflife_steps=400,
-        warmup_steps=100, grad_clip=20.0, log_every=10,
-        merge_target="posterior", loss="evidence",
-        posterior_k_coarse=args.train_k_coarse, posterior_m_fine=args.train_m_fine,
-        posterior_n_sigma=args.train_n_sigma,
-        posterior_max_halfwidth=S["max_halfwidth"],
-        locate_windows=(8.0, 1.0, 0.125),
-        posterior_prior=S["prior"],
-        wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
-        posterior_checkpoint_nodes=args.node_ckpt,
-        encoder_chunk_crystals=args.chunk_crystals,
-        stream_batches=args.stream_batches,
-        split_half_every=args.split_half_every,
-        heldout_frac=args.heldout_frac,
-        device=S["device"], outdir=str(args.out),
+        target_redundancy=args.redundancy, epochs=0, lr=1e-3, mixture_lr_mult=10.0,
+        lam0=10.0, lam_halflife_steps=400 * n_states, warmup_steps=100 * n_states,
+        grad_clip=20.0, log_every=25, merge_target="posterior", loss="evidence",
+        posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
+        posterior_max_halfwidth=settings["max_halfwidth"],
+        locate_windows=(8.0, 1.0, 0.125), posterior_prior=settings["prior"],
+        wilson_basis=settings["wilson_basis"], wilson_degree=settings["wilson_degree"],
+        posterior_checkpoint_nodes=True, encoder_chunk_crystals=400,
+        stream_batches=True, split_half_every=0, heldout_frac=0.05,
+        device=settings["device"], outdir=str(args.out), seed=args.seed,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
-    if S.get("basis") is not None:
-        tr.set_reciprocal_basis(S["basis"], smooth_prior=S["wilson_basis"] == "smooth")
-    tr.data_recipe = dict(bundle.recipe)
-    tr.split_names = list(bundle.split_names)
-    print(f"train {tr.train_crystals.numel():,} / heldout "
-          f"{tr.heldout_crystals.numel():,} crystals"
-          + (f", {tr.n_conditions} splits {bundle.split_names}"
-             if tr.n_conditions > 1 else ""), flush=True)
-
-    # Same-condition TRAINING crystals, scored exactly as the held-out set is
-    # (fixed eval_lam, no penalty).  Without it the only comparison available
-    # is the running train loss against held-out, and those differ in lambda,
-    # in the penalty, and in multiplicity -- 106 observations per reflection in
-    # a 1.5 M batch against 74 in the held-out set -- so their gap is
-    # bookkeeping, not generalisation.  This pair is like for like: if it opens,
-    # the model is overfitting; if it does not, the model is fine and the other
-    # gap was the normaliser.
-    same = tr.train_crystals[
-        tr.condition[tr.train_crystals.cpu()] == (cfg.heldout_condition or 0)]
-    g = torch.Generator().manual_seed(cfg.seed)
-    train_eval = same[torch.randperm(same.numel(), generator=g)[
-        : min(cfg.train_eval_crystals, same.numel())]]
-    print(f"train-eval set: {train_eval.numel():,} crystals from split "
-          f"{bundle.split_names[cfg.heldout_condition or 0] if bundle.split_names else 0!r}, "
-          f"held-out {tr.heldout_crystals.numel():,} from the same split", flush=True)
-
-    base = tr.evaluate(tr.heldout_crystals, phase="heldout_init")
-    print(f"  epoch -   heldout nll/obs {base['nll_per_obs']:.5f}  "
-          f"var_z {base['var_z']:.3f}", flush=True)
-    for ep in range(args.epochs):
-        t1 = time.time()
-        tr._refresh_feature_reference()
-        tr._refresh_wilson_sigma()
-        loss_sum = n_used = 0.0
-        aucs = []
-        skipped0 = tr.n_skipped_steps
-        for _, rows in tr.index.batches(cfg.max_obs_per_batch, generator=tr.gen,
-                                        crystals=tr.train_crystals):
-            r = tr.step(rows.to(S["device"]))
-            # weight by n_used: a plain mean of per-obs RATIOS is not the
-            # epoch's per-observation NLL when the batches differ in size.
-            # A dropped batch contributes nothing rather than turning the
-            # epoch's mean into NaN.
-            if r["n_used"] and math.isfinite(r["nll_per_obs"]):
-                loss_sum += r["nll_per_obs"] * r["n_used"]
-                n_used += r["n_used"]
-            if "condition_auc" in r:
-                aucs.append(r["condition_auc"])
-        h = tr.evaluate(tr.heldout_crystals)
-        te = tr.evaluate(train_eval, phase="train_eval")
-        tr.save_best()
-        auc = f"  auc {sum(aucs) / len(aucs):.3f}" if aucs else ""
-        dropped = tr.n_skipped_steps - skipped0
-        skip = f"  [{dropped} non-finite batches dropped]" if dropped else ""
-        print(f"  epoch {ep:<3d} train {loss_sum / max(n_used, 1):.5f}  "
-              f"heldout {h['nll_per_obs']:.5f} (train-eval "
-              f"{te['nll_per_obs']:.5f}, gap {h['nll_per_obs'] - te['nll_per_obs']:+.5f})  "
-              f"ev/hkl {h['evidence_per_hkl']:.4f}  var_z {h['var_z']:.3f}"
-              f"{auc}  [{time.time() - t1:.1f}s]{skip}", flush=True)
-        if args.split_half_every and (ep + 1) % args.split_half_every == 0:
-            sh = tr.split_half_metrics()
-            print(f"    [merge] CC1/2 full {sh['cc_half_full']:.4f}  "
-                  f"Rsplit {sh['r_split_full']:.4f}  "
-                  f"train {sh['cc_half_train']:.4f} val {sh['cc_half_val']:.4f}",
-                  flush=True)
-
-    # Report the parameters that scored best on held-out, not wherever training
-    # happened to stop: a 300-epoch run peaked at ~230 and degraded past it.
-    ckpt_path = tr.save_best(args.out / "best.pt")
-    if tr.restore_best():
-        print(f"restored best held-out checkpoint from step {tr.best_step} "
-              f"(nll {tr.best_heldout:.5f}) -> {ckpt_path}", flush=True)
-    scale.eval()
-
-    if args.no_merge:
+    try:
+        if settings.get("basis") is not None:
+            tr.set_reciprocal_basis(settings["basis"], smooth_prior=settings["wilson_basis"] == "smooth")
+        tr.split_names = bundle.split_names
+        recipe = dict(version=1, steps=args.steps, config=asdict(cfg),
+                      checkpoint_selection="minimum validation NLL in state 0; last.pt retains endpoint",
+                      validation="5% of condition-zero crystals; all observations retained for export",
+                      refresh_every=25 * n_states, evaluate_every=100 * n_states,
+                      readout={k: v for k, v in settings.items() if k != "basis"})
+        tr.data_recipe = dict(bundle.recipe, training=recipe)
+        (args.out / "run.json").write_text(json.dumps(tr.data_recipe, indent=2) + "\n")
+        print(f"train {tr.train_crystals.numel():,}, validation {tr.heldout_crystals.numel():,} crystals; "
+              f"{args.steps} total updates across {tr.n_conditions} states", flush=True)
+        updates = run_updates(tr, args.steps)
+        (args.out / "training_summary.json").write_text(json.dumps(dict(
+            steps=args.steps, updates_per_state=updates, best_step=tr.best_step,
+            elapsed_seconds=time.time()-t0), indent=2) + "\n")
+        if args.no_merge:
+            return
+        tr.restore_best()
+        tr.scale.eval()
+        tr.opt = None
+        tr.cfg.max_obs_per_batch = P.READOUT_MAX_OBS
+        if str(tr.device).startswith("cuda"):
+            torch.cuda.empty_cache()
+        for target in tr.targets:
+            target.set_grid(settings["k_coarse"], settings["m_fine"], settings["n_sigma"])
+            target.max_halfwidth = settings["max_halfwidth"]
+        args.out = args.out / "merged.mtz"
+        merge_products(tr, prep, args, bundle.split_names or [""], list(range(tr.n_conditions)),
+                       spacegroup=bundle.spacegroup)
+    finally:
         tr.close()
-        print(f"total {time.time() - t0:.0f}s", flush=True)
-        return
-
-    # Free the training state before merging in-process: the merge accumulates
-    # (n_hkl, k_coarse) on the device, and a training run still holding its
-    # optimiser state has OOM'd here before.
-    tr.opt = None
-    if S["device"].startswith("cuda"):
-        torch.cuda.empty_cache()
-
-    # Merge on the MERGE grid, not the (cheaper) grid the run trained on.
-    # The targets carry their placement as plain attributes read at call time,
-    # so this re-grids them in place and keeps each condition's EMA.
-    if (args.train_k_coarse, args.train_m_fine, args.train_n_sigma) != (
-            S["k_coarse"], S["m_fine"], S["n_sigma"]):
-        print(f"\nre-grid for the merge: {args.train_k_coarse}/"
-              f"{args.train_m_fine} n_sigma {args.train_n_sigma:g} -> "
-              f"{S['k_coarse']}/{S['m_fine']} n_sigma {S['n_sigma']:g}", flush=True)
-        for t in tr.targets:
-            t.k_coarse, t.m_fine = S["k_coarse"], S["m_fine"]
-            t.n_sigma, t.max_halfwidth = S["n_sigma"], S["max_halfwidth"]
-
-    names = bundle.split_names or [""]
-    for k, name in enumerate(names):
-        res = tr.merge(condition=(k if tr.n_conditions > 1 else None),
-                       estimator=args.estimator)
-        print(f"\nmerge [{name or 'all'}]: {res['n_crystals']:,} crystals", flush=True)
-        if not res["n_crystals"] or not int(res["seen"].sum()):
-            # A split can be empty -- a subset of the data, or a split file with
-            # a dataset none of the surviving crystals belong to -- and a merge
-            # can come back with nothing usable.  Neither is a reason to throw
-            # away the other merges after hours of training.
-            P.report_merge(res)
-            print("  nothing written for this split", flush=True)
-            continue
-        P.report_merge(res)
-        _write(args, prep, res, bundle,
-               args.out / (f"merged_{name}.mtz" if name else "merged.mtz"))
-    tr.close()
-    print(f"\ntotal {time.time() - t0:.0f}s", flush=True)
-
-
-def _write(args, prep, res: dict, bundle: P.PrepBundle, out: Path) -> None:
-    """One merge result → MTZ (or CrystFEL .hkl for a moment estimator)."""
-    import numpy as np
-
-    hkl = prep.hkl_valid.detach().cpu().numpy().astype(int)
-    seen = res["seen"].cpu().numpy()
-    if res["estimator"] in ("pooled", "mean"):
-        P.write_hkl(out.with_suffix(".hkl"), hkl, res["I"], res["I_sd"],
-                    res["n_meas"], seen)
-        return
-    keep = seen & np.isfinite(res["F"].detach().cpu().numpy())
-    P.write_mtz(out, hkl, res["F"], res["F_sd"],
-                cell=prep.median_cell.detach().cpu().tolist(),
-                spacegroup=bundle.spacegroup,
-                work=P.work_mask(hkl, args), keep=keep)
+    print(f"total {time.time()-t0:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

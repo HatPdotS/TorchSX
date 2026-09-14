@@ -1,32 +1,14 @@
-"""Shared internals for ``torchsx-train`` / ``torchsx-merge-nn`` /
-``torchsx-merge-global``.
+"""Shared input preparation, checkpoint reconstruction and MTZ export.
 
-Everything the three commands have in common and nothing else: turning stream
-paths into a :class:`PreparedObs`, the detector recipe that goes with it, the
-free-flag policy, and writing the result out.  The bench scripts each grew their
-own copy of this; the copies drifted, and one of them merged a fold-encoder
-checkpoint under the default encoder geometry and silently lost 0.022 in R_free.
-
-Two contracts are enforced here rather than left to the caller:
-
-**The measurement recipe must be resolved.** Radii and gain come from explicit
-flags, a checkpoint, or recorded source metadata, in that order. Since
-``bg = bg_per_pixel * n_peak``, substituting a default aperture can silently
-rescale every background. Missing required settings remain explicit.
-
-**No intensity column in an MTZ.**  ``ReflectionData.load`` applies
-French-Wilson whenever an intensity column is present and exposes no flag to
-turn it off, so an ``I`` column would apply the Wilson prior a second time on
-top of the posterior that already integrated against it.  The guarantee is
-structural: F and SIGF are written, and the file is read back with gemmi to
-prove it.  The moment estimators (``pooled``, ``mean``) are the deliberate
-exception and are written as a CrystFEL ``.hkl`` instead, so they take exactly
-the French-Wilson path partialator's own output takes.
+Source metadata resolves integration semantics and detector gain. Posterior
+products contain F/SIGF; alternate research estimators use the Python API.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+
+READOUT_MAX_OBS = 1_500_000
 
 # ── data ───────────────────────────────────────────────────────────────
 
@@ -73,15 +57,6 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                         "takes as --custom-split) or a .pt int64 label per "
                         "crystal after the d_min filter.  Every crystal must "
                         "be labelled.")
-    p.add_argument("--min-split-crystals", type=int, default=0, metavar="N",
-                   help="drop any split with fewer than N crystals, from the "
-                        "DATA and not just from the merge.  A split of a few "
-                        "hundred crystals cannot support a merge worth making "
-                        "(this project's own scan measured the signal peaking "
-                        "at ~10 k crystals per bin), and it still gets its own "
-                        "in-batch merge target during training, where the "
-                        "per-reflection support is what keeps the target "
-                        "finite.  0 keeps everything.")
     p.add_argument("--spacegroup", default=None,
                    help='e.g. "P 1", "P 2 21 21".  Stamped into the MTZ and '
                         "used for centric detection.")
@@ -89,33 +64,33 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                    help="indexamajig integration radii in pixels, e.g. 7,9,11. "
                         "Default: checkpoint recipe, then recorded source metadata. "
                         "Required if neither records a usable ring recipe.")
-    p.add_argument("--gain", default=None,
-                   help="ADU/photon: 'stream' (declared adu_per_photon or "
-                        "adu_per_eV x beam energy), 'auto', 'empirical', or a number. "
-                        "Default: checkpoint recipe, then source declaration.")
+    p.add_argument("--gain", default=None, type=_gain_arg,
+                   help="ADU/photon: auto (default), trust_input, calibrate, or a "
+                        "positive number. Auto replaces the input gain when "
+                        "calibration differs by more than 50%.")
     p.add_argument("--dmin", type=float, default=None, help="high-resolution cut (A)")
-    p.add_argument("--dmax", type=float, default=999.0)
-    p.add_argument("--cache-prep", type=Path, default=None,
-                   help="read the prepared observations from here if the file "
-                        "exists, else write them.  prepare_observations is ~10 "
-                        "min on 133 M observations; nobody should pay it twice.")
-    p.add_argument("--trust-cache-prep", action="store_true", default=False,
-                   help="load --cache-prep without comparing its recorded "
-                        "settings to the command line.  The signature stamps "
-                        "the absolute stream and split-file paths, so a cache "
-                        "moved to another machine is otherwise refused; the "
-                        "inputs need not be present at all.  The recipe still "
-                        "has to be passed for the network to see the same "
-                        "settings, and it is the caller's job that it matches.")
-    p.add_argument("--n-workers", type=int, default=8, help="stream parser workers")
+    p.add_argument("--dmax", type=float, default=None, help="low-resolution cut (A)")
+    p.add_argument("--cache", dest="cache_prep", type=Path, default=None,
+                   help="prepared cache file; default RUN/prepared.pt. "
+                        "Input content and preparation settings are validated.")
     p.add_argument("--no-friedel", dest="merge_friedel", action="store_false",
                    default=True, help="do not merge Friedel mates on load")
-    p.add_argument('--experiment-partition', type=Path, default=None)
-    p.add_argument('--experiment-half', type=int, choices=(0, 1), default=None)
 
 
 # Preserve these import names for callers while keeping one resolver.
-from torchsx.measurement import parse_gain, parse_radii
+from torchsx.measurement import (parse_gain, parse_radii, GAIN_POLICY_VERSION,
+                                 DEFAULT_GAIN_TOLERANCE)
+
+def _gain_arg(value):
+    try:
+        return parse_gain(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+def _workers():
+    available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    return max(1, min(8, available, int(os.environ.get("SLURM_CPUS_PER_TASK", available))))
+
 
 
 def _comparable_prep_signature(signature: dict | None, recipe: dict) -> dict:
@@ -129,10 +104,14 @@ def _comparable_prep_signature(signature: dict | None, recipe: dict) -> dict:
     result = deepcopy(signature or {})
     measurement = result.get("measurement")
     if measurement is not None:
+        if measurement.get("source"):
+            measurement["source"].pop("source_files", None)
         measurement.pop("resolved", None)  # radii/gain already occur at top level
         numeric = (recipe.get("measurement") or {}).get("gain_adu_per_photon")
         if numeric is not None:
             result["gain"] = numeric
+            result.pop("gain_policy_version", None)
+            result.pop("gain_tolerance", None)
     return result
 
 
@@ -143,6 +122,8 @@ def _splits_from_args(args) -> list[tuple[str, Path]]:
         if "=" not in entry:
             raise SystemExit(f"--split wants NAME=PATH, got {entry!r}")
         name, _, path = entry.partition("=")
+        if not name.strip() or not path.strip() or Path(name.strip()).name != name.strip() or name.strip() in (".", ".."):
+            raise SystemExit(f"--split wants a nonempty NAME=PATH with a filename-safe name, got {entry!r}")
         out.append((name.strip(), Path(path.strip())))
     for path in args.stream or []:
         out.append(("", Path(path)))
@@ -151,6 +132,10 @@ def _splits_from_args(args) -> list[tuple[str, Path]]:
     if len(out) > 1 and any(not n for n, _ in out):
         raise SystemExit("mixing --split with unnamed streams is ambiguous; "
                          "name every input")
+    if len({name for name, _ in out}) != len(out):
+        raise SystemExit("Input split names must be unique")
+    if args.split_file is not None and len(out) != 1:
+        raise SystemExit("--split-file labels one input; use --split NAME=PATH for separate inputs")
     return out
 
 
@@ -162,7 +147,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     splits meaningful at all.
     """
     from torchsx.merging.config import MergeConfig
-    from torchsx.merging.hkl.filter import filter_crystals, filter_resolution
+    from torchsx.merging.hkl.filter import filter_resolution
     from torchsx.merging.hkl.noise import PoissonNoiseModel
     from torchsx.merging.observations import OBSERVATION_FILTER_VERSION, prepare_observations
     from torchsx.stream import SFXStream
@@ -172,84 +157,73 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     d = dict(recipe_defaults or {})
     d_min = args.dmin if args.dmin is not None else d.get("d_min")
     spacegroup = args.spacegroup or d.get("spacegroup")
+    args.dmax = args.dmax if args.dmax is not None else d.get("d_max", 999.0)
     if d_min is None:
         raise SystemExit("--dmin is required")
+    if not (np.isfinite(d_min) and np.isfinite(args.dmax) and 0 < d_min < args.dmax):
+        raise SystemExit("Resolution cuts must be finite and satisfy 0 < dmin < dmax")
 
     splits = _splits_from_args(args)
 
     cache = args.cache_prep
+    if cache is None and getattr(args, "out", None) is not None:
+        run = args.ckpt.parent if getattr(args, "ckpt", None) else args.out
+        cache = run / "prepared.pt"
     blob = torch.load(cache, weights_only=False) if cache is not None and cache.exists() else None
     if blob is not None:
         if (blob.get("signature") or {}).get("observation_filter_version") != OBSERVATION_FILTER_VERSION:
             raise SystemExit(
                 f"Prepared cache {cache} uses an incompatible observation filter. "
-                "Rebuild it from the source using a new --cache-prep path; "
-                "--trust-cache-prep cannot bypass measurement filtering."
+                "Rebuild it from the source using a new --cache path; "
+                "Cache validation cannot be bypassed."
             )
-    if blob is not None and getattr(args, "trust_cache_prep", False):
-        if verbose:
-            print(f"prep from cache {cache} (settings not checked): "
-                  f"{blob['prep'].n_valid:,} reflections, "
-                  f"{blob['prep'].I_obs.numel():,} obs, "
-                  f"{len(blob.get('split_names', []))} splits", flush=True)
-        from torchsx.nn.experiment_subset import maybe_subset
-        return maybe_subset(PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
-                                       blob["bg_var_factor"]), args)
-
-    # Everything that changes what prepare_observations returns.  A cache is
-    # only reusable when all of it matches: the blob carries the split labels
-    # baked into obs_info, so a cache built from a different --split-file would
-    # silently merge the wrong crystals together.
     def _stamp(path, *, precise=False):
         if path is None:
             return None
-        st = Path(path).stat()
-        return [str(path), st.st_size, st.st_mtime_ns if precise else int(st.st_mtime)]
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+        return [Path(path).stat().st_size, digest.hexdigest()]
 
     signature = {
         "observation_filter_version": OBSERVATION_FILTER_VERSION,
-        "splits": [[n, str(q)] for n, q in splits],
+        "cache_schema": 2,
+        "splits": [n for n, _ in splits],
         "d_min": float(d_min), "d_max": float(args.dmax),
         "spacegroup": spacegroup,
         "merge_friedel": bool(args.merge_friedel),
         "split_file": _stamp(args.split_file),
-        "min_split_crystals": int(args.min_split_crystals),
     }
 
-    legacy_cache = blob is not None and "measurement" not in (blob.get("signature") or {})
-    if legacy_cache:
-        # Old caches are reusable with their explicit/recorded recipe, without
-        # pretending that their source semantics were validated retroactively.
-        radii = args.int_radius if args.int_radius is not None else d.get("radii")
-        if radii is None:
-            raise SystemExit("Legacy prepared cache requires --int-radius or a checkpoint recipe.")
-        gain = parse_gain(args.gain if args.gain is not None else d.get("gain"))
-        signature.update(radii=list(parse_radii(radii)), gain=gain)
-    else:
-        sources = [path for _, path in splits]
-        try:
-            specs = [inspect_source(path) for path in sources]
-            measurement = combine_measurements(specs)
-            resolved = resolve_measurement(measurement, radii=args.int_radius,
-                                           gain=args.gain, defaults=d)
-            explicit_rings = args.int_radius is not None or d.get("radii") is not None
-            for spec in specs:
-                validate_measurement(spec, explicit_rings=explicit_rings)
-            radii, gain = resolved.radii, resolved.gain
-            signature.update(radii=list(radii), gain=gain,
-                             measurement={"source": measurement.to_dict() if measurement else None,
-                                          "resolved": resolved.to_dict()},
-                             source_files=[_stamp(path, precise=True) for _, path in splits])
-            if verbose:
-                origins = dict(resolved.provenance)
-                print(f"  measurement: radii={radii} [{origins['radii']}], "
-                      f"gain={gain} [{origins['gain']}]", flush=True)
-                for override in resolved.overrides:
-                    print(f"    override: {override}", flush=True)
-                if measurement and measurement.unresolved:
-                    print(f"    unresolved source fields: {', '.join(measurement.unresolved)}", flush=True)
-        except (OSError, ValueError) as exc:
-            raise SystemExit(f"Cannot resolve input measurement: {exc}") from exc
+    sources = [path for _, path in splits]
+    try:
+        specs = [inspect_source(path) for path in sources]
+        measurement = combine_measurements(specs)
+        resolved = resolve_measurement(measurement, radii=args.int_radius,
+                                       gain=args.gain, defaults=d)
+        explicit_rings = args.int_radius is not None or d.get("radii") is not None
+        for spec in specs:
+            validate_measurement(spec, explicit_rings=explicit_rings)
+        radii, gain = resolved.radii, resolved.gain
+        if gain in ("auto", "calibrate"):
+            signature["gain_policy_version"] = GAIN_POLICY_VERSION
+        if gain == "auto":
+            signature["gain_tolerance"] = DEFAULT_GAIN_TOLERANCE
+        signature.update(radii=list(radii), gain=gain,
+                         measurement={"source": measurement.to_dict() if measurement else None,
+                                      "resolved": resolved.to_dict()},
+                         source_files=[_stamp(path, precise=True) for _, path in splits])
+        if verbose:
+            origins = dict(resolved.provenance)
+            print(f"  measurement: radii={radii} [{origins['radii']}], "
+                  f"gain={gain} [{origins['gain']}]", flush=True)
+            for override in resolved.overrides:
+                print(f"    override: {override}", flush=True)
+            if measurement and measurement.unresolved:
+                print(f"    unresolved source fields: {', '.join(measurement.unresolved)}", flush=True)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Cannot resolve input measurement: {exc}") from exc
 
     if blob is not None:
         got = blob.get("signature")
@@ -262,23 +236,22 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                 k for k in set(comparable_signature) | set(comparable_got)
                 if comparable_got.get(k) != comparable_signature.get(k))
             raise SystemExit(
-                f"--cache-prep {cache} was built with different settings "
+                f"--cache {cache} was built with different settings "
                 f"({', '.join(differ) if differ else 'no signature recorded'}); "
-                f"delete it or point --cache-prep somewhere else.")
+                f"delete it or point --cache somewhere else.")
         if verbose:
             print(f"prep from cache {cache} "
                   f"({blob['prep'].n_valid:,} reflections, "
                   f"{blob['prep'].I_obs.numel():,} obs, "
                   f"{len(blob.get('split_names', []))} splits)", flush=True)
-        from torchsx.nn.experiment_subset import maybe_subset
-        return maybe_subset(PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
-                                       blob["bg_var_factor"]), args)
+        return PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
+                          blob["bg_var_factor"])
 
     parts = []
     for name, path in splits:
         s = SFXStream.read(
             path, spacegroup=spacegroup,
-            n_workers=args.n_workers, merge_friedel=args.merge_friedel,
+            n_workers=_workers(), merge_friedel=args.merge_friedel,
         )
         if spacegroup and (s._core.spacegroup or "P 1") != spacegroup:
             # An .sfx cache carries whatever space group it was parsed with, and
@@ -336,13 +309,11 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         if labels.numel() != stream.n_crystals:
             raise SystemExit(
                 f"--split-file has {labels.numel():,} labels but the data has "
-                f"{stream.n_crystals:,} crystals (after --dmin/--crystals-file)")
+                f"{stream.n_crystals:,} crystals (after the resolution filter)")
         if int((labels < 0).sum()):
             raise SystemExit(f"--split-file: {int((labels < 0).sum()):,} unlabelled "
                              "crystals (-1); every crystal must belong to a split")
-        # A custom-split file defines the datasets; a label tensor only implies
-        # them.  A dataset may hold no crystal at all, which --min-split-crystals
-        # then drops below -- the count must not be read off the labels present.
+        # A custom-split file defines state names even if filtering empties a state.
         n_splits = len(names) if names else int(labels.max()) + 1
         if not names:
             names = [str(i) for i in range(n_splits)]
@@ -354,32 +325,6 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         names = [n for n, _ in splits]
     else:
         labels = None
-
-    # ── drop splits too small to merge ─────────────────────────────────
-    if labels is not None and args.min_split_crystals > 0:
-        counts = torch.bincount(labels, minlength=len(names))
-        keep_split = counts >= args.min_split_crystals
-        if not bool(keep_split.any()):
-            raise SystemExit(
-                f"--min-split-crystals {args.min_split_crystals:,} drops every "
-                f"split; largest has {int(counts.max()):,} crystals")
-        if not bool(keep_split.all()):
-            gone = [(names[i], int(counts[i]))
-                    for i in range(len(names)) if not keep_split[i]]
-            keep_obs = keep_split[labels]
-            if verbose:
-                print(f"  dropping {len(gone)} split(s) under "
-                      f"{args.min_split_crystals:,} crystals "
-                      f"({int((~keep_obs).sum()):,} crystals): "
-                      + ", ".join(f"{n} ({c:,})" for n, c in gone), flush=True)
-            # Out of the DATA, not merely out of the merge: a split of a few
-            # hundred crystals also gets its own in-batch merge target, and a
-            # target with no support per reflection is what produced the
-            # non-finite batch that killed a full run.
-            stream = SFXStream(filter_crystals(stream._core, keep_obs))
-            renumber = torch.cumsum(keep_split.long(), 0) - 1
-            labels = renumber[labels[keep_obs]]
-            names = [n for n, k in zip(names, keep_split.tolist()) if k]
 
     noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2],
                               gain=(gain if isinstance(gain, float) else 1.0))
@@ -405,12 +350,18 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     recipe = {"d_min": float(d_min), "d_max": float(args.dmax),
               "spacegroup": stream._core.spacegroup or spacegroup or "P 1",
               "gain": gain, "radii": list(radii),
+              "gain_tolerance": DEFAULT_GAIN_TOLERANCE,
+              "inputs": [[name, str(path.resolve())] for name, path in splits],
               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
               "merge_friedel": bool(args.merge_friedel),
               "measurement": {**resolved.to_dict(), "gain_adu_per_photon": noise.gain,
                               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
+                              "gain_selection": noise.gain_selection,
                               "pixel_count_definition": "nominal_integer_ring_mask",
                               "source": measurement.to_dict() if measurement else None}}
+    previous_selection = (d.get("measurement") or {}).get("gain_selection")
+    if previous_selection and isinstance(gain, (float, int)):
+        recipe["measurement"]["gain_selection"] = dict(previous_selection, reused_from_checkpoint=True)
     if verbose:
         print(f"prepared: {prep.n_valid:,} reflections, {prep.I_obs.numel():,} obs, "
               f"{prep.obs_info.n_crystals:,} crystals, n_peak/n_bg={bvf:.4f}, "
@@ -427,31 +378,21 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         if verbose:
             print(f"  prep cached -> {cache} "
                   f"({cache.stat().st_size / 2**30:.1f} GiB)", flush=True)
-    from torchsx.nn.experiment_subset import maybe_subset
-    return maybe_subset(bundle, args)
+    return bundle
 
 
 # ── free flags ─────────────────────────────────────────────────────────
 
 
 def add_free_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--stream-batches", action="store_true",
-                   help="keep the prepared observations on the host and copy "
-                        "only each batch's rows to the device.  Required for "
-                        "any data set that does not fit the card: 794 M "
-                        "observations is ~38 GB before a single step.  Merging "
-                        "needs it exactly as much as training does.")
+    p.set_defaults(free_frac=0.05, free_seed=20260902, no_free=False)
+    p.add_argument("--seed", type=int, default=None, help="random seed (default 0; merge reuses the run seed)")
     p.add_argument("--free-from", type=Path, default=None,
                    help="take the free set from an existing .mtz (FreeR_flag / "
                         "R-free-flags) or a .pkl of {(h,k,l): flag} on the "
                         "Friedel-canonical index.  Sharing the free set is the "
                         "only thing that makes two merges' R_free comparable, "
                         "so prefer this over generating a new one.")
-    p.add_argument("--free-frac", type=float, default=0.05,
-                   help="fraction held out when generating a new free set")
-    p.add_argument("--free-seed", type=int, default=20260902)
-    p.add_argument("--no-free", action="store_true",
-                   help="write no R-free column")
 
 
 def canonical_hkl(hkl: np.ndarray) -> np.ndarray:
@@ -656,37 +597,12 @@ DEFAULTS = dict(
     obs_self_layers=2, skew=True, miss=0.03, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
-    scatter_family="gengauss", scatter_components=3, scatter_hidden=8, scatter_shape="shared",
+    scatter_family="mixture", scatter_components=4, scatter_hidden=8, scatter_shape="gaussian",
 )
 
 
 def add_model_args(p: argparse.ArgumentParser) -> None:
     """Flags shared by every command that builds the merge stack."""
-    p.add_argument("--scatter-family", default=None, choices=("gengauss", "mixture"),
-                   help="scatter on the scale: one two-width GenGauss, or a mixture of "
-                        "them centred on its mean with parameters from a small conditioner "
-                        f"on the predicted width, shape and skew [default {DEFAULTS['scatter_family']}]")
-    p.add_argument("--scatter-components", type=int, default=None,
-                   help=f"mixture components [default {DEFAULTS['scatter_components']}]")
-    p.add_argument("--scatter-hidden", type=int, default=None,
-                   help=f"hidden units of the mixture conditioner [default {DEFAULTS['scatter_hidden']}]")
-    p.add_argument("--scatter-shape", default=None, choices=("shared", "gaussian", "free", "partiality"),
-                   help="component shapes of the mixture: the base beta for all, Gaussian (beta 2) for all, "
-                        "one beta per component, or a partiality grid (Gaussian components at fixed support "
-                        f"points of log p below the edge, one residual width) [default {DEFAULTS['scatter_shape']}]")
-    p.add_argument("--inner-points", type=int, default=None,
-                   help="SplitLogGrid nodes for the inner integral")
-    p.add_argument("--k-coarse", type=int, default=None)
-    p.add_argument("--m-fine", type=int, default=None)
-    p.add_argument("--n-sigma", type=float, default=None,
-                   help="outer-grid half-width in located sigmas")
-    p.add_argument("--bg-mean-offset", default=None, metavar="C|auto",
-                   help="add C to the background the DETECTION mean uses, "
-                        "correcting the annulus estimate's bias E[B|A] = bg + "
-                        "n_peak/n_bg; 'auto' uses n_peak/n_bg.  Raw bg still "
-                        "feeds the encoder, the pooled estimator and the "
-                        "calibration.  Default: off, or whatever the "
-                        "checkpoint was trained with")
     p.add_argument("--device", default=None, help="cuda | cpu")
 
 
@@ -721,29 +637,9 @@ def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
     return float(bvf) if any(corrected) else 0.0
 
 
-def resolve(args, ckpt: dict | None, key: str, *ckpt_path: str):
-    """A setting from the flag, else the checkpoint, else ``DEFAULTS``."""
-    v = getattr(args, key.replace("-", "_"), None)
-    if v is not None:
-        return v
-    node = ckpt or {}
-    for step in ckpt_path:
-        if not isinstance(node, dict) or step not in node or node[step] is None:
-            node = None
-            break
-        node = node[step]
-    if node is not None and not isinstance(node, dict):
-        return node
-    return DEFAULTS.get(key)
-
-
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                 verbose: bool = True):
-    """``(prep, params, scale, objective, settings)`` on the compute device.
-
-    One builder for all three commands: the *only* difference between the
-    trained merge and the global fit is the scale model handed back here.
-    """
+    """Build the production model, preserving recorded checkpoint geometry."""
     from torchsx.merging.likelihood import Poisson
     from torchsx.merging.parameters import Parameters
     from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
@@ -753,14 +649,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
 
     ck = ckpt or {}
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    # --stream-batches means the per-observation state STAYS ON THE HOST and
-    # only a batch's gathered rows cross the bus; the trainer's ``_batch``
-    # reads ``self.prep.bg.device`` to decide that, so moving prep here made
-    # the flag a no-op that copied device-to-device.  Harmless while the data
-    # fit the card, fatal at 794 M observations: the move alone asks for ~38 GB
-    # before a single step.  The per-reflection parameters still go to the
-    # device -- they are what the optimiser touches.
-    prep = bundle.prep if getattr(args, "stream_batches", False) else bundle.prep.to(dev)
+    prep = bundle.prep  # Host residency bounds device memory independently of dataset size.
     params = Parameters(
         log_I0_init=prep.mu_init.clone(),
         scatter_shape=FreePerHKLShape(prep.alpha_init.log(), prep.beta_perhkl.log()),
@@ -774,14 +663,10 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     w_init = sc.get("w_init", DEFAULTS["w_init"])
     # scatter family: the checkpoint's own family wins over the defaults (a
     # checkpoint written before the key existed is the single family)
-    scatter_family = (args.scatter_family if args.scatter_family is not None
-                      else (scat.get("family", "gengauss") if ck else DEFAULTS["scatter_family"]))
-    n_components = (args.scatter_components if args.scatter_components is not None
-                    else int(scat.get("n_components") or DEFAULTS["scatter_components"]))
-    scatter_hidden = (args.scatter_hidden if args.scatter_hidden is not None
-                      else int(scat.get("conditioner_hidden") or DEFAULTS["scatter_hidden"]))
-    scatter_shape = (args.scatter_shape if args.scatter_shape is not None
-                     else str(scat.get("component_shape") or DEFAULTS["scatter_shape"]))
+    scatter_family = scat.get("family", "gengauss") if ck else DEFAULTS["scatter_family"]
+    n_components = int(scat.get("n_components") or DEFAULTS["scatter_components"])
+    scatter_hidden = int(scat.get("conditioner_hidden") or DEFAULTS["scatter_hidden"])
+    scatter_shape = str(scat.get("component_shape") or ("shared" if ck else DEFAULTS["scatter_shape"]))
     beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
     kw = dict(
         d_model=enc.get("d_model") or sc.get("d_model") or DEFAULTS["d_model"],
@@ -805,29 +690,19 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         predict_skew=bool(skew),
     )
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
+    scale.set_encoder_chunking(400)
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
-    # CLI beats the checkpoint beats OFF.  Deliberately NOT bundle-derived:
-    # silence has to mean the legacy detection model, so every checkpoint
-    # written before this parameter re-merges bit-exactly.
-    if args.bg_mean_offset is None:
-        bg_mean_offset = bg_mean_offset_from_ckpt(ck, bvf)
-    elif str(args.bg_mean_offset).lower() == "auto":
-        bg_mean_offset = float(bvf)
-    else:
-        bg_mean_offset = float(args.bg_mean_offset)
+    bg_mean_offset = bg_mean_offset_from_ckpt(ck, bvf) if ck else float(bvf)
     if bg_mean_offset and float(bvf) <= 0.0:
         raise SystemExit(
-            f"--bg-mean-offset {bg_mean_offset:g} needs a non-zero "
-            "--bg-var-factor: both are n_peak/n_bg and describe the same "
-            "annulus estimate, so correcting its mean without its variance is "
-            "worse than correcting neither")
+            f"Background mean offset {bg_mean_offset:g} requires a positive "
+            "background variance coefficient in the measurement/checkpoint recipe")
     quad = dict(ck.get("quadrature") or {})
-    n_points = (args.inner_points if args.inner_points is not None
-                else quad.get("n_points") or DEFAULTS["inner_points"])
+    n_points = quad.get("n_points") or DEFAULTS["inner_points"]
     if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS):
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
-                         "ship SplitLogGrid only (see bench/to_mtz.py --quadrature)")
+                         "support SplitLogGrid checkpoints only")
     miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
             else (0.5 if scat.get("miss_logit") is not None else 0.0))
     obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev),
@@ -837,6 +712,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     if scat.get("miss_logit") is not None and obj.miss_logit is not None:
         with torch.no_grad():
             obj.miss_logit.fill_(float(scat["miss_logit"]))
+        miss = float(obj.miss_logit.detach().sigmoid())
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at
@@ -863,12 +739,12 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             prep.hkl_valid.long(), prep.median_cell, bundle.spacegroup, degree=wilson_degree,
         )
     settings = dict(
-        device=dev,
-        k_coarse=int(args.k_coarse or DEFAULTS["k_coarse"]),
-        m_fine=int(args.m_fine or DEFAULTS["m_fine"]),
-        n_sigma=float(args.n_sigma or DEFAULTS["n_sigma"]),
+        device=dev, max_obs=READOUT_MAX_OBS,
+        k_coarse=int(DEFAULTS["k_coarse"]),
+        m_fine=int(DEFAULTS["m_fine"]),
+        n_sigma=float(DEFAULTS["n_sigma"]),
         max_halfwidth=float(DEFAULTS["max_halfwidth"]),
-        prior="wilson",
+        prior=str(grid.get("prior", "wilson")),
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
         skew=bool(skew), miss=float(miss),

@@ -225,12 +225,18 @@ class PosteriorMergeTarget(nn.Module):
         self.register_buffer("wilson_coef", torch.zeros(0))
         self.wilson_fit_iters = 0
 
-        u_c = torch.linspace(-n_sigma, n_sigma, k_coarse)
-        u_f = torch.linspace(-n_sigma, n_sigma, m_fine)
+        self.set_grid(k_coarse, m_fine, n_sigma)
+
+    def set_grid(self, k_coarse: int, m_fine: int, n_sigma: float) -> None:
+        """Replace node buffers and interpolation tables together at readout."""
+        if k_coarse < 3 or m_fine < k_coarse or not math.isfinite(n_sigma) or n_sigma <= 0:
+            raise ValueError("need k_coarse >= 3, m_fine >= k_coarse and finite n_sigma > 0")
+        self.k_coarse, self.m_fine, self.n_sigma = int(k_coarse), int(m_fine), float(n_sigma)
+        device = self.ema_I0.device
+        u_c = torch.linspace(-n_sigma, n_sigma, k_coarse).to(device)
+        u_f = torch.linspace(-n_sigma, n_sigma, m_fine).to(device)
         self.register_buffer("u_coarse", u_c)
         self.register_buffer("u_fine", u_f)
-        # Interpolation is on the shared u axis, so the weights are the same for
-        # every reflection — precompute once.
         idx = torch.searchsorted(u_c.contiguous(), u_f.contiguous()).clamp(1, k_coarse - 1)
         t = ((u_f - u_c[idx - 1]) / (u_c[idx] - u_c[idx - 1])).clamp(0.0, 1.0)
         self.register_buffer("_lo", idx - 1)

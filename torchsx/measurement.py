@@ -11,6 +11,8 @@ import math
 
 
 MEASUREMENT_KEY = "_torchsx_measurement"
+GAIN_POLICY_VERSION = 1
+DEFAULT_GAIN_TOLERANCE = 0.5
 
 
 @dataclass(frozen=True)
@@ -83,12 +85,19 @@ def parse_radii(value) -> tuple[float, float, float]:
 
 def parse_gain(value) -> str | float:
     if value is None:
-        return "stream"
-    if str(value) in ("stream", "auto", "empirical"):
+        return "auto"
+    if str(value) == "stream":  # Older recipes used this name for trust_input.
+        return "trust_input"
+    if str(value) in ("trust_input", "auto", "calibrate"):
         return str(value)
-    gain = float(value)
-    if not math.isfinite(gain) or gain <= 0:
-        raise ValueError(f"--gain must be positive and finite, got {value!r}")
+    error = (f"Invalid --gain {value!r}. Expected 'auto' (default), 'trust_input', "
+             "'calibrate', or a positive finite integer/float (ADU/photon).")
+    try:
+        gain = float(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(error) from exc
+    if isinstance(value, bool) or not math.isfinite(gain) or gain <= 0:
+        raise ValueError(error)
     return gain
 
 
@@ -133,7 +142,7 @@ class ResolvedMeasurement:
 
 def resolve_measurement(spec: MeasurementSpec | None, *, radii=None, gain=None,
                         defaults: dict | None = None) -> ResolvedMeasurement:
-    """Explicit values > checkpoint recipe > source declarations.
+    """Explicit values > checkpoint recipe > automatic source-gain validation.
 
     Gain modes remain requests for the existing preparation-time calibration.
     New checkpoints also record the numeric result, so their recipe is reusable.
@@ -153,10 +162,10 @@ def resolve_measurement(spec: MeasurementSpec | None, *, radii=None, gain=None,
     explicit_rings = radii is not None or d.get("radii") is not None
     validate_measurement(spec, explicit_rings=explicit_rings)
     resolved_gain = parse_gain(gain if gain is not None else checkpoint_gain)
-    legacy_stream_request = spec is None and (gain == "stream" or checkpoint_gain == "stream")
-    if resolved_gain == "stream" and not legacy_stream_request and (spec is None or (
+    legacy_stream_request = spec is None and resolved_gain == "trust_input"
+    if resolved_gain == "trust_input" and not legacy_stream_request and (spec is None or (
             spec.intensity_unit != "photon" and not spec.gain_declarations)):
-        raise ValueError("Detector gain unavailable; supply --gain (ADU/photon), auto or empirical.")
+        raise ValueError("Detector gain unavailable; supply --gain (ADU/photon), auto or calibrate.")
     provenance = (("radii", "explicit" if radii is not None else "checkpoint" if d.get("radii") is not None else "source"),
                   ("gain", "explicit" if gain is not None else "checkpoint" if checkpoint_gain is not None else "source"))
     overrides = []
@@ -164,7 +173,7 @@ def resolve_measurement(spec: MeasurementSpec | None, *, radii=None, gain=None,
         overrides.append(f"radii {source_radii} from source -> {resolved_radii}")
     if gain is not None and checkpoint_gain is not None and parse_gain(gain) != parse_gain(checkpoint_gain):
         overrides.append(f"checkpoint gain {checkpoint_gain} -> {resolved_gain}")
-    if resolved_gain != "stream" and spec and spec.gain_declarations:
+    if resolved_gain not in ("trust_input", "auto") and spec and spec.gain_declarations:
         overrides.append(f"source gain declarations overridden by {resolved_gain}")
     return ResolvedMeasurement(resolved_radii, resolved_gain, provenance, tuple(overrides))
 
