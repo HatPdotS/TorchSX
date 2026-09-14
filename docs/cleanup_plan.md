@@ -7,6 +7,12 @@
 > before the work started). Two claims below were wrong and are corrected in
 > place, marked **[corrected]**. What is left is §5 and §6, and the two
 > decisions in §5.2 and §5.3.
+>
+> `--no-friedel` (§5.1) was not removed but repaired: it did not keep Friedel
+> mates apart, it skipped symmetry reduction entirely. It is now
+> `--merge-friedel` / `--no-merge-friedel`, and the CrystFEL `.hkl` writer it
+> shared an ASU convention with is gone — the moment estimators write an
+> intensity MTZ through torchref like every other product.
 
 Goal: get `src/torchsx` into a state a reviewer can read end to end.  The
 package is 30,454 lines of source (excluding tests) in 130 modules, plus

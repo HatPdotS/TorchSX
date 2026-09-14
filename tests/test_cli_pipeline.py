@@ -225,6 +225,76 @@ def test_free_flags_are_reproducible_and_copied(tmp_path):
     assert (~w[:50]).all() and w[50:].all()
 
 
+def test_merge_friedel_flag_and_recipe_resolution():
+    """The flag overrides the checkpoint recipe; absent, the recipe decides."""
+    import argparse
+
+    from torchsx.cli import _pipeline as P
+
+    p = argparse.ArgumentParser()
+    P.add_data_args(p, require_recipe=False)
+    assert p.parse_args(["x.sfx"]).merge_friedel is None
+    assert p.parse_args(["x.sfx", "--merge-friedel"]).merge_friedel is True
+    assert p.parse_args(["x.sfx", "--no-merge-friedel"]).merge_friedel is False
+
+    resolve = lambda flag, recipe: (bool(flag) if flag is not None
+                                    else bool(recipe.get("merge_friedel", True)))
+    assert resolve(None, {}) is True
+    assert resolve(None, {"merge_friedel": False}) is False
+    assert resolve(True, {"merge_friedel": False}) is True
+
+
+def test_anomalous_products_unstack_onto_asu_rows(tmp_path):
+    """Signed indices become (+)/(-) columns; mates share one row and one flag."""
+    import gemmi
+    import numpy as np
+
+    from torchsx.cli import _pipeline as P
+    from torchsx.stream import _is_centric
+    from torchref.symmetry import SpaceGroup
+
+    sg = "P 63"
+    grid = torch.tensor([[h, k, l] for h in range(-3, 4) for k in range(-3, 4)
+                         for l in range(-3, 4)], dtype=torch.int32)
+    grid = grid[grid.abs().sum(1) > 0]
+    group = SpaceGroup(sg)
+    canon, _, flags, order = group.canonicalize_hkl(grid, include_friedel=True)
+    inv = torch.empty_like(order)
+    inv[order] = torch.arange(order.numel())
+    canon, minus = canon[inv], flags[inv].clone()
+    idx = minus.nonzero(as_tuple=True)[0]
+    minus[idx] = ~_is_centric(group, canon[idx])
+    signed = torch.unique(torch.where(minus[:, None], -canon, canon), dim=0).numpy()
+
+    n = len(signed)
+    val = torch.arange(1.0, n + 1)
+    cell = [50.0, 50.0, 80.0, 90.0, 90.0, 120.0]
+    keep = np.ones(n, dtype=bool)
+    n_asu = len(np.unique(np.abs(signed), axis=0))
+
+    out = tmp_path / "anom.mtz"
+    P.write_mtz(out, signed, val, val * 0.1, cell=cell, spacegroup=sg,
+                work=P.work_mask(signed, _FreeArgs(), verbose=False), keep=keep,
+                merge_friedel=False, verbose=False)
+    mtz = gemmi.read_mtz_file(str(out))
+    labels = [c.label for c in mtz.columns]
+    assert "F-obs(+)" in labels and "F-obs(-)" in labels
+    assert mtz.nreflections == n_asu
+    flag = np.array(mtz.column_with_label("R-free-flags"), dtype=int)
+    assert set(np.unique(flag)) <= {0, 1}          # one flag per ASU row, not per mate
+
+    out_i = tmp_path / "anom_i.mtz"
+    P.write_intensity_mtz(out_i, signed, val, val * 0.1, cell=cell, spacegroup=sg,
+                          keep=keep, merge_friedel=False, verbose=False)
+    mtz_i = gemmi.read_mtz_file(str(out_i))
+    labels_i = [c.label for c in mtz_i.columns]
+    assert {"I-obs(+)", "SIGI-obs(+)", "I-obs(-)", "SIGI-obs(-)"} <= set(labels_i)
+    assert mtz_i.nreflections == n_asu
+    asu = gemmi.ReciprocalAsu(gemmi.SpaceGroup(sg))
+    written = np.array(mtz_i, dtype=float)[:, :3].astype(int)
+    assert all(asu.is_in(row.tolist()) for row in written)
+
+
 def test_radii_and_gain_parsing():
     from torchsx.cli import _pipeline as P
 

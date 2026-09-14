@@ -44,6 +44,7 @@ def _core(spacegroup, n=4000, seed=0):
 
 @pytest.mark.parametrize("spacegroup", ["P 1", "P 1 21 1", "P 63", "P 21 21 21"])
 def test_canonicalised_indices_recover_the_observed_offset(spacegroup):
+    """The legacy path: a cache that kept no observed index searches the images."""
     core, raw, true = _core(spacegroup)
     got = _ewald_offset(core)
     ref = _ewald_offset(raw)
@@ -58,12 +59,14 @@ def test_canonicalised_indices_recover_the_observed_offset(spacegroup):
         assert (naive.abs() > got.abs() + 1e-3).float().mean() > 0.3
 
 
-def test_unsymmetrised_stream_uses_the_observed_index_only():
+@pytest.mark.parametrize("canonicalised", [False, True])
+def test_a_retained_observed_index_is_used_directly(canonicalised):
+    """The observed column is read as-is, whatever ``hkl`` holds; no image search."""
     core, raw, _ = _core("P 63")
-    raw.friedel_merged = False
-    off = _ewald_offset(raw)
-    qz_k0 = 12000.0 / 12398.4
-    # identity only: recompute directly
+    target = core if canonicalised else raw
+    target.observed_hkl = raw.hkl
+    k0 = 12000.0 / 12398.4
     B = torch.stack([raw.astar, raw.bstar, raw.cstar], dim=1)[raw.crystal_id]
-    q = torch.einsum("mi,mij->mj", raw.hkl.float(), B); qz = torch.zeros_like(q); qz[:, 2] = qz_k0
-    torch.testing.assert_close(off, (q + qz).norm(dim=1) - qz_k0, atol=1e-6, rtol=1e-5)
+    q = torch.einsum("mi,mij->mj", raw.hkl.float(), B); qz = torch.zeros_like(q); qz[:, 2] = k0
+    torch.testing.assert_close(_ewald_offset(target), (q + qz).norm(dim=1) - k0,
+                               atol=1e-6, rtol=1e-5)

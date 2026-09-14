@@ -14,14 +14,14 @@ flags, a checkpoint, or recorded source metadata, in that order. Since
 ``bg = bg_per_pixel * n_peak``, substituting a default aperture can silently
 rescale every background. Missing required settings remain explicit.
 
-**No intensity column in an MTZ.**  ``ReflectionData.load`` applies
+**No intensity column in a posterior MTZ.**  ``ReflectionData.load`` applies
 French-Wilson whenever an intensity column is present and exposes no flag to
 turn it off, so an ``I`` column would apply the Wilson prior a second time on
 top of the posterior that already integrated against it.  The guarantee is
 structural: F and SIGF are written, and the file is read back with gemmi to
 prove it.  The moment estimators (``pooled``, ``mean``) are the deliberate
-exception and are written as a CrystFEL ``.hkl`` instead, so they take exactly
-the French-Wilson path partialator's own output takes.
+exception: their product *is* an intensity, so they are written as ``I-obs``
+and take French-Wilson downstream like any other unmerged-derived intensity.
 """
 
 from __future__ import annotations
@@ -50,6 +50,11 @@ class PrepBundle:
     @property
     def spacegroup(self) -> str:
         return self.recipe.get("spacegroup") or "P 1"
+
+    @property
+    def merge_friedel(self) -> bool:
+        """False when ``hkl`` holds signed ASU indices keeping Bijvoet mates apart."""
+        return bool(self.recipe.get("merge_friedel", True))
 
 
 def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) -> None:
@@ -108,8 +113,13 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                         "has to be passed for the network to see the same "
                         "settings, and it is the caller's job that it matches.")
     p.add_argument("--n-workers", type=int, default=8, help="stream parser workers")
-    p.add_argument("--no-friedel", dest="merge_friedel", action="store_false",
-                   default=True, help="do not merge Friedel mates on load")
+    p.add_argument("--merge-friedel", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="merge Friedel mates into a single reflection (the "
+                        "default).  --no-merge-friedel keeps them apart: the "
+                        "merge is then over the point group rather than the "
+                        "Laue class, and the products carry I(+)/I(-).  "
+                        "Default: the checkpoint recipe, then merge.")
     p.add_argument('--experiment-partition', type=Path, default=None)
     p.add_argument('--experiment-half', type=int, choices=(0, 1), default=None)
 
@@ -172,6 +182,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     d = dict(recipe_defaults or {})
     d_min = args.dmin if args.dmin is not None else d.get("d_min")
     spacegroup = args.spacegroup or d.get("spacegroup")
+    merge_friedel = (bool(args.merge_friedel) if args.merge_friedel is not None
+                     else bool(d.get("merge_friedel", True)))
     if d_min is None:
         raise SystemExit("--dmin is required")
 
@@ -211,7 +223,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         "splits": [[n, str(q)] for n, q in splits],
         "d_min": float(d_min), "d_max": float(args.dmax),
         "spacegroup": spacegroup,
-        "merge_friedel": bool(args.merge_friedel),
+        "merge_friedel": merge_friedel,
         "split_file": _stamp(args.split_file),
         "min_split_crystals": int(args.min_split_crystals),
     }
@@ -276,18 +288,14 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
     parts = []
     for name, path in splits:
+        # --spacegroup reaches the .sfx loader too, and is applied before
+        # canonicalization: an .sfx cache carries whatever group it was parsed
+        # with, and reducing a P 2 21 21 data set as P 1 marks every reflection
+        # acentric and gives the wrong Wilson prior for 9 % of them.
         s = SFXStream.read(
             path, spacegroup=spacegroup,
-            n_workers=args.n_workers, merge_friedel=args.merge_friedel,
+            n_workers=args.n_workers, merge_friedel=merge_friedel,
         )
-        if spacegroup and (s._core.spacegroup or "P 1") != spacegroup:
-            # An .sfx cache carries whatever space group it was parsed with, and
-            # prepare_observations reads centric reflections off it.  Silently
-            # merging a P 2 21 21 data set as P 1 marks every reflection
-            # acentric and gives the wrong Wilson prior for 9 % of them.
-            print(f"    spacegroup {s._core.spacegroup!r} -> {spacegroup!r} "
-                  f"(from --spacegroup)", flush=True)
-            s = SFXStream(s._core.replace(spacegroup=spacegroup))
         s = SFXStream(filter_resolution(s._core, d_min=d_min, d_max=args.dmax))
         if verbose:
             print(f"  {name or path.name}: {s.n_crystals:,} crystals, "
@@ -406,7 +414,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
               "spacegroup": stream._core.spacegroup or spacegroup or "P 1",
               "gain": gain, "radii": list(radii),
               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
-              "merge_friedel": bool(args.merge_friedel),
+              "merge_friedel": merge_friedel,
               "measurement": {**resolved.to_dict(), "gain_adu_per_photon": noise.gain,
                               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
                               "pixel_count_definition": "nominal_integer_ring_mask",
@@ -498,8 +506,17 @@ def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | No
                   f"({100 * float((~work).mean()):.2f} %)", flush=True)
         return work
     g = torch.Generator().manual_seed(args.free_seed)
-    free = torch.zeros(n, dtype=torch.bool)
-    free[torch.randperm(n, generator=g)[: int(round(args.free_frac * n))]] = True
+    # Draw over sign-folded groups, not rows: separated Friedel mates are two
+    # rows sharing one canonical key, and splitting them across work and free
+    # leaks the held-out reflection.  A no-op when mates are merged, the fold
+    # being injective on ASU representatives.
+    _, group_id = np.unique(canonical_hkl(hkl), axis=0, return_inverse=True)
+    group_id = torch.from_numpy(np.asarray(group_id).reshape(-1)).long()
+    n_groups = int(group_id.max()) + 1 if n else 0
+    free_group = torch.zeros(n_groups, dtype=torch.bool)
+    free_group[torch.randperm(n_groups, generator=g)[
+        : int(round(args.free_frac * n_groups))]] = True
+    free = free_group[group_id]
     if verbose:
         print(f"  free set generated (seed {args.free_seed}): "
               f"{int(free.sum()):,} of {n:,} held out", flush=True)
@@ -510,8 +527,13 @@ def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | No
 
 
 def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
-              work: np.ndarray | None, keep: np.ndarray, verbose: bool = True) -> None:
-    """Write F/SIGF (+ free flags) and prove no intensity column landed."""
+              work: np.ndarray | None, keep: np.ndarray, merge_friedel: bool = True,
+              verbose: bool = True) -> None:
+    """Write F/SIGF (+ free flags) and prove no intensity column landed.
+
+    With ``merge_friedel=False`` the indices are signed, and ``ReflectionData``
+    pivots the mates onto one ASU row carrying ``F-obs(+)``/``F-obs(-)``.
+    """
     import gemmi
     from torchref import ReflectionData
     from torchref.symmetry import Cell, SpaceGroup
@@ -525,6 +547,7 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
         cell=Cell(list(cell)),
         spacegroup=SpaceGroup(spacegroup),
         rfree_flags=(None if work is None else torch.from_numpy(work[keep])),
+        friedel_merged=merge_friedel,
     )
     # Deliberately NOT setting data.I / data.I_sigma -- see the module docstring.
     data.write_mtz(str(path))
@@ -538,58 +561,64 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
     if verbose:
         print(f"wrote {path}\n  reflections {int(keep.sum()):,}  columns {labels}",
               flush=True)
-        if "FreeR_flag" in labels:
-            fr = np.array(mtz.column_with_label("FreeR_flag"), dtype=int)
+        free_label = next((l for l in ("FreeR_flag", "R-free-flags") if l in labels), None)
+        if free_label is not None:
+            fr = np.array(mtz.column_with_label(free_label), dtype=int)
             print(f"  readback free {100 * (fr == 0).mean():.2f} % "
                   f"({int((fr == 0).sum()):,} of {len(fr):,})", flush=True)
 
 
 def write_intensity_mtz(path: Path, hkl: np.ndarray, I, I_sd, *, cell, spacegroup: str,
-                        keep: np.ndarray, verbose: bool = True) -> None:
+                        keep: np.ndarray, merge_friedel: bool = True,
+                        verbose: bool = True) -> None:
     """Write merged intensities as ``I-obs`` / ``SIGI-obs`` (no free flags).
 
-    For the moment estimators, whose product is an intensity: French-Wilson
-    happens downstream, on the same path a CrystFEL ``.hkl`` takes.
+    For the moment estimators, whose product is an intensity; French-Wilson
+    happens downstream.  With ``merge_friedel=False`` the signed indices are
+    pivoted onto ``I-obs(+)``/``I-obs(-)``, since a negative ASU index in the
+    file is not what a reader takes for a Bijvoet mate.
     """
-    import gemmi
+    import pandas as pd
+    from torchref.io.mtz import write
 
     path.parent.mkdir(parents=True, exist_ok=True)
     I = np.asarray(I.detach().cpu().numpy() if hasattr(I, "detach") else I, dtype=np.float64)
     I_sd = np.asarray(I_sd.detach().cpu().numpy() if hasattr(I_sd, "detach") else I_sd, dtype=np.float64)
     keep = np.asarray(keep, dtype=bool) & np.isfinite(I) & np.isfinite(I_sd) & (I_sd > 0)
-    mtz = gemmi.Mtz(with_base=True)
-    mtz.spacegroup = gemmi.SpaceGroup(spacegroup)
-    mtz.set_cell_for_all(gemmi.UnitCell(*[float(c) for c in cell]))
-    mtz.add_dataset("merged")
-    mtz.add_column("I-obs", "J")
-    mtz.add_column("SIGI-obs", "Q")
-    mtz.set_data(np.column_stack([hkl[keep], I[keep], I_sd[keep]]).astype(np.float32))
-    mtz.write_to_file(str(path))
+
+    if merge_friedel:
+        rows, cols = hkl[keep], {"I-obs": I[keep], "SIGI-obs": I_sd[keep]}
+    else:
+        rows, cols = _bijvoet_columns(hkl[keep], I[keep], I_sd[keep], spacegroup)
+    df = pd.DataFrame({"H": rows[:, 0], "K": rows[:, 1], "L": rows[:, 2], **cols})
+    write(df, [float(c) for c in cell], spacegroup, str(path))
     if verbose:
-        print(f"wrote {path}\n  reflections {int(keep.sum()):,}  columns {mtz.column_labels()}", flush=True)
+        print(f"wrote {path}\n  reflections {len(df):,}  "
+              f"columns {list(df.columns)}", flush=True)
 
 
-def write_hkl(path: Path, hkl: np.ndarray, I, I_sd, n_meas, keep: np.ndarray,
-              *, point_group: str = "-1", verbose: bool = True) -> None:
-    """CrystFEL reflection list, for the identical French-Wilson path
-    partialator's own output takes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    I = I.detach().cpu().numpy()
-    I_sd = I_sd.detach().cpu().numpy()
-    n_meas = n_meas.detach().cpu().numpy()
-    n_written = 0
-    with open(path, "w") as f:
-        f.write("CrystFEL reflection list version 2.0\n")
-        f.write(f"Symmetry: {point_group}\n")
-        f.write("   h    k    l          I    phase   sigma(I)   nmeas\n")
-        for (h, k, l), Ii, ss, nn, ok in zip(hkl, I, I_sd, n_meas, keep):
-            if ok and np.isfinite(Ii) and ss > 0:
-                f.write(f"{h:4d} {k:4d} {l:4d} {Ii:10.2f}        - "
-                        f"{ss:10.2f} {int(nn):7d}\n")
-                n_written += 1
-        f.write("End of reflections\n")
-    if verbose:
-        print(f"wrote {path}: {n_written:,} reflections", flush=True)
+def _bijvoet_columns(hkl: np.ndarray, I: np.ndarray, I_sd: np.ndarray,
+                     spacegroup: str) -> tuple[np.ndarray, dict]:
+    """Pivot signed ASU indices onto one row per reflection.
+
+    A row is the I(-) member exactly when its index is outside the ASU, which is
+    what :meth:`SFXStream.symmetrize` encodes by negating it.  Columns are NaN
+    where a mate was not measured.
+    """
+    import gemmi
+
+    asu = gemmi.ReciprocalAsu(gemmi.SpaceGroup(spacegroup))
+    plus = np.array([asu.is_in(row.tolist()) for row in hkl], dtype=bool)
+    rows, inverse = np.unique(np.where(plus[:, None], hkl, -hkl), axis=0,
+                              return_inverse=True)
+    inverse = np.asarray(inverse).reshape(-1)
+
+    cols = {name: np.full(len(rows), np.nan)
+            for name in ("I-obs(+)", "SIGI-obs(+)", "I-obs(-)", "SIGI-obs(-)")}
+    for sel, suffix in ((plus, "(+)"), (~plus, "(-)")):
+        cols[f"I-obs{suffix}"][inverse[sel]] = I[sel]
+        cols[f"SIGI-obs{suffix}"][inverse[sel]] = I_sd[sel]
+    return rows, cols
 
 
 def report_merge(res: dict, *, verbose: bool = True) -> None:

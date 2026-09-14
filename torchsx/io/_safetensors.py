@@ -127,7 +127,6 @@ def load_sfx(path: str | Path) -> BaseStream:
             sidecar.get("spacegroup", "P 1"), sidecar.get("source_path", ""),
             friedel_merged=sidecar.get("friedel_merged", True),
         )
-        obj._legacy_hkl_state = "friedel_merged" not in sidecar
         if "_detector_mask" in all_tensors:
             obj.detector_mask = all_tensors["_detector_mask"].to(torch.bool)
         if "_fixed_pattern" in all_tensors:
@@ -168,6 +167,4 @@ def _load_legacy(all_tensors, sidecar, geometry, metadata) -> _SFXStreamCore:
     kwargs["spacegroup"] = sidecar.get("spacegroup", "P 1")
     kwargs["source_path"] = sidecar.get("source_path", "")
     kwargs["friedel_merged"] = sidecar.get("friedel_merged", True)
-    obj = _SFXStreamCore(**kwargs)
-    obj._legacy_hkl_state = "friedel_merged" not in sidecar
-    return obj
+    return _SFXStreamCore(**kwargs)

@@ -97,11 +97,8 @@ class SFXStream:
             if cache.exists() and json_sidecar.exists():
                 core = load_sfx(cache)
                 stream = cls(core)
-                if merge_friedel:
-                    stream = stream.symmetrize()
-                else:
-                    stream = stream._without_friedel()
-                return stream
+                return stream.symmetrize(spacegroup,
+                                         separate_friedel=not merge_friedel)
 
         core = parse_stream(
             path, spacegroup=spacegroup, n_workers=n_workers,
@@ -112,20 +109,19 @@ class SFXStream:
             save_sfx(core, cache)
 
         stream = cls(core)
-        if merge_friedel:
-            stream = stream.symmetrize()
-        else:
-            stream = stream._without_friedel()
-        return stream
+        return stream.symmetrize(spacegroup, separate_friedel=not merge_friedel)
 
     @classmethod
-    def load(cls, path: str | Path, merge_friedel: bool = True) -> SFXStream:
+    def load(cls, path: str | Path, merge_friedel: bool = True,
+             spacegroup: str | None = None) -> SFXStream:
         """Load from .sfx (safetensors) format.
 
         Parameters
         ----------
         path : .sfx file path
         merge_friedel : if True, canonicalize HKL to merge Friedel mates
+        spacegroup : override the group recorded in the sidecar.  Applied
+            before canonicalization, so the indices and the label agree.
         """
         import warnings
         from torchsx.io._safetensors import load_sfx
@@ -134,7 +130,7 @@ class SFXStream:
         detector_mask = getattr(loaded, "detector_mask", None)
         fixed_pattern = getattr(loaded, "fixed_pattern", None)
         stream = cls(loaded)
-        sg = stream._core.spacegroup
+        sg = spacegroup or stream._core.spacegroup
         if not sg or sg == "P 1":
             warnings.warn(
                 f"SFXStream.load({path!s}): spacegroup is {sg!r}. "
@@ -144,10 +140,7 @@ class SFXStream:
                 f"the 'spacegroup' field in the sidecar JSON.",
                 stacklevel=2,
             )
-        if merge_friedel:
-            stream = stream.symmetrize()
-        else:
-            stream = stream._without_friedel()
+        stream = stream.symmetrize(spacegroup, separate_friedel=not merge_friedel)
         # The detector mask is a per-run constant; re-attach it after the
         # symmetrize/replace post-processing (which rebuilds the core).
         if detector_mask is not None:
@@ -196,11 +189,7 @@ class SFXStream:
             spacegroup = "P 1"
 
         stream = cls(load_duckdb(path, spacegroup=spacegroup, geometry=geometry))
-        if merge_friedel:
-            stream = stream.symmetrize()
-        else:
-            stream = cls(stream._core.replace(friedel_merged=False))
-        return stream
+        return stream.symmetrize(separate_friedel=not merge_friedel)
 
     def save(self, path: str | Path):
         """Save to .sfx (safetensors) format."""
@@ -747,49 +736,60 @@ class SFXStream:
 
     # --- Symmetry ---
 
-    def _without_friedel(self) -> SFXStream:
-        core = self._core
-        if self.observed_hkl is not None:
-            return SFXStream(core.replace(hkl=self.observed_hkl, friedel_merged=False))
-        if getattr(core, "_legacy_hkl_state", False):
-            import warnings
-            warnings.warn("Legacy .sfx has no recorded HKL state; assuming its indices "
-                          "are unmerged as requested. Re-parse to retain observed HKLs.", stacklevel=2)
-        elif core.friedel_merged:
-            raise ValueError("Cannot undo Friedel merging: observed HKLs were not retained.")
-        return SFXStream(core.replace(friedel_merged=False))
-
-    def symmetrize(self, spacegroup: str | None = None) -> SFXStream:
+    def symmetrize(self, spacegroup: str | None = None, *,
+                   separate_friedel: bool = False) -> SFXStream:
         """Remap HKL to canonical ASU representatives using space group symmetry.
 
         Parameters
         ----------
         spacegroup : space group string (e.g. "P -1"). If None, uses core.spacegroup.
+        separate_friedel : keep the two members of a Bijvoet pair apart by
+            negating the ASU index of the I(-) member, merging over the point
+            group rather than the Laue class.
 
         Returns
         -------
-        New SFXStream with HKL replaced by canonical ASU indices.
+        New SFXStream whose HKL holds ASU representatives, signed when
+        ``separate_friedel``.
         """
-        import dataclasses
-
         from torchref.symmetry import SpaceGroup
 
         core = self._core
-        if not core.friedel_merged and self.observed_hkl is None:
-            core = core.with_columns("obs", observed_hkl=core.hkl)
+        observed = self.observed_hkl
+        if observed is None:
+            if core.friedel_merged and separate_friedel:
+                raise ValueError(
+                    "Cannot separate Friedel mates: the HKL column already holds "
+                    "merged ASU representatives and the observed indices were not "
+                    "retained.  Re-parse the original .stream."
+                )
+            observed = core.hkl
+            if not core.friedel_merged:
+                core = core.with_columns("obs", observed_hkl=core.hkl)
         sg = spacegroup or core.spacegroup
-        canonical_hkl, _, _, sort_indices = SpaceGroup(sg).canonicalize_hkl(
-            self._core.hkl.int(), include_friedel=True,
+        group = SpaceGroup(sg)
+        canonical_hkl, _, friedel_flags, sort_indices = group.canonicalize_hkl(
+            observed.int(), include_friedel=True,
         )
         # canonicalize_hkl returns sorted output; invert to restore original order
         inv = torch.empty_like(sort_indices)
         inv[sort_indices] = torch.arange(len(sort_indices))
         canonical_hkl = canonical_hkl[inv]
 
+        if separate_friedel:
+            # A centric reflection is its own Friedel mate, so which branch
+            # canonicalize_hkl reports for it depends on operator order.  Pin
+            # them to the positive one, or one measurement lands under two
+            # indices.
+            minus = friedel_flags[inv]
+            flagged = minus.nonzero(as_tuple=True)[0]
+            minus[flagged] = ~_is_centric(group, canonical_hkl[flagged])
+            canonical_hkl = torch.where(minus[:, None], -canonical_hkl, canonical_hkl)
+
         new_core = core.replace(
             hkl=canonical_hkl.to(torch.int16),
             spacegroup=sg,
-            friedel_merged=True,
+            friedel_merged=not separate_friedel,
         )
         return SFXStream(new_core)
 
@@ -805,6 +805,22 @@ class SFXStream:
             f"n_observations={self.n_observations}, "
             f"n_images={self.n_images})"
         )
+
+
+def _is_centric(group, hkl: torch.Tensor) -> torch.Tensor:
+    """``True`` where some point-group operation carries ``h`` to ``-h``.
+
+    ``Symmetry.is_centric`` materialises ``n_ops x N x 3`` at once -- tens of
+    gigabytes on a full stream -- so loop instead.  Rotation entries are
+    {0, +-1}, which float32 carries exactly.
+    """
+    ops = torch.round(group.reciprocal.matrices).to(torch.float32)
+    h = hkl.to(torch.float32)
+    neg = -h
+    centric = torch.zeros(len(hkl), dtype=torch.bool)
+    for R in ops:
+        centric |= (h @ R.T == neg).all(dim=1)
+    return centric
 
 
 def _is_numeric_list(lst: list) -> bool:

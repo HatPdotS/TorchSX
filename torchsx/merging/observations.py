@@ -286,22 +286,21 @@ def _ewald_offset(core, return_q: bool = False):
     wavelength = 12398.4 / float(core.beam_energy.float().median().item())
     k0 = 1.0 / wavelength
     cid = core.crystal_id.long()
-    hkl = core.hkl.float()
-    # ``symmetrize()`` replaces each observed Miller index by its ASU
-    # representative: a symmetry mate of the reflection that was measured.  The
-    # excitation error of a mate is not the one that was recorded -- the other
-    # mates sit of order a reciprocal lattice spacing away from the sphere --
-    # so evaluate every point-group image (and its Friedel partner) and keep
-    # the one nearest the sphere.  Only one image can be near diffracting
-    # condition, which makes the choice unambiguous.  For a stream that was
-    # not symmetrised the observed index is the right one and only the
-    # identity is tried.
-    if bool(getattr(core, "friedel_merged", True)):
+    # ``symmetrize()`` replaces the observed index by its ASU representative,
+    # whose excitation error is not the one that was recorded -- the other mates
+    # sit of order a reciprocal lattice spacing off the sphere.  The parser keeps
+    # the measured index, so read it; a legacy cache that did not has to recover
+    # it by trying every symmetry image and keeping the one nearest the sphere,
+    # which only one of them can be near.
+    observed = getattr(core, "observed_hkl", None)
+    if observed is not None:
+        hkl = observed.float()
+        ops = torch.eye(3, dtype=hkl.dtype)[None]
+    else:
         from torchsx.merging.priors.reciprocal_basis import _hkl_rotations
+        hkl = core.hkl.float()
         ops = _hkl_rotations(getattr(core, "spacegroup", None)).to(hkl.dtype)
         ops = torch.cat([ops, -ops], dim=0)
-    else:
-        ops = torch.eye(3, dtype=hkl.dtype)[None]
     best_offset = None
     best_q = None
     chunk = 8_000_000

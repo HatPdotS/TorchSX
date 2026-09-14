@@ -51,13 +51,15 @@ def read_source(source, **kwargs):
     path = _path(source)
     if source.kind == "crystfel":
         return SFXStream.from_stream(path, **kwargs)
-    # Parser-only controls have no meaning for an already parsed .sfx.
+    # Parser-only controls have no meaning for an already parsed .sfx, but the
+    # symmetry is not one of them: it decides how the cached indices are reduced.
     merge_friedel = kwargs.pop("merge_friedel", True)
-    for key in ("spacegroup", "cache", "n_workers", "max_crystals", "seed", "sequential"):
+    spacegroup = kwargs.pop("spacegroup", None)
+    for key in ("cache", "n_workers", "max_crystals", "seed", "sequential"):
         kwargs.pop(key, None)
     if kwargs:
         raise TypeError(f"Unexpected read options: {', '.join(kwargs)}")
-    return SFXStream.load(path, merge_friedel=merge_friedel)
+    return SFXStream.load(path, merge_friedel=merge_friedel, spacegroup=spacegroup)
 
 
 def inspect_source(source) -> MeasurementSpec | None:

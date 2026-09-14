@@ -125,8 +125,13 @@ def test_named_dispatch_and_future_seams(stream_file, python_parser):
 
 
 def test_raw_identity_and_spec_survive_transforms(stream_file, python_parser, tmp_path):
+    from torchsx.io._parser import parse_stream
+
+    parsed = parse_stream(stream_file, spacegroup="P 1")
+    assert parsed.hkl.data_ptr() == parsed.observed_hkl.data_ptr()  # no ingestion copy
     raw = SFXStream.read(stream_file, spacegroup="P 1", merge_friedel=False)
-    assert raw.hkl.data_ptr() == raw.observed_hkl.data_ptr()  # no ingestion tensor copy
+    # P 1 has a trivial point group, so the signed ASU index is the observed one.
+    assert torch.equal(raw.hkl, raw.observed_hkl)
     canonical = raw.symmetrize()
     assert torch.equal(canonical.observed_hkl, raw.hkl)
     assert torch.equal(canonical.I, raw.I) and torch.equal(canonical.sigma, raw.sigma)
@@ -283,7 +288,7 @@ def test_prepared_cache_recipe_and_legacy_compatibility(stream_file, python_pars
     assert P.load_prep(args, verbose=False).prep.n_valid == built.prep.n_valid
 
 
-def test_legacy_sfx_requires_recipe_and_preserves_recorded_hkl_state(sample_core, tmp_path):
+def test_legacy_sfx_requires_recipe_and_refuses_to_invent_hkl_state(sample_core, tmp_path):
     path = tmp_path / "legacy.sfx"
     SFXStream(sample_core.replace(friedel_merged=False)).save(path)
     assert inspect_source(path) is None
@@ -297,8 +302,12 @@ def test_legacy_sfx_requires_recipe_and_preserves_recorded_hkl_state(sample_core
     sidecar = json.loads(sidecar_path.read_text())
     sidecar.pop("friedel_merged")
     sidecar_path.write_text(json.dumps(sidecar))
-    with pytest.warns(UserWarning, match="Legacy .sfx"):
-        assert not SFXStream.load(path, merge_friedel=False).friedel_merged
+    # A sidecar predating the flag reads as already merged and kept no observed
+    # index, so asking to keep the mates apart must fail rather than quietly put
+    # them all on one side.
+    with pytest.raises(ValueError, match="Cannot separate Friedel mates"):
+        SFXStream.load(path, merge_friedel=False)
+    assert SFXStream.load(path).friedel_merged
 
 
 @pytest.mark.parametrize("trust", [False, True])

@@ -239,20 +239,22 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _write(args, prep, res: dict, bundle: P.PrepBundle, out: Path) -> None:
-    """One merge result → MTZ (or CrystFEL .hkl for a moment estimator)."""
+    """One merge result → an MTZ: F/SIGF, or I/SIGI for a moment estimator."""
     import numpy as np
 
     hkl = prep.hkl_valid.detach().cpu().numpy().astype(int)
+    cell = prep.median_cell.detach().cpu().tolist()
     seen = res["seen"].cpu().numpy()
     if res["estimator"] in ("pooled", "mean"):
-        P.write_hkl(out.with_suffix(".hkl"), hkl, res["I"], res["I_sd"],
-                    res["n_meas"], seen)
+        P.write_intensity_mtz(out, hkl, res["I"], res["I_sd"], cell=cell,
+                              spacegroup=bundle.spacegroup, keep=seen,
+                              merge_friedel=bundle.merge_friedel)
         return
     keep = seen & np.isfinite(res["F"].detach().cpu().numpy())
-    P.write_mtz(out, hkl, res["F"], res["F_sd"],
-                cell=prep.median_cell.detach().cpu().tolist(),
+    P.write_mtz(out, hkl, res["F"], res["F_sd"], cell=cell,
                 spacegroup=bundle.spacegroup,
-                work=P.work_mask(hkl, args), keep=keep)
+                work=P.work_mask(hkl, args), keep=keep,
+                merge_friedel=bundle.merge_friedel)
 
 
 if __name__ == "__main__":

@@ -18,8 +18,7 @@ Products.  The default run writes three files per split (and per half-set):
                           product for refinement and for difference maps.
 ``<stem>_posterior.mtz``  the raw posterior, F/SIGF.
 ``<stem>_pooled.mtz``     ``sum(n - bg) / sum K`` as I/SIGI, a shape-free mean
-                          estimate; French-Wilson happens downstream, as for a
-                          CrystFEL ``.hkl``.
+                          estimate; French-Wilson happens downstream.
 
 A ``<stem>.calibration.json`` sidecar per split records the surface and a
 per-shell check of the mapping.  ``--no-scale-calibration`` writes only the
@@ -33,7 +32,7 @@ Examples
     torchsx-merge-nn run/best.pt dark.stream -o merged.mtz
     torchsx-merge-nn run/best.pt --split dark=dark.stream --split light=1ps.stream \\
         --all-splits -o out/merged.mtz
-    torchsx-merge-nn run/best.pt dark.stream -o pooled.hkl --estimator pooled
+    torchsx-merge-nn run/best.pt dark.stream -o pooled.mtz --estimator pooled
 """
 
 from __future__ import annotations
@@ -125,9 +124,11 @@ def main(argv: list[str] | None = None) -> None:
     wanted = list(range(tr.n_conditions)) if args.all_splits else [0]
 
     if args.estimator == "posterior":
-        merge_products(tr, prep, args, names, wanted, spacegroup=bundle.spacegroup)
+        merge_products(tr, prep, args, names, wanted, spacegroup=bundle.spacegroup,
+                       merge_friedel=bundle.merge_friedel)
     else:
-        merge_single_estimator(tr, prep, args, names, wanted, spacegroup=bundle.spacegroup)
+        merge_single_estimator(tr, prep, args, names, wanted, spacegroup=bundle.spacegroup,
+                               merge_friedel=bundle.merge_friedel)
     tr.close()
 
 
@@ -167,7 +168,8 @@ def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0", scale=None) -> di
             "d_outer": float(dd[outer].max()), "n": int(ok.sum())}
 
 
-def merge_products(tr, prep, args, names, wanted, *, spacegroup: str, verbose: bool = True) -> dict:
+def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
+                   merge_friedel: bool = True, verbose: bool = True) -> dict:
     """Posterior, pooled and scaled posterior for every wanted split.
 
     Pass one merges every split (and, unless disabled, its two crystal
@@ -252,15 +254,19 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str, verbose: b
                 factors[half] = f
                 sq = torch.from_numpy(np.sqrt(f)).to(F.dtype)
                 P.write_mtz(out.with_name(f"{stem}{out.suffix}"), hkl, F * sq, F_sd * sq,
-                            cell=cell, spacegroup=spacegroup, work=work, keep=keep, verbose=verbose and half == 0)
+                            cell=cell, spacegroup=spacegroup, work=work, keep=keep,
+                            merge_friedel=merge_friedel, verbose=verbose and half == 0)
                 P.write_mtz(out.with_name(f"{stem}_posterior{out.suffix}"), hkl, F, F_sd,
-                            cell=cell, spacegroup=spacegroup, work=work, keep=keep, verbose=False)
+                            cell=cell, spacegroup=spacegroup, work=work, keep=keep,
+                            merge_friedel=merge_friedel, verbose=False)
                 keep_p = pl["seen"].cpu().numpy() & np.isfinite(pl["I"].cpu().numpy()) & (pl["I_sd"].cpu().numpy() > 0)
                 P.write_intensity_mtz(out.with_name(f"{stem}_pooled{out.suffix}"), hkl, pl["I"], pl["I_sd"],
-                                      cell=cell, spacegroup=spacegroup, keep=keep_p, verbose=False)
+                                      cell=cell, spacegroup=spacegroup, keep=keep_p,
+                                      merge_friedel=merge_friedel, verbose=False)
             else:
                 P.write_mtz(out.with_name(f"{stem}{out.suffix}"), hkl, F, F_sd,
-                            cell=cell, spacegroup=spacegroup, work=work, keep=keep, verbose=verbose and half == 0)
+                            cell=cell, spacegroup=spacegroup, work=work, keep=keep,
+                            merge_friedel=merge_friedel, verbose=verbose and half == 0)
         rec = {"split": label, "products": ["scaled_posterior", "posterior", "pooled"] if surface is not None else ["posterior"]}
         if (k, 1) in merges and (k, 2) in merges:
             a, b = merges[(k, 1)][0], merges[(k, 2)][0]
@@ -293,7 +299,8 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str, verbose: b
     return summary
 
 
-def merge_single_estimator(tr, prep, args, names, wanted, *, spacegroup: str) -> None:
+def merge_single_estimator(tr, prep, args, names, wanted, *, spacegroup: str,
+                           merge_friedel: bool = True) -> None:
     """One product per split for the non-posterior estimators (the original path)."""
     hkl = prep.hkl_valid.detach().cpu().numpy().astype(int)
     cell = prep.median_cell.detach().cpu().tolist()
@@ -321,9 +328,12 @@ def merge_single_estimator(tr, prep, args, names, wanted, *, spacegroup: str) ->
             ho = out.with_name(f"{out.stem}_half{j + 1}{out.suffix}")
             if key == "F":
                 P.write_mtz(ho, hkl, r["F"], r["F_sd"], cell=cell, spacegroup=spacegroup,
-                            work=P.work_mask(hkl, args, verbose=False), keep=keep_h, verbose=False)
+                            work=P.work_mask(hkl, args, verbose=False), keep=keep_h,
+                            merge_friedel=merge_friedel, verbose=False)
             else:
-                P.write_hkl(ho.with_suffix(".hkl"), hkl, r["I"], r["I_sd"], r["n_meas"], keep_h, verbose=False)
+                P.write_intensity_mtz(ho.with_suffix(".mtz"), hkl, r["I"], r["I_sd"], cell=cell,
+                                      spacegroup=spacegroup, keep=keep_h,
+                                      merge_friedel=merge_friedel, verbose=False)
         st = _split_half_stats(halves[0], halves[1], prep.d_spacing.detach().cpu().numpy(),
                                key="I0" if key == "F" else "I")
         if st is not None:
@@ -332,14 +342,17 @@ def merge_single_estimator(tr, prep, args, names, wanted, *, spacegroup: str) ->
                   flush=True)
         seen = res["seen"].cpu().numpy()
         if args.estimator in ("pooled", "mean", "wls"):
-            P.write_hkl(out.with_suffix(".hkl"), hkl, res["I"], res["I_sd"], res["n_meas"], seen)
+            P.write_intensity_mtz(out.with_suffix(".mtz"), hkl, res["I"], res["I_sd"],
+                                  cell=cell, spacegroup=spacegroup, keep=seen,
+                                  merge_friedel=merge_friedel)
         else:
             keep = seen & np.isfinite(res["F"].detach().cpu().numpy())
             if not keep.any():
                 print("  no usable reflections for this split -- nothing written", flush=True)
                 continue
             P.write_mtz(out, hkl, res["F"], res["F_sd"], cell=cell, spacegroup=spacegroup,
-                        work=P.work_mask(hkl, args), keep=keep)
+                        work=P.work_mask(hkl, args), keep=keep,
+                        merge_friedel=merge_friedel)
 
 
 if __name__ == "__main__":

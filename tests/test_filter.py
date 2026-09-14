@@ -106,11 +106,16 @@ def test_ewald_offset_is_friedel_invariant(sample_core):
     )
 
 
-def test_ewald_offset_matches_unmerged_when_not_friedel_merged(sample_core):
-    """With ``friedel_merged=False`` the raw ``+q`` branch is used as-is."""
+def test_ewald_offset_reads_the_observed_index_when_it_was_kept(sample_core):
+    """The parser retains the measured index; the image search is the fallback."""
     from torchsx.merging.observations import _ewald_offset
 
-    raw = _ewald_offset(sample_core.replace(friedel_merged=False))
-    merged = _ewald_offset(sample_core.replace(friedel_merged=True))
-    # the fixed path may only ever pick the SMALLER of the two branches
-    assert (merged.abs() <= raw.abs() + 1e-6).all()
+    direct = _ewald_offset(sample_core)
+    # Canonicalisation negated these indices; the observed column still records
+    # what was measured, so the offset must be read straight off it.
+    canonical = sample_core.replace(hkl=-sample_core.hkl)
+    kept = canonical.with_columns("obs", observed_hkl=sample_core.hkl)
+    torch.testing.assert_close(_ewald_offset(kept), direct, atol=1e-6, rtol=1e-5)
+    # Without it the image search recovers the same offset, and may only ever
+    # pick the SMALLER of the two branches.
+    assert (_ewald_offset(canonical).abs() <= direct.abs() + 1e-6).all()

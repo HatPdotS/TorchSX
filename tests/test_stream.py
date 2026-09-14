@@ -220,18 +220,44 @@ def test_symmetrize_default_spacegroup(sample_core):
 
 
 def test_load_merge_friedel(sample_core, tmp_path):
-    """load() with merge_friedel applies symmetrize."""
-    hkl = torch.tensor([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [2, 0, 0], [0, 2, 0]], dtype=torch.int16)
-    core = sample_core.replace(hkl=hkl, spacegroup="P -1", friedel_merged=False)
+    """merge_friedel picks the merging group: the Laue class, or the point group."""
+    hkl = torch.tensor([[1, 0, 1], [-1, 0, -1], [0, 1, 1], [2, 0, 1], [0, 2, 1]],
+                       dtype=torch.int16)
+    core = sample_core.replace(hkl=hkl, spacegroup="P 63", friedel_merged=False)
     stream = SFXStream(core)
     path = tmp_path / "test.sfx"
     stream.save(path)
 
     loaded = SFXStream.load(path, merge_friedel=True)
-    assert torch.equal(loaded.hkl[0], loaded.hkl[1])  # Friedel mates merged
+    assert torch.equal(loaded.hkl[0], loaded.hkl[1])          # mates share one index
+    assert loaded.friedel_merged
 
-    loaded_no = SFXStream.load(path, merge_friedel=False)
-    assert not torch.equal(loaded_no.hkl[0], loaded_no.hkl[1])  # Raw indices kept
+    split = SFXStream.load(path, merge_friedel=False)
+    assert not split.friedel_merged
+    # The mates are the two branches of one ASU index, told apart by its sign.
+    assert torch.equal(split.hkl[0], -split.hkl[1])
+    assert torch.equal(split.hkl[0].abs(), loaded.hkl[0])
+
+
+def test_symmetrize_separates_only_acentric_mates(sample_core):
+    """A centric reflection is its own mate, so it must stay on one branch."""
+    # In P 63 the l = 0 zone is centric; l != 0 is not.
+    hkl = torch.tensor([[1, 0, 0], [-1, 0, 0], [1, 0, 1], [-1, 0, -1], [0, 2, 1]],
+                       dtype=torch.int16)
+    stream = SFXStream(sample_core.replace(hkl=hkl, spacegroup="P 63",
+                                           friedel_merged=False))
+    split = stream.symmetrize(separate_friedel=True)
+    assert torch.equal(split.hkl[0], split.hkl[1])            # centric: still merged
+    assert torch.equal(split.hkl[2], -split.hkl[3])           # acentric: split
+    # Re-merging the signed column reproduces the Laue-class merge.
+    assert torch.equal(split.symmetrize().hkl, stream.symmetrize().hkl)
+
+
+def test_symmetrize_cannot_split_a_merged_stream(sample_core):
+    """Without the observed index the two mates are indistinguishable."""
+    merged = SFXStream(sample_core.replace(spacegroup="P 63", friedel_merged=True))
+    with pytest.raises(ValueError, match="Cannot separate Friedel mates"):
+        merged.symmetrize(separate_friedel=True)
 
 
 def test_split_random_two_halves(sample_core):
