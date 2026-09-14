@@ -103,7 +103,6 @@ and gemmi. The remaining extras are optional because each is imported lazily:
 | Extra | Enables |
 |---|---|
 | `duckdb` | `SFXStream.from_duckdb` — read probixi runs |
-| `patches` | `excise_patches` / `excise_rois` — pixel patches from HDF5 |
 | `native` | JIT-building the native `.stream` parser extension |
 
 ## Quick Start

@@ -133,26 +133,15 @@ class ObsFeatureSpec(nn.Module):
         self_features: tuple[str, ...] = SELF_FEATURES,
         context_features: tuple[str, ...] | None = None,
         include_hkl: bool = True,
-        token_mode: bool = False,
         crystal_features: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__()
-        self.token_mode = bool(token_mode)
         #: Recorded so a checkpoint can say which feature set it was fitted
         #: under; the flag itself is consumed a few lines below.
         self.include_hkl = bool(include_hkl)
 
         if context_features is None:
             context_features = tuple(self_features) + CONTEXT_ONLY_FEATURES
-        if token_mode:
-            # One embedding for every token; the query copy simply has its
-            # measurement channels zeroed.  Same width both ways, so the
-            # embedding weights are shared between the two roles and geometry
-            # is embedded identically whether the token is querying or being
-            # queried.  The leave-one-out contract then lives entirely in the
-            # attention mask rather than in two divergent feature lists.
-            self_features = tuple(context_features)
-
         if not include_hkl:
             self_features = tuple(f for f in self_features if f not in ("h", "k", "l"))
             context_features = tuple(
@@ -160,14 +149,6 @@ class ObsFeatureSpec(nn.Module):
             )
 
         leaks = FORBIDDEN_IN_SELF.intersection(self_features)
-        if leaks and token_mode:
-            # Legitimate here: the query copy of the token has exactly these
-            # columns zeroed (asserted in build()), and the attention encoder
-            # masks the diagonal so a token never attends to itself.  The
-            # contract has moved from "two feature lists" to "one embedding
-            # plus a mask" -- it is not weaker, but it IS enforced elsewhere,
-            # so it is re-asserted at every build rather than only here.
-            leaks = set()
         if leaks:
             raise ValueError(
                 f"{sorted(leaks)} may not be self features: routing an "
@@ -442,39 +423,16 @@ class ObsFeatureSpec(nn.Module):
         x = (self._crys_raw - self._crys_mean) / self._crys_std
         return x.masked_fill(self._crys_const, 0.0)
 
-    @property
-    def measurement_mask(self) -> Tensor:
-        """``(n_self,)`` bool — which query columns are measurement channels.
-
-        These are zeroed in the query copy under :attr:`token_mode`.
-        """
-        return torch.tensor(
-            [f in FORBIDDEN_IN_SELF for f in self.self_features], dtype=torch.bool
-        )
-
     def build(self, meta: ObsInfo) -> tuple[Tensor, Tensor, Tensor]:
         """``meta`` (sliced or gathered) → ``(x_self, x_ctx, x_crys)``, all normalised.
 
         ``x_crys`` is the full ``(n_crystals, n_crystal)`` per-crystal table --
         indexed by ``crystal_id``, not by row -- so it is the same object for
         every slice, gather or chunk of the dataset.
-
-        Under :attr:`token_mode` both are the same full token matrix, with the
-        query copy's measurement channels zeroed — the token formulation.
-        Otherwise they are two different feature lists (Deep Sets).
         """
         if meta.obs_id is None:
             raise ValueError("ObsFeatureSpec.build needs ObsInfo.obs_id")
         x_ctx = self._matrix(meta, self.context_features)
-        if self.token_mode:
-            mask = self.measurement_mask.to(x_ctx.device)
-            x_self = x_ctx.masked_fill(mask, 0.0)
-            # Re-assert the contract the constructor guard normally enforces.
-            # Cheap, and this is the single property the design rests on.
-            assert bool((x_self[:, mask] == 0).all()), (
-                "token-mode query retains a measurement channel"
-            )
-            return x_self, x_ctx, self.crystal_matrix()
         return self._matrix(meta, self.self_features), x_ctx, self.crystal_matrix()
 
 

@@ -45,9 +45,7 @@ class AmortizedScale(ScaleModel):
         Tiered feature builder; enforces the own-intensity and
         condition-blindness contracts.
     encoder
-        Anything satisfying :class:`~torchsx.nn.deepsets.ScaleEncoder`.  The
-        Deep Sets default is abismal's architecture; a transformer over padded
-        crystal batches is a drop-in replacement.
+        Anything satisfying :class:`~torchsx.nn.deepsets.ScaleEncoder`.
     heads
         :class:`~torchsx.nn.heads.ScaleHeads`.
     n_crystals
@@ -140,9 +138,6 @@ class AmortizedScale(ScaleModel):
         d_model: int = 128,
         n_layers: int = 5,
         d_hidden: int | None = None,
-        encoder: str = "deepsets",
-        n_heads: int = 8,
-        max_tokens: int | None = 512,
         include_hkl: bool = False,
         context_folds: int = 0,
         obs_context_layers: int | None = None,
@@ -162,28 +157,16 @@ class AmortizedScale(ScaleModel):
         conditioner_hidden: int = 8,
         component_shape: str = "shared",
     ) -> "AmortizedScale":
-        if encoder not in ("deepsets", "attention"):
-            raise ValueError(f"encoder must be 'deepsets' or 'attention', got {encoder!r}")
-        features = ObsFeatureSpec(
-            prep, include_hkl=include_hkl, token_mode=(encoder == "attention")
+        features = ObsFeatureSpec(prep, include_hkl=include_hkl)
+        enc = DeepSetsEncoder(
+            features.n_self, features.n_context,
+            d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
+            dropout=dropout,
+            n_crystal_features=features.n_crystal,
+            context_folds=context_folds,
+            obs_context_layers=obs_context_layers,
+            obs_self_layers=obs_self_layers,
         )
-        if encoder == "attention":
-            from torchsx.nn.attention import PeerAttentionEncoder
-            enc = PeerAttentionEncoder(
-                features.n_self, features.n_context,
-                d_model=d_model, n_layers=n_layers, n_heads=n_heads,
-                dropout=dropout, max_tokens=max_tokens,
-            )
-        else:
-            enc = DeepSetsEncoder(
-                features.n_self, features.n_context,
-                d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
-                dropout=dropout,
-                n_crystal_features=features.n_crystal,
-                context_folds=context_folds,
-                obs_context_layers=obs_context_layers,
-                obs_self_layers=obs_self_layers,
-            )
         heads = ScaleHeads(
             d_model,
             w_init=w_init,

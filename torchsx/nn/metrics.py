@@ -251,9 +251,8 @@ def grad_norms(module: torch.nn.Module, groups: tuple[str, ...] = ("encoder", "h
     The per-depth breakdown is what matters once the encoder is a deep stack of
     exchange blocks: an aggregate encoder norm cannot distinguish "healthy" from
     "the last two blocks are learning and block 0 sees nothing".  Blocks are
-    identified by the integer following ``blocks.`` in the parameter name, so
-    this works for both ``context_blocks``/``self_blocks`` (Deep Sets) and
-    ``blocks`` (attention).
+    identified by the integer following ``blocks.`` in the parameter name —
+    ``context_blocks`` and ``self_blocks`` in the Deep Sets encoder.
 
     ``gradnorm_depth_ratio`` is last-block / first-block.  Values far above 1
     mean the early blocks are starved; note it is legitimately large at step 0,
