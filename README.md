@@ -11,7 +11,24 @@ pip install -e .
 ```
 
 Python >=3.10 and TorchRef >=0.6.4 are required. Optional extras are `native`
-(for building the stream parser), `duckdb` (the existing Probixi reader) and `dev`.
+(for building the stream parser), `duckdb` (the existing Probixi reader),
+`stats` (Matplotlib for distribution plots) and `dev`.
+
+## Raw-distribution figures
+
+```bash
+pip install -e '.[stats]'
+torchsx-stats indexed.stream --spacegroup 'P 63' -o figures/
+```
+
+Writes **PNG only**: raw intensities, reflection skewness, normalized mean–median
+gaps and individual reflection examples. The default samples 50K crystals in
+complete images; use `--sample-crystals all` for the full dataset. The cell comes
+from the input. Named inputs and CrystFEL custom splits are supported.
+
+These figures describe the observations that motivate scaling and likelihood
+modeling. They complement the independent precision and accuracy comparisons.
+[Plot interpretation, CLI controls and cache replay](docs/stats.md).
 
 ## Train and merge
 

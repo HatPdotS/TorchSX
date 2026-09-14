@@ -19,8 +19,10 @@ dependencies = [
 # these exist for an installed copy and are the same entry points.
 torchsx-train = "torchsx.cli.train:main"
 torchsx-merge-nn = "torchsx.cli.merge_nn:main"
+torchsx-stats = "torchsx.cli.stats:main"
 
 [project.optional-dependencies]
+stats = ["matplotlib>=3.7"]
 # Read probixi's DuckDB runs (SFXStream.from_duckdb).
 duckdb = ["duckdb>=1.0"]
 # Building the native .stream parser extension (io/_native.py JIT-compiles it).

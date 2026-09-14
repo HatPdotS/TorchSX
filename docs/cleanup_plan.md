@@ -1,5 +1,10 @@
 # Deletion plan
 
+> **Later update:** `torchsx-stats` and its tests were restored for dataset
+> characterization and paper motivation figures. Its removal below is historical;
+> absence from training argv records does not make this standalone plotting CLI
+> unused. See [the current stats interface](stats.md).
+
 > **Status (branch `worktree-cleanup-chop`).** Stages 1-2 and part of stage 3
 > are done in three commits: 30,454 source lines / 130 modules down to
 > **20,594 / 76**, a 32 % cut, with the test suite at 4 failed / 454 passed
