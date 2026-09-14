@@ -396,13 +396,21 @@ def test_train_defaults_match_the_scored_recipe():
     stays 0: the scored run passed -0.25, which ``_lam_spread`` gates out at
     ``<= 0``, so it never applied a penalty.
     """
+    import pathlib
+
+    import torchsx.cli.train
     from torchsx.cli.train import _build_parser
 
     a = _build_parser().parse_args(["x.sfx", "-o", "out"])
-    assert (a.lr, a.max_obs, a.epochs and True) == (1e-3, 1_500_000, True)
-    assert a.lam0 == 10.0 and a.lam_halflife == 400 and a.warmup == 100
+    assert (a.lr, a.epochs and True) == (1e-3, True)
     assert (a.train_k_coarse, a.train_m_fine, a.train_n_sigma) == (31, 129, 6.0)
     assert a.heldout_frac == 0.05
+    # No longer flags: read them where train.py now writes them.
+    src = pathlib.Path(torchsx.cli.train.__file__).read_text()
+    for literal in ("max_obs_per_batch=1_500_000",
+                    "lam0=10.0, lam_halflife_steps=400",
+                    "warmup_steps=100"):
+        assert literal in src, literal
 
 
 def test_lam_holds_when_the_halflife_is_zero(tmp_path):
@@ -536,18 +544,17 @@ def test_smooth_basis_flags_round_trip_through_the_checkpoint(tmp_path):
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
     bundle = P.PrepBundle(prep, recipe, [], 0.1)
     targs = train_parser().parse_args(
-        ["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64",
-         "--wilson-basis", "smooth", "--gauge-anchor", "basis", "--wilson-degree", "2"])
+        ["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64"])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
     assert S["wilson_basis"] == "smooth" and S["basis"] is not None
-    assert scale.anchor_stat == "basis" and S["basis"].degree == 2
+    assert scale.anchor_stat == "basis" and S["basis"].degree == 4
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
     t = tr.targets[0]
     assert t.has_basis and t.wilson_coef.abs().sum() > 0
     tr.data_recipe = dict(recipe)
     ck = torch.load(tr.save_best(tmp_path / "smooth.pt"), weights_only=False)
     assert ck["posterior_grid"]["wilson_basis"] == "smooth"
-    assert ck["posterior_grid"]["wilson_degree"] == 2
+    assert ck["posterior_grid"]["wilson_degree"] == 4
     assert ck["scale"]["anchor_stat"] == "basis"
     assert "wilson_coef" in ck["inference_context"]["targets"][0]
     assert "gauge_phi" not in ck["state_dict"], "the basis rows are rebuilt, not stored"
@@ -556,7 +563,7 @@ def test_smooth_basis_flags_round_trip_through_the_checkpoint(tmp_path):
     margs = merge_parser().parse_args(
         ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu", "--inner-points", "64"])
     p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
-    assert S2["wilson_basis"] == "smooth" and S2["wilson_degree"] == 2
+    assert S2["wilson_basis"] == "smooth" and S2["wilson_degree"] == 4
     assert rebuilt.anchor_stat == "basis" and S2["basis"] is not None
     rebuilt.load_state_dict(ck["state_dict"])
     tr2 = _trainer_from_stack(p2, q2, rebuilt, o2, S2)
@@ -579,15 +586,15 @@ def test_shells_checkpoint_rebuilds_without_a_basis(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
     bundle = P.PrepBundle(prep, recipe, [], 0.1)
-    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--inner-points", "64",
-                                       "--wilson-basis", "shells", "--gauge-anchor", "median"])
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu",
+                                       "--inner-points", "64"])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
-    assert S["basis"] is None and S["wilson_basis"] == "shells" and scale.anchor_stat == "median"
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
-    assert not tr.targets[0].has_basis
     tr.data_recipe = dict(recipe)
     ck = torch.load(tr.save_best(tmp_path / "shells.pt"), weights_only=False)
-    del ck["posterior_grid"]["wilson_basis"], ck["posterior_grid"]["wilson_degree"]   # pre-basis writer
+    # A checkpoint written before the smooth basis existed: no wilson_basis key
+    # and no anchor_stat.  That is now the only way to select the shells prior.
+    del ck["posterior_grid"]["wilson_basis"], ck["posterior_grid"]["wilson_degree"]
     del ck["scale"]["anchor_stat"]
     margs = merge_parser().parse_args(
         ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu", "--inner-points", "64"])

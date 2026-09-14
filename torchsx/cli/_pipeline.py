@@ -82,9 +82,6 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                         "in-batch merge target during training, where the "
                         "per-reflection support is what keeps the target "
                         "finite.  0 keeps everything.")
-    p.add_argument("--split-names", default=None,
-                   help="comma-separated names for --split-file labels, in "
-                        "label order (default: 0, 1, ...)")
     p.add_argument("--spacegroup", default=None,
                    help='e.g. "P 1", "P 2 21 21".  Stamped into the MTZ and '
                         "used for centric detection.")
@@ -110,15 +107,9 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                         "inputs need not be present at all.  The recipe still "
                         "has to be passed for the network to see the same "
                         "settings, and it is the caller's job that it matches.")
-    p.add_argument("--sfx-cache", type=Path, default=None,
-                   help="parsed-stream cache (.sfx) for a .stream input")
     p.add_argument("--n-workers", type=int, default=8, help="stream parser workers")
     p.add_argument("--no-friedel", dest="merge_friedel", action="store_false",
                    default=True, help="do not merge Friedel mates on load")
-    p.add_argument("--crystals-file", type=Path, default=None,
-                   help="bool mask over crystals (after the d_min filter) to keep")
-    p.add_argument("--max-crystals", type=int, default=None,
-                   help="parse only a subset of the stream (testing)")
     p.add_argument('--experiment-partition', type=Path, default=None)
     p.add_argument('--experiment-half', type=int, choices=(0, 1), default=None)
 
@@ -185,8 +176,6 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         raise SystemExit("--dmin is required")
 
     splits = _splits_from_args(args)
-    if len(splits) > 1 and args.sfx_cache is not None:
-        raise SystemExit("--sfx-cache accepts one input; use separate .sfx files for named splits.")
 
     cache = args.cache_prep
     blob = torch.load(cache, weights_only=False) if cache is not None and cache.exists() else None
@@ -224,10 +213,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         "spacegroup": spacegroup,
         "merge_friedel": bool(args.merge_friedel),
         "split_file": _stamp(args.split_file),
-        "split_names": args.split_names,
         "min_split_crystals": int(args.min_split_crystals),
-        "crystals_file": _stamp(args.crystals_file),
-        "max_crystals": args.max_crystals,
     }
 
     legacy_cache = blob is not None and "measurement" not in (blob.get("signature") or {})
@@ -240,8 +226,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         gain = parse_gain(args.gain if args.gain is not None else d.get("gain"))
         signature.update(radii=list(parse_radii(radii)), gain=gain)
     else:
-        sources = [args.sfx_cache if (path.suffix == ".stream" and args.sfx_cache is not None
-                   and args.sfx_cache.exists()) else path for _, path in splits]
+        sources = [path for _, path in splits]
         try:
             specs = [inspect_source(path) for path in sources]
             measurement = combine_measurements(specs)
@@ -292,9 +277,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     parts = []
     for name, path in splits:
         s = SFXStream.read(
-            path, spacegroup=spacegroup, cache=args.sfx_cache,
+            path, spacegroup=spacegroup,
             n_workers=args.n_workers, merge_friedel=args.merge_friedel,
-            max_crystals=args.max_crystals,
         )
         if spacegroup and (s._core.spacegroup or "P 1") != spacegroup:
             # An .sfx cache carries whatever space group it was parsed with, and
@@ -311,16 +295,6 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         parts.append(s)
     stream = parts[0] if len(parts) == 1 else SFXStream.concat(parts)
     n_per_split = [p.n_crystals for p in parts]
-
-    if args.crystals_file is not None:
-        mask = torch.load(args.crystals_file)
-        stream = SFXStream(filter_crystals(stream._core, mask))
-        if len(parts) > 1:
-            raise SystemExit("--crystals-file with several splits is ambiguous")
-        n_per_split = [stream.n_crystals]
-        if verbose:
-            print(f"  crystals: {int(mask.sum()):,} of {int(mask.numel()):,} kept",
-                  flush=True)
 
     # ── splits → the per-crystal label the trainer already consumes ──
     names: list[str] = []
@@ -367,16 +341,13 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
             raise SystemExit(f"--split-file: {int((labels < 0).sum()):,} unlabelled "
                              "crystals (-1); every crystal must belong to a split")
         # A custom-split file defines the datasets; a label tensor only implies
-        # them.  After --crystals-file some datasets may hold no crystal at all
-        # (a dark-only subset of a light/dark file), which --min-split-crystals
+        # them.  A dataset may hold no crystal at all, which --min-split-crystals
         # then drops below -- the count must not be read off the labels present.
         n_splits = len(names) if names else int(labels.max()) + 1
-        if args.split_names:
-            names = [n.strip() for n in args.split_names.split(",")]
-        elif not names:
+        if not names:
             names = [str(i) for i in range(n_splits)]
         if len(names) != n_splits:
-            raise SystemExit(f"--split-names has {len(names)} names for {n_splits} labels")
+            raise SystemExit(f"{len(names)} split names for {n_splits} labels")
     elif len(splits) > 1:
         labels = torch.repeat_interleave(
             torch.arange(len(splits)), torch.tensor(n_per_split))
@@ -470,14 +441,6 @@ def add_free_args(p: argparse.ArgumentParser) -> None:
                         "any data set that does not fit the card: 794 M "
                         "observations is ~38 GB before a single step.  Merging "
                         "needs it exactly as much as training does.")
-    p.add_argument("--locate-windows", default=None, metavar="W1,W2,...",
-                   help="scan half-widths (nats) for the merge's locating "
-                        "passes, one data pass each.  Default 8,1,0.125: a "
-                        "single wide pass mis-centres the outer grid by ~0.59 "
-                        "nats at any multiplicity, which is harmless below "
-                        "~1e3 counts per reflection and fatal above ~1e4 "
-                        "(all-NaN F on a 422 k-crystal split).  Pass a single "
-                        "value for the old one-pass behaviour.")
     p.add_argument("--free-from", type=Path, default=None,
                    help="take the free set from an existing .mtz (FreeR_flag / "
                         "R-free-flags) or a .pkl of {(h,k,l): flag} on the "
@@ -699,15 +662,6 @@ DEFAULTS = dict(
 
 def add_model_args(p: argparse.ArgumentParser) -> None:
     """Flags shared by every command that builds the merge stack."""
-    p.add_argument("--skew", dest="skew", action="store_true", default=None,
-                   help="two-width (asymmetric) GenGauss scatter [default on]")
-    p.add_argument("--no-skew", dest="skew", action="store_false",
-                   help="symmetric scatter")
-    p.add_argument("--miss", type=float, default=None,
-                   help=f"miss-component fraction, 0 = off "
-                        f"[default {DEFAULTS['miss']}]")
-    p.add_argument("--w-init", type=float, default=None)
-    p.add_argument("--beta-init", type=float, default=None)
     p.add_argument("--scatter-family", default=None, choices=("gengauss", "mixture"),
                    help="scatter on the scale: one two-width GenGauss, or a mixture of "
                         "them centred on its mean with parameters from a small conditioner "
@@ -726,25 +680,6 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--m-fine", type=int, default=None)
     p.add_argument("--n-sigma", type=float, default=None,
                    help="outer-grid half-width in located sigmas")
-    p.add_argument("--max-halfwidth", type=float, default=None)
-    p.add_argument("--posterior-prior", default=None,
-                   choices=("wilson", "flat_I0"),
-                   help="prior on the outer (signal) integral [default wilson]")
-    p.add_argument("--wilson-basis", default=None, choices=("shells", "smooth"),
-                   help="Wilson prior Sigma: equal-count resolution shells, or a smooth "
-                        "symmetry-adapted surface (Chebyshev in s^2 + invariant "
-                        "anisotropy tensor) fitted by Wilson maximum likelihood "
-                        f"[default {DEFAULTS['wilson_basis']}]")
-    p.add_argument("--wilson-degree", type=int, default=None,
-                   help=f"Chebyshev degree of the smooth surface [default {DEFAULTS['wilson_degree']}]")
-    p.add_argument("--gauge-anchor", default=None, choices=("median", "mean", "basis"),
-                   help="how log K is pinned per batch: a location statistic, or the "
-                        "projection onto the same smooth basis, which removes every "
-                        "smooth resolution-dependent common mode from the scale "
-                        f"[default {DEFAULTS['gauge_anchor']}]")
-    p.add_argument("--bg-var-factor", type=float, default=None,
-                   help="background-estimate variance coefficient; default "
-                        "n_peak/n_bg from --int-radius")
     p.add_argument("--bg-mean-offset", default=None, metavar="C|auto",
                    help="add C to the background the DETECTION mean uses, "
                         "correcting the annulus estimate's bias E[B|A] = bg + "
@@ -834,10 +769,9 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     enc = dict(ck.get("encoder") or {})
     sc = dict(ck.get("scale") or {})
     scat = dict(ck.get("scatter") or {})
-    skew = resolve(args, ck, "skew") if args.skew is not None else bool(
-        scat.get("predict_skew", DEFAULTS["skew"])
-        if scat else DEFAULTS["skew"])
-    w_init = args.w_init if args.w_init is not None else sc.get("w_init", DEFAULTS["w_init"])
+    skew = bool(scat.get("predict_skew", DEFAULTS["skew"]) if scat
+                else DEFAULTS["skew"])
+    w_init = sc.get("w_init", DEFAULTS["w_init"])
     # scatter family: the checkpoint's own family wins over the defaults (a
     # checkpoint written before the key existed is the single family)
     scatter_family = (args.scatter_family if args.scatter_family is not None
@@ -848,8 +782,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                       else int(scat.get("conditioner_hidden") or DEFAULTS["scatter_hidden"]))
     scatter_shape = (args.scatter_shape if args.scatter_shape is not None
                      else str(scat.get("component_shape") or DEFAULTS["scatter_shape"]))
-    beta_init = (args.beta_init if args.beta_init is not None
-                 else sc.get("beta_init", DEFAULTS["beta_init"]))
+    beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
     kw = dict(
         d_model=enc.get("d_model") or sc.get("d_model") or DEFAULTS["d_model"],
         n_layers=enc.get("n_layers") or sc.get("n_layers") or DEFAULTS["n_layers"],
@@ -867,14 +800,13 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     kw.update(
         predict_width=bool(sc.get("predict_width", True)),
         anchor_log_k=bool(sc.get("anchor_log_k", True)),
-        anchor_stat=args.gauge_anchor or sc.get(
-            "anchor_stat", "median" if ck else DEFAULTS["gauge_anchor"]),
+        anchor_stat=sc.get("anchor_stat",
+                            "median" if ck else DEFAULTS["gauge_anchor"]),
         predict_skew=bool(skew),
     )
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
 
-    bvf = (args.bg_var_factor if args.bg_var_factor is not None
-           else (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor))
+    bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
     # CLI beats the checkpoint beats OFF.  Deliberately NOT bundle-derived:
     # silence has to mean the legacy detection model, so every checkpoint
     # written before this parameter re-merges bit-exactly.
@@ -896,9 +828,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS):
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
                          "ship SplitLogGrid only (see bench/to_mtz.py --quadrature)")
-    miss = args.miss if args.miss is not None else (
-        DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
-        else (0.5 if scat.get("miss_logit") is not None else 0.0))
+    miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
+            else (0.5 if scat.get("miss_logit") is not None else 0.0))
     obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev),
                       Poisson(bg_var_factor=float(bvf),
                               bg_mean_offset=bg_mean_offset),
@@ -919,9 +850,9 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # smooth basis existed (no "wilson_basis" key) is rebuilt as it was trained,
     # in shells / median mode, not with today's defaults.
     legacy_ckpt = bool(ck) and "wilson_basis" not in grid
-    wilson_basis = args.wilson_basis or grid.get(
+    wilson_basis = grid.get(
         "wilson_basis", "shells" if legacy_ckpt else DEFAULTS["wilson_basis"])
-    wilson_degree = int(args.wilson_degree or grid.get("wilson_degree", DEFAULTS["wilson_degree"]))
+    wilson_degree = int(grid.get("wilson_degree", DEFAULTS["wilson_degree"]))
     # One smooth reciprocal-space basis for the prior's Sigma(h) and the scale's
     # gauge pin, built from the prepared reflections, the median cell and the
     # space group -- so a merge rebuilds exactly the basis the network trained on.
@@ -936,8 +867,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         k_coarse=int(args.k_coarse or DEFAULTS["k_coarse"]),
         m_fine=int(args.m_fine or DEFAULTS["m_fine"]),
         n_sigma=float(args.n_sigma or DEFAULTS["n_sigma"]),
-        max_halfwidth=float(args.max_halfwidth or DEFAULTS["max_halfwidth"]),
-        prior=args.posterior_prior or "wilson",
+        max_halfwidth=float(DEFAULTS["max_halfwidth"]),
+        prior="wilson",
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
         skew=bool(skew), miss=float(miss),

@@ -60,22 +60,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--out", type=Path, required=True)
     p.add_argument("--estimator", default="posterior",
                    choices=("posterior", "flat", "ml", "pooled", "mean", "wls"))
-    p.add_argument("--merge-split", default=None, metavar="NAME_OR_INDEX",
-                   help="merge only this split (default: the first)")
     p.add_argument("--all-splits", action="store_true",
                    help="merge every split, writing <out stem>_<name><suffix>")
-    p.add_argument("--no-half-datasets", dest="half_datasets",
-                   action="store_false", default=True,
-                   help="skip the half-dataset merges.  By default every split "
-                        "is also merged as two random halves of its crystals, "
-                        "giving CC1/2 and R_split the way partialator's "
-                        ".hkl1/.hkl2 do -- a merge with no internal consistency "
-                        "statistic is not a result anyone can judge.  The "
-                        "halves are written next to the full merge so the "
-                        "numbers can be recomputed independently.  Costs two "
-                        "extra merges per split.")
-    p.add_argument("--half-seed", type=int, default=0,
-                   help="seed for the crystal half-split")
     p.add_argument("--no-scale-calibration", dest="scale_calibration",
                    action="store_false", default=True,
                    help="write the raw posterior as the main product and skip "
@@ -83,9 +69,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--calib-degree", default="9,9", metavar="NX,NY",
                    help="Chebyshev degrees of the scale-calibration surface in "
                         "s^2 and log I")
-    p.add_argument("--unity", action="store_true",
-                   help="ignore the trained weights and merge at K = 1 -- the "
-                        "reference every trained run has to beat")
+    p.add_argument("--half-seed", type=int, default=0,
+                   help="seed for the crystal half-split")
     p.add_argument('--feature-reference', choices=('exact', 'legacy', 'ema'),
                    default='exact', help='Versioned checkpoint-context experiment')
     return p
@@ -109,8 +94,7 @@ def main(argv: list[str] | None = None) -> None:
         posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
         posterior_n_sigma=S["n_sigma"], posterior_max_halfwidth=S["max_halfwidth"],
         stream_batches=args.stream_batches,
-        locate_windows=tuple(float(x) for x in args.locate_windows.split(","))
-        if args.locate_windows else (8.0, 1.0, 0.125),
+        locate_windows=(8.0, 1.0, 0.125),
         posterior_prior=S["prior"],
         wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
         heldout_frac=0.05, device=S["device"], outdir=str(args.out.parent),
@@ -118,37 +102,27 @@ def main(argv: list[str] | None = None) -> None:
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     if S.get("basis") is not None:
         tr.set_reciprocal_basis(S["basis"], smooth_prior=S["wilson_basis"] == "smooth")
-    if not args.unity:
-        # Checkpoints written before the data buffers were made non-persistent
-        # carry the training set's own _I/_bg/_sigma, whose length is that data
-        # set's observation count; drop them rather than refuse to merge a
-        # different set.  Everything the model actually needs must be present.
-        want = scale.state_dict()
-        have = {k: v for k, v in ckpt["state_dict"].items() if k in want}
-        missing = [k for k in want if k not in have]
-        if missing:
-            raise SystemExit(f"checkpoint is missing {len(missing)} parameters, "
-                             f"first {missing[:3]}")
-        scale.load_state_dict(have)
-        from torchsx.nn.checkpoint_context import load_checkpoint_context
-        load_checkpoint_context(tr, ckpt, args.feature_reference)
-    else:
-        print("  --unity: merging at K = 1 with the untrained (zero-init) heads",
-              flush=True)
-    if args.unity or args.feature_reference != 'exact':
+    # Checkpoints written before the data buffers were made non-persistent
+    # carry the training set's own _I/_bg/_sigma, whose length is that data
+    # set's observation count; drop them rather than refuse to merge a
+    # different set.  Everything the model actually needs must be present.
+    want = scale.state_dict()
+    have = {k: v for k, v in ckpt["state_dict"].items() if k in want}
+    missing = [k for k in want if k not in have]
+    if missing:
+        raise SystemExit(f"checkpoint is missing {len(missing)} parameters, "
+                         f"first {missing[:3]}")
+    scale.load_state_dict(have)
+    from torchsx.nn.checkpoint_context import load_checkpoint_context
+    load_checkpoint_context(tr, ckpt, args.feature_reference)
+    if args.feature_reference != 'exact':
         tr._refresh_wilson_sigma()
     scale.eval()
 
     names = ckpt.get("splits") or bundle.split_names or [""]
     if tr.n_conditions != max(len(names), 1) and tr.n_conditions > 1:
         names = [str(i) for i in range(tr.n_conditions)]
-    if args.all_splits:
-        wanted = list(range(tr.n_conditions))
-    elif args.merge_split is not None:
-        wanted = [names.index(args.merge_split)
-                  if args.merge_split in names else int(args.merge_split)]
-    else:
-        wanted = [0]
+    wanted = list(range(tr.n_conditions)) if args.all_splits else [0]
 
     if args.estimator == "posterior":
         merge_products(tr, prep, args, names, wanted, spacegroup=bundle.spacegroup)
@@ -216,10 +190,8 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str, verbose: b
 
     for k in wanted:
         cond = k if tr.n_conditions > 1 else None
-        sets = [(0, None)]
-        if args.half_datasets:
-            h1, h2 = _split_halves(tr, k, args.half_seed)
-            sets += [(1, h1), (2, h2)]
+        h1, h2 = _split_halves(tr, k, args.half_seed)
+        sets = [(0, None), (1, h1), (2, h2)]
         for half, crystals in sets:
             post = tr.merge(crystals=crystals, condition=cond, estimator="posterior")
             pool = (tr.merge(crystals=crystals, condition=cond, estimator="pooled")
@@ -290,7 +262,7 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str, verbose: b
                 P.write_mtz(out.with_name(f"{stem}{out.suffix}"), hkl, F, F_sd,
                             cell=cell, spacegroup=spacegroup, work=work, keep=keep, verbose=verbose and half == 0)
         rec = {"split": label, "products": ["scaled_posterior", "posterior", "pooled"] if surface is not None else ["posterior"]}
-        if args.half_datasets and (k, 1) in merges and (k, 2) in merges:
+        if (k, 1) in merges and (k, 2) in merges:
             a, b = merges[(k, 1)][0], merges[(k, 2)][0]
             raw = _split_half_stats(a, b, d)
             if raw is not None:
@@ -338,27 +310,26 @@ def merge_single_estimator(tr, prep, args, names, wanted, *, spacegroup: str) ->
             print("  nothing written for this split", flush=True)
             continue
         P.report_merge(res)
-        if args.half_datasets:
-            h1, h2 = _split_halves(tr, k, args.half_seed)
-            halves = [tr.merge(crystals=part, condition=cond, estimator=args.estimator) for part in (h1, h2)]
-            key = "I" if args.estimator in ("pooled", "mean", "wls") else "F"
-            for j, r in enumerate(halves):
-                keep_h = r["seen"].cpu().numpy() & np.isfinite(r[key].detach().cpu().numpy())
-                if not keep_h.any():
-                    print(f"  half{j + 1}: no usable reflections -- not written", flush=True)
-                    continue
-                ho = out.with_name(f"{out.stem}_half{j + 1}{out.suffix}")
-                if key == "F":
-                    P.write_mtz(ho, hkl, r["F"], r["F_sd"], cell=cell, spacegroup=spacegroup,
-                                work=P.work_mask(hkl, args, verbose=False), keep=keep_h, verbose=False)
-                else:
-                    P.write_hkl(ho.with_suffix(".hkl"), hkl, r["I"], r["I_sd"], r["n_meas"], keep_h, verbose=False)
-            st = _split_half_stats(halves[0], halves[1], prep.d_spacing.detach().cpu().numpy(),
-                                   key="I0" if key == "F" else "I")
-            if st is not None:
-                print(f"  half-datasets  CC1/2 {st['cc_half']:.4f}  R_split {st['r_split']:.4f}  "
-                      f"(outer 10 % shell d<={st['d_outer']:.2f} A: CC1/2 {st['cc_half_outer']:.4f})  on {st['n']:,} reflections",
-                      flush=True)
+        h1, h2 = _split_halves(tr, k, args.half_seed)
+        halves = [tr.merge(crystals=part, condition=cond, estimator=args.estimator) for part in (h1, h2)]
+        key = "I" if args.estimator in ("pooled", "mean", "wls") else "F"
+        for j, r in enumerate(halves):
+            keep_h = r["seen"].cpu().numpy() & np.isfinite(r[key].detach().cpu().numpy())
+            if not keep_h.any():
+                print(f"  half{j + 1}: no usable reflections -- not written", flush=True)
+                continue
+            ho = out.with_name(f"{out.stem}_half{j + 1}{out.suffix}")
+            if key == "F":
+                P.write_mtz(ho, hkl, r["F"], r["F_sd"], cell=cell, spacegroup=spacegroup,
+                            work=P.work_mask(hkl, args, verbose=False), keep=keep_h, verbose=False)
+            else:
+                P.write_hkl(ho.with_suffix(".hkl"), hkl, r["I"], r["I_sd"], r["n_meas"], keep_h, verbose=False)
+        st = _split_half_stats(halves[0], halves[1], prep.d_spacing.detach().cpu().numpy(),
+                               key="I0" if key == "F" else "I")
+        if st is not None:
+            print(f"  half-datasets  CC1/2 {st['cc_half']:.4f}  R_split {st['r_split']:.4f}  "
+                  f"(outer 10 % shell d<={st['d_outer']:.2f} A: CC1/2 {st['cc_half_outer']:.4f})  on {st['n']:,} reflections",
+                  flush=True)
         seen = res["seen"].cpu().numpy()
         if args.estimator in ("pooled", "mean", "wls"):
             P.write_hkl(out.with_suffix(".hkl"), hkl, res["I"], res["I_sd"], res["n_meas"], seen)

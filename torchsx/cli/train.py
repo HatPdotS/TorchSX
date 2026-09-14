@@ -61,8 +61,6 @@ def _build_parser() -> argparse.ArgumentParser:
                         "carried between data sets silently changes the "
                         "objective (1.5 M obs is 106 obs/reflection on a 14 k "
                         "cell and 13 on a 114 k one).")
-    p.add_argument("--max-obs", type=int, default=1_500_000,
-                   help="batch size in observations when --redundancy is unset")
     p.add_argument("--heldout-frac", type=float, default=0.05)
     p.add_argument("--chunk-crystals", type=int, default=0,
                    help="crystals per encoder chunk (0 = whole batch).  The "
@@ -70,16 +68,6 @@ def _build_parser() -> argparse.ArgumentParser:
                         "exact; 400 is what makes redundancy 200 fit on 40 GB.")
     p.add_argument("--node-ckpt", action="store_true",
                    help="recompute outer quadrature nodes in backward")
-    p.add_argument("--lam0", type=float, default=10.0,
-                   help="EMA prior strength on the in-batch merge target")
-    p.add_argument("--lam-halflife", type=int, default=400,
-                   help="steps for lam0 to halve; 0 = no decay.  400 is what "
-                        "the scored SwissFEL run used (bench/asym.py), so it "
-                        "is the default: the prior carries the in-batch target "
-                        "through the early steps and is gone by the time the "
-                        "model can stand on its own.")
-    p.add_argument("--warmup", type=int, default=100,
-                   help="linear LR warmup steps (100 in the scored run)")
     p.add_argument("--train-k-coarse", type=int, default=31)
     p.add_argument("--train-m-fine", type=int, default=129)
     p.add_argument("--train-n-sigma", type=float, default=6.0,
@@ -92,7 +80,6 @@ def _build_parser() -> argparse.ArgumentParser:
                         "grid edge in a full merge.")
     p.add_argument("--split-half-every", type=int, default=0,
                    help="run the CC1/2 / R_split merge every N epochs")
-    p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--estimator", default="posterior",
                    choices=("posterior", "flat", "ml", "pooled", "mean"),
                    help="estimator for the final merge (see torchsx-merge-nn)")
@@ -113,17 +100,16 @@ def main(argv: list[str] | None = None) -> None:
         scale.set_encoder_chunking(args.chunk_crystals)
 
     cfg = TrainConfig(
-        max_obs_per_batch=args.max_obs,
+        max_obs_per_batch=1_500_000,
         target_redundancy=args.redundancy,
         epochs=args.epochs, lr=args.lr, mixture_lr_mult=args.mixture_lr_mult,
-        lam0=args.lam0, lam_halflife_steps=args.lam_halflife,
-        warmup_steps=args.warmup, grad_clip=20.0, log_every=args.log_every,
+        lam0=10.0, lam_halflife_steps=400,
+        warmup_steps=100, grad_clip=20.0, log_every=10,
         merge_target="posterior", loss="evidence",
         posterior_k_coarse=args.train_k_coarse, posterior_m_fine=args.train_m_fine,
         posterior_n_sigma=args.train_n_sigma,
         posterior_max_halfwidth=S["max_halfwidth"],
-        locate_windows=tuple(float(x) for x in args.locate_windows.split(","))
-        if args.locate_windows else (8.0, 1.0, 0.125),
+        locate_windows=(8.0, 1.0, 0.125),
         posterior_prior=S["prior"],
         wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
         posterior_checkpoint_nodes=args.node_ckpt,
