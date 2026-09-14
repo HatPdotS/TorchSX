@@ -1,34 +1,103 @@
-# TorchSX
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/torchsx-banner-dark.png">
+    <img src="assets/torchsx-banner-light.png" alt="TorchSX" width="420">
+  </picture>
+</p>
 
-TorchSX scales and merges indexed serial crystallography observations with a
-shared neural network and a posterior likelihood. It starts from integrated
-observations; peak finding and indexing belong to CrystFEL, Probixi or DIALS.
+<h1 align="center">A Py<ins>Torch</ins>-based scaling and merging library for serial crystallography (<ins>SX</ins>)</h1>
 
-## Install
+<div align="center">
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.4+-ee4c2c.svg)](https://pytorch.org/)
+[![TorchRef](https://img.shields.io/badge/TorchRef-0.6.4+-f97316.svg)](https://github.com/HatPdotS/TorchRef)
+[![CUDA](https://img.shields.io/badge/CUDA-supported-76b900.svg)](https://developer.nvidia.com/cuda-zone)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+</div>
+
+In serial crystallography every reflection is seen once per crystal, with an
+unknown partiality, incident intensity and crystal volume. Established programs
+scale each crystal with a few parameters and average. TorchSX instead trains one
+neural network per dataset that predicts, for every observation, a scale factor
+and the parameters of a multiplicative scatter distribution from that
+observation's crystal- and image-level context.
+
+Merging is then a posterior integral rather than an average: for each reflection
+the latent intensity is integrated under a Wilson prior over a per-observation
+likelihood that convolves the learned scatter law with a Poisson detector law,
+including the variance of the background estimate. The amplitude and its
+uncertainty come out of the same posterior, and the network is trained on the
+marginal likelihood of the data alone — never against a reference structure.
+
+> **Scope.** TorchSX starts from integrated observations; peak finding and
+> indexing belong to CrystFEL or Probixi, and refinement to TorchRef.
+> Training length remains an empirical setting: validation NLL is not established
+> as an optimum for independent difference-map precision.
+
+## Where it sits
+
+TorchSX occupies the scaling and merging step. TorchRef sits on both sides of it
+— it is the tensor, structure-factor and GPU substrate TorchSX is built on, and
+it provides the refinement and difference-map tools that consume the merge.
+
+```
+  CrystFEL / Probixi           TorchSX                    TorchRef
+  -----------------------  ->  ---------------------  ->  ---------------
+  peak finding, indexing,      amortized scaling,         refinement,
+  integration                  posterior merging          difference maps
+
+  .stream                      F, sigma(F) per state      model, maps
+```
+
+## Key features
+
+- **Amortized scaling.** One network predicts a per-observation scale and scatter
+  law from crystal- and image-level context, rather than fitting a handful of
+  parameters per crystal.
+
+- **Posterior merging.** The merged amplitude and its standard uncertainty are
+  moments of one posterior integral, not an average and a propagated error.
+
+- **Reference-free objective.** Training maximizes the marginal likelihood of the
+  observations. No reference structure, target set or external intensity enters
+  the objective.
+
+- **Joint multi-state training.** Light and dark (or any set of labelled states)
+  share one network while remaining separate merge targets. The state label is
+  not a network feature.
+
+- **Gain calibrated from the data.** The detector gain is estimated from the input
+  and reconciled with its declared value, because converting to photons wrongly
+  misspecifies the detector law.
+
+- **GPU quadrature.** The posterior integral runs as a Triton kernel with an
+  analytic backward pass; encoder chunking bounds GPU memory without reducing the
+  requested statistical batch support.
+
+- **Built on PyTorch.** PyTorch throughout, so the model, likelihood and
+  quadrature are ordinary differentiable modules that compose with the rest of a
+  PyTorch workflow, maybe at some point we differentiate the model against all the data? 
+
+## Quickstart
 
 ```bash
 pip install -e .
+
+torchsx-train indexed.stream --spacegroup 'P 63' --dmin 2.0 --steps 800 -o run/
 ```
 
-Python >=3.10 and TorchRef >=0.6.4 are required. Optional extras are `native`
-(for building the stream parser), `duckdb` (the existing Probixi reader),
-`stats` (Matplotlib for distribution plots) and `dev`.
+That writes checkpoints and merged MTZs into `run/`. Everything below expands on
+it: separate readout of a checkpoint, joint light/dark states, difference maps,
+and the observation statistics that motivate the model.
 
-## Raw-distribution figures
+## Install
 
-```bash
-pip install -e '.[stats]'
-torchsx-stats indexed.stream --spacegroup 'P 63' -o figures/
-```
-
-Writes **PNG only**: raw intensities, reflection skewness, normalized mean–median
-gaps and individual reflection examples. The default samples 50K crystals in
-complete images; use `--sample-crystals all` for the full dataset. The cell comes
-from the input. Named inputs and CrystFEL custom splits are supported.
-
-These figures describe the observations that motivate scaling and likelihood
-modeling. They complement the independent precision and accuracy comparisons.
-[Plot interpretation, CLI controls and cache replay](docs/stats.md).
+Python >=3.10 and TorchRef >=0.6.4 are required; TorchRef brings torch, triton
+and gemmi. Optional extras are `native` (for building the stream parser),
+`duckdb` (the existing Probixi reader), `stats` (Matplotlib for distribution
+plots) and `dev`, installed as `pip install -e '.[stats,native]'`.
 
 ## Train and merge
 
@@ -54,6 +123,10 @@ observations per reflection). A small state uses all its available training
 crystals. Data stay on the host; encoder chunking and quadrature recomputation
 bound GPU memory without reducing the requested statistical batch support.
 Parser workers respect the available CPU allocation, capped at eight.
+
+Measurement policy, gain selection and the full public option surface —
+`--gain`, `--int-radius`, `--free-from`, `--cache`, `--seed` and the rest — are
+in the [command-line reference](docs/cli.md).
 
 ## Joint light/dark inputs
 
@@ -106,71 +179,21 @@ light/dark runs, with disjoint pattern sets; do not impose an extra reserved-HKL
 subset. Use TorchSX amplitude/sigma MTZs and Partialator intensity/sigma MTZs,
 letting TorchRef perform its own intensity-to-amplitude conversion.
 
-## Measurement and gain
+## Raw-distribution figures
 
-CrystFEL loading retains raw intensities, backgrounds, sigmas and integration
-metadata. Ring radii resolve from an explicit `--int-radius`, then the checkpoint,
-then the input's recorded integration command. Missing radii need an explicit
-value, for example `--int-radius 3,4,7`. Unsupported integration semantics are
-rejected. Nominal aperture counts do not account for masked or clipped pixels.
+```bash
+pip install -e '.[stats]'
+torchsx-stats indexed.stream --spacegroup 'P 63' -o figures/
+```
 
-`--gain` accepts:
+Writes **PNG only**: raw intensities, reflection skewness, normalized mean–median
+gaps and individual reflection examples. The default samples 50K crystals in
+complete images; use `--sample-crystals all` for the full dataset. The cell comes
+from the input. Named inputs and CrystFEL custom splits are supported.
 
-| Value | Behavior |
-|---|---|
-| `auto` (default) | Compare input and calibrated gains; replace input when the relative discrepancy exceeds 50%. |
-| `trust_input` | Use the datasource declaration without calibration. |
-| `calibrate` | Always use a valid calibrated estimate; fail if unavailable. |
-| Positive finite number | Explicit ADU/photon gain. |
-
-Auto retains a valid input gain when calibration is unavailable and uses valid
-calibration when input gain is missing. It fails when neither is usable. Invalid
-arguments report the received value and accepted choices. The resolved gain,
-selection reason and calibration diagnostics are recorded; checkpoint readout
-reuses the selected numeric gain. The legacy `stream` spelling remains a Python
-recipe alias for `trust_input`.
-
-New training uses the annulus background-mean correction inferred from integration
-metadata and a four-component Gaussian mixture. Gain conversion, background-mean
-correction and posterior uncertainty are distinct operations. Existing checkpoints
-retain their recorded scatter family and background convention.
-
-## Public controls and reproducibility
-
-The shared options are `--out`, `--split`, `--split-file`, `--spacegroup`,
-`--dmin`, `--dmax`, `--gain`, `--int-radius`, `--merge-friedel`/`--no-merge-friedel`, `--free-from`,
-`--device`, `--cache` and `--seed`. Training adds `--steps`, `--redundancy` and
-`--no-merge`. Friedel mates are merged by default; checkpoint readout inherits
-the recorded choice unless overridden. `--no-merge-friedel` keeps acentric mates
-separate and writes (+)/(−) columns. Bijvoet mates share refinement free flags.
-
-Use `--free-from existing.mtz` to preserve a refinement free set. Otherwise the
-existing default 5% free-flag export policy applies. Refinement free flags are
-export annotations, distinct from validation crystals and the diagnostic halves;
-no reflections are removed from the difference calculation by these flags.
-
-`--seed` controls initialization and batch sampling, with a derived diagnostic
-half seed. Merge reuses the saved run seed unless overridden. Refinement free-flag
-assignment retains its separate fixed seed, so changing the training seed does
-not deliberately change the refinement comparison.
-
-`--cache` names a prepared cache (default `RUN/prepared.pt`; merge uses the
-checkpoint directory). Input contents, labels, measurement policy and preparation
-settings are validated. Identical files may move without invalidating the cache;
-source hashes cost one sequential input read. Inputs must remain available for
-validation. Changed data/settings and older cache schemas require a new cache
-path. There is no bypass flag. Original input paths remain recorded as provenance.
-
-Model, likelihood and quadrature settings are internal and recorded in each run.
-Training uses the 31/129/6 outer grid; readout uses 63/257/24, with inner 192 and
-locating windows 8/1/0.125. The resolved recipe records learning rates, per-state
-warmup/decay, resource policy and evaluation cadence. Research variants use the
-Python API rather than another public configuration language.
-
-Historical experiment scripts using removed flags or the retired correction need
-their original source revision. Checkpoints with recorded inference context remain
-readable; older checkpoints without it need the original versioned recipe or
-retraining. This cleanup does not assert new accuracy or data-efficiency results.
+These figures describe the observations that motivate scaling and likelihood
+modeling. They complement the independent precision and accuracy comparisons.
+[Plot interpretation, CLI controls and cache replay](docs/stats.md).
 
 ## Datasource API
 
@@ -180,10 +203,29 @@ from torchsx import SFXStream, SourceInput
 stream = SFXStream.read('indexed.stream', spacegroup='P 63')
 print(stream.measurement)
 probixi = SourceInput('probixi', {'database': 'run.duckdb'})
-dials = SourceInput('dials', {'experiments': 'run.expt', 'reflections': 'run.refl'})
 ```
 
-CrystFEL is implemented through the measurement adapter. Probixi and DIALS
-measurement adapters remain reserved seams; the existing `SFXStream.from_duckdb`
+CrystFEL is implemented through the measurement adapter. The Probixi
+measurement adapter remains a reserved seam; the existing `SFXStream.from_duckdb`
 reader is available separately. Filtering and storage retain source identities
 and measurement provenance.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/cli.md](docs/cli.md) | Measurement policy, gain selection, the full public option surface, caching and reproducibility |
+| [docs/stats.md](docs/stats.md) | `torchsx-stats` plot interpretation, CLI controls and cache replay |
+
+Design notes recording why the model looks the way it does:
+[scaling_merging](docs/scaling_merging.md),
+[optimize_integration](docs/optimize_integration.md),
+[sparse_poisson_loss](docs/sparse_poisson_loss.md),
+[fused_gaussian_mixture](docs/fused_gaussian_mixture.md) and
+[crystfel_ingestion_validation](docs/crystfel_ingestion_validation.md). The
+remaining files in `docs/` are working plans and drafts, kept as a record of the
+decisions rather than as current interface documentation.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
