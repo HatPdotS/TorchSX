@@ -238,7 +238,6 @@ def test_checkpoint_carries_the_recipe(tmp_path):
     ck = torch.load(tr.save_best(tmp_path / "best.pt"), weights_only=False)
     assert ck["data"]["radii"] == [7.0, 9.0, 11.0]
     assert ck["likelihood"]["bg_var_factor"] == pytest.approx(0.1)
-    assert ck["likelihood"]["bg_var_mode"] == "deviance"
     assert ck["scatter"]["predict_skew"] and not ck["scatter"]["global_skew"]
     assert ck["quadrature"] == {"kind": "SplitLogGrid", "n_points": 64}
     assert ck["scale"]["predict_shape"] is False and ck["scale"]["unity_k"] is False

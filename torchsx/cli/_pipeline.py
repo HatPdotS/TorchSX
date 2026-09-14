@@ -745,7 +745,6 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bg-var-factor", type=float, default=None,
                    help="background-estimate variance coefficient; default "
                         "n_peak/n_bg from --int-radius")
-    p.add_argument("--bg-var-mode", choices=("deviance", "second_order"), default=None)
     p.add_argument("--bg-mean-offset", default=None, metavar="C|auto",
                    help="add C to the background the DETECTION mean uses, "
                         "correcting the annulus estimate's bias E[B|A] = bg + "
@@ -886,8 +885,6 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
 
     bvf = (args.bg_var_factor if args.bg_var_factor is not None
            else (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor))
-    mode = (args.bg_var_mode
-            or (ck.get("likelihood") or {}).get("bg_var_mode") or "deviance")
     # CLI beats the checkpoint beats OFF.  Deliberately NOT bundle-derived:
     # silence has to mean the legacy detection model, so every checkpoint
     # written before this parameter re-merges bit-exactly.
@@ -916,7 +913,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
         else (0.5 if scat.get("miss_logit") is not None else 0.0))
     obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev),
-                      Poisson(bg_var_factor=float(bvf), bg_var_mode=mode,
+                      Poisson(bg_var_factor=float(bvf),
                               bg_mean_offset=bg_mean_offset),
                       miss_frac=float(miss)).to(dev)
     if scat.get("miss_logit") is not None and obj.miss_logit is not None:
@@ -954,7 +951,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         n_sigma=float(args.n_sigma or DEFAULTS["n_sigma"]),
         max_halfwidth=float(args.max_halfwidth or DEFAULTS["max_halfwidth"]),
         prior=args.posterior_prior or "wilson",
-        bg_var_factor=float(bvf), bg_var_mode=mode,
+        bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
         skew=bool(skew), miss=float(miss),
         wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
@@ -967,7 +964,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
               f"miss {miss:.3f}, SplitLogGrid({n_points}), "
               f"outer {settings['k_coarse']}/{settings['m_fine']} "
               f"n_sigma {settings['n_sigma']:g}, "
-              f"Poisson(bg_var={bvf:.4f}, {mode}"
+              f"Poisson(bg_var={bvf:.4f}"
               + (f", bg_mean+{bg_mean_offset:.4f}" if bg_mean_offset else "")
               + f"), device {dev}", flush=True)
         if bg_mean_offset:

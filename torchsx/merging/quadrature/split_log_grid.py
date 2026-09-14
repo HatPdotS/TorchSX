@@ -33,10 +33,8 @@ Everything about the grid is a function of ``(n_ph, bg)`` only.  That is the
 property that makes it a legal quadrature for training: the node positions
 never depend on ``log_mean``, ``alpha`` or ``beta``, so the integral is a
 smooth function of the parameters and the analytic per-node gradients of the
-Triton kernel remain exact.  The earlier data-driven grids (``TrapezoidalLogGrid``,
-``HybridLogGrid``) failed because their windows were built from the Poisson
-factor alone and *cut* the scatter tail; here the tail is not cut, it is
-integrated in closed form.
+Triton kernel remain exact.  The window is sized from the Poisson factor but
+does not cut the scatter tail: the tail is integrated in closed form.
 
 The window is 7-15 nats for the real dark stream against the fixed grid's 69,
 so the same 0.1-nat resolution the narrowest predicted scatter (``w = 0.38``)
@@ -105,7 +103,6 @@ class SplitLogGrid(Quadrature):
         only when ``sigma_x / 2`` is below the coarse spacing.
     """
 
-    requires_per_call_posterior: bool = True
 
     def __init__(
         self,
@@ -250,8 +247,7 @@ class SplitLogGrid(Quadrature):
                 and 1 <= scatter.n_components <= 8
                 and log_mean.is_cuda and log_mean.dtype == torch.float32
                 and bg.dtype == torch.float32 and not bg.requires_grad
-                and isinstance(likelihood, Poisson)
-                and likelihood.bg_var_mode == "deviance"):
+                and isinstance(likelihood, Poisson)):
             mix = scatter.mixture_obs(meta)
             if mix.dtype == torch.float32:
                 sig_b2 = self._sig_b2(likelihood, bg)
@@ -300,8 +296,6 @@ class SplitLogGrid(Quadrature):
             raise NotImplementedError("SplitLogGrid needs a GenGauss scatter (tail CDF)")
         if not isinstance(likelihood, Poisson):
             raise NotImplementedError("SplitLogGrid is written for the Poisson likelihood")
-        if getattr(likelihood, "bg_var_mode", "deviance") == "second_order":
-            raise NotImplementedError("second_order background mode is not supported")
         K = self.n_points
         log_alpha_obs, log_beta_obs = scatter.log_alpha_beta_obs(params, meta)
         log_alpha_hi_obs = scatter.log_alpha_hi_obs(params, meta)   # None = symmetric

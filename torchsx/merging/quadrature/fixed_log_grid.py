@@ -1,20 +1,20 @@
 """Fixed-range uniform log_S grid: no centering on log_mean, n, or bg.
 
-Both ``TrapezoidalLogGrid`` (centered on the Poisson MLE ``n - bg``) and
-``WideLogGrid`` (centered on the gengauss prior mode ``log_mean``) bake
-in an assumption about where the integrand has mass.  This quadrature
-makes no such assumption — the grid is the same tensor for every
-observation and every µ-coarse posterior offset:
+The grid is the same tensor for every observation and every mu-coarse
+posterior offset::
 
-    log_S ∈ [log(S_min), log(S_max)],  uniform, K nodes
+    log_S in [log(S_min), log(S_max)],  uniform, K nodes
 
-with trapezoidal weights ``Δlog_S`` (half on the endpoints).  At the
-default ``S_min=1e-3, S_max=1e6, n_points=10001`` the spacing is
-``Δlog_S ≈ 2.07e-3`` over a 9-decade window — wide enough that the
-likelihood × scatter integrand is numerically zero at both ends for any
-realistic ``log_mean``, and dense enough that the discretisation error
-sits below MC noise.  Used as a reference to test whether the
-centering choice in the other grids biases the merged intensities.
+with trapezoidal weights ``d log_S`` (half on the endpoints).  At the default
+``S_min=1e-3, S_max=1e6, n_points=10001`` the spacing is ``d log_S ~ 2.07e-3``
+over a 9-decade window — wide enough that the likelihood x scatter integrand is
+numerically zero at both ends for any realistic ``log_mean``, and dense enough
+that the discretisation error sits below MC noise.
+
+Because the nodes never move, the MAP marginal and every posterior offset are
+integrated on one grid.  This is what the posterior readout uses;
+:mod:`~torchsx.merging.quadrature.split_log_grid` places nodes per observation
+and is what training uses.
 """
 from __future__ import annotations
 
@@ -76,11 +76,7 @@ class FixedLogGrid(Quadrature):
     """Uniform log_S grid in absolute coordinates ``[log(S_min), log(S_max)]``.
 
     The grid is independent of ``log_mean``, ``n_ph``, ``bg``, and any
-    iterate — same K nodes for every observation, every µ-coarse offset.
-    ``requires_per_call_posterior = True`` so the merger routes posterior
-    moment computation through ``compute_posterior_moments_per_call``,
-    which keeps the MAP marginal and every posterior offset on this same
-    fixed grid (no fallback to the softplus inner grid).
+    iterate — same K nodes for every observation, every mu-coarse offset.
 
     Parameters
     ----------
@@ -91,7 +87,6 @@ class FixedLogGrid(Quadrature):
         Number of nodes (default 10001 → ``Δlog_S ≈ 2.07e-3``).
     """
 
-    requires_per_call_posterior: bool = True
 
     def __init__(
         self,
@@ -173,8 +168,7 @@ class FixedLogGrid(Quadrature):
                 log_mean, n_ph, bg_mean, log_alpha_obs, log_beta_obs,
                 self.log_S_grid, log_w,
                 sig_b2=sig_b2,
-                bg_deviance=getattr(likelihood, "bg_var_mode", "deviance")
-                != "second_order",
+                bg_deviance=True,
             )
 
         # Eager fallback — bit-exact w.r.t. the original implementation.

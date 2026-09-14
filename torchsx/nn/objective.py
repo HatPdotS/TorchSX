@@ -52,42 +52,18 @@ _LOG_2PI = math.log(2.0 * math.pi)
 
 
 def wide_log_grid(n_points: int = 2001):
-    """DEPRECATED — widening a *fixed* grid is not the fix.  Use
-    :class:`~torchsx.merging.quadrature.wide_log_grid.WideLogGrid`, whose grid
-    is per observation (``log_S = log_mean + alpha*u``) so it follows the
-    integrand.
+    """A :class:`~torchsx.merging.quadrature.fixed_log_grid.FixedLogGrid` wide
+    enough that the scatter never falls off it.
 
-    Widening a fixed grid pads it with nodes where the detector likelihood and
-    the scatter prior have no overlap at all, wasting resolution for nothing.
+    The grid spans ``log S`` in [-34.5, 34.5], which holds +-5 sigma for scatter
+    widths up to ``w ~ 5`` — beyond anything physical, since ``w = 5`` already
+    means the scale varies by a factor of ``e^5 = 148``.  A narrower window
+    truncates the GenGauss tail for ``alpha`` above ~2.5, and a truncated
+    marginal is no longer a density.
 
-    It also removes an accidental brake.  Measured on the real dark: with the
-    default narrow grid the width head ran to w = 6.75; with this wide fixed
-    grid it ran to **26.96**, with beta pinned at the 4.0 ceiling.  Truncation
-    was penalising ``alpha`` above ~2.5 and capping the runaway.
-
-    **The runaway is not a quadrature artefact.**  A side-by-side sweep of
-    NLL vs w over Trapezoidal, Wide and Fixed grids agrees to <0.01 nat and
-    puts the minimum in the same place for all three, with a clean rise on
-    either side.  The integral is fine; what runs away is the *joint* training
-    dynamics of K, the leave-one-out target and w, which the static sweep
-    cannot see because it holds ``log_mean`` at the converged value.
-
-    Prefer :class:`~torchsx.merging.quadrature.trapezoidal.TrapezoidalLogGrid`,
-    the pipeline default: its grid is per observation and data-driven, so nodes
-    land where the detector likelihood has mass.
-
-    A ``FixedLogGrid`` wide enough that the scatter never falls off it.
-
-    The default grid spans ``log S`` in [-6.9, 13.8] — only 20.7 wide — so a
-    GenGauss with ``alpha`` above ~2.5 already loses mass off the ends and the
-    marginal stops being a density (measured: 81.4 % of the mass in-grid at
-    w = 6.75, 54.7 % at w = 12).
-
-    This spans [-34.5, 34.5], which holds +-5 sigma for widths up to w ~ 5 —
-    comfortably beyond anything physical, since w = 5 already means the scale
-    varies by a factor of e^5 = 148.  At ``n_points=2001`` the spacing is 0.034,
-    slightly *finer* than the default grid's 0.041, and the runtime sweep showed
-    the node count barely matters (K 501 -> 10001 cost 26 % wall clock).
+    At ``n_points=2001`` the node spacing is 0.034.  Cost is close to flat in
+    the node count (K 501 -> 10001 is 26 % wall clock), so the default is set
+    by resolution rather than by budget.
     """
     from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
     import math as _m

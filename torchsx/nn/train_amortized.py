@@ -1051,9 +1051,6 @@ class AmortizedTrainer:
                     "bg_var_factor": float(getattr(
                         getattr(self.objective, "likelihood", None),
                         "bg_var_factor", 0.0) or 0.0),
-                    "bg_var_mode": getattr(
-                        getattr(self.objective, "likelihood", None),
-                        "bg_var_mode", None),
                     "bg_mean_offset": _bg_mean_offset(self.objective),
                 },
                 "data": dict(self.data_recipe or {}),

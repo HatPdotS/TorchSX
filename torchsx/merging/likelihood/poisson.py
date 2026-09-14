@@ -79,36 +79,10 @@ class Poisson(DetectionLikelihood):
         exact marginal over the annulus's Gamma posterior, and only 0.32× as
         wide in the weakest quartile.
 
-    bg_var_mode
-        How the background estimate's variance enters, when
-        ``bg_var_factor > 0``.
-
-        ``"deviance"`` (default) scales the Poisson deviance by the dispersion
-        ``φ = 1 + σ_b²/λ`` — the saddlepoint density of the overdispersed law
-        with ``Var = λ + σ_b²``:
-
-        .. math::
-            \log p = -\frac{D(n, \lambda)}{2\varphi}
-                     - \tfrac12\log\varphi + \log p_{\text{peak}}(n)
-
-        It keeps the mode at ``λ = n``, matches the variance, collapses to the
-        exact Poisson at ``σ_b² = 0``, and is bounded, so it needs no clamp.
-
-        ``"second_order"`` is the earlier expansion of
-        ``∫ Poisson(n|S+b)·N(b|bg,σ_b²) db`` about ``b = bg``,
-        ``+½σ_b²[(n/λ−1)² − n/λ²]``, clamped to ``±10``.  Kept only to
-        reproduce those measurements: it is unbounded as ``λ`` leaves ``n``, the
-        clamp fires on 16 % of the grid points that carry mass, and it inflates
-        the weakest quartile's posterior mean 5.4× (15.9 photons against the
-        exact marginal's 2.9).
-
-        Median |error| against the exact marginal on a real batch, over grid
-        points within 15 nats of the peak: **0.13 nats** for ``"deviance"``,
-        0.89 for ``"second_order"``, 1.48 for the plain Poisson.
-
-        Note ``d log p/d bg`` is no longer the plain ``S2`` statistic when
-        either is on, so a learned background (``bg_mix``) must not be combined
-        with them; the Triton path raises rather than return a wrong gradient.
+    Note ``d log p/d bg`` is no longer the plain ``S2`` statistic when
+    ``bg_var_factor > 0``, so a learned background (``bg_mix``) must not be
+    combined with it; the Triton path raises rather than return a wrong
+    gradient.
 
     bg_mean_offset
         Added to the background the detection mean uses: ``λ = S + bg + offset``.
@@ -153,14 +127,10 @@ class Poisson(DetectionLikelihood):
         it), the bg gate and the σ²(bg) calibration.
     """
 
-    def __init__(self, bg_var_factor: float = 0.0,
-                 bg_var_mode: str = "deviance", *,
+    def __init__(self, bg_var_factor: float = 0.0, *,
                  bg_mean_offset: float = 0.0) -> None:
         super().__init__()
         self.bg_var_factor = float(bg_var_factor)
-        if bg_var_mode not in ("deviance", "second_order"):
-            raise ValueError(f"unknown bg_var_mode {bg_var_mode!r}")
-        self.bg_var_mode = bg_var_mode
         if not math.isfinite(bg_mean_offset) or bg_mean_offset < 0.0:
             raise ValueError("bg_mean_offset must be finite and non-negative, "
                              f"got {bg_mean_offset!r}")
@@ -193,13 +163,6 @@ class Poisson(DetectionLikelihood):
             return n[:, None] * torch.log(lam) - lam - log_nf[:, None]
 
         sig_b2 = sig_b2[:, None]
-        if self.bg_var_mode == "second_order":
-            out = n[:, None] * torch.log(lam) - lam - log_nf[:, None]
-            inv = 1.0 / lam
-            r = n[:, None] * inv
-            corr = 0.5 * sig_b2 * ((r - 1.0) ** 2 - r * inv)
-            return out + corr.clamp(-10.0, 10.0)
-
         # Deviance scaling.  Formed about the Poisson's own peak, as the Triton
         # path does, so the three ~3e6 terms of `n log λ − λ − log n!` never
         # cancel against each other in float32.
