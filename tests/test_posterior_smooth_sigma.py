@@ -83,14 +83,14 @@ def test_trainer_installs_basis_on_targets_and_refreshes():
     from tests.test_amortized_training import _synthetic
     from torchsx.merging.config import MergeConfig
     from torchsx.merging.likelihood import Poisson
-    from torchsx.merging.quadrature import TrapezoidalLogGrid
+    from torchsx.nn.objective import wide_log_grid
     from torchsx.merging.scale.amortized import AmortizedScale
     from torchsx.nn.objective import MarginalNLL
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
     prep, params, _, _, _ = _synthetic(n_hkl=60, n_xtal=60, per=30, seed=3)
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=1, include_hkl=False)
-    obj = MarginalNLL(TrapezoidalLogGrid.from_prep(prep, MergeConfig()), Poisson())
+    obj = MarginalNLL(wide_log_grid(), Poisson())
     cfg = TrainConfig(epochs=0, merge_target="posterior", loss="evidence",
                       posterior_prior="wilson", device="cpu", heldout_frac=0.1)
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)

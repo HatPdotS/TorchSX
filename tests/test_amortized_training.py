@@ -23,7 +23,7 @@ from torchsx.merging.hkl import build_adjacency
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
-from torchsx.merging.quadrature import TrapezoidalLogGrid
+from torchsx.nn.objective import wide_log_grid
 from torchsx.merging.scale import AmortizedScale
 from torchsx.merging.scatter_shape import FreePerHKLShape
 from torchsx.nn.metrics import scale_metrics, spearman
@@ -100,7 +100,7 @@ def test_leave_one_out_context_recovers_a_hidden_per_crystal_scale(tmp_path):
     scale = AmortizedScale.from_prep(
         prep, d_model=64, n_layers=3, include_hkl=False
     )
-    obj = MarginalNLL(TrapezoidalLogGrid.from_prep(prep, MergeConfig()), Poisson())
+    obj = MarginalNLL(wide_log_grid(), Poisson())
     # ~30 epochs to converge from zero-init.  The scale ramps up from 0 and
     # OVERSHOOTS around epoch 10 (slope of predicted-on-true peaks near 1.6
     # before settling at ~0.94), so a short run measures the overshoot, not the
@@ -146,7 +146,7 @@ def test_hkl_permutation_stays_flat_when_hkl_is_not_a_feature(tmp_path):
     """Control for the degeneracy monitor: with hkl excluded it must read 0."""
     prep, params, *_ = _synthetic(n_hkl=40, n_xtal=60, per=30)
     scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, include_hkl=False)
-    obj = MarginalNLL(TrapezoidalLogGrid.from_prep(prep, MergeConfig()), Poisson())
+    obj = MarginalNLL(wide_log_grid(), Poisson())
     trainer = AmortizedTrainer(
         prep, scale, obj, params,
         config=TrainConfig(max_obs_per_batch=3000, epochs=2, device="cpu",
@@ -248,7 +248,7 @@ def test_batches_are_condition_pure_and_complete():
 def _two_condition_trainer(tmp_path, **cfg_kw):
     prep, params, log_G, cid, per = _synthetic(n_hkl=40, n_xtal=120, per=40, n_cond=2)
     scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, include_hkl=False)
-    obj = MarginalNLL(TrapezoidalLogGrid.from_prep(prep, MergeConfig()), Poisson())
+    obj = MarginalNLL(wide_log_grid(), Poisson())
     cfg = TrainConfig(
         max_obs_per_batch=1000, epochs=1, lr=1e-3, lam0=3.0, log_every=1,
         heldout_frac=0.2, device="cpu", outdir=str(tmp_path),

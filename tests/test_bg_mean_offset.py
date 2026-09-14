@@ -142,14 +142,10 @@ def test_learned_background_is_refused():
 
 
 def test_quadratures_that_cannot_model_it_raise():
-    """The handful that hardcode the plain Poisson say so rather than compute
+    """A path that hardcodes the plain Poisson says so rather than compute
     the uncorrected quantity."""
-    from torchsx.merging.quadrature.moment_matched import MomentMatchedQuadrature
     n_ph, bg, la, lb, mu = _batch("cpu", M=64)
     lik = Poisson(bg_var_factor=C, bg_mean_offset=C)
-    q = MomentMatchedQuadrature(alpha_ref=1.0, beta_ref=1.7)
-    with pytest.raises(NotImplementedError, match="bg_mean_offset"):
-        q.marginalize_signal(_scatter(la, lb), lik, mu, n_ph, bg, None, None)
     with pytest.raises(NotImplementedError):
         FixedLogGrid(S_min=1e-6, S_max=1e6, n_points=64) \
             .marginalize_signal_with_reml_aux(

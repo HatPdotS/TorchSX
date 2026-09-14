@@ -26,15 +26,11 @@ import os
 import torch
 from torch import Tensor
 
-from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood.base import DetectionLikelihood
 from torchsx.merging.likelihood.poisson import Poisson
-from torchsx.merging.observations import ObsInfo, PreparedObs
+from torchsx.merging.observations import ObsInfo
 from torchsx.merging.parameters import Parameters
 from torchsx.merging.quadrature.base import Quadrature
-from torchsx.merging.quadrature.trapezoidal import (
-    TrapezoidalLogGrid, _compute_sig_lo_per_obs,
-)
 from torchsx.merging.scatter.base import ScatterModel
 from torchsx.merging.scatter.gengauss import GenGaussLogScatter
 
@@ -43,13 +39,9 @@ try:
     from torchsx.merging.quadrature._fixed_log_grid_triton import (
         HAVE_TRITON, marginalize_signal_triton,
     )
-    from torchsx.merging.quadrature._fixed_log_grid_triton_gaussian import (
-        marginalize_signal_triton_gaussian,
-    )
 except ImportError:
     HAVE_TRITON = False
     marginalize_signal_triton = None  # type: ignore[assignment]
-    marginalize_signal_triton_gaussian = None  # type: ignore[assignment]
 
 # Set ``TORCHSX_FIXEDLOGGRID_NO_TRITON=1`` to force the eager fallback
 # (e.g. for debugging numerical drift between paths).
@@ -97,11 +89,6 @@ class FixedLogGrid(Quadrature):
         ``1e6`` — 9 decades, ample for BR-scale data).
     n_points
         Number of nodes (default 10001 → ``Δlog_S ≈ 2.07e-3``).
-    sig_lo_per_obs
-        Optional precomputed buffer; only forwarded to an inner
-        ``TrapezoidalLogGrid`` so legacy ``_sig_lo_slice`` /
-        ``_build_grid`` callers keep working.  Never touched by
-        ``marginalize_signal``.
     """
 
     requires_per_call_posterior: bool = True
@@ -111,7 +98,6 @@ class FixedLogGrid(Quadrature):
         S_min: float = 1e-3,
         S_max: float = 1e6,
         n_points: int = 10001,
-        sig_lo_per_obs: Tensor | None = None,
     ) -> None:
         super().__init__()
         if not (S_min > 0.0 and S_max > S_min):
@@ -127,28 +113,6 @@ class FixedLogGrid(Quadrature):
         self.dlog_S = float(
             (math.log(self.S_max) - math.log(self.S_min)) / (self.n_points - 1)
         )
-        self.s_grid = TrapezoidalLogGrid(sig_lo_per_obs=sig_lo_per_obs)
-
-    @classmethod
-    def from_prep(
-        cls, prep: PreparedObs, config: MergeConfig,
-    ) -> "FixedLogGrid":
-        sig_lo = _compute_sig_lo_per_obs(
-            n_valid=prep.n_valid, hkl_id=prep.hkl_id, bg=prep.bg,
-            obs_counts=prep.obs_counts, override=config.sig_lo_override,
-        )
-        return cls(
-            S_min=getattr(config, "fixed_log_S_min", 1e-3),
-            S_max=getattr(config, "fixed_log_S_max", 1e6),
-            n_points=getattr(config, "fixed_log_n_points", 10001),
-            sig_lo_per_obs=sig_lo,
-        )
-
-    def _sig_lo_slice(self, n_ph, bg, obs_range):
-        return self.s_grid._sig_lo_slice(n_ph, bg, obs_range)
-
-    def _build_grid(self, n_ph, bg, sig_lo_per_obs):
-        return self.s_grid._build_grid(n_ph, bg, sig_lo_per_obs)
 
     def _trap_log_w(self, ref: Tensor, K: int) -> Tensor:
         """Trapezoidal log-weights with half-weight endpoints."""
@@ -163,22 +127,15 @@ class FixedLogGrid(Quadrature):
         likelihood: DetectionLikelihood,
         log_mean: Tensor,
     ) -> bool:
-        """Triton path is valid for (GenGauss × {Poisson, GaussianLikelihood})
-        on a CUDA tensor with Triton installed.
-
-        ``GaussianLikelihood`` subclasses pass σ² as a per-observation
-        ``(M,)`` tensor; autograd handles chain rule through whatever
-        graph produced it (including trainable coefficients), so no
-        special probing is needed.
-        """
-        from torchsx.merging.likelihood import GaussianLikelihood
+        """Triton path is valid for (GenGauss × Poisson) on a CUDA tensor
+        with Triton installed."""
         return (
             HAVE_TRITON
             and not _DISABLE_TRITON
             and not _eager_only.get()
             and log_mean.is_cuda
             and isinstance(scatter, GenGaussLogScatter)
-            and isinstance(likelihood, (Poisson, GaussianLikelihood))
+            and isinstance(likelihood, Poisson)
         )
 
     def marginalize_signal(
@@ -203,7 +160,6 @@ class FixedLogGrid(Quadrature):
 
         if self._can_use_triton(scatter, likelihood, log_mean):
             log_w = self._trap_log_w(self.log_S_grid, K)
-            from torchsx.merging.likelihood import GaussianLikelihood
             # The kernels reimplement the integrand, so they -- unlike the eager
             # fallback below, which delegates to `log_prob_given_signal` -- must
             # ask the likelihood what background its mean uses.  Handing the raw
@@ -211,16 +167,6 @@ class FixedLogGrid(Quadrature):
             # trap; `test_fixed_eager_matches_triton_under_bg_mean_offset` is
             # what catches it.
             bg_mean, sig_b2 = likelihood.detection_params(bg)
-            if isinstance(likelihood, GaussianLikelihood):
-                # σ² is the Gaussian's own recipe from the RAW estimate.
-                var = likelihood.sigma_squared_obs(n_ph, bg).clamp(
-                    min=likelihood.var_floor,
-                )
-                return marginalize_signal_triton_gaussian(
-                    log_mean, n_ph, bg_mean, var.contiguous(),
-                    log_alpha_obs, log_beta_obs,
-                    self.log_S_grid, log_w,
-                )
             # A non-zero bg_var_factor accounts for the background estimate's
             # own variance; 0 (the default) is the plain Poisson.
             return marginalize_signal_triton(

@@ -215,12 +215,19 @@ torchsx/
 Organised as the layers of the generative model:
 
 ```
-IntensityPrior → ScaleModel × ScatterModel → Quadrature → DetectionLikelihood
+ScaleModel × ScatterModel → Quadrature → DetectionLikelihood
 ```
 
-Each is an `nn.Module` behind a narrow ABC, aggregated by a single `LossState`
-into one scalar for LBFGS. Subpackages: `priors/`, `scale/`, `scatter/`,
-`quadrature/`, `likelihood/`, `targets/`, `regularizers/`, `hkl/`.
+Each is an `nn.Module` behind a narrow ABC. The latent per-reflection intensity
+is integrated out by the quadrature rather than estimated, so what the network
+trains against is a marginal evidence (`nn/objective.py`). Subpackages:
+`scale/`, `scatter/`, `quadrature/`, `likelihood/`, `priors/`, `hkl/`.
+
+`quadrature/` holds two grids. `SplitLogGrid` places nodes per observation and
+carries the two-width and mixture scatter paths; it is what training integrates
+against. `FixedLogGrid` shares one wide grid across observations, which is what
+the posterior readout wants. Each has a Triton fast path and an eager fallback
+that must agree.
 
 `hkl/` is the reflection-bookkeeping layer — HKL indexing, filtering, shell
 statistics, and the Poisson noise model whose `calibrate_sigma2_of_bg` derives

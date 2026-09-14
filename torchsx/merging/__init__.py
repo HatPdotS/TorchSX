@@ -1,51 +1,30 @@
-"""Modular SFX merging pipeline.
+"""SFX merging: observation preparation and the generative-model layers.
 
-Replaces ``torchsx.merging_clean``.  The package is organised around the
-generative-model layers from ``design_doc.md`` §3:
+The model an observation's intensity is drawn from, in the order the code
+composes it::
 
-    IntensityPrior → ScaleModel × ScatterModel → Quadrature → DetectionLikelihood
+    ScaleModel x ScatterModel -> Quadrature -> DetectionLikelihood
 
-Each layer is an ``nn.Module`` behind a narrow abstract base; a single
-``torchref.refinement.loss_state.LossState`` aggregates them into one
-scalar loss that LBFGS minimises.
+Each layer is an ``nn.Module`` behind a narrow abstract base.  The latent
+per-reflection intensity is integrated out by the quadrature rather than
+estimated, so the objective is a marginal evidence; see
+:mod:`torchsx.nn.objective`.
 
-Public API is populated incrementally as subpackages land.  See
-``torchsx.merging.parameters``, ``torchsx.merging.observations``,
-``torchsx.merging.config``, and ``torchsx.merging.hkl``.
+Import the layer you need from its own subpackage
+(:mod:`torchsx.merging.scale`, :mod:`~torchsx.merging.scatter`,
+:mod:`~torchsx.merging.quadrature`, :mod:`~torchsx.merging.likelihood`).
+This module re-exports only the observation-preparation surface, which
+everything else is built on.
 """
 
 from torchsx.merging.config import MergeConfig
+from torchsx.merging.observations import ObsInfo, PreparedObs, prepare_observations
 from torchsx.merging.parameters import Parameters
-from torchsx.merging.observations import PreparedObs, ObsInfo, prepare_observations
-from torchsx.merging.merger import Merger
-from torchsx.merging.result import MergedResult
-
-# Streamlined chain: stream → loss → posterior → ReflectionData.
-from torchsx.merging.loss import LogSpaceLoss
-from torchsx.merging.posterior import Posterior
-
-# Re-export the scale models most experiment scripts need.
-from torchsx.merging.scale import (
-    ScaleModel,
-    ScaleBPerCrystal,
-    PanelScale,
-    FixedScale,
-    CompositeScale,
-)
 
 __all__ = [
     "MergeConfig",
+    "ObsInfo",
     "Parameters",
     "PreparedObs",
-    "ObsInfo",
     "prepare_observations",
-    "Merger",
-    "MergedResult",
-    "LogSpaceLoss",
-    "Posterior",
-    "ScaleModel",
-    "ScaleBPerCrystal",
-    "PanelScale",
-    "FixedScale",
-    "CompositeScale",
 ]

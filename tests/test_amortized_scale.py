@@ -248,13 +248,13 @@ def test_anchor_pins_the_gauge():
 def test_marginal_nll_backward_reaches_the_network():
     """prime() -> quadrature marginal -> backward, gradients on encoder+heads."""
     from torchsx.merging.likelihood import Poisson
-    from torchsx.merging.quadrature import TrapezoidalLogGrid
+    from torchsx.nn.objective import wide_log_grid
     from torchsx.merging.config import MergeConfig
 
     prep = _toy_prep()
     params = _params(prep)
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    quad = TrapezoidalLogGrid.from_prep(prep, MergeConfig())
+    quad = wide_log_grid()
     lik = Poisson()
 
     # Heads are zero-initialised, so at step 0 the encoder correctly receives
@@ -288,13 +288,13 @@ def test_zero_init_still_bootstraps_the_heads():
     """At exact zero-init the encoder gets no gradient (dL/dz = W = 0), but the
     head weights do — which is how training starts moving at all."""
     from torchsx.merging.likelihood import Poisson
-    from torchsx.merging.quadrature import TrapezoidalLogGrid
+    from torchsx.nn.objective import wide_log_grid
     from torchsx.merging.config import MergeConfig
 
     prep = _toy_prep()
     params = _params(prep)
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    quad = TrapezoidalLogGrid.from_prep(prep, MergeConfig())
+    quad = wide_log_grid()
 
     meta = prep.obs_info
     pred = scale.prime(meta)

@@ -1,21 +1,13 @@
 """Latent-intensity priors on ``log_I0``.
 
-Each concrete prior is an ``nn.Module`` that owns any per-shell / per-HKL
-buffers and returns either a per-HKL vector (MAP-style) or a scalar
-(distribution-match style) from its ``forward(log_I0)``.  They are wrapped
-into the loss by ``torchsx.merging.targets.prior.IntensityPriorTarget``.
+The Wilson prior in use is parameterised on a smooth reciprocal-space basis
+rather than per-shell: :mod:`torchsx.merging.priors.reciprocal_basis`.
 """
 
-from torchsx.merging.priors.base import IntensityPrior
-from torchsx.merging.priors.wilson import WilsonPrior
-from torchsx.merging.priors.wilson_aniso import WilsonAnisoPrior
-from torchsx.merging.priors.wilson_match import WilsonMatchPrior
-from torchsx.merging.priors.flat import FlatPrior
+from torchsx.merging.priors.reciprocal_basis import (
+    ReciprocalBasis,
+    fit_wilson_log_sigma,
+    wilson_b_equivalent,
+)
 
-__all__ = [
-    "IntensityPrior",
-    "WilsonPrior",
-    "WilsonAnisoPrior",
-    "WilsonMatchPrior",
-    "FlatPrior",
-]
+__all__ = ["ReciprocalBasis", "fit_wilson_log_sigma", "wilson_b_equivalent"]

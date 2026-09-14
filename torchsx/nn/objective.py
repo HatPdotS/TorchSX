@@ -166,8 +166,7 @@ class MarginalNLL(nn.Module):
         Any :class:`~torchsx.merging.quadrature.base.Quadrature`.  Use
         ``FixedLogGrid`` on CUDA to get the Triton fast path.
     likelihood
-        Detection likelihood.  ``Poisson`` for counts; a
-        ``GaussianLikelihood`` subclass to consume supplied CrystFEL sigmas.
+        Detection likelihood; ``Poisson`` for counts.
     chunk_size
         Observations per quadrature call, or ``None`` for one call.  Chunk
         boundaries must not split a crystal if the caller is also pooling — but
