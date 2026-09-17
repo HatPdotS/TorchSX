@@ -118,7 +118,7 @@ length remains empirical. `best.pt` selects minimum validation NLL in state zero
 for independent difference-map precision. Validation uses 5% of state-zero
 crystals; all supplied observations remain eligible for the final merge.
 
-The statistical batch size is controlled by `--redundancy` (default 25 target
+The statistical batch size is controlled by `--redundancy` (default 100 target
 observations per reflection). A small state uses all its available training
 crystals. Data stay on the host; encoder chunking and quadrature recomputation
 bound GPU memory without reducing the requested statistical batch support.

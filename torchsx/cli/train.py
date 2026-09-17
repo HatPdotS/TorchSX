@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import random
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -44,8 +45,8 @@ def _build_parser():
     p.add_argument("-o", "--out", type=Path, required=True, help="run directory")
     p.add_argument("--steps", type=_steps, default=800,
                    help="total optimizer updates, balanced across states (default 800)")
-    p.add_argument("--redundancy", type=_positive, default=25,
-                   help="target observations per reflection in a batch (default 25)")
+    p.add_argument("--redundancy", type=_positive, default=100,
+                   help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
     p.add_argument("--reference-estimator", choices=("wls", "posterior"), default="wls",
                    help="estimate averaged into the running reference (default wls)")
@@ -63,6 +64,22 @@ def _batch(tr):
     g = torch.Generator().manual_seed(tr.cfg.seed + 1000003 * (tr.step_i // tr.n_conditions))
     perm = pool[torch.randperm(len(pool), generator=g)]
     counts = tr.index.counts[perm].cumsum(0)
+    requested = tr.cfg.max_obs_per_batch
+    if getattr(tr.cfg, "target_redundancy", None) is not None:
+        requested = int(round(tr.cfg.target_redundancy * tr.prep.n_valid))
+    available = int(counts[-1])
+    if available < requested:
+        warned = getattr(tr, "_small_batch_warned_states", set())
+        if k not in warned:
+            warnings.warn(
+                f"State {k} has {available:,} training observations, fewer than the "
+                f"requested batch size of {requested:,}; using all {len(pool):,} "
+                "training crystals in one batch. Validation crystals remain held out.",
+                UserWarning, stacklevel=2,
+            )
+            warned.add(k)
+            tr._small_batch_warned_states = warned
+        return k, tr.index.rows(perm)
     n = max(1, int(torch.searchsorted(counts, tr.cfg.max_obs_per_batch, right=True)))
     chosen = perm[:n]
     return k, tr.index.rows(chosen)

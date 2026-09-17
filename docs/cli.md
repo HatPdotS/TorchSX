@@ -30,6 +30,15 @@ selection reason and calibration diagnostics are recorded; checkpoint readout
 reuses the selected numeric gain. The legacy `stream` spelling remains a Python
 recipe alias for `trust_input`.
 
+Calibration uses background-binned off-Bragg variance. The systematically biased
+truncated-normal estimator is deprecated and is no longer an automatic fallback.
+If too few off-Bragg observations or background bins are available, calibration
+is unavailable: `auto` retains a valid declared gain, while `calibrate` fails.
+The Python method `calibrate_gain_truncnorm` remains available for historical
+reproduction with a `FutureWarning`. New `auto`/`calibrate` requests require
+prepared caches built with the current gain policy; checkpoint readout still
+reuses its recorded numeric gain.
+
 New training uses the annulus background-mean correction inferred from integration
 metadata and a four-component Gaussian mixture. Gain conversion, background-mean
 correction and posterior uncertainty are distinct operations. Existing checkpoints
@@ -43,6 +52,12 @@ The shared options are `--out`, `--split`, `--split-file`, `--spacegroup`,
 `--no-merge`. Friedel mates are merged by default; checkpoint readout inherits
 the recorded choice unless overridden. `--no-merge-friedel` keeps acentric mates
 separate and writes (+)/(−) columns. Bijvoet mates share refinement free flags.
+
+`--redundancy` sets the target observations per reflection in a training batch
+(default 100).
+If a state's available training data is smaller than the requested batch,
+training warns once for that state and uses all its training crystals in one
+batch. Validation crystals remain held out.
 
 Use `--free-from existing.mtz` to preserve a refinement free set. Otherwise the
 existing default 5% free-flag export policy applies. Refinement free flags are

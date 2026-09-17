@@ -401,16 +401,25 @@ def test_checkpoint_pins_gain_without_recalibration(stream_file, python_parser, 
     assert result.recipe["measurement"]["gain_adu_per_photon"] == 2.0
 
 
-@pytest.mark.parametrize("change", ["tolerance", "policy"])
-def test_auto_gain_cache_policy_is_checked(stream_file, python_parser, tmp_path, monkeypatch, change):
+@pytest.mark.parametrize("mode", ["auto", "calibrate"])
+@pytest.mark.parametrize("change", ["tolerance", "policy", "previous_policy"])
+def test_auto_gain_cache_policy_is_checked(stream_file, python_parser, tmp_path, monkeypatch, change, mode):
+    if mode == "calibrate" and change == "tolerance":
+        pytest.skip("calibrate does not use a discrepancy tolerance")
+    monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg",
+                        lambda self, *args: (2.0, 0.0, 0.0))
     cache = tmp_path / "prep.pt"
     args = _args(stream_file, cache_prep=cache)
+    args.gain = mode
     P.load_prep(args, verbose=False)
     if change == "tolerance":
         monkeypatch.setattr(P, "DEFAULT_GAIN_TOLERANCE", 0.2)
     else:
         blob = torch.load(cache, weights_only=False)
-        blob["signature"].pop("gain_policy_version")
+        if change == "previous_policy":
+            blob["signature"]["gain_policy_version"] = 1
+        else:
+            blob["signature"].pop("gain_policy_version")
         torch.save(blob, cache)
     with pytest.raises(SystemExit, match="different settings"):
         P.load_prep(args, verbose=False)
@@ -449,6 +458,57 @@ def test_insufficient_calibration_does_not_return_initial_gain():
     assert math.isnan(gain)
     assert not noise.gain_calibration_info["valid"]
     assert noise.gain_calibration_info["n_observations"] == 0
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("off_bragg", "insufficient off-Bragg observations"),
+    ("usable", "insufficient usable off-Bragg observations"),
+    ("bins", "insufficient background bins"),
+])
+def test_off_bragg_calibration_never_falls_back_to_truncnorm(monkeypatch, case, reason):
+    import math
+
+    def no_truncnorm(*args, **kwargs):
+        pytest.fail("biased truncated-normal calibration must not be an automatic fallback")
+
+    monkeypatch.setattr(PoissonNoiseModel, "calibrate_gain_truncnorm", no_truncnorm)
+    noise = PoissonNoiseModel(gain=7.0, read_var_adu_sq=12.0, sigma2_bg_slope=3.0)
+    bg = torch.full((6000,), 10.0, dtype=torch.float64)
+    sigma = (bg * noise.n_peak * (1 + noise.n_peak / noise.n_bg)).sqrt()
+    rng = torch.Generator().manual_seed(92)
+    intensity = sigma * torch.randn(bg.shape, dtype=bg.dtype, generator=rng)
+    offset = torch.ones_like(bg)
+    if case == "off_bragg":
+        offset.zero_()
+    elif case == "usable":
+        intensity[:2000] = 30 * sigma[:2000]
+    # Constant background leaves only one populated bin in the remaining case.
+    gain, bias, read_var = noise.calibrate_sigma2_of_bg(intensity, bg, offset)
+    assert math.isnan(gain)
+    assert bias == read_var == 0.0
+    assert noise.gain == 7.0
+    assert noise.read_var_adu_sq == noise.sigma2_bg_slope == 0.0
+    info = noise.gain_calibration_info
+    assert info["method"] == "off_bragg_variance"
+    assert not info["valid"]
+    assert info["reason"] == reason
+    assert info["n_observations"] == (0 if case == "off_bragg" else 6000)
+
+
+def test_truncated_normal_gain_emits_visible_deprecation_warning():
+    noise = PoissonNoiseModel()
+    with pytest.warns(FutureWarning, match="deprecated.*systematically biased"):
+        noise.calibrate_gain_truncnorm(torch.ones(20), torch.ones(20))
+
+
+def test_auto_retains_declared_gain_without_off_bragg_calibration(stream_file, python_parser):
+    result = P.load_prep(_args(stream_file), verbose=False)
+    decision = result.recipe["measurement"]["gain_selection"]
+    assert decision["selected_gain"] == 1.0
+    assert decision["reason"] == "calibration_unavailable"
+    assert decision["calibrated_gain"] is None
+    assert decision["calibration"]["method"] == "off_bragg_variance"
+    assert decision["calibration"]["reason"] == "insufficient off-Bragg observations"
 
 
 @pytest.mark.parametrize("value", ["foo", "empirical", "AUTO", "", 0, -1, True, "nan", "inf"])

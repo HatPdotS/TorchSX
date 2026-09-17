@@ -204,8 +204,10 @@ those of `-q`: |offset| ran to 0.89 A^-1 (q75 = 0.43) instead of 0.0068 A^-1 max
 `calibrate_sigma2_of_bg` gates on `|r| > 0.25` for a signal-free sample and
 therefore selected 36 % of observations whose mean I was 68 photons -- Bragg
 peaks -- so its `intercept = 29.65` and `mu_z = +1.63 sigma` were meaningless.
-After the fix there are no off-Bragg observations at all, and the truncnorm
-fallback gives `mu_z = +0.061 sigma`: **there is no systematic background bias.**
+After the fix there are no off-Bragg observations at all. The historical truncnorm
+fallback gave `mu_z = +0.061 sigma`, but that systematically biased estimator is
+now deprecated; its fitted mean does not establish the absence of background
+bias. Current calibration reports unavailable for this sample.
 `ewald_offset` is also a *network input feature*, and features are standardised,
 so the artefact spanned the whole range and compressed the genuine +-0.007 A^-1
 partiality signal into ~1.5 % of it.  With `--fix-profile-radius` having already

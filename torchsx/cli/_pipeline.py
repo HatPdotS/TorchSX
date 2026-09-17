@@ -72,7 +72,7 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
     p.add_argument("--gain", default=None, type=_gain_arg,
                    help="ADU/photon: auto (default), trust_input, calibrate, or a "
                         "positive number. Auto replaces the input gain when "
-                        "calibration differs by more than 50%.")
+                        "calibration differs by more than 50%%.")
     p.add_argument("--dmin", type=float, default=None, help="high-resolution cut (A)")
     p.add_argument("--dmax", type=float, default=None, help="low-resolution cut (A)")
     p.add_argument("--cache", dest="cache_prep", type=Path, default=None,

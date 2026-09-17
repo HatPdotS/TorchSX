@@ -2,12 +2,13 @@
 
 Provides σ²_poisson per observation from CrystFEL ring-integration geometry
 (peak counts, background, integration radii) and a gain calibration using
-negative-intensity observations.
+off-Bragg observations.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 
 import torch
@@ -73,7 +74,7 @@ class PoissonNoiseModel:
         2/3/6, BR (CSPAD) uses 3/4/7.  Mismatch silently corrupts both
         the gain auto-fit AND every per-observation bg-in-peak value.
     gain :
-        ADU-to-photon conversion factor; calibrate via ``calibrate_gain*``.
+        ADU-to-photon conversion factor; calibrate via ``calibrate_sigma2_of_bg``.
     exact_pixel_counts :
         If ``True`` (default), ``n_peak`` and ``n_bg`` are the exact integer
         pixel counts produced by CrystFEL's mask kernel
@@ -124,7 +125,7 @@ class PoissonNoiseModel:
 
         Note: assumes the negatives are zero-centred. Real data has a
         positive μ-bias (signal contamination + centroiding), so this
-        estimator runs high. Prefer ``calibrate_gain_truncnorm``.
+        estimator runs high. Prefer ``calibrate_sigma2_of_bg``.
         """
         neg = I_obs < 0
         n_neg = int(neg.sum().item())
@@ -191,7 +192,11 @@ class PoissonNoiseModel:
         max_iter: int = 200,
         seed: int = 0,
     ) -> tuple[float, float]:
-        """Bias-aware gain from bg-normalised truncated-Gaussian fit on negatives.
+        """Deprecated gain fit retained for reproducing historical results.
+
+        This estimator is systematically biased. Use
+        :meth:`calibrate_sigma2_of_bg` with off-Bragg observations, or supply
+        a declared/explicit detector gain when calibration is unavailable.
 
         Each negative ``I_j`` is whitened by its predicted σ at g=1,
         ``z_j = I_j / sqrt(bg_j · n_peak · (1 + n_peak/n_bg))``. The pool of
@@ -208,6 +213,13 @@ class PoissonNoiseModel:
         -------
         (gain, mu_bias_in_sigma_units)
         """
+        warnings.warn(
+            "calibrate_gain_truncnorm is deprecated because its gain estimates "
+            "are systematically biased. Use calibrate_sigma2_of_bg with "
+            "off-Bragg observations, or supply a declared/explicit detector gain.",
+            FutureWarning,
+            stacklevel=2,
+        )
         device = I_obs.device
         dtype = torch.float64
 
@@ -300,6 +312,9 @@ class PoissonNoiseModel:
             Sets ``self.gain = gain`` and
             ``self.read_var_adu_sq = read_var_adu_sq``; also clears
             ``self.sigma2_bg_slope = 0`` (legacy field).
+            Insufficient observations or background bins return
+            ``(nan, 0.0, 0.0)`` with ``gain_calibration_info['valid'] = False``
+            and preserve ``self.gain``. There is no negative-only fallback.
         """
         device = I_obs.device
         dtype = torch.float64
@@ -312,17 +327,17 @@ class PoissonNoiseModel:
         n_sel = int(mask.sum().item())
         self.gain_calibration_info = {"method": "off_bragg_variance", "valid": False,
                                       "n_observations": n_sel}
-        if n_sel < 5000:
-            print(
-                f"  PoissonNoiseModel.sigma2_of_bg: only {n_sel} off-Bragg "
-                f"obs (|r|>{ewald_min} Å⁻¹); falling back to "
-                f"calibrate_gain_truncnorm.", flush=True,
-            )
-            gain, mu = self.calibrate_gain_truncnorm(I_obs, background)
-            self.gain_calibration_info["fallback_reason"] = "insufficient off-Bragg observations"
+
+        def unavailable(reason: str) -> tuple[float, float, float]:
+            self.gain_calibration_info["reason"] = reason
             self.sigma2_bg_slope = 0.0
             self.read_var_adu_sq = 0.0
-            return gain, mu, 0.0
+            print(f"  PoissonNoiseModel.sigma2_of_bg: gain calibration unavailable: "
+                  f"{reason}.", flush=True)
+            return float("nan"), 0.0, 0.0
+
+        if n_sel < 5000:
+            return unavailable("insufficient off-Bragg observations")
 
         I_off = I_obs[mask].to(dtype=dtype)
         bg_off = background[mask].to(dtype=dtype)
@@ -331,12 +346,9 @@ class PoissonNoiseModel:
         keep = z.abs() < z_max
         z = z[keep]
         bg_off = bg_off[keep]
+        self.gain_calibration_info["n_usable_observations"] = int(z.numel())
         if z.numel() < 5000:
-            gain, mu = self.calibrate_gain_truncnorm(I_obs, background)
-            self.gain_calibration_info["fallback_reason"] = "insufficient usable off-Bragg observations"
-            self.sigma2_bg_slope = 0.0
-            self.read_var_adu_sq = 0.0
-            return gain, mu, 0.0
+            return unavailable("insufficient usable off-Bragg observations")
 
         # Quantile-bin in log(bg).  ``torch.quantile`` caps at 2²⁴ elements
         # (int32 internal sort indexing), so do the quantile by sort+gather
@@ -375,17 +387,9 @@ class PoissonNoiseModel:
             mu_per_bin.append(mu_k)
             n_per_bin.append(n_k)
 
+        self.gain_calibration_info["n_bins"] = len(sigma2_per_bin)
         if len(sigma2_per_bin) < 3:
-            print(
-                f"  PoissonNoiseModel.sigma2_of_bg: only "
-                f"{len(sigma2_per_bin)} bins passed min_per_bin; falling "
-                f"back to calibrate_gain_truncnorm.", flush=True,
-            )
-            gain, mu = self.calibrate_gain_truncnorm(I_obs, background)
-            self.gain_calibration_info["fallback_reason"] = "insufficient background bins"
-            self.sigma2_bg_slope = 0.0
-            self.read_var_adu_sq = 0.0
-            return gain, mu, 0.0
+            return unavailable("insufficient background bins")
 
         # Bin QC: keep bins where |μ_z| < mu_z_max (rules out residual
         # signal-contaminated bins that slipped through Ewald-gating).

@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import json
 import shutil
+import warnings
 
 import numpy as np
 import pytest
@@ -109,14 +110,34 @@ def test_batches_are_balanced_and_allow_small_states():
     tr=SimpleNamespace(step_i=0,n_conditions=2,train_crystals=torch.arange(6),condition=condition,
                        index=index,cfg=SimpleNamespace(seed=7,max_obs_per_batch=100))
     sizes=[]
-    for step in range(6):
-        tr.step_i=step
-        k,rows=train._batch(tr)
-        assert k==step%2
-        crystals=rows//3
-        assert torch.all(condition[crystals]==k)
-        sizes.append(len(rows))
+    with pytest.warns(UserWarning, match='using all') as caught:
+        for step in range(6):
+            tr.step_i=step
+            k,rows=train._batch(tr)
+            assert k==step%2
+            crystals=rows//3
+            assert torch.all(condition[crystals]==k)
+            sizes.append(len(rows))
+    assert len(caught)==2  # Once per state, rather than once per update.
     assert sizes==[6,12,6,12,6,12]
+
+
+@pytest.mark.parametrize('requested', [6, 9, 100])
+def test_small_batch_respects_holdout_and_original_redundancy(requested):
+    from torchsx.nn.train_amortized import CrystalIndex
+    condition=torch.zeros(3, dtype=torch.long)
+    index=CrystalIndex(torch.arange(3).repeat_interleave(3),3,condition)
+    tr=SimpleNamespace(step_i=0,n_conditions=1,train_crystals=torch.tensor([0,1]),
+                       condition=condition,index=index,prep=SimpleNamespace(n_valid=1),
+                       cfg=SimpleNamespace(seed=7,max_obs_per_batch=min(requested,9),
+                                           target_redundancy=requested))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        _, rows=train._batch(tr)
+    assert set(rows.tolist())==set(range(6))  # Crystal 2 is held out.
+    assert len(caught)==int(requested>6)
+    if caught:
+        assert f'requested batch size of {requested:,}' in str(caught[0].message)
 
 
 @pytest.mark.parametrize("merge_friedel", [True, False])
