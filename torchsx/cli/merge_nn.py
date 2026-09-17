@@ -51,6 +51,8 @@ def main(argv: list[str] | None = None) -> None:
         stream_batches=True, encoder_chunk_crystals=400,
         locate_windows=(8.0, 1.0, 0.125),
         posterior_prior=S["prior"],
+        reference_estimator=ckpt.get("reference_update", {}).get("estimator", "wls"),
+        reference_ema_decay=ckpt.get("reference_update", {}).get("ema_decay", 0.99),
         wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
         heldout_frac=0.05, device=S["device"], outdir=str(args.out.parent),
     )
@@ -70,6 +72,9 @@ def main(argv: list[str] | None = None) -> None:
     scale.load_state_dict(have)
     from torchsx.nn.checkpoint_context import load_checkpoint_context
     load_checkpoint_context(tr, ckpt)
+    saved_prior = ckpt.get("posterior_grid", {}).get("prior", "wilson")
+    if args.prior is not None and S["prior"] != saved_prior and S["prior"] in ("wilson", "joined-wilson"):
+        tr._refresh_wilson_sigma()
     scale.eval()
 
     names = ckpt.get("splits") or bundle.split_names or [""]
@@ -144,7 +149,7 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
                             cell=cell, spacegroup=spacegroup, work=work, keep=keep,
                             merge_friedel=merge_friedel,
                             verbose=verbose and half == 0)
-        rec = {"split": label, "products": ["posterior"]}
+        rec = {"split": label, "products": ["posterior"], "prior": post["prior"]}
         stats = _split_half_stats(merges[1], merges[2], d)
         if stats is not None:
             rec["split_half_posterior"] = stats

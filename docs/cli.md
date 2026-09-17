@@ -71,3 +71,60 @@ Historical experiment scripts using removed flags or the retired correction need
 their original source revision. Checkpoints with recorded inference context remain
 readable; older checkpoints without it need the original versioned recipe or
 retraining. This cleanup does not assert new accuracy or data-efficiency results.
+
+### Running intensity reference
+
+`torchsx-train --reference-estimator posterior --reference-ema-decay 0.99`
+reuses each training batch's integrated posterior mean for the running intensity
+reference. For reflections observed in the batch, the update is
+`reference = 0.99 * reference + 0.01 * posterior_mean`. Absent reflections retain
+their previous value. This is an exponential average with no fixed window; its
+e-folding horizon is about 100 updates **per observed reflection**. The initial
+unity merge supplies the starting value.
+
+The reference is detached from autograd and is used for network context, Wilson
+prior fitting and integration-grid placement. Posterior densities are not reused
+as priors. Validation does not update any running reference. Checkpoints record
+the estimator and decay as well as the running state. The default estimator
+remains `wls` for comparison; both estimators use decay 0.99 by default.
+
+### Intensity prior
+
+`torchsx-train ... --prior wilson` is the default. `--prior none` removes the
+Wilson intensity density and integrates the observation likelihood with respect
+to positive intensity (`dI`, including the Jacobian on the log-intensity grid).
+It does not select a maximum-likelihood point estimate or a flat-log prior.
+Training's integrated likelihood, validation, and full/half posterior readouts all
+use the selected measure. I, F, their uncertainties and integration-edge
+statistics come from those same weights. The scale anchor remains enabled.
+
+The choice is saved in `posterior_grid.prior` and the resolved training recipe.
+`torchsx-merge-nn best.pt ...` inherits it; an explicit `--prior none` or
+`--prior wilson` overrides it for a readout experiment without retraining.
+The resolved prior is printed and saved for each state in `.metrics.json`.
+Historical `flat_I0` checkpoints are read as `none`; historical `flat_log`
+checkpoints retain their original measure. Neither legacy spelling is a CLI option.
+
+`none` uses the finite numerical integration range. In particular, the existing
+missed-spot likelihood has an intensity-independent component, so a uniform prior
+over an unbounded positive intensity axis would not yield a proper posterior.
+The resulting integrated-likelihood score is not normalized Bayesian evidence;
+its scale and the weak-reflection moments can depend on the grid bounds. Inspect
+edge mass and range sensitivity before interpreting results. Wilson and `none`
+validation scores should not be compared as interchangeable model evidences.
+
+### Shared Wilson surface
+
+`--prior joined-wilson` fits one Wilson surface from all conditions and uses it
+for training and integration. Conditions retain separate intensity running means
+and integration widths. Each observed condition contributes equally to the fit,
+regardless of its reflection count; untouched running estimates are excluded.
+Before any updates the shared pooled initialization supplies the fit. Smooth and
+shell bases are supported; unsupported shells retain their previous prior.
+Use `--reference-estimator posterior` to fit from posterior running means
+(the reference estimator default remains `wls`).
+
+Checkpoint readout restores the shared surface exactly. Explicit overrides
+between `wilson` and `joined-wilson` refit from restored running estimates,
+without changing network weights or feature references. All readout halves use
+the same surface; independently trained arms never share a fitted prior.

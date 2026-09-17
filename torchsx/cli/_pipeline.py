@@ -641,6 +641,9 @@ DEFAULTS = dict(
 def add_model_args(p: argparse.ArgumentParser) -> None:
     """Flags shared by every command that builds the merge stack."""
     p.add_argument("--device", default=None, help="cuda | cpu")
+    p.add_argument("--prior", choices=("none", "wilson", "joined-wilson"), default=None,
+                   help="intensity prior: wilson (separate, default), joined-wilson (shared), or none "
+                        "(flat in positive intensity); merge inherits the checkpoint unless set")
 
 
 # Checkpoint ``kind`` markers for the corrected detection stack.  The first of
@@ -759,6 +762,14 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # that has been scored was merged at 24 / 63 / 257, so that is the default
     # and the checkpoint's training grid is reported, not applied.
     grid = dict(ck.get("posterior_grid") or {})
+    prior = getattr(args, "prior", None)
+    if prior is None:
+        prior = str(grid.get("prior", "wilson"))
+    if prior == "flat_I0":  # Historical checkpoint spelling.
+        prior = "none"
+    if prior not in ("none", "wilson", "joined-wilson", "flat_log"):
+        raise ValueError(f"Invalid checkpoint prior {prior!r}; expected 'none', 'wilson' or 'joined-wilson' "
+                         "(legacy 'flat_I0' and 'flat_log' are also readable)")
     # A checkpoint decides its own prior and anchor; one written before the
     # smooth basis existed (no "wilson_basis" key) is rebuilt as it was trained,
     # in shells / median mode, not with today's defaults.
@@ -781,7 +792,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         m_fine=int(DEFAULTS["m_fine"]),
         n_sigma=float(DEFAULTS["n_sigma"]),
         max_halfwidth=float(DEFAULTS["max_halfwidth"]),
-        prior=str(grid.get("prior", "wilson")),
+        prior=prior,
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
         skew=bool(skew), miss=float(miss),
@@ -789,6 +800,13 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
     )
     if verbose:
+        print(f"intensity prior: {prior}"
+              + (" (overriding checkpoint prior " + str(grid.get("prior", "wilson")) + ")"
+                 if ck and getattr(args, "prior", None) is not None else ""), flush=True)
+        if prior == "none":
+            print("  none: integrate likelihood with dI on the finite intensity grid; "
+                  "the missed-spot component prevents an unbounded flat posterior. "
+                  "Check edge mass and integration-range sensitivity.", flush=True)
         print(f"stack: amortised scale, "
               f"{'two-width' if skew else 'symmetric'} "
               f"{f'{n_components}-component {scatter_shape}-shape mixture ' if scatter_family == 'mixture' else ''}scatter, "

@@ -203,6 +203,7 @@ def fit_wilson_log_sigma(
     is_centric: Tensor | None = None,
     coef0: Tensor | None = None,
     *,
+    sample_weight: Tensor | None = None,
     n_iter: int = 8,
     ridge: float = 1e-6,
     tol: float = 1e-8,
@@ -214,6 +215,9 @@ def fit_wilson_log_sigma(
     distributions up to constants -- by damped Newton steps from ``coef0``
     (warm start) or from the flat ``log mean(I)`` solution.
 
+    Optional ``sample_weight`` multiplies the centric/acentric weight; zero
+    weight excludes a reflection from both fitting and initialization.
+
     Returns ``(coef, n_iterations_used)``; ``coef`` has ``phi.dtype``.
     """
     phi64 = phi.detach().to(torch.float64)
@@ -221,10 +225,16 @@ def fit_wilson_log_sigma(
     w = torch.ones_like(I64)
     if is_centric is not None:
         w = torch.where(is_centric.to(I64.device), torch.full_like(I64, 0.5), w)
+    if sample_weight is not None:
+        weights = sample_weight.detach().to(I64)
+        if weights.shape != I64.shape or not bool(torch.isfinite(weights).all()) or bool((weights < 0).any()) or not bool((weights > 0).any()):
+            raise ValueError("Wilson sample weights must be finite, nonnegative and nonempty")
+        keep = weights > 0
+        phi64, I64, w = phi64[keep], I64[keep], (w * weights)[keep]
     p = phi64.shape[1]
     if coef0 is None:
         c = torch.zeros(p, dtype=torch.float64, device=phi64.device)
-        c[0] = I64.mean().log()
+        c[0] = (I64.mean() if sample_weight is None else (w * I64).sum() / w.sum()).log()
     else:
         c = coef0.detach().to(torch.float64).clone()
 

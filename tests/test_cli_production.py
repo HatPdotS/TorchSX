@@ -14,7 +14,7 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file, python_parser
 
 
-@pytest.mark.parametrize('module,count', [(train,16), (merge_nn,13)])
+@pytest.mark.parametrize('module,count', [(train,19), (merge_nn,14)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
@@ -27,7 +27,7 @@ def test_public_options_and_split_inputs(module, count):
 
 
 @pytest.mark.parametrize('module', [train,merge_nn])
-@pytest.mark.parametrize('option,value', [('--gain','garbage'),('--scatter-family','mixture'),('--calib-degree','9,9')])
+@pytest.mark.parametrize('option,value', [('--gain','garbage'),('--prior','flat'),('--scatter-family','mixture'),('--calib-degree','9,9')])
 def test_invalid_or_removed_options_fail_before_loading(module,option,value,capsys):
     prefix = [] if module is train else ['model.pt']
     with pytest.raises(SystemExit):
@@ -37,6 +37,8 @@ def test_invalid_or_removed_options_fail_before_loading(module,option,value,caps
     if option == '--gain':
         for valid in ('auto','trust_input','calibrate','positive finite'):
             assert valid in error
+    if option == '--prior':
+        assert 'none' in error and 'wilson' in error
 
 
 def test_custom_split_matches_source_images(stream_file,python_parser,tmp_path):
@@ -72,6 +74,7 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
     assert host is prep
     assert (scale.heads.scatter_family,scale.heads.n_components,scale.heads.mixture.shape)==('mixture',4,'gaussian')
     assert obj.likelihood.bg_mean_offset==0.125
+    assert S['prior']=='wilson'
     oldscale,oldobj,tr=_stack(prep,params,tmp_path)
     try:
         ck=torch.load(tr.save_best(),weights_only=False)
@@ -81,6 +84,22 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
         assert oldlik.likelihood.bg_mean_offset==0.0
     finally:
         tr.close()
+
+
+@pytest.mark.parametrize('saved,requested,expected', [
+    ('none',None,'none'), ('wilson','none','none'), ('none','wilson','wilson'),
+    ('joined-wilson',None,'joined-wilson'), ('wilson','joined-wilson','joined-wilson'),
+    ('joined-wilson','wilson','wilson'), ('flat_I0',None,'none'), ('flat_log',None,'flat_log'),
+])
+def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,requested,expected):
+    prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10)
+    bundle=P.PrepBundle(prep,{'spacegroup':'P 1'},[],0.125)
+    argv=['model.pt','x.stream','-o',str(tmp_path/'merged.mtz'),'--device','cpu']
+    if requested is not None:
+        argv+=['--prior',requested]
+    args=merge_nn._build_parser().parse_args(argv)
+    _,_,_,_,settings=P.build_stack(bundle,args,ckpt={'posterior_grid':{'prior':saved}},verbose=False)
+    assert settings['prior']==expected
 
 
 def test_batches_are_balanced_and_allow_small_states():
@@ -101,20 +120,29 @@ def test_batches_are_balanced_and_allow_small_states():
 
 
 @pytest.mark.parametrize("merge_friedel", [True, False])
-def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel):
+@pytest.mark.parametrize("prior", ["none", "wilson", "joined-wilson"])
+def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,prior):
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10,n_cond=2)
     bundle=P.PrepBundle(prep,{'spacegroup':'P 1','d_min':0.9,'gain':1.0,'radii':[7,9,11],'merge_friedel':merge_friedel},['dark','light'],0.1)
     monkeypatch.setattr(P,'load_prep',lambda *a,**k: bundle)
     for key,value in dict(d_model=16,n_layers=2,inner_points=32,k_coarse=15,m_fine=65).items():
         monkeypatch.setitem(P.DEFAULTS,key,value)
     run=tmp_path/'run'
-    train.main(['x.stream','-o',str(run),'--device','cpu','--steps','4','--seed','17'])
+    train.main(['x.stream','-o',str(run),'--device','cpu','--steps','4','--seed','17',
+                '--reference-estimator','posterior','--reference-ema-decay','0.99',
+                '--prior',prior])
     summary=json.loads((run/'training_summary.json').read_text())
     assert summary['updates_per_state']==[2,2]
     ck=torch.load(run/'best.pt',weights_only=False)
     assert ck['scatter']['family']=='mixture' and ck['scatter']['n_components']==4
     assert ck['likelihood']['bg_mean_offset']==0.1
     assert ck['data']['training']['config']['seed']==17
+    assert ck['reference_update']=={'estimator':'posterior','ema_decay':0.99}
+    assert ck['data']['training']['config']['reference_estimator']=='posterior'
+    assert ck['posterior_grid']['prior']==prior
+    assert ck['data']['training']['config']['posterior_prior']==prior
+    assert ck['data']['training']['readout']['prior']==prior
+    assert all(r['prior']==prior for r in json.loads((run/'merged.metrics.json').read_text()).values())
     assert (run/'last.pt').exists()
     assert len(list(run.glob('*.mtz')))==6
     exported=[]
@@ -124,6 +152,7 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel):
         return original(path,hkl,F,F_sd,**kwargs)
     monkeypatch.setattr(P,'write_mtz',capture)
     merge_nn.main([str(run/'best.pt'),'x.stream','-o',str(tmp_path/'again.mtz'),'--device','cpu'])
+    assert all(r['prior']==prior for r in json.loads((tmp_path/'again.metrics.json').read_text()).values())
     assert len(exported)==6
     import gemmi
     for path,F,sd,keep in exported:
@@ -143,6 +172,36 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel):
         np.testing.assert_array_equal(np.sort(sigmas[np.isfinite(sigmas)]),np.sort(sd[keep]))
     assert not list(tmp_path.rglob('*pooled*'))
     assert not list(tmp_path.rglob('*.calibration.json'))
+
+    if prior in ("wilson", "joined-wilson"):
+        # An override must use the saved EMAs, not the pooled initialization.
+        import copy
+        from torchsx.nn.train_amortized import AmortizedTrainer
+        requested = "joined-wilson" if prior == "wilson" else "wilson"
+        checked = []
+        def verify_override(tr, *a, **kw):
+            context = ck["inference_context"]
+            assert torch.equal(tr.scale.features._I0_ref.cpu(), context["feature_reference"])
+            expected = []
+            for target, saved in zip(tr.targets, context["targets"]):
+                assert torch.equal(target.ema_I0.cpu(), saved["ema_I0"])
+                clone = copy.deepcopy(target)
+                for name in ("wilson_sigma", "wilson_coef"):
+                    getattr(clone, name).copy_(saved[name])
+                expected.append(clone)
+            original_targets = tr.targets
+            tr.targets = expected
+            try:
+                AmortizedTrainer._refresh_wilson_sigma(tr)
+            finally:
+                tr.targets = original_targets
+            for actual, target in zip(tr.targets, expected):
+                torch.testing.assert_close(actual.wilson_sigma, target.wilson_sigma, rtol=0, atol=0)
+            checked.append(True)
+        monkeypatch.setattr(merge_nn, "merge_products", verify_override)
+        merge_nn.main([str(run/'best.pt'), 'x.stream', '-o', str(tmp_path/'override.mtz'),
+                       '--device', 'cpu', '--prior', requested])
+        assert checked == [True]
 
 
 def test_readout_grid_rebuilds_nodes_and_interpolation():

@@ -142,6 +142,7 @@ class LOOInBatchTarget(nn.Module):
         bg: Tensor,          # (n,)
         sigma: Tensor,       # (n,) detector sigma on (n - bg)
         hkl_id: Tensor,      # (n,)
+        *, update_state: bool = True,
     ) -> MergeTargetOut:
         K = log_K.exp().clamp(min=1e-8)
         n_signal = n_ph - bg                       # the data, left alone
@@ -157,11 +158,14 @@ class LOOInBatchTarget(nn.Module):
         b = K * K / var
 
         den_batch = group_sum(b, hkl_id, self.n_hkl)
+        prior_den = self.ema_den
         if not bool(self._den_seeded):
-            self.ema_den.copy_(den_batch)
-            self._den_seeded.fill_(True)
+            prior_den = den_batch
+            if update_state:
+                self.ema_den.copy_(den_batch)
+                self._den_seeded.fill_(True)
 
-        prior_b = self.lam * self.ema_den
+        prior_b = self.lam * prior_den
         target, valid = loo_ratio(
             a, b, hkl_id, self.n_hkl,
             fill=self.ema_I0[hkl_id],
@@ -175,7 +179,8 @@ class LOOInBatchTarget(nn.Module):
         resid = n_signal - K * I0                  # observation space
         z = resid / var.sqrt()
 
-        self._update_ema(a, b, hkl_id, den_batch)
+        if update_state:
+            self._update_ema(a, b, hkl_id, den_batch)
 
         return MergeTargetOut(
             log_I0=I0.log(),

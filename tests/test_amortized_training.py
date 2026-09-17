@@ -323,6 +323,106 @@ def test_per_condition_targets_keep_the_difference(tmp_path):
     tr.close()
 
 
+@pytest.mark.parametrize("prior", ["wilson", "joined-wilson"])
+@pytest.mark.parametrize("merge_target", ["posterior", "loo"])
+@pytest.mark.parametrize("reference_estimator", ["wls", "posterior"])
+def test_evaluation_preserves_running_references(tmp_path, merge_target, reference_estimator, prior):
+    """Scoring held-out data must not feed its intensities into later training."""
+    prep, params, *_ = _synthetic(n_hkl=12, n_xtal=24, per=12, n_cond=2)
+    scale = AmortizedScale.from_prep(
+        prep, d_model=8, n_layers=1, include_hkl=False, context_folds=2,
+    )
+    tr = AmortizedTrainer(
+        prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
+        config=TrainConfig(
+            max_obs_per_batch=24, heldout_frac=0.25, device="cpu",
+            outdir=str(tmp_path), merge_target=merge_target,
+            loss="evidence" if merge_target == "posterior" else "per_obs",
+            posterior_prior=prior, posterior_k_coarse=5, posterior_m_fine=17,
+            reference_estimator=reference_estimator,
+            split_half_every=0,
+        ),
+    )
+
+    def state():
+        refs = {f"target_{i}.{name}": value.detach().clone()
+                for i, target in enumerate(tr._all_targets())
+                for name, value in target.named_buffers()}
+        refs.update({f"features.{name}": getattr(scale.features, name).clone()
+                     for name in ("_I0_ref", "_mean", "_std")})
+        return refs
+
+    try:
+        # Cover both initial validation and validation after a training update,
+        # with several batches and best-checkpoint context capture enabled.
+        for trained in (False, True):
+            if trained:
+                crystals = tr.train_crystals[tr.condition[tr.train_crystals] == 0][:2]
+                before_train = tr.targets[0].ema_I0.clone()
+                tr._forward(tr.index.rows(crystals), grad=True)
+                tr.scale.clear()
+                assert not torch.equal(tr.targets[0].ema_I0, before_train)
+
+            before = state()
+            first = tr.evaluate(tr.heldout_crystals)
+            second = tr.evaluate(tr.heldout_crystals)
+            tr._canonical_nll(tr.index.rows(tr.heldout_crystals))
+            assert math.isfinite(first["nll_per_obs"])
+            assert first["nll_per_obs"] == second["nll_per_obs"]
+            for name, value in state().items():
+                assert torch.equal(value, before[name]), name
+    finally:
+        tr.close()
+
+
+def test_posterior_reference_follows_integrated_mean_during_optimizer_steps(tmp_path):
+    """Use actual quadrature and backward; missing HKLs and other states stay put."""
+    prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8, n_cond=2)
+    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
+    tr = AmortizedTrainer(
+        prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
+        config=TrainConfig(
+            device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
+            merge_target="posterior", loss="evidence", reference_estimator="posterior",
+            reference_ema_decay=0.99, posterior_prior="wilson",
+            posterior_k_coarse=5, posterior_m_fine=17, split_half_every=0,
+        ),
+    )
+    captured = []
+    def capture(module, args, kwargs, out):
+        if kwargs.get("update_state", True):
+            captured.append((out.I0_mean.detach().clone(), out.seen.clone()))
+    hook = tr.targets[0].register_forward_hook(capture, with_kwargs=True)
+    try:
+        other = tr.targets[1].ema_I0.clone()
+        crystals = tr.train_crystals[tr.condition[tr.train_crystals] == 0][:2]
+        for crystal in crystals:
+            before = tr.targets[0].ema_I0.clone()
+            rec = tr.step(tr.index.rows(crystal.reshape(1)))
+            assert not rec.get("step_skipped") and rec["n_used"] > 0
+            mean, seen = captured[-1]
+            assert seen.any() and (~seen).any()
+            expected = before.clone()
+            expected[seen] = 0.99 * before[seen] + 0.01 * mean[seen]
+            torch.testing.assert_close(tr.targets[0].ema_I0, expected)
+            assert torch.equal(tr.targets[0].ema_I0[~seen], before[~seen])
+            assert torch.equal(tr.targets[1].ema_I0, other)
+            assert tr.targets[0].ema_I0.grad_fn is None
+    finally:
+        hook.remove()
+        tr.close()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"ema_decay": -0.1}, {"ema_decay": 1.0}, {"ema_decay": float("nan")},
+    {"ema_decay": float("inf")}, {"reference_estimator": "unknown"},
+])
+def test_invalid_reference_update_is_rejected(kwargs):
+    from torchsx.nn.posterior_target import PosteriorMergeTarget
+    with pytest.raises(ValueError):
+        PosteriorMergeTarget(torch.ones(4), **kwargs)
+
+
 def test_posterior_integrate_is_finite_for_flat_curves():
     """A flat curve at n_sigma=24 puts nodes ~96 nats above the centre.
 

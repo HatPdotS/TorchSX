@@ -101,7 +101,8 @@ class PosteriorMergeTarget(nn.Module):
         but the 90th-percentile error is *width*-limited (flat in node count),
         so 8 is the safer default now that width is free.
     prior
-        ``"flat_I0"`` integrates ``dI0`` (weight ``exp(v)``); ``"flat_log"``
+        ``"none"`` integrates ``dI0`` (weight ``exp(v)``), with no Wilson
+        density; ``"flat_I0"`` is its legacy alias. ``"flat_log"``
         integrates ``d log I0``; ``"wilson"`` uses ``p(I) = exp(-I/Sigma)/Sigma``
         with ``Sigma`` the shell mean.  **Use wilson.**  Where the likelihood is
         uninformative — and 84 % of observations here are noise-limited — the
@@ -144,6 +145,7 @@ class PosteriorMergeTarget(nn.Module):
         prior: str = "wilson",
         node_placement: str = "laplace",
         ema_decay: float = 0.99,
+        reference_estimator: str = "wls",
         floor: float = 1e-3,
         sigma_bounds: tuple[float, float] = (0.02, 4.0),
         scan_points: int = 9,
@@ -152,16 +154,27 @@ class PosteriorMergeTarget(nn.Module):
         max_halfwidth: float = 12.0,
     ) -> None:
         super().__init__()
-        if prior not in ("flat_I0", "flat_log", "wilson"):
+        if prior == "flat_I0":
+            prior = "none"
+        if prior not in ("none", "flat_log", "wilson"):
             raise ValueError(
-                f"prior must be 'flat_I0', 'flat_log' or 'wilson', got {prior!r}"
+                f"prior must be 'none' or 'wilson', got {prior!r} "
+                "(legacy 'flat_I0' and 'flat_log' are also accepted)"
             )
         if node_placement not in ("laplace", "wilson"):
             raise ValueError(
                 f"node_placement must be 'laplace' or 'wilson', got {node_placement!r}"
             )
+        if node_placement == "wilson" and prior != "wilson":
+            raise ValueError("Wilson node placement requires prior='wilson'; "
+                             "use Laplace placement for prior='none'")
         if k_coarse < 3 or m_fine < k_coarse:
             raise ValueError("need k_coarse >= 3 and m_fine >= k_coarse")
+        if reference_estimator not in ("wls", "posterior"):
+            raise ValueError("reference_estimator must be 'wls' or 'posterior'")
+        if not 0 <= ema_decay < 1:
+            raise ValueError("ema_decay must be finite and in [0, 1)")
+        self.reference_estimator = reference_estimator
         self.n_hkl = int(I0_init.shape[0])
         self.k_coarse, self.m_fine = int(k_coarse), int(m_fine)
         self.n_sigma, self.prior = float(n_sigma), prior
@@ -384,7 +397,9 @@ class PosteriorMergeTarget(nn.Module):
         self.wilson_fit_iters = 0
 
     @torch.no_grad()
-    def set_wilson_sigma(self, shell_id: Tensor, n_shells: int) -> None:
+    def set_wilson_sigma(self, shell_id: Tensor, n_shells: int, *,
+                         reference: Tensor | None = None,
+                         sample_weight: Tensor | None = None) -> None:
         """Refresh ``Sigma`` from the running merge.
 
         Shells mode: the equal-count shell mean of ``ema_I0`` (``shell_id`` /
@@ -392,11 +407,13 @@ class PosteriorMergeTarget(nn.Module):
         ``log Sigma = phi @ coef`` is refitted by Wilson maximum likelihood,
         warm-started from the previous coefficients.
         """
+        reference = self.ema_I0 if reference is None else reference
         if self.has_basis:
             from torchsx.merging.priors.reciprocal_basis import fit_wilson_log_sigma
             coef0 = self.wilson_coef if bool(self.wilson_coef.abs().sum() > 0) else None
             coef, used = fit_wilson_log_sigma(
-                self.wilson_phi, self.ema_I0.clamp(min=self.floor), self.is_centric, coef0,
+                self.wilson_phi, reference.clamp(min=self.floor), self.is_centric, coef0,
+                sample_weight=sample_weight,
             )
             self.wilson_coef.copy_(coef)
             self.wilson_fit_iters = int(used)
@@ -406,9 +423,11 @@ class PosteriorMergeTarget(nn.Module):
             return
         m = torch.zeros(n_shells, device=self.ema_I0.device)
         c = torch.zeros(n_shells, device=self.ema_I0.device)
-        m.index_add_(0, shell_id, self.ema_I0)
-        c.index_add_(0, shell_id, torch.ones_like(self.ema_I0))
-        self.wilson_sigma.copy_((m / c.clamp(min=1))[shell_id].clamp(min=self.floor))
+        weights = torch.ones_like(reference) if sample_weight is None else sample_weight
+        m.index_add_(0, shell_id, reference * weights)
+        c.index_add_(0, shell_id, weights)
+        fitted = (m / c.clamp(min=1e-30))[shell_id]
+        self.wilson_sigma.copy_(torch.where(c[shell_id] > 0, fitted, self.wilson_sigma).clamp(min=self.floor))
 
     @torch.no_grad()
     def set_is_centric(self, is_centric: Tensor) -> None:
@@ -576,7 +595,7 @@ class PosteriorMergeTarget(nn.Module):
             v = centre[:, None] + sig_h[:, None] * self.u_fine[None, :]
             du = float(2 * self.n_sigma / (self.m_fine - 1))
             log_w = (sig_h * du).log()[:, None].expand_as(v).clone()
-            if self.prior == "flat_I0":
+            if self.prior in ("none", "flat_I0"):
                 log_w = log_w + v                       # dI0 = I0 dv
             elif self.prior == "wilson":
                 rate = self._prior_rate()[:, None]
@@ -637,7 +656,9 @@ class PosteriorMergeTarget(nn.Module):
     def forward(
         self, objective, scatter, params, pred,
         n_ph: Tensor, bg: Tensor, sigma: Tensor, hkl_id: Tensor, meta,
+        *, update_state: bool = True,
     ) -> PosteriorOut:
+        """Infer this batch; advance running references only for training batches."""
         if self.node_placement == "wilson":
             # Importance placement: nodes already sit where the mass is, so the
             # coarse->fine interpolation that compensates for a badly placed
@@ -672,8 +693,10 @@ class PosteriorMergeTarget(nn.Module):
 
         floored = I0_mean < self.floor
         I0_mean = torch.where(seen, I0_mean.clamp(min=self.floor), self.ema_I0)
-        self._update_ema(pred, n_ph - bg, sigma, hkl_id)
-        if self.node_placement == "laplace":
+        if update_state:
+            self._update_ema(pred, n_ph - bg, sigma, hkl_id,
+                             posterior_mean=I0_mean, posterior_seen=seen)
+        if update_state and self.node_placement == "laplace":
             # Only the uniform-grid path has an extent to maintain.  Wilson
             # placement draws nodes through an inverse CDF over u in (0,1), so
             # there is nothing to widen or shrink and nothing to truncate.
@@ -711,30 +734,40 @@ class PosteriorMergeTarget(nn.Module):
         self.ema_log_sigma[seen] = target[seen].log()
 
     @torch.no_grad()
-    def _update_ema(self, pred, n_signal, sigma, hkl_id) -> None:
-        """Roll the grid centre and width forward with the current model."""
+    def _update_ema(self, pred, n_signal, sigma, hkl_id, *,
+                    posterior_mean=None, posterior_seen=None) -> None:
+        """Update a detached running mean, once per observed training batch.
+
+        Posterior mode reuses this batch's integrated mean. It averages estimates;
+        it does not multiply old posteriors into the next batch's prior. Missing
+        reflections retain their reference. Decay 0.99 gives each update 1% weight.
+        The WLS denominator remains an auxiliary grid-placement statistic in both
+        modes, so changing the mean estimator does not change its definition.
+        """
         K = pred.log_K.exp().clamp(min=1e-8)
         I0_ref = self.ema_I0[hkl_id].clamp(min=self.floor)
         w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
-        # These weights deliberately do NOT carry the likelihood's
-        # background-estimate variance, even when it is switched on.  They set
-        # the grid CENTRE and the LOO blend, not the integral: the posterior is
-        # computed by quadrature against the full likelihood, so a slightly
-        # mis-weighted proposal costs nothing but a slightly worse-placed grid,
-        # and `edge_mass` reports if that ever matters.  Adding the term here
-        # would change the merge itself, which is a separate decision from
-        # changing the likelihood.
+        # Preserve the historical auxiliary weights in both modes. They omit
+        # background-estimate variance. Posterior means, in contrast, integrate
+        # the full likelihood. In WLS mode these weights also define the mean
+        # used by network context and Wilson fitting.
         var = (sigma**2 + (K * I0_ref) ** 2 * torch.expm1(w2)).clamp(min=1e-12)
-        num = group_sum(K * n_signal / var, hkl_id, self.n_hkl)
         den = group_sum(K * K / var, hkl_id, self.n_hkl)
+        if self.reference_estimator == "posterior":
+            if posterior_mean is None or posterior_seen is None:
+                raise ValueError("posterior reference requires integrated means and seen mask")
+            seen = posterior_seen
+            batch = posterior_mean.detach().clamp(min=self.floor)
+        else:
+            num = group_sum(K * n_signal / var, hkl_id, self.n_hkl)
+            seen = den > 0
+            batch = torch.zeros_like(self.ema_I0)
+            batch[seen] = (num[seen] / den[seen]).clamp(min=self.floor)
         if not bool(self._den_seeded):
             self.ema_den.copy_(den)
             self._den_seeded.fill_(True)
-        seen = den > 0
         if not bool(seen.any()):
             return
-        batch = torch.zeros_like(self.ema_I0)
-        batch[seen] = (num[seen] / den[seen]).clamp(min=self.floor)
         d = self.ema_decay
         self.ema_I0[seen] = d * self.ema_I0[seen] + (1 - d) * batch[seen]
         self.ema_den[seen] = d * self.ema_den[seen] + (1 - d) * den[seen]

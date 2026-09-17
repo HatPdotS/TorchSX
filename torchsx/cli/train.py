@@ -29,6 +29,13 @@ def _steps(value):
     return number
 
 
+def _decay(value):
+    number = float(value)
+    if not 0 <= number < 1:
+        raise argparse.ArgumentTypeError("Expected a finite decay in [0, 1)")
+    return number
+
+
 def _build_parser():
     p = argparse.ArgumentParser(prog="torchsx-train", description=__doc__)
     P.add_data_args(p)
@@ -40,6 +47,10 @@ def _build_parser():
     p.add_argument("--redundancy", type=_positive, default=25,
                    help="target observations per reflection in a batch (default 25)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
+    p.add_argument("--reference-estimator", choices=("wls", "posterior"), default="wls",
+                   help="estimate averaged into the running reference (default wls)")
+    p.add_argument("--reference-ema-decay", type=_decay, default=0.99,
+                   help="exponential decay of the running reference (default 0.99)")
     return p
 
 
@@ -125,6 +136,8 @@ def main(argv=None):
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
         posterior_max_halfwidth=settings["max_halfwidth"],
         locate_windows=(8.0, 1.0, 0.125), posterior_prior=settings["prior"],
+        reference_estimator=args.reference_estimator,
+        reference_ema_decay=args.reference_ema_decay,
         wilson_basis=settings["wilson_basis"], wilson_degree=settings["wilson_degree"],
         posterior_checkpoint_nodes=True, encoder_chunk_crystals=400,
         stream_batches=True, split_half_every=0, heldout_frac=0.05,

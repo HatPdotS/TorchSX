@@ -256,7 +256,11 @@ class TrainConfig:
     posterior_k_coarse: int = 31
     posterior_m_fine: int = 257
     posterior_n_sigma: float = 8.0
-    posterior_prior: str = "flat_I0"
+    posterior_prior: str = "wilson"
+    #: Running reference for network context, Wilson fitting and grid placement.
+    #: Posterior mode averages detached batch posterior means, not densities.
+    reference_estimator: str = "wls"
+    reference_ema_decay: float = 0.99
     #: How the Wilson prior's Sigma is estimated from the running merge:
     #: ``"shells"`` (equal-count resolution shells) or ``"smooth"`` (a
     #: symmetry-adapted surface on a reciprocal-space basis, see
@@ -374,7 +378,7 @@ class AmortizedTrainer:
         )
         seed_I0 = unity_merge(prep.I_obs, self.sigma, prep.hkl_id, prep.n_valid)
         # One merge target PER CONDITION: separate EMA centre, grid width and
-        # Wilson Sigma, so dark and light each converge to their own merge
+        # optional separate Wilson Sigma; dark and light keep their own merge
         # while the network is shared.  All are seeded from the pooled unity
         # merge -- the EMA moves within a few steps and ``locate`` rescans
         # +-8 nats around it, so a per-condition seed buys nothing.
@@ -387,7 +391,10 @@ class AmortizedTrainer:
                     k_coarse=self.cfg.posterior_k_coarse,
                     m_fine=self.cfg.posterior_m_fine,
                     n_sigma=self.cfg.posterior_n_sigma,
-                    prior=self.cfg.posterior_prior,
+                    prior=("wilson" if self.cfg.posterior_prior == "joined-wilson"
+                           else self.cfg.posterior_prior),
+                    reference_estimator=self.cfg.reference_estimator,
+                    ema_decay=self.cfg.reference_ema_decay,
                     max_halfwidth=self.cfg.posterior_max_halfwidth,
                 ).to(self.device)
                 t.checkpoint_nodes = bool(self.cfg.posterior_checkpoint_nodes)
@@ -419,7 +426,10 @@ class AmortizedTrainer:
                         k_coarse=self.cfg.posterior_k_coarse,
                         m_fine=self.cfg.posterior_m_fine,
                         n_sigma=self.cfg.posterior_n_sigma,
-                        prior=self.cfg.posterior_prior,
+                        prior=("wilson" if self.cfg.posterior_prior == "joined-wilson"
+                           else self.cfg.posterior_prior),
+                        reference_estimator=self.cfg.reference_estimator,
+                        ema_decay=self.cfg.reference_ema_decay,
                         max_halfwidth=self.cfg.posterior_max_halfwidth,
                     ).to(self.device)
                     for _ in range(self.n_conditions)
@@ -638,7 +648,9 @@ class AmortizedTrainer:
             # redundant pass was ~25 % of the step.
             pred = self.scale.prime(meta)
             if self.cfg.merge_target == "posterior":
-                tgt, log_Z = self._posterior_step(pred, n_ph, bg, sigma, meta)
+                tgt, log_Z = self._posterior_step(
+                    pred, n_ph, bg, sigma, meta, update_state=grad,
+                )
             else:
                 if grad:
                     self.target.lam = self._lam()
@@ -647,6 +659,7 @@ class AmortizedTrainer:
                     tgt = self.target(
                         pred.log_K.detach(), pred.log_w.detach(),
                         n_ph, bg, sigma, meta.hkl_idx,
+                        update_state=grad,
                     )
             # log_I0 is a LINEAR (mean) estimate; the GenGauss is centred on
             # log_mean, i.e. a median.  Shift by -log E[exp(eps)] so the two
@@ -663,11 +676,12 @@ class AmortizedTrainer:
                 )
         return meta, pred, tgt, nll, n_ph, bg, sigma
 
-    def _posterior_step(self, pred, n_ph, bg, sigma, meta):
+    def _posterior_step(self, pred, n_ph, bg, sigma, meta, *, update_state: bool):
         """Posterior merge: returns a ``MergeTargetOut`` plus per-HKL log Z."""
         post = self.target(
             self.objective, self.scale.scatter, self.params, pred,
             n_ph, bg, sigma, meta.hkl_idx, meta,
+            update_state=update_state,
         )
         self.target.last_seen = post.seen
         self.last_n_hkl = int(post.seen.sum())
@@ -938,6 +952,9 @@ class AmortizedTrainer:
     def evaluate(self, crystals: Tensor, *, phase: str = "heldout") -> dict:
         """Score crystals the network never trained on.
 
+        Running intensity and width references are not updated: held-out
+        measurements must not feed subsequent context features or prior fits.
+
         In-batch loss falling while this does not is co-adaptation through the
         merge rather than learning — the diagnostic that was missing throughout
         the abismal investigation.
@@ -1089,6 +1106,10 @@ class AmortizedTrainer:
                     else torch.stack([t['ema_I0'] for t in context['targets']])
                 ),
                 "n_conditions": self.n_conditions,
+                "reference_update": {
+                    "estimator": self.cfg.reference_estimator,
+                    "ema_decay": self.cfg.reference_ema_decay,
+                },
                 # outer-grid geometry, so a later merge integrates on the SAME grid
                 "posterior_grid": {
                     "k_coarse": self.cfg.posterior_k_coarse, "m_fine": self.cfg.posterior_m_fine,
@@ -1139,8 +1160,9 @@ class AmortizedTrainer:
         ``estimator``:
 
         ``posterior``  Wilson-posterior mean of ``sqrt(I0)`` over the very
-                       weights the merge computed -- what the French-Wilson
-                       tables approximate, evaluated on the actual posterior.
+                       weights the merge computed, or the flat-in-intensity
+                       mean when ``posterior_prior='none'``. The selected prior
+                       governs I, F, uncertainties and edge diagnostics alike.
         ``flat``       the same moment under the measure alone (no Wilson
                        prior).
         ``ml``         ``sqrt(I0)`` at the likelihood maximum, prior-free;
@@ -1390,7 +1412,7 @@ class AmortizedTrainer:
             F = (F_flat if estimator == "flat"
                  else rootI.gather(1, S_fine.argmax(1, keepdim=True)).squeeze(1))
         result = {
-            "estimator": estimator,
+            "estimator": estimator, "prior": self.cfg.posterior_prior,
             "F": F, "F_sd": F_sd, "I0": I0, "I0_sd": I0_sd,
             "seen": acc.abs().sum(1) > 0,
             "edge_mass": edge,
@@ -1648,19 +1670,52 @@ class AmortizedTrainer:
             info[f"wilson_aniso_{i}"] = float(coef[b.degree + 1 + i])
         return info
 
+    @torch.no_grad()
     def _refresh_wilson_sigma(self) -> None:
-        """Keep the Wilson Sigma on the running merge (shell means, or the smooth fit)."""
-        for t in self._all_targets():
-            if not hasattr(t, "set_wilson_sigma"):
-                continue
-            sid = self.prep.shell_id_fw.to(self.device)
-            t.set_wilson_sigma(sid, int(sid.max().item()) + 1)
-            # Centric reflections take a different Wilson prior.  This is a
-            # no-op in P 1 (nothing is centric) but not in any higher symmetry:
-            # in Laue class mmm the three principal zones are centric, and the
-            # acentric prior under-shrinks them.
-            if hasattr(t, "set_is_centric"):
-                t.set_is_centric(self.prep.is_centric.to(self.device))
+        """Refresh separate or equally state-weighted shared Wilson surfaces."""
+        targets = [t for t in self._all_targets() if hasattr(t, "set_wilson_sigma")]
+        sid = self.prep.shell_id_fw.to(self.device)
+        n_shells = int(sid.max().item()) + 1
+        for t in targets:
+            t.set_is_centric(self.prep.is_centric.to(self.device))
+        if self.cfg.posterior_prior != "joined-wilson":
+            for t in targets:
+                if t.prior == "wilson":
+                    t.set_wilson_sigma(sid, n_shells)
+            return
+        # Primary posterior targets are one per condition. Research LOO targets
+        # have no Wilson state: in that case use their posterior scoring targets.
+        states = [t for t in self.targets if hasattr(t, "set_wilson_sigma")]
+        if not states:
+            states = list(self._score_targets or [])
+        if not states:
+            raise ValueError("joined-wilson requires posterior targets")
+        first = states[0]
+        if len(states) == 1:
+            first.set_wilson_sigma(sid, n_shells)
+        else:
+            if first.has_basis:
+                # Also order invariant when converting independent saved fits.
+                first.wilson_coef.copy_(torch.stack([t.wilson_coef for t in states]).mean(0))
+            values = torch.stack([t.ema_I0 for t in states])
+            support = torch.stack([t.ema_den > 0 for t in states])
+            support &= torch.isfinite(values) & (values > 0)
+            if not bool(support.any()):
+                # All states start from the same pooled unity merge.
+                first.set_wilson_sigma(sid, n_shells, reference=values.mean(0))
+            else:
+                weights = support.to(values.dtype)
+                weights /= weights.sum(1, keepdim=True).clamp(min=1)
+                total = weights.sum(0)
+                reference = (torch.where(support, values, 0) * weights).sum(0) / total.clamp(min=1e-30)
+                # Keep the objective scale comparable to an ordinary HKL fit.
+                total *= total.numel() / total.sum()
+                first.set_wilson_sigma(sid, n_shells, reference=reference, sample_weight=total)
+        for t in targets:
+            if t is not first:
+                t.wilson_sigma.copy_(first.wilson_sigma)
+                t.wilson_coef.copy_(first.wilson_coef)
+                t.wilson_fit_iters = first.wilson_fit_iters
 
     def _refresh_feature_reference(self) -> None:
         """Roll the obs_scale reference forward with the running merge."""
