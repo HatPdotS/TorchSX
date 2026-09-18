@@ -132,6 +132,20 @@ def calibration_metrics(
 # ── C. is the network learning a scale? ────────────────────────────────
 
 
+def _diagnostic_quantile(values: Tensor, q: float) -> Tensor:
+    """Compute a scalar linear quantile beyond torch.quantile's size limit."""
+    if values.numel() <= 2**24:
+        return values.quantile(q)
+    values = values.flatten().sort().values
+    rank = q * (values.numel() - 1)
+    lower, upper = math.floor(rank), math.ceil(rank)
+    lo = values[lower]
+    result = lo if lower == upper else lo.lerp(
+        values[upper], rank - lower
+    )
+    return torch.where(values.isnan().any(), result.new_full((), float("nan")), result)
+
+
 def scale_metrics(
     log_K: Tensor,
     crystal_id: Tensor,
@@ -151,8 +165,8 @@ def scale_metrics(
     out = {
         "sd_log_K": float(log_K.std().item()),
         "mean_log_K": float(log_K.mean().item()),
-        "p01_log_K": float(log_K.quantile(0.01).item()),
-        "p99_log_K": float(log_K.quantile(0.99).item()),
+        "p01_log_K": float(_diagnostic_quantile(log_K, 0.01).item()),
+        "p99_log_K": float(_diagnostic_quantile(log_K, 0.99).item()),
     }
 
     # variance decomposition: between-crystal vs within-crystal

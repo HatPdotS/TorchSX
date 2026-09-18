@@ -41,6 +41,7 @@ from torchsx.nn.merge_target import (
 )
 from torchsx.nn.metrics import (
     MetricLogger,
+    _diagnostic_quantile,
     calibration_metrics,
     condition_auc,
     grad_norms,
@@ -927,7 +928,7 @@ class AmortizedTrainer:
             # => the scatter is wider than the grid can represent and the
             # likelihood is only a density because we divided this out.
             out["grid_mass_median"] = float(gm.median().item())
-            out["grid_mass_p01"] = float(gm.quantile(0.01).item())
+            out["grid_mass_p01"] = float(_diagnostic_quantile(gm, 0.01).item())
         _m_, _n_, _b_, _s_ = self._batch(rows)
         ios = (_n_ - _b_) / _s_
         # shell_of_obs is prep-derived and stays on the host under
