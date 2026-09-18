@@ -154,6 +154,10 @@ in text custom-split files are sorted; repeated `--split NAME=PATH` inputs retai
 argument order. Supply the same states in the same order for checkpoint readout.
 All supplied states are exported automatically.
 
+In text split files, repeat a `filename event` pair with different dataset names
+to include the frame (and all its crystals) in multiple bins. Repeated identical
+rows count only once per bin.
+
 ## Products and difference maps
 
 Both commands use one writer. Each state produces the raw posterior amplitude

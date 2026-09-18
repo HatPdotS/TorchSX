@@ -421,6 +421,30 @@ def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
     assert set(labels.tolist()) == {0, 1}
     assert labels[0] == labels[2] and labels[1] == labels[3]
 
+    # Both crystals of frame a belong to three bins. Repeating the same
+    # membership must not count either crystal twice within that bin.
+    overlapping = tmp_path / "overlapping.split"
+    overlapping.write_text(
+        "/raw/a.h5 //0 beta\n/raw/a.h5 //0 alpha\n"
+        "/raw/a.h5 //0 gamma\n/raw/a.h5 //0 alpha\n"
+        "/raw/b.h5 //1 alpha\n"
+    )
+    overlap_args = _DataArgs(stream=[cache], split_file=overlapping,
+                             cache_prep=tmp_path / "overlapping.pt")
+    expanded = P.load_prep(overlap_args, verbose=False)
+    assert expanded.split_names == ["alpha", "beta", "gamma"]
+    expanded_labels = expanded.prep.obs_info.delay_bin_idx
+    assert torch.bincount(expanded_labels).tolist() == [4, 2, 2]
+    obs_labels = expanded_labels[expanded.prep.obs_info.crystal_id]
+    original_labels = labels[b.prep.obs_info.crystal_id]
+    for k in range(3):
+        expected = b.prep.I_obs if k == 0 else b.prep.I_obs[original_labels == 1]
+        torch.testing.assert_close(expanded.prep.I_obs[obs_labels == k].sort().values,
+                                   expected.sort().values)
+    cached = P.load_prep(overlap_args, verbose=False)
+    assert torch.equal(cached.prep.obs_info.delay_bin_idx, expanded_labels)
+    torch.testing.assert_close(cached.prep.I_obs, expanded.prep.I_obs)
+
     # a frame the split file does not mention is refused, not silently pooled
     partial = tmp_path / "partial.split"
     with open(partial, "w") as fh:

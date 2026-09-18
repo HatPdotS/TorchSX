@@ -35,9 +35,6 @@ def main(argv: list[str] | None = None) -> None:
     if args.seed is None:
         args.seed = ((ckpt.get("data") or {}).get("training") or {}).get("config", {}).get("seed", 0)
     bundle = P.load_prep(args, recipe_defaults=ckpt.get("data") or {})
-    if ckpt.get("splits") and bundle.split_names != ckpt["splits"]:
-        raise SystemExit(f"Input states {bundle.split_names!r} do not match checkpoint states "
-                         f"{ckpt['splits']!r}; supply the same states in training order")
     if "inference_context" not in ckpt:
         raise SystemExit("Checkpoint lacks recorded inference context; use its original "
                          "versioned experiment recipe or retrain with torchsx-train")

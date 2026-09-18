@@ -61,7 +61,8 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                         "'filename event dataset', the same file partialator "
                         "takes as --custom-split) or a .pt int64 label per "
                         "crystal after the d_min filter.  Every crystal must "
-                        "be labelled.")
+                        "be labelled. Repeat a filename/event with different "
+                        "dataset names to include a frame in multiple splits.")
     p.add_argument("--spacegroup", default=None,
                    help='e.g. "P 1", "P 2 21 21".  Stamped into the MTZ and '
                         "used for centric detection.")
@@ -205,6 +206,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         "merge_friedel": merge_friedel,
         "split_file": _stamp(args.split_file),
     }
+    if args.split_file is not None:
+        signature["split_file_version"] = 2  # Preserve overlapping assignments.
 
     sources = [path for _, path in splits]
     try:
@@ -282,9 +285,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
             labels = torch.load(args.split_file).long().reshape(-1)
         else:
             # CrystFEL custom-split file: "filename event dataset", the unit
-            # being a frame, not a crystal -- multi-crystal frames put all
-            # their crystals in the same split, which is what partialator
-            # does with the same file.
+            # being a frame, not a crystal. All crystals of a frame belong
+            # to each of its named splits.
             lookup = {}
             for raw in open(args.split_file):
                 line = raw.split("#", 1)[0].split()
@@ -294,8 +296,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                     raise SystemExit(
                         f"{args.split_file}: expected 'filename event dataset', "
                         f"got {raw.rstrip()!r}")
-                lookup[(line[0], line[1])] = line[2]
-            names = sorted(set(lookup.values()))
+                lookup.setdefault((line[0], line[1]), set()).add(line[2])
+            names = sorted({name for bins in lookup.values() for name in bins})
             index = {n: i for i, n in enumerate(names)}
             fnames, evts = stream.filenames, stream.events
             if not fnames or not evts:
@@ -303,15 +305,30 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                     "the stream carries no image filename/event metadata, so a "
                     "custom-split file cannot be matched to it; re-parse from "
                     "the .stream, or pass a .pt label tensor")
-            per_image = torch.tensor(
-                [index.get(lookup.get((f, e), None), -1)
-                 for f, e in zip(fnames, evts)], dtype=torch.long)
+            memberships = [sorted(index[name] for name in lookup.get((f, e), ()))
+                           for f, e in zip(fnames, evts)]
+            per_image = torch.tensor([bins[0] if bins else -1 for bins in memberships],
+                                     dtype=torch.long)
             labels = per_image[stream.image_id.long()]
             if verbose:
                 miss = int((labels < 0).sum())
                 print(f"  custom split {args.split_file.name}: {len(lookup):,} "
                       f"frames, {len(names)} datasets, {miss:,} crystals "
                       f"unmatched", flush=True)
+            # The trainer consumes one label per crystal. Add another copy
+            # of the frame's crystals/observations for each extra membership.
+            # Sets above prevent duplicate rows from double-counting a bin.
+            parts, label_parts = [stream], [labels]
+            for slot in range(1, max(map(len, memberships), default=0)):
+                extra = torch.tensor([bins[slot] if len(bins) > slot else -1
+                                      for bins in memberships], dtype=torch.long)
+                extra = extra[stream.image_id.long()]
+                mask = extra >= 0
+                if mask.any():
+                    parts.append(stream.filter_crystals(mask))
+                    label_parts.append(extra[mask])
+            stream = SFXStream.concat(parts)
+            labels = torch.cat(label_parts)
         if labels.numel() != stream.n_crystals:
             raise SystemExit(
                 f"--split-file has {labels.numel():,} labels but the data has "
