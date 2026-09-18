@@ -184,9 +184,9 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
         a=np.concatenate([np.asarray(trained.column_with_label(label)) for label in labels])
         b=np.concatenate([np.asarray(mtz.column_with_label(label)) for label in labels])
         np.testing.assert_array_equal(np.isfinite(a), np.isfinite(b))
-        a,b=a[np.isfinite(a)],b[np.isfinite(b)]
-        assert np.corrcoef(a,b)[0,1] > 0.999
-        assert np.median(b/a) == pytest.approx(1.0,rel=0.01)
+        # Separate readout rebuilds the reference from the current data, so
+        # its amplitudes need not reproduce training's running-reference merge.
+        np.testing.assert_array_equal(np.sort(b[np.isfinite(b)]), np.sort(F[keep]))
         # Sorting survives ASU reordering and checks the actual per-merge sigma values.
         sigmas=np.concatenate([np.asarray(mtz.column_with_label(c))
                                for c in mtz.column_labels() if c.upper().startswith('SIG')])
@@ -194,35 +194,32 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
     assert not list(tmp_path.rglob('*pooled*'))
     assert not list(tmp_path.rglob('*.calibration.json'))
 
-    if prior in ("wilson", "joined-wilson"):
-        # An override must use the saved EMAs, not the pooled initialization.
-        import copy
-        from torchsx.nn.train_amortized import AmortizedTrainer
-        requested = "joined-wilson" if prior == "wilson" else "wilson"
-        checked = []
-        def verify_override(tr, *a, **kw):
-            context = ck["inference_context"]
-            assert torch.equal(tr.scale.features._I0_ref.cpu(), context["feature_reference"])
-            expected = []
-            for target, saved in zip(tr.targets, context["targets"]):
-                assert torch.equal(target.ema_I0.cpu(), saved["ema_I0"])
-                clone = copy.deepcopy(target)
-                for name in ("wilson_sigma", "wilson_coef"):
-                    getattr(clone, name).copy_(saved[name])
-                expected.append(clone)
-            original_targets = tr.targets
-            tr.targets = expected
-            try:
-                AmortizedTrainer._refresh_wilson_sigma(tr)
-            finally:
-                tr.targets = original_targets
-            for actual, target in zip(tr.targets, expected):
-                torch.testing.assert_close(actual.wilson_sigma, target.wilson_sigma, rtol=0, atol=0)
-            checked.append(True)
-        monkeypatch.setattr(merge_nn, "merge_products", verify_override)
-        merge_nn.main([str(run/'best.pt'), 'x.stream', '-o', str(tmp_path/'override.mtz'),
-                       '--device', 'cpu', '--prior', requested])
-        assert checked == [True]
+
+def test_separate_merge_exports_new_bins(tmp_path, monkeypatch):
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=24, per=10, n_cond=2)
+    _, _, trainer = _stack(prep, params, tmp_path)
+    trainer.split_names = ['dark', 'light']
+    trainer.cfg.wilson_basis = 'shells'
+    try:
+        checkpoint = trainer.save_best(tmp_path / 'model.pt')
+    finally:
+        trainer.close()
+
+    current, *_ = _synthetic(n_hkl=20, n_xtal=24, per=10, n_cond=3, seed=9)
+    names = ['early', 'middle', 'late']
+    bundle = P.PrepBundle(current, {'spacegroup': 'P 1'}, names, 0.1)
+    monkeypatch.setattr(P, 'load_prep', lambda *a, **kw: bundle)
+    monkeypatch.setitem(P.DEFAULTS, 'k_coarse', 15)
+    monkeypatch.setitem(P.DEFAULTS, 'm_fine', 65)
+    merge_nn.main([str(checkpoint), 'new.stream', '-o', str(tmp_path / 'rebinned.mtz'),
+                   '--device', 'cpu'])
+
+    metrics = json.loads((tmp_path / 'rebinned.metrics.json').read_text())
+    assert set(metrics) == {'early', 'middle', 'late'}
+    assert {p.name for p in tmp_path.glob('*.mtz')} == {
+        f'rebinned_{name}{half}.mtz'
+        for name in names for half in ('', '_half1', '_half2')
+    }
 
 
 def test_readout_grid_rebuilds_nodes_and_interpolation():

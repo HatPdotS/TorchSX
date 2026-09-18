@@ -83,9 +83,11 @@ warmup/decay, resource policy and evaluation cadence. Research variants use the
 Python API rather than another public configuration language.
 
 Historical experiment scripts using removed flags or the retired correction need
-their original source revision. Checkpoints with recorded inference context remain
-readable; older checkpoints without it need the original versioned recipe or
-retraining. This cleanup does not assert new accuracy or data-efficiency results.
+their original source revision. Separate merge initializes its intensity reference
+and merge targets from a unity merge of the supplied observations, retaining the
+checkpoint's network weights and fitted feature standardization. Any number of
+bins can be exported under their current labels. Exact checkpoint replay through
+the Python API still requires recorded inference context and matching data.
 
 ### Running intensity reference
 
@@ -139,7 +141,8 @@ shell bases are supported; unsupported shells retain their previous prior.
 Use `--reference-estimator posterior` to fit from posterior running means
 (the reference estimator default remains `wls`).
 
-Checkpoint readout restores the shared surface exactly. Explicit overrides
-between `wilson` and `joined-wilson` refit from restored running estimates,
-without changing network weights or feature references. All readout halves use
-the same surface; independently trained arms never share a fitted prior.
+Separate checkpoint readout fits the Wilson surface from the current input's
+unity reference, including when overriding `wilson` or `joined-wilson`. All bins
+start from this common reference, and full/half readouts use the same fitted
+surface. Separate readout can therefore differ from training's immediate exports,
+which use the trained per-state running references.

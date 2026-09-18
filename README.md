@@ -151,8 +151,11 @@ torchsx-train combined.stream --split-file states.split \
 `--split-file` also accepts an integer label tensor (`.pt`), one label per
 crystal after the resolution filter. Every crystal must be labelled. State names
 in text custom-split files are sorted; repeated `--split NAME=PATH` inputs retain
-argument order. Supply the same states in the same order for checkpoint readout.
-All supplied states are exported automatically.
+argument order. Separate checkpoint readout accepts any number of bins and uses
+their supplied names. References and merge targets are initialized from the
+current input data; network weights and feature standardization are restored
+from the checkpoint. All supplied states are exported automatically. For changed
+inputs or split assignments, supply a new `--cache` path.
 
 In text split files, repeat a `filename event` pair with different dataset names
 to include the frame (and all its crystals) in multiple bins. Repeated identical

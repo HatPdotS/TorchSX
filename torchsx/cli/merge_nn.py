@@ -35,9 +35,6 @@ def main(argv: list[str] | None = None) -> None:
     if args.seed is None:
         args.seed = ((ckpt.get("data") or {}).get("training") or {}).get("config", {}).get("seed", 0)
     bundle = P.load_prep(args, recipe_defaults=ckpt.get("data") or {})
-    if "inference_context" not in ckpt:
-        raise SystemExit("Checkpoint lacks recorded inference context; use its original "
-                         "versioned experiment recipe or retrain with torchsx-train")
     prep, params, scale, obj, S = P.build_stack(bundle, args, ckpt=ckpt)
 
     cfg = TrainConfig(
@@ -56,6 +53,8 @@ def main(argv: list[str] | None = None) -> None:
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     if S.get("basis") is not None:
         tr.set_reciprocal_basis(S["basis"], smooth_prior=S["wilson_basis"] == "smooth")
+    else:
+        tr._refresh_wilson_sigma()
     # Checkpoints written before the data buffers were made non-persistent
     # carry the training set's own _I/_bg/_sigma, whose length is that data
     # set's observation count; drop them rather than refuse to merge a
@@ -67,14 +66,11 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"checkpoint is missing {len(missing)} parameters, "
                          f"first {missing[:3]}")
     scale.load_state_dict(have)
-    from torchsx.nn.checkpoint_context import load_checkpoint_context
-    load_checkpoint_context(tr, ckpt)
-    saved_prior = ckpt.get("posterior_grid", {}).get("prior", "wilson")
-    if args.prior is not None and S["prior"] != saved_prior and S["prior"] in ("wilson", "joined-wilson"):
-        tr._refresh_wilson_sigma()
+    # Keep references and merge targets initialized from the supplied data.
+    # Only network weights and fitted feature standardization are restored.
     scale.eval()
 
-    names = ckpt.get("splits") or bundle.split_names or [""]
+    names = bundle.split_names or [""]
     if tr.n_conditions != max(len(names), 1) and tr.n_conditions > 1:
         names = [str(i) for i in range(tr.n_conditions)]
     try:
