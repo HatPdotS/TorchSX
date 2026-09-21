@@ -593,3 +593,47 @@ p0/corner_y = -256
     assert core.geometry.photon_energy_eV == 11330
     assert load_duckdb(db_path, load_geom_file=False).geometry is None
     assert load_duckdb(db_path, geometry=sample_geometry).geometry is sample_geometry
+
+
+@pytest.fixture
+def model_bg_path(v2_path):
+    """A run written with the integration recipe and model-background columns."""
+    with duckdb.connect(str(v2_path)) as conn:
+        conn.execute("""
+            CREATE TABLE integration (r_peak DOUBLE, r_gap DOUBLE, r_bg DOUBLE,
+                                      adu_per_photon DOUBLE, bg_annulus_pixels DOUBLE,
+                                      aperture VARCHAR);
+            INSERT INTO integration VALUES (1.5, 6.0, 8.6, 9.9, 280, 'snr');
+            ALTER TABLE reflections ADD COLUMN n_pixels INTEGER;
+            ALTER TABLE reflections ADD COLUMN background_model DOUBLE;
+            ALTER TABLE reflections ADD COLUMN background_model_var DOUBLE;
+            UPDATE reflections SET n_pixels = 9, background_model = 4.5 * h,
+                                   background_model_var = 0.25
+            WHERE intensity > 0;
+        """)
+    return v2_path
+
+
+def test_model_background_columns_and_recipe(model_bg_path):
+    from torchsx.measurement import MeasurementSpec
+
+    core = load_duckdb(model_bg_path)
+    for name in ("n_pix", "bg_model", "bg_model_var"):
+        assert name in core.levels["obs"]
+    # the peeled lattice's rows were left NULL -> NaN, everything else filled
+    positive = core.I > 0
+    assert torch.isnan(core.bg_model[~positive]).all()
+    assert torch.equal(core.n_pix[positive], torch.full((int(positive.sum()),), 9.0))
+    assert torch.allclose(core.bg_model[positive], 4.5 * core.hkl[positive, 0].float())
+    spec = MeasurementSpec.from_metadata(core.metadata)
+    assert spec.producer == "probixi" and spec.radii == (1.5, 6.0, 8.6)
+    assert spec.gain_declarations == (("probixi", "adu_per_photon", 9.9),)
+    assert spec.reflection_columns == ("n_pix", "bg_model", "bg_model_var")
+
+
+def test_run_without_recipe_has_no_measurement(v2_path):
+    from torchsx.measurement import MeasurementSpec
+
+    core = load_duckdb(v2_path)
+    assert "bg_model" not in core.levels["obs"]
+    assert MeasurementSpec.from_metadata(core.metadata) is None

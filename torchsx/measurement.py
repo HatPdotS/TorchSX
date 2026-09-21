@@ -37,9 +37,12 @@ class MeasurementSpec:
     source_files: tuple[str, ...] = ()
     provenance: tuple[tuple[str, str], ...] = ()
     unresolved: tuple[str, ...] = ()
+    # Producer columns beyond the CrystFEL ten (probixi: n_pix bg_model bg_model_var).
+    reflection_columns: tuple[str, ...] = ()
 
     def __post_init__(self):
-        for key in ("integration_modifiers", "upstream_corrections", "source_files", "unresolved"):
+        for key in ("integration_modifiers", "upstream_corrections", "source_files", "unresolved",
+                    "reflection_columns"):
             object.__setattr__(self, key, tuple(getattr(self, key)))
         for key in ("gain_declarations", "provenance"):
             object.__setattr__(self, key, tuple(tuple(row) for row in getattr(self, key)))

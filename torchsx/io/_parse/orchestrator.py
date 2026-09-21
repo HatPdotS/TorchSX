@@ -59,6 +59,17 @@ def parse_stream(
     core = _parse_stream(path, spacegroup, n_workers, max_crystals, seed, sequential)
     # The core is still private to this reader: add columns in place, avoiding
     # repeated whole-tensor validation passes on very large observation tables.
+    if spec.reflection_columns:
+        if max_crystals is not None:
+            import warnings
+            warnings.warn("Sampled parsing drops the producer's extra reflection columns "
+                          f"{spec.reflection_columns}; parse the whole stream to keep them.",
+                          stacklevel=2)
+        else:
+            from torchsx.io._probixi import read_reflection_columns
+            for name, column in read_reflection_columns(
+                    path, spec.reflection_columns, core.n_observations).items():
+                core.levels["obs"][name] = column
     core.levels["obs"]["observed_hkl"] = core.hkl
     core.levels["crystal"]["source_lattice_index"] = core.crystal_in_image
     core.metadata[MEASUREMENT_KEY] = {"record": spec.to_dict()}
