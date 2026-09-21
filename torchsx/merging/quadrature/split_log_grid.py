@@ -250,7 +250,7 @@ class SplitLogGrid(Quadrature):
                 and isinstance(likelihood, Poisson)):
             mix = scatter.mixture_obs(meta)
             if mix.dtype == torch.float32:
-                sig_b2 = self._sig_b2(likelihood, bg)
+                sig_b2 = self._sig_b2(likelihood, bg, meta)
                 p = self.grid_params(n_ph, bg, sig_b2, self._bg_mean_offset(likelihood))
                 return marginalize_gaussian_mixture(log_mean, n_ph, mix, p, self.n_points,
                                                      sig_b2=sig_b2)
@@ -258,16 +258,18 @@ class SplitLogGrid(Quadrature):
             scatter, likelihood, log_mean, n_ph, bg, params, meta, obs_range,
         )
 
-    def _sig_b2(self, likelihood: DetectionLikelihood, bg: Tensor) -> Tensor | None:
+    def _sig_b2(self, likelihood: DetectionLikelihood, bg: Tensor,
+                meta: ObsInfo | None = None) -> Tensor | None:
+        # -1 keys a per-observation variance (a fixed function of obs_id) apart from any factor
         bvf = float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0)
-        self._last_bvf = bvf
-        return likelihood.detection_params(bg)[1]
+        self._last_bvf = -1.0 if getattr(likelihood, "has_bg_var", False) else bvf
+        return likelihood.detection_params(bg, meta)[1]
 
     def _bg_mean_offset(self, likelihood: DetectionLikelihood) -> float:
         return float(getattr(likelihood, "bg_mean_offset", 0.0) or 0.0)
 
     def log_miss(self, likelihood: DetectionLikelihood, n_ph: Tensor,
-                 bg: Tensor) -> Tensor:
+                 bg: Tensor, meta: ObsInfo | None = None) -> Tensor:
         """``log L(0)`` -- the same one the analytic tail already uses.
 
         Reuses the cached grid, so the miss component costs nothing on top of
@@ -277,8 +279,8 @@ class SplitLogGrid(Quadrature):
         refuses if the likelihood also carries a background-mean offset).
         """
         if bg.requires_grad:
-            return super().log_miss(likelihood, n_ph, bg)
-        return self.grid_params(n_ph, bg, self._sig_b2(likelihood, bg),
+            return super().log_miss(likelihood, n_ph, bg, meta)
+        return self.grid_params(n_ph, bg, self._sig_b2(likelihood, bg, meta),
                                 self._bg_mean_offset(likelihood))["log_L0"]
 
     def marginalize_signal(
@@ -299,7 +301,7 @@ class SplitLogGrid(Quadrature):
         K = self.n_points
         log_alpha_obs, log_beta_obs = scatter.log_alpha_beta_obs(params, meta)
         log_alpha_hi_obs = scatter.log_alpha_hi_obs(params, meta)   # None = symmetric
-        sig_b2 = self._sig_b2(likelihood, bg)
+        sig_b2 = self._sig_b2(likelihood, bg, meta)
         # The RAW bg goes down to grid_params -- it is what the cache keys on
         # and pins; the shifted background comes back as `p["bg_model"]` and is
         # what the integrand below (and the kernel) must use.

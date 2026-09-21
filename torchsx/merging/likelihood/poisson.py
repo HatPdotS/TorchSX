@@ -125,15 +125,30 @@ class Poisson(DetectionLikelihood):
         pooled ``(n − bg)/K`` estimator (unbiased at fixed true background
         precisely because it averages over ``A`` rather than conditioning on
         it), the bg gate and the σ²(bg) calibration.
+
+    bg_var
+        Per-observation variance of the model background (probixi's ``bg_model``),
+        ``(n_obs_total,)`` photons^2, gathered by ``meta.obs_id``.  The producer
+        measured it, so it replaces the annulus ``bg_var_factor``/``bg_mean_offset``
+        (mutually exclusive with both).
     """
 
     def __init__(self, bg_var_factor: float = 0.0, *,
-                 bg_mean_offset: float = 0.0) -> None:
+                 bg_mean_offset: float = 0.0, bg_var: Tensor | None = None) -> None:
         super().__init__()
         self.bg_var_factor = float(bg_var_factor)
         if not math.isfinite(bg_mean_offset) or bg_mean_offset < 0.0:
             raise ValueError("bg_mean_offset must be finite and non-negative, "
                              f"got {bg_mean_offset!r}")
+        if bg_var is not None:
+            if self.bg_var_factor > 0.0 or bg_mean_offset > 0.0:
+                raise ValueError("bg_var carries the estimate's own variance; "
+                                 "bg_var_factor and bg_mean_offset describe the "
+                                 "annulus estimate and must both be 0 with it")
+            if bg_var.ndim != 1 or not bool(torch.isfinite(bg_var).all()) or bool((bg_var < 0).any()):
+                raise ValueError("bg_var must be a finite non-negative (n_obs,) tensor")
+            self.register_buffer("bg_var_obs", bg_var.detach().float().clone(), persistent=False)
+            self.has_bg_var = True
         if bg_mean_offset > 0.0 and self.bg_var_factor <= 0.0:
             # Mean shifted but the estimate's variance unmodelled: the two are
             # the same annulus constant c = n_peak/n_bg, and correcting one
@@ -142,7 +157,7 @@ class Poisson(DetectionLikelihood):
                              "are n_peak/n_bg and describe the same estimate")
         self.bg_mean_offset = float(bg_mean_offset)
 
-    def detection_params(self, bg: Tensor) -> tuple[Tensor, Tensor | None]:
+    def detection_params(self, bg: Tensor, meta=None) -> tuple[Tensor, Tensor | None]:
         if self.bg_mean_offset and bg.requires_grad:
             # `SplitLogGrid.grid_params` is `no_grad`, so a shifted background
             # derived inside it would be silently detached; and the kernels'
@@ -150,12 +165,21 @@ class Poisson(DetectionLikelihood):
             # shift invalidates.  Refuse rather than return a wrong gradient.
             raise RuntimeError("bg_mean_offset does not support a learned "
                                "background (bg.requires_grad)")
+        if self.has_bg_var:
+            obs_id = getattr(meta, "obs_id", None)
+            if obs_id is None:
+                raise ValueError("a per-observation background variance needs the "
+                                 "batch's ObsInfo with obs_id")
+            if obs_id.numel() != bg.numel():
+                raise ValueError(f"obs_id has {obs_id.numel()} rows for {bg.numel()} backgrounds")
+            var = self.bg_var_obs[obs_id.to(self.bg_var_obs.device)]
+            return bg, var.to(device=bg.device, dtype=bg.dtype)
         return (bg + self.bg_mean_offset if self.bg_mean_offset else bg), (
             self.bg_var_factor * bg.clamp(min=0.0)
             if self.bg_var_factor > 0.0 else None)
 
-    def log_prob_given_signal(self, n: Tensor, S: Tensor, bg: Tensor) -> Tensor:
-        bg_mean, sig_b2 = self.detection_params(bg)
+    def log_prob_given_signal(self, n: Tensor, S: Tensor, bg: Tensor, meta=None) -> Tensor:
+        bg_mean, sig_b2 = self.detection_params(bg, meta)
         lam = S + bg_mean[:, None]
         lam = lam.clamp(min=1e-6)
         log_nf = torch.lgamma(n + 1)

@@ -28,12 +28,18 @@ class DetectionLikelihood(nn.Module):
 
     @abstractmethod
     def log_prob_given_signal(
-        self, n: Tensor, S: Tensor, bg: Tensor
+        self, n: Tensor, S: Tensor, bg: Tensor, meta: ObsInfo | None = None,
     ) -> Tensor:  # (M, K)
         ...
 
-    def detection_params(self, bg: Tensor) -> tuple[Tensor, Tensor | None]:
+    #: True when the background variance is per-observation (gathered by ``meta.obs_id``).
+    has_bg_var: bool = False
+
+    def detection_params(self, bg: Tensor, meta: ObsInfo | None = None) -> tuple[Tensor, Tensor | None]:
         """``(bg_mean, sig_b2)`` for the raw stored estimate ``bg``.
+
+        ``meta`` (the batch's :class:`ObsInfo`) lets a per-observation variance
+        gather by ``obs_id``.
 
         ``bg_mean`` is the background the detection mean uses; ``sig_b2`` is the
         estimate's own variance, or ``None`` when it is not modelled.  Identity

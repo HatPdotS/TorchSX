@@ -377,6 +377,9 @@ class PreparedObs:
     # scheme (the ``timepoint`` metadata it keyed off still exists).
     obs_weights: Tensor | None = None
 
+    # Measured variance of the model background (``--background model``); None for annulus.
+    bg_var: Tensor | None = None
+
     def to(self, device) -> "PreparedObs":
         return PreparedObs(
             hkl_valid=self.hkl_valid.to(device),
@@ -397,10 +400,15 @@ class PreparedObs:
             shell_id_fw=self.shell_id_fw.to(device),
             is_centric=self.is_centric.to(device),
             obs_weights=None if self.obs_weights is None else self.obs_weights.to(device),
+            bg_var=None if self.bg_var is None else self.bg_var.to(device),
         )
 
 
 # ── prepare_observations ────────────────────────────────────────────────
+
+#: Extra columns ``--background model`` requires (probixi's stream extras).
+MODEL_BACKGROUND_COLUMNS = ("n_pix", "bg_model", "bg_model_var")
+BACKGROUND_MODES = ("annulus", "model")
 
 
 def prepare_observations(
@@ -411,6 +419,7 @@ def prepare_observations(
     poisson_noise: PoissonNoiseModel | None = None,
     crystal_weights: Tensor | None = None,
     resolved_measurement: ResolvedMeasurement | None = None,
+    background: str = "annulus",
 ) -> PreparedObs:
     """Stream → PreparedObs (CPU).  Call ``.to(device)`` afterwards.
 
@@ -420,7 +429,14 @@ def prepare_observations(
     :attr:`PreparedObs.obs_weights`.  Multiplies ``log p`` per
     observation in the data NLL.  Default ``None`` → no weighting,
     bit-for-bit identical to the unweighted pipeline.
+
+    ``background`` selects the detection model's background: ``"annulus"``
+    (default) uses the stream's ring mean with variance ``n_peak/n_bg * bg``;
+    ``"model"`` uses probixi's noise-model background under the disk
+    (``bg_model``) with its measured variance ``bg_model_var`` and pixel count.
     """
+    if background not in BACKGROUND_MODES:
+        raise ValueError(f"background must be one of {BACKGROUND_MODES}, got {background!r}")
     from torchref.base.reciprocal.hkl import get_d_spacing
     from torchsx.measurement import (
         gain_from_measurement, legacy_stream_gain, parse_gain,
@@ -445,8 +461,18 @@ def prepare_observations(
     # existing noise-model fallback; supplied sigma must be finite and positive.
     valid = torch.ones_like(core.I, dtype=torch.bool)
     rejected = {}
-    for name, values in (("I", core.I), ("background", core.background),
-                         ("sigma", getattr(core, "sigma", None))):
+    checked = [("I", core.I), ("background", core.background),
+               ("sigma", getattr(core, "sigma", None))]
+    if background == "model":
+        model_columns = [(name, getattr(core, name, None)) for name in MODEL_BACKGROUND_COLUMNS]
+        missing = [name for name, values in model_columns if values is None]
+        if missing:
+            raise ValueError("--background model needs a producer stream carrying "
+                             f"{MODEL_BACKGROUND_COLUMNS}; missing {missing}. "
+                             "probixi writes them after the panel column.")
+        # a crystal written without prediction leaves these NaN
+        checked += model_columns
+    for name, values in checked:
         if values is None:
             continue
         bad = ~torch.isfinite(values)
@@ -549,6 +575,18 @@ def prepare_observations(
     # ADU → photon counts for the Poisson likelihood.
     core_I = core_I / gain
     core_background = core_background / gain
+    bg_core = bg_var_core = sigma_core = None
+    if background == "model":
+        # raw disk counts, then the model background under the disk and its variance
+        n_raw = core_I + core_background * core.n_pix
+        bg_core = core.bg_model / gain
+        bg_var_core = (core.bg_model_var / gain ** 2).clamp(min=0.0)
+        core_I = n_raw - bg_core
+        # keep the stream sigma: a counts-based one biases the EMA target low (BR 10k R_free 0.230 -> 0.226)
+        print(f"  background: noise model under the disk (median {float(bg_core.median()):.2f} "
+              f"photons, sd {float(bg_var_core.median().sqrt()):.3f}); annulus would carry "
+              f"sd {float((poisson_noise.n_peak / poisson_noise.n_bg * bg_core.clamp(min=0)).median().sqrt()):.3f}",
+              flush=True)
     hkl_idx = compute_hkl_index(core.hkl)
     _lap("hkl index")
     hkl_id_raw = hkl_idx.hkl_id
@@ -661,8 +699,13 @@ def prepare_observations(
     obs_counts = torch.bincount(hkl_id, minlength=n_valid)
     n_obs_total = int(I_obs.shape[0])
 
-    bg_per_pixel = core_background[keep_all][sort_all]
-    bg = bg_per_pixel * poisson_noise.n_peak
+    if bg_core is None:
+        bg_per_pixel = core_background[keep_all][sort_all]
+        bg = bg_per_pixel * poisson_noise.n_peak
+        bg_var = None
+    else:
+        bg = bg_core[keep_all][sort_all]
+        bg_var = bg_var_core[keep_all][sort_all]
     _lap("gather I/bg")
 
     # ── Initial log-space MLE for μ and α (positive obs per HKL) ──
@@ -763,7 +806,8 @@ def prepare_observations(
         # divided by the detector gain above).  Consumed by the agreement /
         # marginal objective and by a supplied-σ likelihood.
         sigma=(
-            (core.sigma / gain)[keep_all][sort_all].float()
+            sigma_core[keep_all][sort_all].float() if sigma_core is not None
+            else (core.sigma / gain)[keep_all][sort_all].float()
             if getattr(core, "sigma", None) is not None else None
         ),
         q_dir=q_dir_core[keep_all][sort_all].float(),
@@ -821,4 +865,5 @@ def prepare_observations(
         shell_id_fw=shell_id_fw,
         is_centric=is_centric,
         obs_weights=obs_weights_sorted,
+        bg_var=bg_var,
     )

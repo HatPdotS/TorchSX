@@ -161,7 +161,7 @@ class FixedLogGrid(Quadrature):
             # bg to one and the modelled bg to the other is the double-apply
             # trap; `test_fixed_eager_matches_triton_under_bg_mean_offset` is
             # what catches it.
-            bg_mean, sig_b2 = likelihood.detection_params(bg)
+            bg_mean, sig_b2 = likelihood.detection_params(bg, meta)
             # A non-zero bg_var_factor accounts for the background estimate's
             # own variance; 0 (the default) is the plain Poisson.
             return marginalize_signal_triton(
@@ -182,7 +182,7 @@ class FixedLogGrid(Quadrature):
             log_scatter = gengauss_log_prob_from_obs(eps, log_alpha_obs, log_beta_obs)
         else:
             log_scatter = scatter.log_prob(eps, params, meta)        # (M, K)
-        log_lik = likelihood.log_prob_given_signal(n_ph, S, bg)      # (M, K)
+        log_lik = likelihood.log_prob_given_signal(n_ph, S, bg, meta)  # (M, K)
 
         log_w = self._trap_log_w(log_scatter, K)
         return torch.logsumexp(log_scatter + log_lik + log_w[None, :], dim=1)

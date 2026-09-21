@@ -544,6 +544,7 @@ class PosteriorMergeTarget(nn.Module):
                 # be dropped here while the loss honours it.
                 and not float(getattr(objective.likelihood, "bg_mean_offset",
                                       0.0) or 0.0)
+                and not getattr(objective.likelihood, "has_bg_var", False)
             ):
                 la, lb = scatter.log_alpha_beta_obs(params, meta)
                 lp = fused_posterior_logp(

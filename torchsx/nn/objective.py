@@ -185,7 +185,7 @@ class MarginalNLL(nn.Module):
                 raise ValueError(f"miss_frac must be in (0, 1), got {miss_frac}")
             self.miss_logit = nn.Parameter(torch.tensor(math.log(miss_frac / (1.0 - miss_frac))))
 
-    def _log_miss(self, n_ph: Tensor, bg: Tensor) -> Tensor:
+    def _log_miss(self, n_ph: Tensor, bg: Tensor, meta=None) -> Tensor:
         """``log p(n | S = 0)`` on the kernel's scale (Poisson about its peak,
         with the background-variance term when the likelihood carries one).
 
@@ -196,16 +196,16 @@ class MarginalNLL(nn.Module):
         """
         q = getattr(self, "quadrature", None)
         if q is not None and hasattr(q, "log_miss"):
-            return q.log_miss(self.likelihood, n_ph, bg)
-        bg_mean, sig_b2 = self.likelihood.detection_params(bg)
+            return q.log_miss(self.likelihood, n_ph, bg, meta)
+        bg_mean, sig_b2 = self.likelihood.detection_params(bg, meta)
         return poisson_log_prob_at_zero_signal(n_ph, bg_mean, sig_b2)
 
-    def _mix_miss(self, lp: Tensor, n_ph: Tensor, bg: Tensor) -> Tensor:
+    def _mix_miss(self, lp: Tensor, n_ph: Tensor, bg: Tensor, meta=None) -> Tensor:
         if self.miss_logit is None:
             return lp
         log_pi = torch.nn.functional.logsigmoid(self.miss_logit)
         log_1m = torch.nn.functional.logsigmoid(-self.miss_logit)
-        return torch.logaddexp(log_1m + lp, log_pi + self._log_miss(n_ph, bg))
+        return torch.logaddexp(log_1m + lp, log_pi + self._log_miss(n_ph, bg, meta))
 
     def _grid_bounds(self) -> tuple[float, float] | None:
         g = getattr(self.quadrature, "log_S_grid", None)
@@ -247,7 +247,7 @@ class MarginalNLL(nn.Module):
         cs = self.chunk_size or n
         if cs >= n:
             lp = self._marginal(scatter, params, log_mean, n_ph, bg, meta, (0, n))
-            return self._mix_miss(lp, n_ph, bg)
+            return self._mix_miss(lp, n_ph, bg, meta)
         parts = []
         for s in range(0, n, cs):
             e = min(s + cs, n)
@@ -255,7 +255,7 @@ class MarginalNLL(nn.Module):
 
             def _chunk(lm, nn, bb, _sub=sub, _s=s, _e=e):
                 lp = self._marginal(scatter, params, lm, nn, bb, _sub, (_s, _e))
-                return self._mix_miss(lp, nn, bb)
+                return self._mix_miss(lp, nn, bb, _sub)
 
             args = (log_mean[s:e], n_ph[s:e], bg[s:e])
             if self.checkpoint_chunks and torch.is_grad_enabled():

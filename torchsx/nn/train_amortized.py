@@ -57,6 +57,20 @@ def _bg_mean_offset(objective) -> float:
                          "bg_mean_offset", 0.0) or 0.0)
 
 
+def _has_bg_var(objective) -> bool:
+    """Whether the likelihood carries a per-observation background variance."""
+    return bool(getattr(getattr(objective, "likelihood", None), "has_bg_var", False))
+
+
+def _bg_variance(objective, bg, meta):
+    """The background estimate's variance the likelihood models, ``(n,)``; zeros if none."""
+    lik = getattr(objective, "likelihood", None)
+    if lik is None or not hasattr(lik, "detection_params"):
+        return torch.zeros_like(bg)
+    s2 = lik.detection_params(bg, meta)[1]
+    return torch.zeros_like(bg) if s2 is None else s2
+
+
 class CrystalIndex:
     """Crystal-major view of the hkl-sorted observation list.
 
@@ -697,9 +711,7 @@ class AmortizedTrainer:
         # calibration change when nothing about the residuals moved.  At this
         # data's median bg the term is 135 against sigma^2 = 136, so it is not
         # a refinement.
-        bvf = float(getattr(getattr(self.objective, "likelihood", None),
-                            "bg_var_factor", 0.0) or 0.0)
-        var = (sigma**2 + bvf * bg.clamp(min=0.0)
+        var = (sigma**2 + _bg_variance(self.objective, bg, meta)
                + var_scatter).clamp(min=1e-12)
         # Same argument for the mean: under a bg_mean_offset the model claims
         # E[n] = K*I0 + bg + offset, so the residual this metric standardises
@@ -1048,7 +1060,8 @@ class AmortizedTrainer:
                     # checkpoint (see _pipeline's kind check) instead of merging
                     # it at the uncorrected background convention.
                     "kind": type(getattr(self.objective, "quadrature", None)).__name__
-                            + ("+bgmean" if _bg_mean_offset(self.objective) else ""),
+                            + ("+bgmean" if _bg_mean_offset(self.objective) else "")
+                            + ("+bgvar" if _has_bg_var(self.objective) else ""),
                     "n_points": getattr(getattr(self.objective, "quadrature", None),
                                         "n_points", None),
                 },
@@ -1064,11 +1077,14 @@ class AmortizedTrainer:
                 # silent mismatch here has already cost 0.022 in R_free once.
                 "likelihood": {
                     "kind": type(getattr(self.objective, "likelihood", None)).__name__
-                            + ("+bgmean" if _bg_mean_offset(self.objective) else ""),
+                            + ("+bgmean" if _bg_mean_offset(self.objective) else "")
+                            + ("+bgvar" if _has_bg_var(self.objective) else ""),
                     "bg_var_factor": float(getattr(
                         getattr(self.objective, "likelihood", None),
                         "bg_var_factor", 0.0) or 0.0),
                     "bg_mean_offset": _bg_mean_offset(self.objective),
+                    # variance lives in the prepared data; the marker makes a bare build refuse the checkpoint
+                    "bg_var": "per_observation" if _has_bg_var(self.objective) else None,
                 },
                 "data": dict(self.data_recipe or {}),
                 "scale": {
@@ -1221,7 +1237,6 @@ class AmortizedTrainer:
             # estimates E[I p] whatever the partiality distribution is.
             I0_ref = tgt.ema_I0.to(dev)
             floor = float(getattr(tgt, "floor", 1e-6) or 1e-6)
-            bvf = float(getattr(self.objective.likelihood, "bg_var_factor", 0.0) or 0.0)
             S = {k: torch.zeros(n_hkl, device=dev, dtype=torch.float64)
                  for k in ("cnt", "r", "r2", "sig", "K", "var", "sig2", "sigK", "K2",
                            "num", "den", "A", "B", "C")}
@@ -1232,8 +1247,9 @@ class AmortizedTrainer:
                 sig = (n_ph - bg).double()
                 h = meta.hkl_idx
                 ratio = sig / K
+                s2_bg = _bg_variance(self.objective, bg, meta).double()
                 var = ((K * I0_ref[h].double()).clamp(min=0)
-                       + bg.double() * (1.0 + bvf))
+                       + bg.double() + s2_bg)
                 # per-observation variance of (n - bg) under the trained model:
                 # counting term plus the multiplicative log-scatter of width w.
                 # The counting term is the model's (K I0_ref + bg), not the
@@ -1245,7 +1261,7 @@ class AmortizedTrainer:
                 # observation can dominate a reflection.
                 w2 = (pred.log_w.exp().double() ** 2).clamp(max=20.0)
                 mu = K * I0_ref[h].double().clamp(min=floor)
-                V = ((mu + bg.double() * (1.0 + bvf)).clamp(min=1.0)
+                V = ((mu + bg.double() + s2_bg).clamp(min=1.0)
                      + mu * mu * torch.expm1(w2))
                 g = K / V                     # weight on (n - bg) for the WLS mean
                 for k, v in (("cnt", torch.ones_like(sig)), ("r", ratio),

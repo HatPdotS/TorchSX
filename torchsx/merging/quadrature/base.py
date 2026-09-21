@@ -57,13 +57,15 @@ class Quadrature(nn.Module):
             raise NotImplementedError(
                 f"{type(self).__name__} hardcodes the plain-Poisson integrand "
                 "and would silently ignore the likelihood's bg_mean_offset")
-        if variance and float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0):
+        if variance and (float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0)
+                         or getattr(likelihood, "has_bg_var", False)):
             raise NotImplementedError(
                 f"{type(self).__name__} hardcodes the plain-Poisson integrand "
-                "and would silently ignore the likelihood's bg_var_factor")
+                "and would silently ignore the likelihood's background variance")
 
     def log_miss(
         self, likelihood: DetectionLikelihood, n_ph: Tensor, bg: Tensor,
+        meta: ObsInfo | None = None,
     ) -> Tensor:                   # (n_obs,)
         """``log p(n | S = 0)`` under the same detection model as the marginal.
 
@@ -76,7 +78,7 @@ class Quadrature(nn.Module):
         from torchsx.merging.likelihood.poisson import (
             poisson_log_prob_at_zero_signal,
         )
-        bg_mean, sig_b2 = likelihood.detection_params(bg)
+        bg_mean, sig_b2 = likelihood.detection_params(bg, meta)
         return poisson_log_prob_at_zero_signal(n_ph, bg_mean, sig_b2)
 
     @abstractmethod
