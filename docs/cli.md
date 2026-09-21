@@ -44,6 +44,33 @@ metadata and a four-component Gaussian mixture. Gain conversion, background-mean
 correction and posterior uncertainty are distinct operations. Existing checkpoints
 retain their recorded scatter family and background convention.
 
+## Probixi streams and the model background
+
+A probixi stream declares its own recipe in the header (`probixi/int_radius`,
+`probixi/adu_per_photon`, `probixi/bg_annulus_pixels`, `probixi/aperture`) and
+appends three columns to every reflection row: `n_pix`, the disk pixels actually
+summed; `bg_model`, the noise-model background under those pixels (ADU); and
+`bg_model_var`, that estimate's variance (ADU^2). The reader resolves radii and
+gain from the header, with the run's measured gain superseding the geometry
+file's nominal declaration, and keeps the extra columns as observation columns
+(`.sfx` caches retain them). A probixi header without the recipe leaves it
+unresolved and needs `--int-radius`; CrystFEL defaults are never assumed.
+
+`--background` selects the background the detection model uses:
+
+| Value | Behavior |
+|---|---|
+| `annulus` (default) | The stream's per-pixel ring mean times the nominal disk size, with variance `n_peak/n_bg * bg` and the `+c` mean correction: the CrystFEL model, for both CrystFEL and probixi streams. |
+| `model` | The producer's noise-model background under the disk with its own measured variance (per observation, no `+c`); the raw disk count is `I + background * n_pix` and the reported intensity becomes `raw - bg_model`. Needs the probixi columns. |
+
+Either way the stream's own sigma is kept: it weights the EMA merge target that
+centres the posterior grid, and replacing it with a counts-based `sqrt(raw +
+bg_var)` biases that average low (BR 10k, R_free 0.230 against 0.226).
+
+The choice is recorded in the recipe, cache signature and checkpoint
+(`Poisson+bgvar` / `SplitLogGrid+bgvar` markers), so a merge inherits it and an
+older build refuses the checkpoint instead of merging at the wrong convention.
+
 ## Public controls and reproducibility
 
 The shared options are `--out`, `--split`, `--split-file`, `--spacegroup`,

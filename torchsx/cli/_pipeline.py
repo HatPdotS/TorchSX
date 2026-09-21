@@ -30,6 +30,7 @@ class PrepBundle:
     recipe: dict                      # d_min, spacegroup, gain, radii, ...
     split_names: list[str] = field(default_factory=list)
     bg_var_factor: float = 0.0
+    background: str = "annulus"
 
     @property
     def spacegroup(self) -> str:
@@ -84,6 +85,13 @@ def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) ->
                    help="merge Friedel mates into a single reflection. "
                         "--no-merge-friedel keeps mates apart and writes (+)/(-) "
                         "columns. Default: the checkpoint recipe, then merge.")
+    p.add_argument("--background", choices=("annulus", "model"), default=None,
+                   help="background estimate the detection model uses: the "
+                        "stream's ring mean (annulus; the CrystFEL model, default) "
+                        "or the producer's noise-model background under the disk "
+                        "with its measured variance (model; needs probixi's "
+                        "n_pix/bg_model/bg_model_var columns). Default: the "
+                        "checkpoint recipe, then annulus.")
 
 
 # Preserve these import names for callers while keeping one resolver.
@@ -169,6 +177,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     merge_friedel = (bool(args.merge_friedel) if args.merge_friedel is not None
                      else bool(d.get("merge_friedel", True)))
     args.dmax = args.dmax if args.dmax is not None else d.get("d_max", 999.0)
+    background = getattr(args, "background", None) or d.get("background") or "annulus"
     if d_min is None:
         raise SystemExit("--dmin is required")
     if not (np.isfinite(d_min) and np.isfinite(args.dmax) and 0 < d_min < args.dmax):
@@ -204,6 +213,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         "d_min": float(d_min), "d_max": float(args.dmax),
         "spacegroup": spacegroup,
         "merge_friedel": merge_friedel,
+        "background": background,
         "split_file": _stamp(args.split_file),
     }
     if args.split_file is not None:
@@ -258,7 +268,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                   f"{blob['prep'].I_obs.numel():,} obs, "
                   f"{len(blob.get('split_names', []))} splits)", flush=True)
         return PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
-                          blob["bg_var_factor"])
+                          blob["bg_var_factor"],
+                          background=blob["recipe"].get("background", "annulus"))
 
     parts = []
     for name, path in splits:
@@ -353,7 +364,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                               gain=(gain if isinstance(gain, float) else 1.0))
     try:
         prep = prepare_observations(stream, MergeConfig(gain=gain), poisson_noise=noise,
-                                    resolved_measurement=resolved)
+                                    resolved_measurement=resolved, background=background)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     bvf = noise.n_peak / noise.n_bg
@@ -377,6 +388,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
               "inputs": [[name, str(path.resolve())] for name, path in splits],
               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
               "merge_friedel": merge_friedel,
+              "background": background,
               "measurement": {**resolved.to_dict(), "gain_adu_per_photon": noise.gain,
                               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
                               "gain_selection": noise.gain_selection,
@@ -388,8 +400,9 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     if verbose:
         print(f"prepared: {prep.n_valid:,} reflections, {prep.I_obs.numel():,} obs, "
               f"{prep.obs_info.n_crystals:,} crystals, n_peak/n_bg={bvf:.4f}, "
-              f"{100 * float(prep.is_centric.float().mean()):.1f} % centric", flush=True)
-    bundle = PrepBundle(prep, recipe, names, bvf)
+              f"{100 * float(prep.is_centric.float().mean()):.1f} % centric, "
+              f"background {background}", flush=True)
+    bundle = PrepBundle(prep, recipe, names, bvf, background=background)
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
         tmp = cache.with_suffix(cache.suffix + ".partial")
@@ -669,6 +682,22 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
 # trained models predate the parameter and are still worth merging.
 _BG_MEAN_QUAD_KINDS = ("SplitLogGrid+bgmean", "AnnulusMeanOnlySplitLogGridV1")
 _BG_MEAN_LIK_KINDS = ("Poisson+bgmean", "AnnulusMeanOnlyPoissonV1")
+# Per-observation background variance (``--background model``): both markers must agree.
+_BG_VAR_QUAD_KIND = "SplitLogGrid+bgvar"
+_BG_VAR_LIK_KIND = "Poisson+bgvar"
+
+
+def per_observation_bg_var_from_ckpt(ck: dict) -> bool:
+    """Whether a checkpoint was trained on a per-observation background variance."""
+    qkind = (ck.get("quadrature") or {}).get("kind")
+    lkind = (ck.get("likelihood") or {}).get("kind")
+    flags = (qkind == _BG_VAR_QUAD_KIND, lkind == _BG_VAR_LIK_KIND)
+    if any(flags) and not all(flags):
+        raise SystemExit(
+            f"checkpoint markers disagree: quadrature {qkind!r} vs likelihood "
+            f"{lkind!r}; one says the background variance was per observation and "
+            "the other does not")
+    return all(flags)
 
 
 def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
@@ -749,22 +778,31 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
     scale.set_encoder_chunking(400)
 
-    bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
-    bg_mean_offset = bg_mean_offset_from_ckpt(ck, bvf) if ck else float(bvf)
-    if bg_mean_offset and float(bvf) <= 0.0:
-        raise SystemExit(
-            f"Background mean offset {bg_mean_offset:g} requires a positive "
-            "background variance coefficient in the measurement/checkpoint recipe")
+    per_obs = per_observation_bg_var_from_ckpt(ck) if ck else bundle.background == "model"
+    if per_obs and getattr(prep, "bg_var", None) is None:
+        raise SystemExit("The checkpoint/recipe uses a per-observation background "
+                         "variance but the prepared data carries none; prepare with "
+                         "--background model from a probixi stream")
+    if per_obs:
+        bvf, bg_mean_offset = 0.0, 0.0
+        likelihood = Poisson(bg_var=prep.bg_var)
+    else:
+        bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
+        bg_mean_offset = bg_mean_offset_from_ckpt(ck, bvf) if ck else float(bvf)
+        if bg_mean_offset and float(bvf) <= 0.0:
+            raise SystemExit(
+                f"Background mean offset {bg_mean_offset:g} requires a positive "
+                "background variance coefficient in the measurement/checkpoint recipe")
+        likelihood = Poisson(bg_var_factor=float(bvf), bg_mean_offset=bg_mean_offset)
     quad = dict(ck.get("quadrature") or {})
     n_points = quad.get("n_points") or DEFAULTS["inner_points"]
-    if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS):
+    if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS,
+                                         _BG_VAR_QUAD_KIND):
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
                          "support SplitLogGrid checkpoints only")
     miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
             else (0.5 if scat.get("miss_logit") is not None else 0.0))
-    obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev),
-                      Poisson(bg_var_factor=float(bvf),
-                              bg_mean_offset=bg_mean_offset),
+    obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev), likelihood,
                       miss_frac=float(miss)).to(dev)
     if scat.get("miss_logit") is not None and obj.miss_logit is not None:
         with torch.no_grad():
@@ -810,7 +848,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         n_sigma=float(DEFAULTS["n_sigma"]),
         max_halfwidth=float(DEFAULTS["max_halfwidth"]),
         prior=prior,
-        bg_var_factor=float(bvf),
+        bg_var_factor=float(bvf), background="model" if per_obs else "annulus",
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
         skew=bool(skew), miss=float(miss),
         wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
@@ -830,9 +868,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
               f"miss {miss:.3f}, SplitLogGrid({n_points}), "
               f"outer {settings['k_coarse']}/{settings['m_fine']} "
               f"n_sigma {settings['n_sigma']:g}, "
-              f"Poisson(bg_var={bvf:.4f}"
-              + (f", bg_mean+{bg_mean_offset:.4f}" if bg_mean_offset else "")
-              + f"), device {dev}", flush=True)
+              + (f"Poisson(bg_var per observation, median sd "
+                 f"{float(prep.bg_var.median().sqrt()):.3f} photons)" if per_obs else
+                 f"Poisson(bg_var={bvf:.4f}"
+                 + (f", bg_mean+{bg_mean_offset:.4f}" if bg_mean_offset else "") + ")")
+              + f", device {dev}", flush=True)
         if bg_mean_offset:
             print(f"  detection background mean is bg+{bg_mean_offset:.4f} "
                   f"({bg_mean_offset / float(bvf):.3f} x n_peak/n_bg); variance "

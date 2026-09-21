@@ -24,12 +24,18 @@ by ``A_INV_TO_NM_INV``, so they are nm⁻¹ like the rest.
 
 Beam energy and camera length come from run-level geometry. Detector shifts
 are unavailable and are emitted as zero-valued image columns.
+
+Runs written with the integration recipe carry an ``integration`` table and
+``n_pixels`` / ``background_model`` / ``background_model_var`` columns, exposed
+as the same ``n_pix`` / ``bg_model`` / ``bg_model_var`` obs columns the stream
+reader attaches, so ``--background model`` works from either file.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from torchsx._core import _SFXStreamCore
@@ -143,14 +149,18 @@ def load_duckdb(
             FROM {source} c JOIN _images i USING (frame_id) WHERE c.indexed
         """)
         crys = conn.execute("SELECT * FROM _ordered ORDER BY cid").fetchnumpy()
+        refl_columns = {r[0] for r in conn.execute("DESCRIBE reflections").fetchall()}
+        model = all(c in refl_columns for c in ("n_pixels", "background_model", "background_model_var"))
+        extra = ", r.n_pixels, r.background_model, r.background_model_var" if model else ""
         refl = conn.execute(f"""
             SELECT r.h, r.k, r.l, r.intensity, r.sigma, r.peak, r.background,
-                   r.fs, r.ss, r.panel, o.cid
+                   r.fs, r.ss, r.panel, o.cid{extra}
             FROM reflections r JOIN _ordered o
               ON r.{key} = o.{key} AND r.frame_id = o.frame_id
             ORDER BY o.cid, r.h, r.k, r.l, r.panel, r.fs, r.ss,
                      r.intensity, r.sigma, r.peak, r.background
         """).fetchnumpy()
+        integration = _scalar_row(conn, "integration") if "integration" in tables else {}
     finally:
         conn.close()
 
@@ -223,7 +233,30 @@ def load_duckdb(
     photon_eV = float(geom_row.get("photon_energy_eV") or 0.0)
     clen = float(geom_row.get("clen") or 0.0)
 
-    return _SFXStreamCore(
+    obs_extra = {}
+    if model:
+        # NULL (no prediction) -> NaN, as in the stream
+        for src, name in (("n_pixels", "n_pix"), ("background_model", "bg_model"),
+                          ("background_model_var", "bg_model_var")):
+            col = refl[src]
+            if hasattr(col, "filled"):   # int column can't hold NaN until cast
+                col = np.ma.masked_array(col.data.astype(np.float32), col.mask).filled(np.nan)
+            obs_extra[name] = torch.as_tensor(np.asarray(col, dtype=np.float32))
+        if all(torch.isnan(t).all() for t in obs_extra.values()):
+            obs_extra = {}
+    if integration:
+        from torchsx.io._crystfel import probixi_measurement
+        from torchsx.measurement import MEASUREMENT_KEY
+        radii = tuple(integration.get(k) for k in ("r_peak", "r_gap", "r_bg"))
+        spec = probixi_measurement(
+            path, None,
+            {"int_radius": ",".join(str(r) for r in radii) if all(r is not None for r in radii) else None,
+             "adu_per_photon": integration.get("adu_per_photon"),
+             "reflection_columns": " ".join(obs_extra) if obs_extra else None},
+            [], [("probixi:integration", str(integration))], [])
+        metadata[MEASUREMENT_KEY] = {"record": spec.to_dict()}
+
+    core = _SFXStreamCore(
         hkl=hkl,
         I=_o("intensity"),
         sigma=_o("sigma"),
@@ -256,3 +289,6 @@ def load_duckdb(
         spacegroup=spacegroup,
         source_path=str(path),
     )
+    for name, column in obs_extra.items():
+        core.levels["obs"][name] = column
+    return core
