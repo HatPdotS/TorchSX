@@ -1,0 +1,102 @@
+# Tests for both packages in this repository: the Rust crate (native/) and the
+# Python package, which is tested against the native module built from the same
+# commit. publish.yml calls this workflow as its release gate.
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      torchref-from-pypi:
+        description: "Test against the released TorchRef on PyPI (the release gate)"
+        type: boolean
+        default: false
+
+env:
+  # torchsx needs TorchRef >= 0.7.0, which is not on PyPI yet, so pushes and PRs
+  # test against TorchRef's dev branch. The release gate uses PyPI's TorchRef,
+  # which is what users get. Drop this once TorchRef 0.7 is released.
+  TORCHREF_GIT: git+https://github.com/HatPdotS/TorchRef@dev
+
+jobs:
+  rust:
+    name: Rust unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # pyo3 links libpython into the test binary.
+      - name: cargo test
+        run: cargo test --release --manifest-path native/Cargo.toml
+        env:
+          PYO3_PYTHON: python
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
+
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+      # CPU torch within TorchRef's bound, so the next install keeps it rather
+      # than pulling a CUDA build. torchsx-native is built from this commit
+      # first, so the torchsx pin resolves to it instead of a published wheel.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4,<2.14" --index-url https://download.pytorch.org/whl/cpu
+          if [ "${{ inputs.torchref-from-pypi }}" != "true" ]; then pip install "torchref @ $TORCHREF_GIT"; fi
+          pip install ./native
+          pip install -e ".[dev]"
+
+      - name: The native module is the one in use
+        run: python -c "from torchsx.io import _native; m = _native.load(); assert m is not None; print(m.__file__, m.PROTOCOL)"
+
+      - name: Run tests
+        run: pytest -q -rs -m "not slow" tests
+
+  native-macos:
+    name: Native parity on macOS (arm64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ inputs.torchref-from-pypi }}" != "true" ]; then pip install "torchref @ $TORCHREF_GIT"; fi
+          pip install ./native
+          pip install -e ".[dev]"
+
+      - name: Run the native parser/writer tests
+        run: pytest -q -rs tests/test_native_parse.py tests/test_native_index.py tests/test_writeback_native.py tests/test_writeback.py

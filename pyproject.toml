@@ -1,17 +1,34 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchsx"
 version = "0.1.0"
 description = "GPU-friendly stacked tensors for unmerged serial crystallography data"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Hans Peter Seidel" }]
 requires-python = ">=3.10"
-dependencies = [
-    "torchref>=0.6.4",   # brings torch, triton and gemmi
-    "numpy>=1.24",
-    "safetensors>=0.4",  # the .sfx working format
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
+dependencies = [
+    "torchref>=0.7.0",   # brings torch, triton and gemmi; SpaceGroup.canonicalize_hkl/expand_reciprocal
+    "numpy>=2",          # the Python writer's float32 arithmetic (NEP 50)
+    "safetensors>=0.4",  # the .sfx working format
+    # The .stream reader/writer (Rust), built from native/ in this repository and
+    # released with torchsx. The pin follows native/Cargo.toml's minor version;
+    # bump both (and PROTOCOL) when the Rust↔Python interface changes.
+    "torchsx-native==0.1.*",
+]
+
+[project.urls]
+Repository = "https://github.com/HatPdotS/torchsx"
 
 [project.scripts]
 # The venvs put torchsx on PYTHONPATH rather than pip-installing it, so
@@ -25,8 +42,6 @@ torchsx-stats = "torchsx.cli.stats:main"
 stats = ["matplotlib>=3.7"]
 # Read probixi's DuckDB runs (SFXStream.from_duckdb).
 duckdb = ["duckdb>=1.0"]
-# Building the native .stream parser extension (io/_native.py JIT-compiles it).
-native = ["ninja>=1.11"]
 
 dev = ["pytest>=6.0", "black>=21.5", "isort>=5.9"]
 

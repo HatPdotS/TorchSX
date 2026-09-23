@@ -1,6 +1,6 @@
 """Invariants for the native CrystFEL stream writer.
 
-The C++ ``write_stream_reconstruct`` must:
+The native ``torchsx_native.write_stream`` must:
 
 1. **Byte-exact vs. Python** — the file it produces must be byte-identical to
    what the pure-Python writer produces from the same ``_SFXStreamCore``.
@@ -30,41 +30,18 @@ from torchsx.io._writeback import (
 from torchsx.stream import SFXStream
 
 
-def _candidate_streams() -> list[Path]:
-    paths: list[Path] = []
-    try:
-        from tests.conftest import STREAM_PATH
-        paths.append(Path(STREAM_PATH))
-    except Exception:
-        pass
-    paths.append(Path(
-        "/data/project/cls/standfuss/torchsx/experiments/sfx_scan/streams/delay_-45.stream"
-    ))
-    return [p for p in paths if p.exists()]
-
-
-@pytest.fixture(scope="module")
-def stream_path() -> Path:
-    cands = _candidate_streams()
-    if not cands:
-        pytest.skip("no real .stream file available")
-    return cands[0]
-
-
 @pytest.fixture(scope="module")
 def native():
     mod = _native.load()
     if mod is None:
-        pytest.skip("native extension not loaded")
-    if not hasattr(mod, "write_stream_reconstruct"):
-        pytest.skip("native module lacks write_stream_reconstruct")
+        pytest.skip("native module not installed")
     return mod
 
 
 @pytest.fixture(scope="module")
-def small_stream(stream_path: Path) -> SFXStream:
+def small_stream(real_stream: Path) -> SFXStream:
     return SFXStream.from_stream(
-        str(stream_path), spacegroup="P 1", merge_friedel=False,
+        str(real_stream), spacegroup="P 1", merge_friedel=False,
         max_crystals=200, sequential=True,
     )
 

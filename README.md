@@ -94,10 +94,23 @@ and the observation statistics that motivate the model.
 
 ## Install
 
-Python >=3.10 and TorchRef >=0.6.4 are required; TorchRef brings torch, triton
-and gemmi. Optional extras are `native` (for building the stream parser),
-`duckdb` (the existing Probixi reader), `stats` (Matplotlib for distribution
-plots) and `dev`, installed as `pip install -e '.[stats,native]'`.
+Python >=3.10 and TorchRef >=0.7.0 are required; TorchRef brings torch, triton
+and gemmi. `.stream` files are read and written by `torchsx-native`, a small
+Rust package built from `native/` in this repository and released with
+torchsx; `pip install torchsx` installs the prebuilt wheel for your platform.
+Optional extras are `duckdb` (the existing Probixi reader), `stats` (Matplotlib
+for distribution plots) and `dev`.
+
+From a checkout, build the native package first (needs a Rust toolchain, see
+[native/README.md](native/README.md)), then install torchsx against it:
+
+```bash
+pip install ./native
+pip install -e '.[stats]'
+```
+
+If `torchsx_native` cannot be imported, torchsx reads and writes streams with
+slower pure-Python code and warns once.
 
 ## Train and merge
 

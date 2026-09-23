@@ -1,0 +1,243 @@
+# Releases the two PyPI projects built from this repository:
+#
+#   torchsx-native  the Rust .stream reader/writer (native/): one abi3 wheel per
+#                   platform (Python >= 3.10) plus an sdist
+#   torchsx         the pure-Python package; depends on torchsx-native
+#
+# torchsx-native is uploaded first, with skip-existing, so a torchsx-only
+# release leaves the published native version in place. check_release.py
+# refuses a release whose native build changed without a version bump.
+#
+# One-time setup:
+#   - On PyPI and on TestPyPI, add a trusted publisher for BOTH projects
+#     (a "pending publisher" until the first upload): owner HatPdotS,
+#     repository torchsx, workflow publish.yml, environment pypi / testpypi.
+#   - Create the GitHub environments "pypi" and "testpypi".
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target"
+        required: true
+        default: "testpypi"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+jobs:
+  check:
+    name: Versions, pins and protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the previous tag, for the unchanged-native check
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check
+        run: |
+          python -m pip install packaging
+          python .github/scripts/check_release.py "${{ github.event.release.tag_name }}"
+
+  # Release gate: nothing is uploaded unless the full suite passes.
+  tests:
+    name: Test suite
+    needs: check
+    uses: ./.github/workflows/tests.yml
+    with:
+      torchref-from-pypi: true
+
+  native-linux:
+    name: torchsx-native wheel (linux ${{ matrix.target }})
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          args: --release --out dist --manifest-path native/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-${{ matrix.target }}
+          path: dist/
+
+  native-macos:
+    name: torchsx-native wheel (macOS universal2)
+    needs: check
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          target: universal2-apple-darwin
+          args: --release --out dist --manifest-path native/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-macos-universal2
+          path: dist/
+
+  native-windows:
+    name: torchsx-native wheel (windows x64)
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist --manifest-path native/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-x64
+          path: dist/
+
+  native-sdist:
+    name: torchsx-native sdist
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path native/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-sdist
+          path: dist/
+
+  # Every wheel is installed and exercised on its own platform, at both ends of
+  # the abi3 range.
+  native-smoke:
+    name: Smoke ${{ matrix.platform.artifact }} (Python ${{ matrix.python-version }})
+    needs: [native-linux, native-macos, native-windows]
+    runs-on: ${{ matrix.platform.runner }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { runner: ubuntu-latest, artifact: native-linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, artifact: native-linux-aarch64 }
+          - { runner: macos-15, artifact: native-macos-universal2 }
+          - { runner: windows-latest, artifact: native-windows-x64 }
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.platform.artifact }}
+          path: dist/
+
+      - name: Install the wheel
+        run: |
+          python -m pip install numpy
+          python -m pip install --no-index --no-deps --find-links dist torchsx-native
+
+      - name: Smoke test
+        run: python native/tests/smoke.py
+
+  torchsx-dist:
+    name: torchsx sdist and wheel
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build and check
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: torchsx-dist
+          path: dist/
+
+  publish-native:
+    name: Upload torchsx-native to ${{ github.event_name == 'release' && 'pypi' || inputs.target }}
+    needs: [tests, native-smoke, native-sdist, torchsx-dist]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'release' && 'pypi' || inputs.target }}
+      url: ${{ (github.event_name == 'release' || inputs.target == 'pypi') && 'https://pypi.org/p/torchsx-native' || 'https://test.pypi.org/p/torchsx-native' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ (github.event_name == 'release' || inputs.target == 'pypi') && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          # An unchanged torchsx-native version is already on the index.
+          skip-existing: true
+
+  publish-torchsx:
+    name: Upload torchsx to ${{ github.event_name == 'release' && 'pypi' || inputs.target }}
+    needs: publish-native
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'release' && 'pypi' || inputs.target }}
+      url: ${{ (github.event_name == 'release' || inputs.target == 'pypi') && 'https://pypi.org/p/torchsx' || 'https://test.pypi.org/p/torchsx' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: torchsx-dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ (github.event_name == 'release' || inputs.target == 'pypi') && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}

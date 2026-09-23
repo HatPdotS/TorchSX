@@ -19,7 +19,7 @@ def write_stream_reconstruct(
 ):
     """Generate a valid CrystFEL stream from tensors.
 
-    Dispatches to the native C++ writer when the JIT extension loads;
+    Dispatches to the native writer (``torchsx_native``) when it is installed;
     falls back to the pure-Python writer otherwise.
 
     Parameters
@@ -27,9 +27,9 @@ def write_stream_reconstruct(
     core : _SFXStreamCore
     path : output .stream file path
     original_stream : if provided, copy geometry/unit cell sections verbatim
-    n_threads : ≥1. Native-only. Parallel-format / sequential-drain pipeline;
-        memory peak stays bounded regardless of total output size. Ignored
-        by the Python fallback.
+    n_threads : ≥1. Native-only: images are formatted on this many threads in
+        batches and written in order, so memory stays bounded whatever the
+        output size. Ignored by the Python fallback.
     """
     from torchsx.io import _native
 
@@ -57,18 +57,16 @@ def _build_header_blob(core: _SFXStreamCore, original_stream: str | Path | None)
     return buf.getvalue()
 
 
-def _parse_cell_section(original_stream: str | Path | None) -> tuple[str, str, str]:
+def _parse_cell_section(original_stream: str | Path | None) -> tuple[str | None, str | None, str | None]:
     """Pull lattice_type / centering / unique_axis from the original unit cell.
 
-    Returns ("", "", "") if any field is absent — the C++ writer skips empty
-    strings (matching the Python writer's `if value is not None` checks).
+    A field absent from the section is ``None`` and is not written, as in the
+    Python writer's ``if value is not None`` checks.
     """
     if not original_stream or not Path(str(original_stream)).exists():
-        return "", "", ""
-    lattice_type = ""
-    centering = ""
-    unique_axis = ""
-    with open(str(original_stream), "r") as orig:
+        return None, None, None
+    lattice_type = centering = unique_axis = None
+    with open(str(original_stream), "r", encoding="utf-8", errors="replace") as orig:
         in_cell = False
         for line in orig:
             if line.startswith("----- Begin unit cell"):
@@ -87,6 +85,10 @@ def _parse_cell_section(original_stream: str | Path | None) -> tuple[str, str, s
     return lattice_type, centering, unique_axis
 
 
+def _np(t: torch.Tensor, dtype) -> np.ndarray:
+    return np.ascontiguousarray(t.detach().cpu().numpy(), dtype=dtype)
+
+
 def _write_stream_reconstruct_native(
     core: _SFXStreamCore,
     path: str | Path,
@@ -97,8 +99,8 @@ def _write_stream_reconstruct_native(
     """Native writer dispatcher.
 
     Sorts observations by crystal_id, builds the panel-name lookup and
-    pre-assembles the header bytes in Python (cheap, one-shot), then hands
-    the tensors and metadata to the C++ writer for the hot loop.
+    pre-assembles the header in Python (cheap, one-shot), then hands numpy
+    arrays and metadata to ``torchsx_native.write_stream`` for the hot loop.
     """
     path = Path(path)
 
@@ -113,8 +115,8 @@ def _write_stream_reconstruct_native(
         filenames = list(core.metadata["image"].get("filename", []))
         events = list(core.metadata["image"].get("event", []))
 
-    # Panel name lookup, with "m{i}" fallback for any gaps (matches the
-    # pname_arr build at _writeback.py:94-98 in the Python writer).
+    # Panel name lookup, with "m{i}" fallback for any gaps (as the pname_arr
+    # build in the Python writer).
     panel_names_in: list[str] = []
     if core.geometry:
         panel_names_in = list(core.geometry.panel_names)
@@ -130,50 +132,29 @@ def _write_stream_reconstruct_native(
     # Sort observations by crystal_id so each crystal's reflections are a
     # contiguous slice. The parser already emits them in this order, but
     # this is cheap and matches what the Python writer does.
-    crystal_id = core.crystal_id
-    sort_idx = torch.argsort(crystal_id, stable=True)
-    hkl = core.hkl.index_select(0, sort_idx).contiguous()
-    I = core.I.index_select(0, sort_idx).contiguous()
-    sigma = core.sigma.index_select(0, sort_idx).contiguous()
-    peak = core.peak.index_select(0, sort_idx).contiguous()
-    background = core.background.index_select(0, sort_idx).contiguous()
-    fs = core.fs.index_select(0, sort_idx).contiguous()
-    ss = core.ss.index_select(0, sort_idx).contiguous()
-    panel_id = panel_id_t.index_select(0, sort_idx).contiguous()
+    sort_idx = torch.argsort(core.crystal_id, stable=True)
+    obs = {
+        "hkl": np.int16, "I": np.float32, "sigma": np.float32, "peak": np.float32,
+        "background": np.float32, "fs": np.float32, "ss": np.float32, "panel_id": np.int16,
+    }
+    arrays = {k: _np(getattr(core, k).index_select(0, sort_idx), dt) for k, dt in obs.items()}
+    for k, dt in (
+        ("cell", np.float32), ("astar", np.float32), ("bstar", np.float32), ("cstar", np.float32),
+        ("profile_rad", np.float32), ("resolution", np.float32), ("n_refl", np.int32),
+        ("image_id", np.int32), ("beam_energy", np.float32), ("n_peaks", np.int32),
+        ("det_shift_x", np.float32), ("det_shift_y", np.float32),
+    ):
+        arrays[k] = _np(getattr(core, k), dt)
+    clen = core.camera_length
+    arrays["camera_length"] = (
+        _np(clen, np.float32) if clen is not None else np.empty(0, dtype=np.float32)
+    )
 
-    # Per-crystal tensors (no sort needed — already in crystal order).
-    cell = core.cell.contiguous()
-    astar = core.astar.contiguous()
-    bstar = core.bstar.contiguous()
-    cstar = core.cstar.contiguous()
-    profile_rad = core.profile_rad.contiguous()
-    resolution = core.resolution.contiguous()
-    n_refl = core.n_refl.to(torch.int32).contiguous()
-    image_id = core.image_id.to(torch.int32).contiguous()
-
-    # Per-image tensors
-    beam_energy = core.beam_energy.contiguous()
-    n_peaks = core.n_peaks.to(torch.int32).contiguous()
-    det_shift_x = core.det_shift_x.contiguous()
-    det_shift_y = core.det_shift_y.contiguous()
-    if core.camera_length is not None and core.camera_length.numel() > 0:
-        camera_length = core.camera_length.contiguous()
-    else:
-        camera_length = torch.empty(0, dtype=torch.float32)
-
-    # Pre-assemble preamble + parse optional unit-cell strings.
-    header_blob = _build_header_blob(core, original_stream)
     lattice_type, centering, unique_axis = _parse_cell_section(original_stream)
-
-    mod.write_stream_reconstruct(
-        str(path),
-        hkl, I, sigma, peak, background, fs, ss, panel_id,
-        cell, astar, bstar, cstar,
-        profile_rad, resolution, n_refl, image_id,
-        beam_energy, n_peaks, det_shift_x, det_shift_y, camera_length,
-        filenames, events, panel_names,
+    mod.write_stream(
+        str(path), arrays, filenames, events, panel_names,
         lattice_type, centering, unique_axis,
-        header_blob,
+        _build_header_blob(core, original_stream),
         n_threads=int(n_threads),
     )
 
@@ -183,7 +164,7 @@ def _write_stream_reconstruct_python(
     path: str | Path,
     original_stream: str | Path | None = None,
 ):
-    """Pure-Python fallback (used when the C++ extension is unavailable)."""
+    """Pure-Python writer: the fallback, and the only writer for a ``peak`` level."""
     path = Path(path)
 
     # Reverse panel ID mapping
@@ -291,7 +272,7 @@ def _write_stream_reconstruct_python(
     centering = None
     unique_axis = None
     if original_stream and Path(str(original_stream)).exists():
-        with open(str(original_stream), "r") as orig:
+        with open(str(original_stream), "r", encoding="utf-8", errors="replace") as orig:
             in_cell = False
             for line in orig:
                 if line.startswith("----- Begin unit cell"):
@@ -311,7 +292,8 @@ def _write_stream_reconstruct_python(
     det_shift_x_np = core.det_shift_x.cpu().numpy()
     det_shift_y_np = core.det_shift_y.cpu().numpy()
 
-    with open(path, "w") as f:
+    # UTF-8 and "\n" on every platform, as the native writer and CrystFEL write.
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         # Header
         f.write("CrystFEL stream format 2.3\n")
         f.write("Generated by torchsx\n")
@@ -436,7 +418,7 @@ def _copy_section(fout, stream_path: str, section_name: str):
     """Copy a named section from a stream file."""
     begin_marker = f"----- Begin {section_name} -----"
     end_marker = f"----- End {section_name} -----"
-    with open(stream_path, "r") as fin:
+    with open(stream_path, "r", encoding="utf-8", errors="replace") as fin:
         in_section = False
         for line in fin:
             if line.startswith(begin_marker):

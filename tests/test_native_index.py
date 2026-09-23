@@ -1,88 +1,53 @@
 """Invariants for the native chunk indexer.
 
-The C++ ``index_chunks`` must produce a chunk list bit-exactly matching
-the pure-Python ``_index_chunks`` reference, regardless of how many
-threads it ran with. Three cheap invariants pin this down:
-
-1. **Cross-thread invariance** — output is independent of ``n_threads``.
-2. **Coverage** — chunks are contiguous and cover [header_end, file_size).
-3. **Bit-exact vs. Python** — every tuple equals the Python reference.
-
-The early-exit head-mode path is also covered.
+``torchsx_native.index_chunks`` must return exactly what the pure-Python
+``_index_chunks`` / ``_index_chunks_until`` return, whatever the thread count.
+Chunk markers end reflection tables in both, which is what keeps the threaded
+scan equal to the serial one even for truncated tables.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 
 from torchsx.io import _native
-from torchsx.io._parser import _find_first_chunk_offset, _index_chunks
+from torchsx.io._parser import _find_first_chunk_offset, _index_chunks, _index_chunks_until
 
 
-def _candidate_streams() -> list[Path]:
-    """Return existing .stream files this test can run against."""
-    paths: list[Path] = []
-    try:
-        from tests.conftest import STREAM_PATH
-        paths.append(Path(STREAM_PATH))
-    except Exception:
-        pass
-    paths.append(Path(
-        "/data/project/cls/standfuss/torchsx/experiments/sfx_scan/streams/delay_-45.stream"
-    ))
-    return [p for p in paths if p.exists()]
-
-
-@pytest.fixture(scope="module")
-def stream_path() -> Path:
-    cands = _candidate_streams()
-    if not cands:
-        pytest.skip("no real .stream file available")
-    return cands[0]
+def _rows(arr) -> list[tuple[int, int, int, int]]:
+    return [tuple(int(x) for x in r) for r in arr]
 
 
 @pytest.fixture(scope="module")
 def native():
     mod = _native.load()
     if mod is None:
-        pytest.skip("native extension not loaded")
+        pytest.skip("native module not installed")
     return mod
 
 
 @pytest.mark.slow
-def test_native_matches_python(stream_path: Path, native):
-    """C++ single-threaded == Python serial, bit-exact."""
-    py_chunks = _index_chunks(str(stream_path))[1]
-    nat_chunks = [tuple(t) for t in native.index_chunks(str(stream_path), 1, -1)]
-    assert nat_chunks == py_chunks, (
-        f"native single-thread differs from Python: "
-        f"py={len(py_chunks)} nat={len(nat_chunks)}"
-    )
+def test_native_matches_python(real_stream: Path, native):
+    """Native single-threaded == Python serial, exactly."""
+    py_chunks = _index_chunks(str(real_stream))[1]
+    assert _rows(native.index_chunks(str(real_stream), 1)) == py_chunks
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("n_threads", [1, 2, 4, 8])
-def test_cross_thread_invariance(stream_path: Path, native, n_threads: int):
-    """index_chunks output is independent of n_threads."""
-    ref = [tuple(t) for t in native.index_chunks(str(stream_path), 1, -1)]
-    got = [tuple(t) for t in native.index_chunks(str(stream_path), n_threads, -1)]
-    assert got == ref, (
-        f"n_threads={n_threads} differs from serial: "
-        f"len ref={len(ref)} got={len(got)}"
-    )
+@pytest.mark.parametrize("n_threads", [2, 4, 8])
+def test_cross_thread_invariance(real_stream: Path, native, n_threads: int):
+    ref = _rows(native.index_chunks(str(real_stream), 1))
+    assert _rows(native.index_chunks(str(real_stream), n_threads)) == ref
 
 
 @pytest.mark.slow
-def test_coverage(stream_path: Path, native):
+def test_coverage(real_stream: Path, native):
     """Chunks tile [header_end, file_size) with no gaps and no overlaps."""
-    file_size = stream_path.stat().st_size
-    header_end = _find_first_chunk_offset(str(stream_path))
-    chunks = [tuple(t) for t in native.index_chunks(str(stream_path), 4, -1)]
-    assert chunks, "no chunks indexed"
-
+    file_size = real_stream.stat().st_size
+    header_end = _find_first_chunk_offset(str(real_stream))
+    chunks = _rows(native.index_chunks(str(real_stream), 4))
     assert chunks[0][0] == header_end
     assert chunks[-1][1] == file_size
     for a, b in zip(chunks, chunks[1:]):
@@ -91,24 +56,47 @@ def test_coverage(stream_path: Path, native):
 
 
 @pytest.mark.slow
-def test_head_mode_early_exit(stream_path: Path, native):
-    """max_crystals>0 stops as soon as the threshold is crossed."""
+def test_head_mode(real_stream: Path, native):
+    """Head mode stops at the first chunk reaching the target, as in Python."""
     target = 100
-    chunks = [tuple(t) for t in native.index_chunks(str(stream_path), 1, target)]
-    n_crys = sum(c[2] for c in chunks)
-    assert n_crys >= target
-    # Should have stopped at the FIRST chunk that pushed us over the target,
-    # so removing the last chunk drops us below.
-    if len(chunks) > 1:
-        assert sum(c[2] for c in chunks[:-1]) < target
+    chunks = _rows(native.index_chunks(str(real_stream), 1, target))
+    assert sum(c[2] for c in chunks) >= target
+    assert sum(c[2] for c in chunks[:-1]) < target
+    assert chunks == _index_chunks_until(str(real_stream), target)
 
 
-@pytest.mark.slow
-def test_head_mode_matches_python(stream_path: Path, native):
-    """Native head-mode bit-exact against pure-Python _index_chunks_until."""
-    from torchsx.io._parser import _index_chunks_until
+def _chunk(i: int, table: str) -> str:
+    return (
+        "----- Begin chunk -----\n"
+        f"Image filename: img{i}.h5\n"
+        "Peaks from peak search\nEnd of peak list\n"
+        "--- Begin crystal\n"
+        "Reflections measured after indexing\n"
+        "   h    k    l          I   sigma(I)       peak background  fs/px  ss/px panel\n"
+        f"{table}"
+        "----- End chunk -----\n"
+    )
 
-    target = 100
-    py = _index_chunks_until(str(stream_path), target)
-    nat = [tuple(t) for t in native.index_chunks(str(stream_path), 1, target)]
-    assert nat == py
+
+def test_truncated_tables_split_chunks(native, tmp_path: Path):
+    """A table without ``End of reflections`` ends at the next chunk marker."""
+    line = "   1    2    3 1.0 2.0 3.0 4.0 5.0 6.0 p0\n"
+    good = line * 3 + "End of reflections\n--- End crystal\n"
+    cut = line * 2  # no End of reflections
+    text = "header\n" + "".join(_chunk(i, cut if i % 3 == 1 else good) for i in range(40))
+    path = tmp_path / "cut.stream"
+    path.write_text(text)
+    py = _index_chunks(str(path))[1]
+    assert len(py) == 40
+    assert [c[3] for c in py[:3]] == [3, 2, 3]
+    for n in (1, 2, 3, 7):
+        assert _rows(native.index_chunks(str(path), n)) == py
+    assert _rows(native.index_chunks(str(path), 1, 5)) == _index_chunks_until(str(path), 5)
+
+
+def test_empty_index(native, tmp_path: Path):
+    path = tmp_path / "none.stream"
+    path.write_text("CrystFEL stream format 2.3\nno chunks here\n")
+    assert len(native.index_chunks(str(path), 4)) == 0
+    with pytest.raises(ValueError, match="No chunks"):
+        _index_chunks(str(path))

@@ -6,11 +6,9 @@ import torch
 from torchsx.geometry import Geometry, Panel
 
 
-def test_geometry_from_stream():
+def test_geometry_from_stream(merged_368_stream):
     """Parse geometry from the real stream file."""
-    from tests.conftest import STREAM_PATH
-
-    geom = Geometry.from_stream(STREAM_PATH)
+    geom = Geometry.from_stream(merged_368_stream)
     assert geom.n_panels == 32
     assert geom.photon_energy_eV == 12960.0
     assert abs(geom.clen - 0.0939) < 1e-4

@@ -1,0 +1,25 @@
+[package]
+name = "torchsx-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native CrystFEL .stream reader/writer for torchsx"
+authors = ["Hans Peter Seidel"]
+repository = "https://github.com/HatPdotS/torchsx"
+readme = "README.md"
+# Released to PyPI as a wheel (see ../.github/workflows/publish.yml), not to crates.io.
+publish = false
+
+[lib]
+name = "torchsx_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+numpy = "0.29"
+rayon = "1.12"
+memchr = "2.8"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
