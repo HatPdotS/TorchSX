@@ -204,8 +204,20 @@ if HAVE_TRITON:
                 tl.atomic_add(Gz, tl.sum(gz, axis=0))
 
 
-#: observations per program and outer nodes per inner-grid pass
-_BM, _KO = 4, 8
+#: ``(observations per program, outer nodes per inner-grid pass, warps)`` by the
+#: node count.  Measured on A100 at 1.41 M observations: two warps win
+#: throughout; 16 nodes per pass for the 31-node training grid (forward +
+#: backward 371 ms, against 599 at (4, 8, 4)), 8 for the 9-node locate scan
+#: (41 ms against 64), where 16 wastes most of the pass.
+_CONFIG_MANY, _CONFIG_FEW = (2, 16, 2), (2, 8, 2)
+#: benchmarking override, ``(BM, KO, warps)`` or None
+_OVERRIDE = None
+
+
+def _config(n_nodes: int) -> tuple[int, int, int]:
+    if _OVERRIDE is not None:
+        return _OVERRIDE
+    return _CONFIG_MANY if n_nodes >= 16 else _CONFIG_FEW
 
 
 def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, S=None, G=None):
@@ -218,8 +230,9 @@ def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, S=None, G
                "gz": torch.zeros(1, device=mu.device, dtype=torch.float32)}
     l1m, lpi, sig_z = miss if miss is not None else (0.0, 0.0, 0.0)
     bc = triton.next_power_of_2(C)
+    bm, ko, warps = _config(KN)
     if M:
-        _nodes_kernel[(triton.cdiv(M, _BM),)](
+        _nodes_kernel[(triton.cdiv(M, bm),)](
             mu, n_ph, p["bg_model"], mix,
             sig_b2 if sig_b2 is not None else dummy, p["logpeak"], p["log_L0"],
             *(p[k] for k in ("x_lo", "h1", "d_lo", "h_d", "d_hi", "h2", "n1", "n1d")),
@@ -227,8 +240,8 @@ def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, S=None, G
             out.get("gmu", dummy), out.get("gmix", dummy), out.get("gz", dummy),
             M, KN, l1m, lpi, sig_z,
             C, int(nodes), sig_b2 is not None, miss is not None, bool(grad),
-            _BM, 8, bc, _KO, _KO * bc,
-            num_warps=4,
+            bm, 8, bc, ko, ko * bc,
+            num_warps=warps,
         )
     return out
 
