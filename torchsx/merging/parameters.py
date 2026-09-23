@@ -56,26 +56,6 @@ class Parameters(nn.Module):
         self.q_a = nn.Parameter(torch.tensor(float(q_a_init), dtype=torch.float32))
         self.q_b = nn.Parameter(torch.tensor(float(q_b_init), dtype=torch.float32))
 
-    @classmethod
-    def from_prep(
-        cls,
-        prep: PreparedObs,
-        scatter_shape: ScatterShape | None = None,
-    ) -> "Parameters":
-        """Seed parameters from ``PreparedObs`` init estimates.
-
-        ``scatter_shape=None`` instantiates the legacy
-        :class:`FreePerHKLShape` from ``prep.alpha_init`` /
-        ``prep.beta_perhkl`` so callers that don't pass anything see
-        identical behaviour to the previous per-HKL ``nn.Parameter``
-        layout.
-        """
-        if scatter_shape is None:
-            log_alpha_init = torch.log(prep.alpha_init.clamp(min=1e-3))
-            log_beta_init = torch.log(prep.beta_perhkl.clamp(min=1e-3))
-            scatter_shape = FreePerHKLShape(log_alpha_init, log_beta_init)
-        return cls(log_I0_init=prep.mu_init, scatter_shape=scatter_shape)
-
     @property
     def log_alpha(self) -> Tensor:
         return self.scatter_shape.log_alpha()

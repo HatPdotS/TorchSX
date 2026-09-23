@@ -210,9 +210,10 @@ class ObsFeatureSpec(nn.Module):
         self.register_buffer("_hkl", prep.hkl_valid.float(), persistent=False)
         self.has_supplied_sigma = oi.sigma is not None
         # Reference merged intensity per reflection, used to form obs_scale.
-        # Always detached: it is a lookup, never a gradient path.
-        self.register_buffer("_I0_ref", prep.mu_init.exp().clamp(min=1e-3).float(),
-                             persistent=False)
+        # Always detached: it is a lookup, never a gradient path.  Starts flat;
+        # the trainer installs the running merge (set_reference_I0) before the
+        # first forward.
+        self.register_buffer("_I0_ref", torch.ones(prep.n_valid), persistent=False)
 
         # Normalisation stats over the FULL dataset (never per batch — that
         # would leak batch composition into the features).
@@ -284,8 +285,10 @@ class ObsFeatureSpec(nn.Module):
         meta_s = self._stat_obs_info
         n = int(meta_s.hkl_idx.numel())
         if n > self.STAT_SAMPLE:
+            # With replacement: a full randperm(n) to take 2 M rows costs
+            # seconds at 1e8 observations and buys nothing for a mean and std.
             g = torch.Generator(device="cpu").manual_seed(0)
-            idx = torch.randperm(n, generator=g)[: self.STAT_SAMPLE]
+            idx = torch.randint(n, (self.STAT_SAMPLE,), generator=g)
             meta_s = meta_s.gather(idx.to(meta_s.hkl_idx.device))
         meta_s = meta_s.to(self._I.device)
         full = self._raw_columns(meta_s, self._stat_names)

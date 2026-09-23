@@ -768,20 +768,16 @@ class SFXStream:
                 core = core.with_columns("obs", observed_hkl=core.hkl)
         sg = spacegroup or core.spacegroup
         group = SpaceGroup(sg)
-        canonical_hkl, _, friedel_flags, sort_indices = group.canonicalize_hkl(
-            observed.int(), include_friedel=True,
+        canonical_hkl, _, friedel_flags, _ = group.canonicalize_hkl(
+            observed.int(), include_friedel=True, sort=False,
         )
-        # canonicalize_hkl returns sorted output; invert to restore original order
-        inv = torch.empty_like(sort_indices)
-        inv[sort_indices] = torch.arange(len(sort_indices))
-        canonical_hkl = canonical_hkl[inv]
 
         if separate_friedel:
             # A centric reflection is its own Friedel mate, so which branch
             # canonicalize_hkl reports for it depends on operator order.  Pin
             # them to the positive one, or one measurement lands under two
             # indices.
-            minus = friedel_flags[inv]
+            minus = friedel_flags.clone()
             flagged = minus.nonzero(as_tuple=True)[0]
             minus[flagged] = ~_is_centric(group, canonical_hkl[flagged])
             canonical_hkl = torch.where(minus[:, None], -canonical_hkl, canonical_hkl)

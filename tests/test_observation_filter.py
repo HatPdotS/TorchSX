@@ -44,7 +44,7 @@ def test_filter_before_calibration_preserves_alignment(sample_core, monkeypatch,
     expected = prepare_observations(SFXStream(core.select_cascade({"obs": keep})),
                                     MergeConfig(gain=2.0), partiality=partiality[keep],
                                     crystal_weights=weights)
-    for name in ("I_obs", "bg", "hkl_id", "mu_init", "alpha_init", "partiality", "obs_weights"):
+    for name in ("I_obs", "bg", "hkl_id", "partiality", "obs_weights"):
         torch.testing.assert_close(getattr(actual, name), getattr(expected, name))
     for name in ("crystal_id", "sigma", "peak", "fs", "ss", "q_dir", "ewald_offset"):
         torch.testing.assert_close(getattr(actual.obs_info, name), getattr(expected.obs_info, name))

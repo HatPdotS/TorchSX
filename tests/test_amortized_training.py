@@ -19,7 +19,6 @@ import pytest
 import torch
 
 from torchsx.merging.config import MergeConfig
-from torchsx.merging.hkl import build_adjacency
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
@@ -78,16 +77,14 @@ def _synthetic(n_hkl=60, n_xtal=150, per=40, seed=0, n_cond=1, shift=1.5):
         I_obs=I, hkl_id=hkl, bg=bg,
         obs_counts=torch.bincount(hkl, minlength=n_hkl),
         n_obs_total=hkl.numel(),
-        mu_init=torch.full((n_hkl,), math.log(60.0)),
-        alpha_init=torch.full((n_hkl,), 1.65),
-        beta_perhkl=torch.full((n_hkl,), 2.0),
-        adjacency=build_adjacency(hkl_valid), obs_info=oi, partiality=None,
+        obs_info=oi, partiality=None,
         shell_id_fw=torch.arange(n_hkl) % 4,
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
     )
     params = Parameters(
-        log_I0_init=prep.mu_init.clone(),
-        scatter_shape=FreePerHKLShape(prep.alpha_init.log(), prep.beta_perhkl.log()),
+        log_I0_init=torch.full((n_hkl,), math.log(60.0)),
+        scatter_shape=FreePerHKLShape(torch.full((n_hkl,), 1.65).log(),
+                                      torch.full((n_hkl,), 2.0).log()),
     )
     return prep, params, log_G, cid, per
 

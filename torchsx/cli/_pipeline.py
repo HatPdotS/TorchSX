@@ -698,19 +698,17 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                 verbose: bool = True):
     """Build the production model, preserving recorded checkpoint geometry."""
     from torchsx.merging.likelihood import Poisson
-    from torchsx.merging.parameters import Parameters
     from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
     from torchsx.merging.scale import AmortizedScale
-    from torchsx.merging.scatter_shape import FreePerHKLShape
     from torchsx.nn.objective import MarginalNLL
 
     ck = ckpt or {}
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     prep = bundle.prep  # Host residency bounds device memory independently of dataset size.
-    params = Parameters(
-        log_I0_init=prep.mu_init.clone(),
-        scatter_shape=FreePerHKLShape(prep.alpha_init.log(), prep.beta_perhkl.log()),
-    ).to(dev)
+    # The predicted scatter families carry every per-observation shape parameter;
+    # there are no per-HKL parameters to fit, so the objective's ``params`` slot
+    # is empty.
+    params = None
 
     enc = dict(ck.get("encoder") or {})
     sc = dict(ck.get("scale") or {})

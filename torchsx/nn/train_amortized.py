@@ -551,12 +551,20 @@ class AmortizedTrainer:
         #: unnamed split).  Travels to the checkpoint and names the outputs.
         self.split_names: list[str] = []
 
-        # Resolution shell per observation, for the calibration breakdown.
-        d = prep.d_spacing[prep.hkl_id]
-        rank = d.argsort().argsort().float() / max(d.numel(), 1)
-        self.shell_of_obs = (rank * self.cfg.shell_bins).long().clamp(
-            max=self.cfg.shell_bins - 1
-        )
+        # Resolution shell per observation (equal observation count, low d
+        # first), for the calibration breakdown.  Every observation of a
+        # reflection shares its d, so the ranking is done over reflections
+        # weighted by multiplicity instead of by sorting all observations
+        # twice; stored as int16 because it is one entry per observation.
+        bins = self.cfg.shell_bins
+        hid = prep.hkl_id
+        counts = torch.bincount(hid, minlength=prep.n_valid).double()
+        order = prep.d_spacing.to(hid.device).argsort()
+        below = counts[order].cumsum(0) - counts[order]
+        shell_h = torch.empty(prep.n_valid, dtype=torch.int16, device=hid.device)
+        shell_h[order] = (below / max(hid.numel(), 1) * bins).floor().clamp(
+            max=bins - 1).to(torch.int16)
+        self.shell_of_obs = shell_h[hid]
 
     # ── condition-indexed state ────────────────────────────────────────
 
@@ -877,7 +885,7 @@ class AmortizedTrainer:
         # stream_batches, while ``rows`` and z come off the device -- so the
         # index has to go to the table, not the table to the index.
         out.update(calibration_metrics(
-            z, shell_id=self.shell_of_obs[rows.to(self.shell_of_obs.device)].to(z.device),
+            z, shell_id=self.shell_of_obs[rows.to(self.shell_of_obs.device)].to(z.device).long(),
             n_shells=self.cfg.shell_bins, i_over_sigma=ios,
         ))
         # Is the width head actually using its per-observation freedom?  var_z
