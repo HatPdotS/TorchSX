@@ -150,7 +150,7 @@ def main(argv=None):
     prep, params, scale, obj, settings = P.build_stack(bundle, args)
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
-        target_redundancy=args.redundancy, epochs=0, lr=1e-3, mixture_lr_mult=10.0,
+        target_redundancy=args.redundancy, epochs=0, lr=1e-3,
         lam0=10.0, lam_halflife_steps=400 * n_states, warmup_steps=100 * n_states,
         grad_clip=20.0, log_every=25, merge_target="posterior", loss="evidence",
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,

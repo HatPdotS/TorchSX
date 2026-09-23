@@ -180,9 +180,10 @@ class TrainConfig:
     target_redundancy: float | None = None
     epochs: int = 10
     lr: float = 1e-3
-    #: Learning-rate multiplier for the mixture conditioner's parameters: its
-    #: outputs enter the likelihood through a softmax and a mean correction
-    #: whose gradients are small near the initial state.
+    #: Learning-rate multiplier for the mixture head's parameters.  10 suited
+    #: the old three-input conditioner, whose outputs had small gradients near
+    #: the initial state; the head reads the full embedding like the other
+    #: heads, and at 10 it drove lower widths to alpha ~ 1e5 within 200 updates.
     mixture_lr_mult: float = 1.0
     #: Linear LR warmup.  Matters once the encoder is a deep stack of exchange
     #: blocks: the zero-initialised output projections make every block start
