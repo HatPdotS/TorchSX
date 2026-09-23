@@ -99,7 +99,11 @@ class MixtureHead(nn.Module):
     the other components may be wider or narrower below the centre but only
     narrower above it, because the mean multiplicative factor of a
     heavy-tailed component that is wide on the upper side is not finite, and
-    the mixture is centred on that mean.  The weights are zero-initialised, so
+    the mixture is centred on that mean.  Gaussian components (``"gaussian"``)
+    have a finite mean at any width, so there the upper delta takes either
+    sign: bounding every component's upper width by the base's made the base
+    component itself carry the widest upper side any component needed (seen:
+    alpha_hi ~ 4 nats at 1-2 % weight, half of E[S]).  The weights are zero-initialised, so
     the first forward returns the biases for every observation: component 0
     carries most of the weight and the others start at a small but
     non-negligible weight with distinct offsets and widths, large enough that
@@ -132,6 +136,10 @@ class MixtureHead(nn.Module):
         self.lambda_init_raw = math.log(math.expm1(3.0))
         with torch.no_grad():
             self.l2.bias.copy_(self.init_bias(self.n_components, shape))
+        #: the upper-width delta is free in sign for Gaussian components (see above)
+        self.free_upper = shape == "gaussian"
+        K = self.n_components
+        self.register_buffer("_hi_init", self.init_bias(K, shape)[3 * K:4 * K].clone())
 
     @staticmethod
     def init_bias(n_components: int, shape: str = "shared") -> Tensor:
@@ -165,7 +173,12 @@ class MixtureHead(nn.Module):
         logits = raw[:, :K]
         offset = raw[:, K:2 * K] * keep
         d_lo = raw[:, 2 * K:3 * K] * keep
-        d_hi = -torch.nn.functional.softplus(raw[:, 3 * K:4 * K]) * keep
+        raw_hi = raw[:, 3 * K:4 * K]
+        if self.free_upper:
+            # same value and orientation as -softplus at the initial bias, no sign limit
+            d_hi = (-torch.nn.functional.softplus(self._hi_init) - (raw_hi - self._hi_init)) * keep
+        else:
+            d_hi = -torch.nn.functional.softplus(raw_hi) * keep
         d_beta = raw[:, 4 * K:] * keep
         return logits, offset, d_lo, d_hi, d_beta
 

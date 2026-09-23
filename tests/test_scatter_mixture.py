@@ -179,6 +179,21 @@ def test_mixture_heads_start_at_the_single_family_and_expose_components():
     assert base.mix is None and base.detach().mix is None and p.detach().mix is not None
 
 
+
+def test_gaussian_components_may_be_wider_above_than_the_base():
+    from torchsx.nn.heads import MixtureHead
+    torch.manual_seed(0)
+    z = torch.randn(200, 16)
+    for shape, free in (("gaussian", True), ("shared", False)):
+        head = MixtureHead(16, 3, shape=shape)
+        d0 = head(z)[3]
+        torch.testing.assert_close(d0[:, 1:], -torch.nn.functional.softplus(head._hi_init[1:]).expand(200, -1))
+        with torch.no_grad():
+            head.l2.weight.normal_(0.0, 1.0)
+        d_hi = head(z)[3]
+        assert (d_hi[:, 0] == 0).all()
+        assert bool((d_hi[:, 1:] > 0).any()) is free
+
 def test_mixture_scale_model_primes_the_mixture_scatter_and_chunks_exactly():
     from tests.test_amortized_training import _synthetic
     from torchsx.merging.scale import AmortizedScale
