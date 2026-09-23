@@ -332,10 +332,10 @@ class ScaleHeads(nn.Module):
             mix = torch.cat([log_pi, offset, la, la, beta_k.log()], dim=1)
             return ScalePrediction(
                 log_K=log_K,
-                log_w=mixture_log_sd(log_pi, offset, la, la, beta_k),
+                log_w=mixture_log_sd(log_pi, offset, la, la, beta_k, gaussian=True),
                 beta=beta_k[:, 0],
                 log_alpha=la[:, 0],
-                log_e_s=mixture_log_e_s(log_pi, offset, la, la, beta_k),
+                log_e_s=mixture_log_e_s(log_pi, offset, la, la, beta_k, gaussian=True),
                 log_alpha_hi=la[:, 0],
                 mix=mix,
             )
@@ -352,12 +352,13 @@ class ScaleHeads(nn.Module):
         la_lo = base_lo + d_lo
         la_hi = base_hi + d_hi
         mix = torch.cat([log_pi, offset, la_lo, la_hi, beta_k.log()], dim=1)
+        gaussian = self.mixture.shape == "gaussian"
         return ScalePrediction(
             log_K=log_K,
-            log_w=mixture_log_sd(log_pi, offset, la_lo, la_hi, beta_k),
+            log_w=mixture_log_sd(log_pi, offset, la_lo, la_hi, beta_k, gaussian=gaussian),
             beta=beta_k[:, 0],
             log_alpha=la_lo[:, 0],
-            log_e_s=mixture_log_e_s(log_pi, offset, la_lo, la_hi, beta_k),
+            log_e_s=mixture_log_e_s(log_pi, offset, la_lo, la_hi, beta_k, gaussian=gaussian),
             log_alpha_hi=la_hi[:, 0],
             mix=mix,
         )
