@@ -31,3 +31,6 @@ tests/**/*.pt
 *.npy
 *.npz
 *.pkl
+
+# written to the working directory by the trainer tests
+/metrics.jsonl
