@@ -62,15 +62,13 @@ def test_sfxstream_to_device(sample_core):
 
 
 @pytest.mark.slow
-def test_sfxstream_cache_round_trip(tmp_path):
+def test_sfxstream_cache_round_trip(tmp_path, merged_368_stream):
     """Parse real stream, cache as .sfx, reload and compare."""
-    from tests.conftest import STREAM_PATH
-
     cache_path = tmp_path / "cached.sfx"
-    stream1 = SFXStream.from_stream(STREAM_PATH, spacegroup="P 1", cache=cache_path)
+    stream1 = SFXStream.from_stream(merged_368_stream, spacegroup="P 1", cache=cache_path)
 
     # Load from cache
-    stream2 = SFXStream.from_stream(STREAM_PATH, spacegroup="P 1", cache=cache_path)
+    stream2 = SFXStream.from_stream(merged_368_stream, spacegroup="P 1", cache=cache_path)
 
     assert stream2.n_crystals == stream1.n_crystals
     assert stream2.n_observations == stream1.n_observations

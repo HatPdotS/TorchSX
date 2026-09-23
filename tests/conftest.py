@@ -1,5 +1,8 @@
 """Test fixtures for torchsx."""
 
+import os
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -9,6 +12,30 @@ from torchsx.io._metadata import StreamMetadata
 
 # Path to the real stream file for integration tests
 STREAM_PATH = "/das/work/units/LBR-FEL/p17490/Peter/torchsx/experiments/data/merged_368.stream"
+
+# Real streams for the native parser/writer parity tests; the first that exists
+# is used. TORCHSX_TEST_STREAM overrides.
+REAL_STREAMS = (
+    os.environ.get("TORCHSX_TEST_STREAM", ""),
+    STREAM_PATH,
+    "/data/project/cls/standfuss/torchsx_new/gym/data/sm20k/A.stream",
+)
+
+
+@pytest.fixture
+def merged_368_stream() -> str:
+    """The reference stream the geometry/parse tests were written against."""
+    if not Path(STREAM_PATH).exists():
+        pytest.skip(f"{STREAM_PATH} not available")
+    return STREAM_PATH
+
+
+@pytest.fixture(scope="session")
+def real_stream() -> Path:
+    for p in REAL_STREAMS:
+        if p and Path(p).exists():
+            return Path(p)
+    pytest.skip("no real .stream file available (set TORCHSX_TEST_STREAM)")
 
 
 @pytest.fixture

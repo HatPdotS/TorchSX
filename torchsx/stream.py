@@ -64,7 +64,7 @@ class SFXStream:
         path : .stream file path
         spacegroup : space group string
         cache : if provided, save/load .sfx cache at this path
-        n_workers : parallel workers (default 1 for login node safety)
+        n_workers : native parser threads (default 1 for login node safety)
         merge_friedel : if True, canonicalize HKL to merge Friedel mates
         max_crystals : if set, parse a subset of chunks whose total crystal
             count is ≥ this value.  Uses a streaming two-pass strategy that
@@ -723,9 +723,9 @@ class SFXStream:
         Parameters
         ----------
         path : output .stream file path
-        n_threads : ≥1. Parallel-format / sequential-drain pipeline; memory
-            peak stays bounded regardless of total output size. Effective
-            only when the native writer is loaded.
+        n_threads : ≥1. Threads for the native writer, which formats images
+            in batches and writes them in order, so memory stays bounded
+            whatever the output size. Ignored by the Python fallback.
         """
         from torchsx.io._writeback import write_stream_reconstruct
         write_stream_reconstruct(
@@ -810,10 +810,12 @@ def _is_centric(group, hkl: torch.Tensor) -> torch.Tensor:
     gigabytes on a full stream -- so loop instead.  Rotation entries are
     {0, +-1}, which float32 carries exactly.
     """
-    ops = torch.round(group.reciprocal.matrices).to(torch.float32)
+    # The group's matrices live on TorchRef's default device (CUDA on a GPU
+    # node); the test runs where ``hkl`` is.
+    ops = torch.round(group.reciprocal.matrices).to(device=hkl.device, dtype=torch.float32)
     h = hkl.to(torch.float32)
     neg = -h
-    centric = torch.zeros(len(hkl), dtype=torch.bool)
+    centric = torch.zeros(len(hkl), dtype=torch.bool, device=hkl.device)
     for R in ops:
         centric |= (h @ R.T == neg).all(dim=1)
     return centric

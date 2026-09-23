@@ -87,7 +87,9 @@ class Geometry:
         """Parse geometry from first geometry section in a .stream file."""
         geom_lines = []
         in_geom = False
-        with open(path, "r") as f:
+        # Undecodable bytes elsewhere in the file (e.g. a Latin-1 filename)
+        # must not stop the header read; the parser replaces them the same way.
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 if line.startswith("----- Begin geometry file -----"):
                     in_geom = True

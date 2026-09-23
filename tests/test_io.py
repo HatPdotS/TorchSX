@@ -37,16 +37,15 @@ def test_sfx_geometry_round_trip(sample_core, tmp_path):
 
 
 @pytest.mark.slow
-def test_parse_real_stream():
+def test_parse_real_stream(merged_368_stream):
     """Parse the real merged_368.stream file.
 
     Run with: pytest -m slow
     Expected: ~81k crystals, ~195k images, 32 panels
     """
-    from tests.conftest import STREAM_PATH
     from torchsx.io._parser import parse_stream
 
-    core = parse_stream(STREAM_PATH, spacegroup="P 1", n_workers=1)
+    core = parse_stream(merged_368_stream, spacegroup="P 1", n_workers=1)
 
     # Known properties of merged_368.stream
     assert core.n_crystals > 80000, f"Expected >80k crystals, got {core.n_crystals}"

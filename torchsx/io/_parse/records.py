@@ -1,6 +1,27 @@
-"""Pass-2 record parsing: line streaming, tensor allocation, direct writes.
+"""Pass-2 record parsing: line streaming, array allocation, direct writes.
 
-Leaf module (numpy + torch only).
+Leaf module (numpy + torch only). This is the pure-Python twin of the native
+parser (``native/src/parse.rs``): same state machine, same rules for malformed
+input, same report. Keep the two in step; ``tests/test_native_parse.py``
+checks they agree.
+
+Malformed content is excluded at the smallest unit that keeps the rest valid,
+and each exclusion is counted by reason (see :data:`REASONS`):
+
+- a reflection line with fewer than ten fields, a non-numeric field or an hkl
+  outside int16 is dropped;
+- a crystal whose cell line has fewer than six numbers, whose reciprocal
+  vector line has no ``=`` or fewer than three numbers, or that is cut off
+  (chunk marker or end of input before ``End of reflections``) is dropped with
+  its reflections;
+- a non-numeric value of a key that is read keeps the default; a ``det_shift``
+  line that does not parse is ignored;
+- an ``Image filename:`` line with nothing after it, and a chunk without one,
+  are skipped.
+
+A chunk marker (``----- Begin chunk -----`` / ``----- End chunk -----``) ends
+whatever image or crystal is open, so no chunk can swallow the next one, and
+``--- Begin crystal`` starts a crystal even where a peak section was expected.
 """
 
 from __future__ import annotations
@@ -8,64 +29,170 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+REASONS = (
+    "reflection_short",
+    "reflection_value",
+    "reflection_hkl_range",
+    "crystal_cell",
+    "crystal_vector",
+    "crystal_truncated",
+    "image_truncated",
+    "chunk_no_image",
+    "key_value",
+    "det_shift",
+)
+
+_BEGIN_CHUNK = "----- Begin chunk -----"
+_END_CHUNK = "----- End chunk -----"
+
+(_OUTER, _AFTER_FILENAME, _CHUNK_KV, _PEAKS, _CRYSTALS, _CELL, _VECTOR,
+ _CRYSTAL_KV, _REFL_HEADER, _REFL, _SKIP_CRYSTAL) = range(11)
+
 
 def _line_iter(f, end_pos: int | None):
-    """Yield decoded lines from ``f`` up to (but not past) ``end_pos`` bytes."""
-    while end_pos is None or f.tell() < end_pos:
+    """Yield ``(offset, line)`` for the lines starting before ``end_pos``.
+
+    Lines are decoded as UTF-8 (invalid bytes replaced) without the trailing
+    ``\\r``/``\\n`` run.
+    """
+    pos = f.tell()
+    while end_pos is None or pos < end_pos:
         b = f.readline()
         if not b:
             return
-        yield b.rstrip(b"\r\n").decode("utf-8", "replace")
-
-
-def _is_valid_float(s: str) -> bool:
-    try:
-        float(s)
-        return True
-    except ValueError:
-        return False
-
-
-def _parse_vec_line(line: str) -> list[float]:
-    """Parse ``'astar = -0.513 -0.297 -0.420 nm^-1'`` → ``[-0.513, -0.297, -0.420]``."""
-    parts = line.split("=", 1)[1].split()
-    return [float(x) for x in parts if _is_valid_float(x)]
+        yield pos, b.rstrip(b"\r\n").decode("utf-8", "replace")
+        pos += len(b)
 
 
 # ---------------------------------------------------------------------------
-# Pass 2: preallocated tensors + direct writes through numpy views
+# Arrays
 # ---------------------------------------------------------------------------
 
+_LEVEL_SHAPES = {
+    "obs": {
+        "hkl": ((3,), np.int16),
+        "I": ((), np.float32),
+        "sigma": ((), np.float32),
+        "peak": ((), np.float32),
+        "background": ((), np.float32),
+        "fs": ((), np.float32),
+        "ss": ((), np.float32),
+        "panel_id": ((), np.int16),
+        "crystal_id": ((), np.int32),
+    },
+    "crystal": {
+        "cell": ((6,), np.float32),
+        "astar": ((3,), np.float32),
+        "bstar": ((3,), np.float32),
+        "cstar": ((3,), np.float32),
+        "profile_rad": ((), np.float32),
+        "resolution": ((), np.float32),
+        "n_refl": ((), np.int32),
+        "image_id": ((), np.int32),
+        "crystal_in_image": ((), np.int32),
+    },
+    "image": {
+        "beam_energy": ((), np.float32),
+        "det_shift_x": ((), np.float32),
+        "det_shift_y": ((), np.float32),
+        "camera_length": ((), np.float32),
+        "n_peaks": ((), np.int32),
+    },
+}
 
-def _allocate_tensors(n_obs: int, n_crys: int, n_imgs: int) -> dict[str, torch.Tensor]:
+
+def _allocate_arrays(n_obs: int, n_crys: int, n_imgs: int) -> dict[str, np.ndarray]:
+    """Uninitialised column arrays; the counts are capacity hints."""
+    sizes = {"obs": n_obs, "crystal": n_crys, "image": n_imgs}
     return {
-        # obs
-        "hkl":        torch.empty((n_obs, 3), dtype=torch.int16),
-        "I":          torch.empty(n_obs, dtype=torch.float32),
-        "sigma":      torch.empty(n_obs, dtype=torch.float32),
-        "peak":       torch.empty(n_obs, dtype=torch.float32),
-        "background": torch.empty(n_obs, dtype=torch.float32),
-        "fs":         torch.empty(n_obs, dtype=torch.float32),
-        "ss":         torch.empty(n_obs, dtype=torch.float32),
-        "panel_id":   torch.empty(n_obs, dtype=torch.int16),
-        "crystal_id": torch.empty(n_obs, dtype=torch.int32),
-        # crystals
-        "cell":              torch.empty((n_crys, 6), dtype=torch.float32),
-        "astar":             torch.empty((n_crys, 3), dtype=torch.float32),
-        "bstar":             torch.empty((n_crys, 3), dtype=torch.float32),
-        "cstar":             torch.empty((n_crys, 3), dtype=torch.float32),
-        "profile_rad":       torch.empty(n_crys, dtype=torch.float32),
-        "resolution":        torch.empty(n_crys, dtype=torch.float32),
-        "n_refl":            torch.empty(n_crys, dtype=torch.int32),
-        "image_id":          torch.empty(n_crys, dtype=torch.int32),
-        "crystal_in_image":  torch.empty(n_crys, dtype=torch.int32),
-        # images
-        "beam_energy":   torch.empty(n_imgs, dtype=torch.float32),
-        "det_shift_x":   torch.empty(n_imgs, dtype=torch.float32),
-        "det_shift_y":   torch.empty(n_imgs, dtype=torch.float32),
-        "camera_length": torch.empty(n_imgs, dtype=torch.float32),
-        "n_peaks":       torch.empty(n_imgs, dtype=torch.int32),
+        name: np.empty((sizes[level],) + shape, dtype)
+        for level, fields in _LEVEL_SHAPES.items()
+        for name, (shape, dtype) in fields.items()
     }
+
+
+def _grow(v: dict[str, np.ndarray], level: str, need: int) -> None:
+    """Enlarge every array of ``level`` in place in ``v`` to hold ``need`` rows."""
+    for name in _LEVEL_SHAPES[level]:
+        old = v[name]
+        new = np.empty((max(need, 2 * len(old) + 16),) + old.shape[1:], old.dtype)
+        new[: len(old)] = old
+        v[name] = new
+
+
+def _finalize(
+    v: dict[str, np.ndarray],
+    n_obs: int,
+    n_crys: int,
+    n_imgs: int,
+) -> dict[str, torch.Tensor]:
+    """Trim the arrays to the parsed counts and wrap them as tensors.
+
+    A trimmed array is copied so the unused capacity is released; an exact
+    one is shared with its tensor.
+    """
+    counts = {"obs": n_obs, "crystal": n_crys, "image": n_imgs}
+    out = {}
+    for level, fields in _LEVEL_SHAPES.items():
+        n = counts[level]
+        for name in fields:
+            a = v[name]
+            out[name] = torch.from_numpy(a if len(a) == n else a[:n].copy())
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Number parsing, as the stored values were read before (int(), float())
+# ---------------------------------------------------------------------------
+
+
+def _float(s: str) -> float | None:
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _number_f64(s: str) -> float | None:
+    """``float(v)`` of a chunk value stored as ``int(v0)``, else ``float(v0)``."""
+    try:
+        i = int(s)
+    except ValueError:
+        return _float(s)
+    try:
+        return float(i)
+    except OverflowError:
+        return None
+
+
+def _number_i32(s: str) -> int | None:
+    """``int(v)`` of the same stored value, which must fit an int32."""
+    try:
+        i = int(s)
+    except ValueError:
+        f = _float(s)
+        if f is None:
+            return None
+        try:
+            i = int(f)
+        except (ValueError, OverflowError):
+            return None
+    return i if -(2**31) <= i < 2**31 else None
+
+
+def _report_add(report: dict[str, list[int]], reason: str, off: int) -> None:
+    entry = report.get(reason)
+    if entry is None:
+        report[reason] = [1, off]
+    else:
+        entry[0] += 1
+        if off < entry[1]:
+            entry[1] = off
+
+
+# ---------------------------------------------------------------------------
+# Pass 2
+# ---------------------------------------------------------------------------
 
 
 def _parse_into_views(
@@ -74,246 +201,320 @@ def _parse_into_views(
     v: dict[str, np.ndarray],
     filenames: list[str],
     events: list[str],
+    report: dict[str, list[int]],
     crystal_idx: int = 0,
     image_idx: int = 0,
     n_obs: int = 0,
 ) -> tuple[int, int, int]:
-    """Pass 2 core: write directly into preallocated numpy views ``v``.
+    """Parse ``(offset, line)`` pairs from ``it`` into the arrays of ``v``.
 
-    Indices ``(crystal_idx, image_idx, n_obs)`` are threaded in/out so
-    non-contiguous byte ranges (sampled-crystal mode) can call this multiple
-    times with the same views.
+    ``v`` entries are replaced by larger arrays if they fill up. Indices
+    ``(crystal_idx, image_idx, n_obs)`` are threaded in/out so separate byte
+    ranges (sampled-crystal mode) can call this repeatedly; each range must
+    start at a chunk. Exclusions are added to ``report`` as
+    ``reason -> [count, first_offset]``.
     """
-    while True:
-        try:
-            line = next(it)
-        except StopIteration:
-            break
+    st = _OUTER
+    chunk_off = None
+    chunk_has_image = False
+    filename = event = ""
+    filename_off = crystal_off = 0
+    energy = npeaks = clen = prof = res = None
+    det = None
+    cur_image = crystal_in_image = obs_start = 0
+    cell: list[float] = []
+    vecs: list[list[float]] = []
 
-        if not line.startswith("Image filename:"):
-            continue
+    I_cap = len(v["I"])
 
-        # --- chunk / image start ---
-        filenames.append(line.split(":", 1)[1].strip())
-
-        try:
-            line = next(it)
-        except StopIteration:
-            break
-        if line.startswith("Event:"):
-            events.append(line.split(":", 1)[1].strip())
-        else:
-            events.append("")
-
-        # Chunk-level key/value pairs
-        chunk_meta: dict[str, object] = {}
-        for line in it:
-            if line.startswith("Peaks from peak search"):
-                break
-            if line.startswith("----- End chunk -----"):
-                break
-            if "=" in line:
-                key, _, val = line.partition("=")
-                key = key.strip()
-                vparts = val.strip().split()
-                if not vparts:
-                    continue
-                v0 = vparts[0]
-                try:
-                    chunk_meta[key] = int(v0)
-                except ValueError:
-                    try:
-                        chunk_meta[key] = float(v0)
-                    except ValueError:
-                        chunk_meta[key] = v0
-
-        v["beam_energy"][image_idx]   = float(chunk_meta.get("photon_energy_eV", 0.0))
-        v["n_peaks"][image_idx]       = int(chunk_meta.get("num_peaks", 0))
-        v["det_shift_x"][image_idx]   = 0.0  # may be overwritten by first crystal
-        v["det_shift_y"][image_idx]   = 0.0
-        v["camera_length"][image_idx] = float(chunk_meta.get("average_camera_length", 0.0))
-
-        current_image_id = image_idx
+    def commit_image():
+        nonlocal image_idx, cur_image, crystal_in_image
+        be = cl = 0.0
+        npk = 0
+        if energy is not None:
+            be = _number_f64(energy[0])
+            if be is None:
+                _report_add(report, "key_value", energy[1])
+                be = 0.0
+        if npeaks is not None:
+            npk = _number_i32(npeaks[0])
+            if npk is None:
+                _report_add(report, "key_value", npeaks[1])
+                npk = 0
+        if clen is not None:
+            cl = _number_f64(clen[0])
+            if cl is None:
+                _report_add(report, "key_value", clen[1])
+                cl = 0.0
+        if image_idx >= len(v["beam_energy"]):
+            _grow(v, "image", image_idx + 1)
+        v["beam_energy"][image_idx] = be
+        v["n_peaks"][image_idx] = npk
+        v["det_shift_x"][image_idx] = 0.0
+        v["det_shift_y"][image_idx] = 0.0
+        v["camera_length"][image_idx] = cl
+        filenames.append(filename)
+        events.append(event)
+        cur_image = image_idx
         image_idx += 1
-        crystal_in_image_counter = 0
+        crystal_in_image = 0
 
-        # Skip peak list
-        for line in it:
-            if line.startswith("End of peak list"):
-                break
+    def commit_crystal():
+        nonlocal crystal_idx, crystal_in_image
+        p = 0.04
+        r = 0.0
+        if prof is not None:
+            p = _float(prof[0])
+            if p is None:
+                _report_add(report, "key_value", prof[1])
+                p = 0.04
+        if res is not None:
+            r = _float(res[0])
+            if r is None:
+                _report_add(report, "key_value", res[1])
+                r = 0.0
+        if crystal_idx >= len(v["n_refl"]):
+            _grow(v, "crystal", crystal_idx + 1)
+        row = v["cell"][crystal_idx]
+        row[0] = cell[0] * 10.0
+        row[1] = cell[1] * 10.0
+        row[2] = cell[2] * 10.0
+        row[3] = cell[3]
+        row[4] = cell[4]
+        row[5] = cell[5]
+        for key, vec in zip(("astar", "bstar", "cstar"), vecs):
+            row = v[key][crystal_idx]
+            row[0] = vec[0] / 10.0
+            row[1] = vec[1] / 10.0
+            row[2] = vec[2] / 10.0
+        v["profile_rad"][crystal_idx] = p / 10.0
+        v["resolution"][crystal_idx] = 10.0 / r if r > 0 else 999.0
+        v["n_refl"][crystal_idx] = n_obs - obs_start
+        v["image_id"][crystal_idx] = cur_image
+        v["crystal_in_image"][crystal_idx] = crystal_in_image
+        crystal_in_image += 1
+        if det is not None:
+            v["det_shift_x"][cur_image] = det[0]
+            v["det_shift_y"][cur_image] = det[1]
+        crystal_idx += 1
 
-        # Parse crystals in this chunk
-        for line in it:
-            if line.startswith("----- End chunk -----"):
-                break
-            if not line.startswith("--- Begin crystal"):
-                continue
-
-            # Cell parameters (nm → Å on a,b,c; α,β,γ in degrees)
-            try:
-                line = next(it)
-            except StopIteration:
-                break
-            cell_vals = [float(x) for x in line.split() if _is_valid_float(x)]
-            cell_row = v["cell"][crystal_idx]
-            cell_row[0] = cell_vals[0] * 10.0
-            cell_row[1] = cell_vals[1] * 10.0
-            cell_row[2] = cell_vals[2] * 10.0
-            cell_row[3] = cell_vals[3]
-            cell_row[4] = cell_vals[4]
-            cell_row[5] = cell_vals[5]
-
-            # Reciprocal vectors (nm⁻¹ → Å⁻¹)
-            for key in ("astar", "bstar", "cstar"):
-                line = next(it)
-                vec = _parse_vec_line(line)
-                row = v[key][crystal_idx]
-                row[0] = vec[0] / 10.0
-                row[1] = vec[1] / 10.0
-                row[2] = vec[2] / 10.0
-
-            # Crystal key/value pairs
-            crystal_meta: dict[str, object] = {}
-            for line in it:
-                if line.startswith("Reflections measured after indexing"):
-                    break
-                if "=" not in line:
-                    continue
-                try:
-                    key, _, val = line.partition("=")
-                    key = key.strip()
-                    val = val.strip()
-                    if "det_shift" in key and "y =" in val:
-                        parts = val.split("y =")
-                        crystal_meta["det_shift_x"] = float(parts[0].strip())
-                        crystal_meta["det_shift_y"] = float(
-                            parts[1].strip().replace("mm", "").strip()
-                        )
-                    else:
-                        first_val = val.split()[0]
-                        try:
-                            crystal_meta[key] = float(first_val)
-                        except ValueError:
-                            crystal_meta[key] = first_val
-                except Exception:
-                    pass
-
-            profile_rad_nm = float(crystal_meta.get("profile_radius", 0.04))
-            v["profile_rad"][crystal_idx] = profile_rad_nm / 10.0
-
-            res_nm = float(crystal_meta.get("diffraction_resolution_limit", 0.0))
-            v["resolution"][crystal_idx] = 10.0 / res_nm if res_nm > 0 else 999.0
-
-            if "det_shift_x" in crystal_meta:
-                v["det_shift_x"][current_image_id] = crystal_meta["det_shift_x"]
-                v["det_shift_y"][current_image_id] = crystal_meta["det_shift_y"]
-
-            # Skip reflection-table header
-            try:
-                next(it)
-            except StopIteration:
-                break
-
-            # Reflections
-            n_refl_count = 0
-            hkl_view = v["hkl"]
-            I_view = v["I"]
-            sig_view = v["sigma"]
-            peak_view = v["peak"]
-            bg_view = v["background"]
-            fs_view = v["fs"]
-            ss_view = v["ss"]
-            pid_view = v["panel_id"]
-            cid_view = v["crystal_id"]
-
-            for line in it:
+    for off, line in it:
+        marker = line.startswith(_BEGIN_CHUNK) or line.startswith(_END_CHUNK)
+        while True:
+            if st == _REFL:
                 if line.startswith("End of reflections"):
+                    commit_crystal()
+                    st = _SKIP_CRYSTAL
                     break
+                if marker:
+                    n_obs = obs_start
+                    _report_add(report, "crystal_truncated", crystal_off)
+                    st = _OUTER
+                    continue
                 parts = line.split()
                 if len(parts) < 10:
-                    continue
+                    _report_add(report, "reflection_short", off)
+                    break
                 try:
                     h = int(parts[0]); k = int(parts[1]); l = int(parts[2])
                     I_val = float(parts[3]); sigma_val = float(parts[4])
                     peak_val = float(parts[5]); bg_val = float(parts[6])
                     fs_val = float(parts[7]); ss_val = float(parts[8])
-                    pid = panel_name_to_id.get(parts[9], 0)
-                except (ValueError, IndexError):
-                    continue
-                hkl_view[n_obs, 0] = h
-                hkl_view[n_obs, 1] = k
-                hkl_view[n_obs, 2] = l
-                I_view[n_obs]   = I_val
-                sig_view[n_obs] = sigma_val
-                peak_view[n_obs] = peak_val
-                bg_view[n_obs]  = bg_val
-                fs_view[n_obs]  = fs_val
-                ss_view[n_obs]  = ss_val
-                pid_view[n_obs] = pid
-                cid_view[n_obs] = crystal_idx
-                n_refl_count += 1
-                n_obs += 1
-
-            v["n_refl"][crystal_idx]           = n_refl_count
-            v["image_id"][crystal_idx]         = current_image_id
-            v["crystal_in_image"][crystal_idx] = crystal_in_image_counter
-            crystal_in_image_counter += 1
-            crystal_idx += 1
-
-            # Skip to End crystal
-            for line in it:
-                if line.startswith("--- End crystal"):
+                except ValueError:
+                    _report_add(report, "reflection_value", off)
                     break
+                if not (-32768 <= h <= 32767 and -32768 <= k <= 32767 and -32768 <= l <= 32767):
+                    _report_add(report, "reflection_hkl_range", off)
+                    break
+                if n_obs >= I_cap:
+                    _grow(v, "obs", n_obs + 1)
+                    I_cap = len(v["I"])
+                hkl = v["hkl"]
+                hkl[n_obs, 0] = h
+                hkl[n_obs, 1] = k
+                hkl[n_obs, 2] = l
+                v["I"][n_obs] = I_val
+                v["sigma"][n_obs] = sigma_val
+                v["peak"][n_obs] = peak_val
+                v["background"][n_obs] = bg_val
+                v["fs"][n_obs] = fs_val
+                v["ss"][n_obs] = ss_val
+                v["panel_id"][n_obs] = panel_name_to_id.get(parts[9], 0)
+                v["crystal_id"][n_obs] = crystal_idx
+                n_obs += 1
+                break
+
+            if st == _OUTER:
+                if line.startswith(_BEGIN_CHUNK):
+                    if chunk_off is not None and not chunk_has_image:
+                        _report_add(report, "chunk_no_image", chunk_off)
+                    chunk_off = off
+                    chunk_has_image = False
+                elif line.startswith("Image filename:"):
+                    chunk_has_image = True
+                    filename = line[len("Image filename:"):].strip()
+                    filename_off = off
+                    st = _AFTER_FILENAME
+                break
+
+            if st == _AFTER_FILENAME:
+                if marker:
+                    _report_add(report, "image_truncated", filename_off)
+                    st = _OUTER
+                    continue
+                event = line[len("Event:"):].strip() if line.startswith("Event:") else ""
+                energy = npeaks = clen = None
+                st = _CHUNK_KV
+                break
+
+            if st == _CHUNK_KV:
+                if line.startswith("Peaks from peak search"):
+                    commit_image()
+                    st = _PEAKS
+                    break
+                if marker:
+                    commit_image()
+                    st = _OUTER
+                    continue
+                if line.startswith("--- Begin crystal"):
+                    # No peak section: the crystals still count.
+                    commit_image()
+                    st = _CRYSTALS
+                    continue
+                eq = line.find("=")
+                if eq >= 0:
+                    vparts = line[eq + 1:].split()
+                    if vparts:
+                        key = line[:eq].strip()
+                        if key == "photon_energy_eV":
+                            energy = (vparts[0], off)
+                        elif key == "num_peaks":
+                            npeaks = (vparts[0], off)
+                        elif key == "average_camera_length":
+                            clen = (vparts[0], off)
+                break
+
+            if st == _PEAKS:
+                if marker:
+                    st = _OUTER
+                    continue
+                if line.startswith("End of peak list"):
+                    st = _CRYSTALS
+                elif line.startswith("--- Begin crystal"):
+                    st = _CRYSTALS
+                    continue
+                break
+
+            if st == _CRYSTALS:
+                if marker:
+                    st = _OUTER
+                    continue
+                if line.startswith("--- Begin crystal"):
+                    crystal_off = off
+                    st = _CELL
+                break
+
+            if st == _CELL:
+                if marker:
+                    _report_add(report, "crystal_truncated", crystal_off)
+                    st = _OUTER
+                    continue
+                cell = []
+                for tok in line.split():
+                    x = _float(tok)
+                    if x is not None:
+                        cell.append(x)
+                        if len(cell) == 6:
+                            break
+                if len(cell) == 6:
+                    vecs = []
+                    st = _VECTOR
+                else:
+                    _report_add(report, "crystal_cell", off)
+                    st = _SKIP_CRYSTAL
+                break
+
+            if st == _VECTOR:
+                if marker:
+                    _report_add(report, "crystal_truncated", crystal_off)
+                    st = _OUTER
+                    continue
+                vec = []
+                eq = line.find("=")
+                if eq >= 0:
+                    for tok in line[eq + 1:].split():
+                        x = _float(tok)
+                        if x is not None:
+                            vec.append(x)
+                            if len(vec) == 3:
+                                break
+                if len(vec) < 3:
+                    _report_add(report, "crystal_vector", off)
+                    st = _SKIP_CRYSTAL
+                    break
+                vecs.append(vec)
+                if len(vecs) == 3:
+                    prof = res = det = None
+                    st = _CRYSTAL_KV
+                break
+
+            if st == _CRYSTAL_KV:
+                if line.startswith("Reflections measured after indexing"):
+                    st = _REFL_HEADER
+                    break
+                if marker:
+                    _report_add(report, "crystal_truncated", crystal_off)
+                    st = _OUTER
+                    continue
+                eq = line.find("=")
+                if eq >= 0:
+                    key = line[:eq].strip()
+                    val = line[eq + 1:].strip()
+                    if "det_shift" in key and "y =" in val:
+                        parts = val.split("y =")
+                        x = _float(parts[0].strip())
+                        y = _float(parts[1].strip().replace("mm", "").strip())
+                        if x is None or y is None:
+                            _report_add(report, "det_shift", off)
+                        else:
+                            det = (x, y)
+                    else:
+                        vs = val.split()
+                        if vs:
+                            if key == "profile_radius":
+                                prof = (vs[0], off)
+                            elif key == "diffraction_resolution_limit":
+                                res = (vs[0], off)
+                break
+
+            if st == _REFL_HEADER:
+                if marker:
+                    _report_add(report, "crystal_truncated", crystal_off)
+                    st = _OUTER
+                    continue
+                obs_start = n_obs
+                st = _REFL
+                break
+
+            # _SKIP_CRYSTAL: after a committed or rejected crystal, up to
+            # "--- End crystal".
+            if marker:
+                st = _OUTER
+                continue
+            if line.startswith("--- End crystal"):
+                st = _CRYSTALS
+            break
+
+    # End of input closes whatever is open, as a chunk marker would.
+    if st == _AFTER_FILENAME:
+        _report_add(report, "image_truncated", filename_off)
+    elif st == _CHUNK_KV:
+        commit_image()
+    elif st in (_CELL, _VECTOR, _CRYSTAL_KV, _REFL_HEADER, _REFL):
+        if st == _REFL:
+            n_obs = obs_start
+        _report_add(report, "crystal_truncated", crystal_off)
+    if chunk_off is not None and not chunk_has_image:
+        _report_add(report, "chunk_no_image", chunk_off)
 
     return crystal_idx, image_idx, n_obs
-
-
-_OBS_TRIM_FIELDS = (
-    "hkl", "I", "sigma", "peak", "background", "fs", "ss",
-    "panel_id", "crystal_id",
-)
-_CRYS_TRIM_FIELDS = (
-    "cell", "astar", "bstar", "cstar",
-    "profile_rad", "resolution", "n_refl", "image_id", "crystal_in_image",
-)
-_IMG_TRIM_FIELDS = (
-    "beam_energy", "det_shift_x", "det_shift_y", "camera_length", "n_peaks",
-)
-
-
-def _finalize(
-    tensors: dict[str, torch.Tensor],
-    n_obs_actual: int,
-    n_obs_alloc: int,
-    n_crys_actual: int,
-    n_crys_alloc: int,
-    n_imgs_actual: int,
-    n_imgs_alloc: int,
-    filenames: list[str],
-    events: list[str],
-) -> dict:
-    """Package tensors + metadata as a segment result.
-
-    Any dimension where the pass-2 count came in below the pre-allocation
-    (e.g. malformed chunks without ``Image filename:`` in the sampled path)
-    is trimmed via contiguous ``clone`` so the returned tensor size matches
-    reality.
-    """
-    if n_obs_actual != n_obs_alloc:
-        for k in _OBS_TRIM_FIELDS:
-            tensors[k] = tensors[k][:n_obs_actual].clone()
-    if n_crys_actual != n_crys_alloc:
-        for k in _CRYS_TRIM_FIELDS:
-            tensors[k] = tensors[k][:n_crys_actual].clone()
-    if n_imgs_actual != n_imgs_alloc:
-        for k in _IMG_TRIM_FIELDS:
-            tensors[k] = tensors[k][:n_imgs_actual].clone()
-
-    return {
-        **tensors,
-        "filenames":  filenames,
-        "events":     events,
-        "n_crystals": n_crys_actual,
-        "n_images":   n_imgs_actual,
-        "n_obs":      n_obs_actual,
-    }

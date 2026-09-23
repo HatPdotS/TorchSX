@@ -11,8 +11,8 @@ I/O for serial crystallography data. Three formats, three jobs: DuckDB and
 | `_crystfel.py` | Interpret recorded CrystFEL commands and gain declarations |
 | `_duckdb.py` | Read a probixi DuckDB run into a stream core (the key/unit mapping is documented there) |
 | `_parser.py` | Parse CrystFEL `.stream` files into stacked tensors — a facade over `_parse/` |
-| `_parse/` | The parser proper: `indexing` (byte scanning) and `records` (per-record parse) are leaves, `workers` builds on both, `orchestrator` drives all three |
-| `_native.py` | Optional C extension for chunk-offset scanning, JIT-built via ninja |
+| `_parse/` | The pure-Python parser and the driver: `indexing` (byte scanning) and `records` (per-record parse) are leaves, `workers` (serial range parse) builds on both, `orchestrator` drives index → select → parse for either implementation |
+| `_native.py` | Loads `torchsx_native`, the Rust index/parse/write module built from `native/`; `None` means the pure-Python fallback |
 | `_safetensors.py` | Save/load `.sfx` (safetensors + JSON sidecar), columnar v2 |
 | `_metadata.py` | `StreamMetadata` — per-level metadata with tensor round-trip |
 | `_writeback.py` | Write refined data back to `.stream` |
@@ -55,4 +55,8 @@ stream = SFXStream.load("data.sfx")
 - Probixi and DIALS are reserved dispatcher kinds. Probixi's existing direct
   reader stays usable; no DIALS parser or dependency is added in this phase.
 - Imports are lazy (`__getattr__`) so heavy or optional modules (duckdb, h5py,
-  the native extension) are not loaded until used.
+  the native module) are not loaded until used.
+- Malformed stream content is excluded, not fatal: a bad reflection line, a
+  crystal with a broken or cut-off header or table, or a chunk without an
+  image is skipped, and one warning per parse counts the exclusions by reason
+  (`_parse/records.py` lists the rules; both implementations follow them).
