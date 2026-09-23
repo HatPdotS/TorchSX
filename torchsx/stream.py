@@ -814,10 +814,12 @@ def _is_centric(group, hkl: torch.Tensor) -> torch.Tensor:
     gigabytes on a full stream -- so loop instead.  Rotation entries are
     {0, +-1}, which float32 carries exactly.
     """
-    ops = torch.round(group.reciprocal.matrices).to(torch.float32)
+    # The group's matrices live on TorchRef's default device (CUDA on a GPU
+    # node); the test runs where ``hkl`` is.
+    ops = torch.round(group.reciprocal.matrices).to(device=hkl.device, dtype=torch.float32)
     h = hkl.to(torch.float32)
     neg = -h
-    centric = torch.zeros(len(hkl), dtype=torch.bool)
+    centric = torch.zeros(len(hkl), dtype=torch.bool, device=hkl.device)
     for R in ops:
         centric |= (h @ R.T == neg).all(dim=1)
     return centric
