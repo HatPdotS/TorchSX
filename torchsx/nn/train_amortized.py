@@ -45,6 +45,7 @@ from torchsx.nn.metrics import (
     condition_auc,
     grad_norms,
     hkl_permutation_sensitivity,
+    hkl_permutation_sensitivity_shape,
     scale_metrics,
 )
 
@@ -1095,8 +1096,6 @@ class AmortizedTrainer:
                     "predict_skew": bool(getattr(self.scale.heads, "predict_skew", False)),
                     "family": getattr(self.scale.heads, "scatter_family", "gengauss"),
                     "n_components": int(getattr(self.scale.heads, "n_components", 1)),
-                    "conditioner_hidden": (int(self.scale.heads.mixture.hidden)
-                                           if getattr(self.scale.heads, "scatter_family", "gengauss") == "mixture" else None),
                     "component_shape": (self.scale.heads.mixture.shape
                                         if getattr(self.scale.heads, "scatter_family", "gengauss") == "mixture" else None),
                     "miss_logit": (None if getattr(self.objective, "miss_logit", None) is None
@@ -1627,8 +1626,10 @@ class AmortizedTrainer:
             # D. a scale that depends on hkl is degenerate with I0 and is the
             # one channel that can manufacture a difference peak.
             "hkl_permutation_frac": hkl_permutation_sensitivity(self.scale, meta),
+            # the same test on the predicted width and mixture shape
+            "hkl_permutation_frac_shape": hkl_permutation_sensitivity_shape(self.scale, meta),
         }
-        frac = rec["hkl_permutation_frac"]
+        frac = max(rec["hkl_permutation_frac"], rec["hkl_permutation_frac_shape"])
         if frac == frac and frac > self.cfg.hkl_permutation_warn:
             warnings.warn(
                 f"hkl-permutation sensitivity {frac:.3f} exceeds "

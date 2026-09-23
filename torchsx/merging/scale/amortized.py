@@ -152,7 +152,6 @@ class AmortizedScale(ScaleModel):
         dropout: float = 0.0,
         scatter_family: str = "gengauss",
         n_components: int = 3,
-        conditioner_hidden: int = 8,
         component_shape: str = "shared",
     ) -> "AmortizedScale":
         features = ObsFeatureSpec(prep, include_hkl=include_hkl)
@@ -174,7 +173,6 @@ class AmortizedScale(ScaleModel):
             predict_skew=predict_skew,
             scatter_family=scatter_family,
             n_components=n_components,
-            conditioner_hidden=conditioner_hidden,
             component_shape=component_shape,
         )
         return cls(

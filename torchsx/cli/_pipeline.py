@@ -651,7 +651,7 @@ DEFAULTS = dict(
     obs_self_layers=2, skew=True, miss=0.03, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
-    scatter_family="mixture", scatter_components=4, scatter_hidden=8, scatter_shape="gaussian",
+    scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
 )
 
 
@@ -720,7 +720,6 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # checkpoint written before the key existed is the single family)
     scatter_family = scat.get("family", "gengauss") if ck else DEFAULTS["scatter_family"]
     n_components = int(scat.get("n_components") or DEFAULTS["scatter_components"])
-    scatter_hidden = int(scat.get("conditioner_hidden") or DEFAULTS["scatter_hidden"])
     scatter_shape = str(scat.get("component_shape") or ("shared" if ck else DEFAULTS["scatter_shape"]))
     beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
     kw = dict(
@@ -732,7 +731,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         context_folds=enc.get("context_folds", DEFAULTS["context_folds"]),
         obs_context_layers=enc.get("obs_context_layers", DEFAULTS["obs_context_layers"]),
         obs_self_layers=enc.get("obs_self_layers", DEFAULTS["obs_self_layers"]),
-        scatter_family=scatter_family, n_components=n_components, conditioner_hidden=scatter_hidden,
+        scatter_family=scatter_family, n_components=n_components,
         component_shape=scatter_shape,
     )
     # A checkpoint's own head geometry wins over the defaults: rebuilding it
