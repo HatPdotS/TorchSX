@@ -34,7 +34,7 @@ def test_density_integrates_to_one():
 def test_zero_when_every_observation_shares_one_shape():
     one = _gauss_mix(1, 3)
     mix = one.expand(200, -1).clone()
-    kl, _ = shape_prior_kl(mix, _log_e_s(mix, 3))
+    kl, _, _ = shape_prior_kl(mix, _log_e_s(mix, 3))
     assert abs(float(kl)) < 1e-9
 
 
@@ -47,8 +47,8 @@ def test_independent_of_the_parametrisation():
     two = torch.cat([torch.full((300, 2), -math.log(2.0), dtype=torch.float64),
                      torch.zeros(300, 2, dtype=torch.float64),
                      one[:, 2:3].expand(-1, 2), one[:, 3:4].expand(-1, 2), one[:, 4:5].expand(-1, 2)], 1)
-    kl1, _ = shape_prior_kl(one, _log_e_s(one, 1))
-    kl2, _ = shape_prior_kl(two, _log_e_s(two, 2))
+    kl1, _, _ = shape_prior_kl(one, _log_e_s(one, 1))
+    kl2, _, _ = shape_prior_kl(two, _log_e_s(two, 2))
     torch.testing.assert_close(kl1, kl2, atol=1e-10, rtol=0)
     assert float(kl1) > 1e-3
 
@@ -58,7 +58,7 @@ def test_pulls_an_outlier_toward_the_population():
     la[0] = math.log(4.0)                              # one very wide observation
     la = la.requires_grad_()
     mix = pack_single(la, torch.full_like(la, 2.0))
-    kl, sd_bar = shape_prior_kl(mix, _log_e_s(mix, 1))
+    kl, sd_bar, _ = shape_prior_kl(mix, _log_e_s(mix, 1))
     kl.backward()
     assert la.grad[0] > 0                              # descending narrows the outlier
     assert (la.grad[1:] < 0).all()                     # and widens the rest toward p_bar, which holds it
@@ -66,12 +66,33 @@ def test_pulls_an_outlier_toward_the_population():
     assert abs(sd_bar - 0.961) < 0.01
 
 
+
+def test_mass_moved_off_the_grid_is_penalised():
+    # the loophole: one component far wider than the grid, carrying 25 % of the weight
+    base = pack_single(torch.full((200,), math.log(1.5), dtype=torch.float64),
+                       torch.full((200,), 2.0, dtype=torch.float64), torch.full((200,), math.log(1.0), dtype=torch.float64))
+    two = torch.cat([torch.zeros(200, 2, dtype=torch.float64), torch.zeros(200, 2, dtype=torch.float64),
+                     base[:, 2:3].expand(-1, 2).clone(), base[:, 3:4].expand(-1, 2).clone(),
+                     base[:, 4:5].expand(-1, 2).clone()], 1)
+    two[:, :2] = torch.log(torch.tensor([1.0, 1e-9], dtype=torch.float64))
+    parked = two.clone()
+    parked[:100, :2] = torch.log(torch.tensor([0.75, 0.25], dtype=torch.float64))
+    parked[:100, 3] = -4.0                                  # offset of component 1
+    parked[:100, 5] = math.log(1000.0)                      # lower width of component 1
+    kl, _, off = shape_prior_kl(parked, _log_e_s(parked, 2))
+    assert 0.08 < off < 0.14                                # half the observations park ~0.24 off the grid
+    assert float(kl) > 0.05
+    # narrow components are resolved: nothing leaks into the overflow bin
+    narrow = pack_single(torch.full((50,), math.log(0.25), dtype=torch.float64), torch.full((50,), 2.0, dtype=torch.float64))
+    _, _, off = shape_prior_kl(narrow, _log_e_s(narrow, 1))
+    assert off < 1e-6
+
 def test_float32_is_finite_for_extreme_widths():
     mix = _gauss_mix(64, 4).float()
     mix[:4, 8:12] = 12.0                               # lower widths ~ 1.6e5
     mix[4:8, 12:16] = -8.0                             # upper widths ~ 3e-4
     mix = mix.requires_grad_()
-    kl, _ = shape_prior_kl(mix, _log_e_s(mix, 4))
+    kl, _, _ = shape_prior_kl(mix, _log_e_s(mix, 4))
     kl.backward()
     assert torch.isfinite(kl) and torch.isfinite(mix.grad).all()
 

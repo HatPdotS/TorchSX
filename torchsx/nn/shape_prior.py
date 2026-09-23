@@ -64,8 +64,9 @@ def mixture_log_density(mix: Tensor, eps: Tensor) -> Tensor:
 
 
 def shape_prior_kl(mix: Tensor, log_e_s: Tensor, *, n_sample: int = 2048,
-                   grid: Tensor | None = None) -> tuple[Tensor, float]:
-    """``(mean_j KL(p_bar || p_j), p_bar's SD)`` over a random sample of observations.
+                   grid: Tensor | None = None) -> tuple[Tensor, float, float]:
+    """``(mean_j KL(p_bar || p_j), p_bar's SD on the grid, p_bar's mass off it)``
+    over a random sample of observations.
 
     ``mix`` is the packed ``(n, 5K)`` prediction and ``log_e_s`` its
     ``log E[exp(eps)]``.  The mean is an unbiased estimate of the per-observation
@@ -77,13 +78,21 @@ def shape_prior_kl(mix: Tensor, log_e_s: Tensor, *, n_sample: int = 2048,
         mix, log_e_s = mix.index_select(0, idx), log_e_s.index_select(0, idx)
     if grid is None:
         grid = torch.arange(U_LO, U_HI + 0.5 * U_STEP, U_STEP, device=mix.device, dtype=mix.dtype)
-    # every density as its weights on the grid, so the KL is a proper discrete
-    # one: non-negative, and zero when an observation has the population shape
-    log_q = torch.log_softmax(mixture_log_density(mix, grid[None, :] + log_e_s[:, None]), dim=1)   # (m, G)
+    du = float(grid[1] - grid[0])
+    # Every density as bin masses: the grid cells plus one overflow bin for the
+    # mass beyond the grid, so the KL is a proper discrete one -- non-negative,
+    # zero when an observation has the population shape -- and a component
+    # moved far off the grid (seen: alpha_lo ~ 1e3 carrying a quarter of the
+    # weight once the grid alone was normalised) is visible to it.
+    log_cell = mixture_log_density(mix, grid[None, :] + log_e_s[:, None]) + math.log(du)    # (m, G)
+    on_grid = torch.logsumexp(log_cell, dim=1).exp()
+    log_out = torch.log((1.0 - on_grid).clamp(min=1e-12))
+    log_q = torch.log_softmax(torch.cat([log_cell, log_out[:, None]], dim=1), dim=1)       # (m, G + 1)
     with torch.no_grad():
         log_bar = torch.logsumexp(log_q, dim=0) - math.log(log_q.shape[0])
         w = log_bar.exp()
-        mean = (w * grid).sum()
-        sd = float(((w * (grid - mean) ** 2).sum()).sqrt())
+        wg = w[:-1] / w[:-1].sum()
+        mean = (wg * grid).sum()
+        sd = float(((wg * (grid - mean) ** 2).sum()).sqrt())
     kl = (w[None, :] * (log_bar[None, :] - log_q)).sum(dim=1)
-    return kl.mean(), sd
+    return kl.mean(), sd, float(w[-1])

@@ -779,9 +779,10 @@ class AmortizedTrainer:
         shape_rec = {}
         if self.cfg.lam_shape_prior > 0:
             mix = pred.mix if pred.mix is not None else pack_single(pred.log_alpha, pred.beta, pred.log_alpha_hi)
-            kl, sd_bar = shape_prior_kl(mix, pred.log_e_s, n_sample=self.cfg.shape_prior_sample)
+            kl, sd_bar, out_bar = shape_prior_kl(mix, pred.log_e_s, n_sample=self.cfg.shape_prior_sample)
             loss = loss + self.cfg.lam_shape_prior * kl
-            shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar}
+            shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar,
+                         "shape_prior_off_grid": out_bar}
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = grad_norms(self.scale)
