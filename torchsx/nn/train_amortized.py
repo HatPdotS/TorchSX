@@ -48,6 +48,7 @@ from torchsx.nn.metrics import (
     hkl_permutation_sensitivity_shape,
     scale_metrics,
 )
+from torchsx.nn.shape_prior import pack_single, shape_prior_kl
 
 __all__ = ["CrystalIndex", "TrainConfig", "AmortizedTrainer"]
 
@@ -275,6 +276,16 @@ class TrainConfig:
     #: Halflife of the spread penalty in steps; ``0`` disables the ramp and
     #: holds ``lam_spread`` constant for the whole run.
     lam_spread_halflife_steps: int = 400
+    #: Hierarchical prior on each observation's scatter density
+    #: (:mod:`torchsx.nn.shape_prior`): ``lam_shape_prior`` pseudo-observations
+    #: per observation drawn from the batch's population density, i.e.
+    #: ``lam * mean_j KL(p_bar || p_j)`` added to the per-observation loss.
+    #: Weak observations, whose likelihood barely depends on their scatter
+    #: shape, take the population shape; strong ones keep what their data say.
+    #: Constant over the run (it is a prior, not an escape schedule).
+    lam_shape_prior: float = 0.0
+    #: observations sampled per update to estimate the prior term
+    shape_prior_sample: int = 2048
     log_every: int = 10
     eval_lam: float = 0.0
     heldout_frac: float = 0.05
@@ -764,6 +775,12 @@ class AmortizedTrainer:
         lam_s = self._lam_spread()
         if lam_s > 0:
             loss = loss + lam_s * pred.log_w.mean()
+        shape_rec = {}
+        if self.cfg.lam_shape_prior > 0:
+            mix = pred.mix if pred.mix is not None else pack_single(pred.log_alpha, pred.beta, pred.log_alpha_hi)
+            kl, sd_bar = shape_prior_kl(mix, pred.log_e_s, n_sample=self.cfg.shape_prior_sample)
+            loss = loss + self.cfg.lam_shape_prior * kl
+            shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar}
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = grad_norms(self.scale)
@@ -824,6 +841,7 @@ class AmortizedTrainer:
             "n_floored": tgt.n_floored,
             "lam": self.target.lam,
             "lam_spread": lam_s,
+            **shape_rec,
             "lr": float(self.opt.param_groups[0]["lr"]),
             "sec": time.time() - t0,
             **gn,
