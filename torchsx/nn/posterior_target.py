@@ -53,6 +53,7 @@ resolution, not truncation).
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -70,6 +71,30 @@ except ImportError:                                  # pragma: no cover
     _HAVE_FUSED = False
 
 __all__ = ["PosteriorOut", "PosteriorMergeTarget"]
+
+#: TORCHSX_NODE_LOOP=1 forces the node-by-node accumulation (A/B timing, tests).
+_NODE_LOOP = os.environ.get("TORCHSX_NODE_LOOP", "") == "1"
+
+
+def _all_nodes_kernel(objective, scatter, n_ph: Tensor, bg: Tensor) -> bool:
+    """Whether ``accumulate`` can take every outer node in one fused pass.
+
+    That kernel is the split-grid fixed-Gaussian mixture marginal of the
+    production model (with its optional miss component); anything else keeps
+    the node-by-node loop.
+    """
+    if _NODE_LOOP or not n_ph.is_cuda or bg.requires_grad or bg.dtype != torch.float32:
+        return False
+    from torchsx.merging.likelihood import Poisson
+    from torchsx.merging.quadrature import split_log_grid as slg
+    from torchsx.merging.scatter.mixture import PredictedMixtureScatter
+    from torchsx.nn.objective import MarginalNLL
+    return (slg.HAVE_TRITON and not slg._DISABLE_TRITON
+            and isinstance(objective, MarginalNLL) and objective.chunk_size is None
+            and isinstance(objective.quadrature, slg.SplitLogGrid)
+            and isinstance(objective.likelihood, Poisson)
+            and isinstance(scatter, PredictedMixtureScatter) and scatter.fixed_gaussian
+            and 1 <= scatter.n_components <= 8)
 
 
 @dataclass
@@ -493,6 +518,18 @@ class PosteriorMergeTarget(nn.Module):
         :meth:`integrate` once.
         """
         base = pred.log_K - pred.log_e_s
+
+        if _all_nodes_kernel(objective, scatter, n_ph, bg):
+            from torchsx.merging.quadrature._posterior_nodes_triton import (
+                posterior_node_sums,
+            )
+            q, lik = objective.quadrature, objective.likelihood
+            sig_b2 = q._sig_b2(lik, bg)
+            p = q.grid_params(n_ph, bg, sig_b2, q._bg_mean_offset(lik))
+            return posterior_node_sums(
+                base, scatter.mixture_obs(meta), objective.miss_logit, v_nodes, hkl_id,
+                n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=self.n_hkl,
+            )
 
         # Fused path -- OFF by default; measured, not deprecated.  One launch
         # for all C nodes instead of C, hoisting the Poisson factor out of the
