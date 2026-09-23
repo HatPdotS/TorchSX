@@ -658,9 +658,6 @@ DEFAULTS = dict(
 def add_model_args(p: argparse.ArgumentParser) -> None:
     """Flags shared by every command that builds the merge stack."""
     p.add_argument("--device", default=None, help="cuda | cpu")
-    p.add_argument("--outlier-frac", type=float, default=None,
-                   help="initial fraction of the learnable detector-outlier component "
-                        "(0 disables; merge inherits the checkpoint)")
     p.add_argument("--prior", choices=("none", "wilson", "joined-wilson"), default=None,
                    help="intensity prior: wilson (separate, default), joined-wilson (shared), or none "
                         "(flat in positive intensity); merge inherits the checkpoint unless set")

@@ -45,6 +45,9 @@ def _build_parser():
     p.add_argument("-o", "--out", type=Path, required=True, help="run directory")
     p.add_argument("--steps", type=_steps, default=800,
                    help="total optimizer updates, balanced across states (default 800)")
+    p.add_argument("--outlier-frac", type=float, default=None,
+                   help="initial fraction of the learnable detector-outlier component "
+                        "(default 0 = off; the merge inherits the checkpoint)")
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
