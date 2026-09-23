@@ -44,6 +44,25 @@ def test_gradients():
                                     (lo.requires_grad_(), hi.requires_grad_()))
 
 
+
+def test_float32_stays_exact_for_very_wide_lower_sides():
+    # the lower side as s^2/2 + log_ndtr(-s) cancels two ~s^2 terms; at
+    # log alpha_lo ~ 12 (seen in training) float32 returned NaN gradients
+    from scipy.special import erfcx
+    la_lo = torch.linspace(-3.0, 14.0, 300, dtype=torch.float64)
+    la_hi = torch.full_like(la_lo, math.log(0.8))
+    a_lo, a_hi = la_lo.exp(), la_hi.exp()
+    below = a_lo / (a_lo + a_hi) * torch.from_numpy(erfcx((0.5 * a_lo).numpy()))
+    s_hi = a_hi * math.sqrt(0.5)
+    above = 2 * a_hi / (a_lo + a_hi) * torch.exp(0.5 * s_hi ** 2 + torch.special.log_ndtr(s_hi))
+    want = (below + above).log()
+    lo32 = la_lo.float().requires_grad_()
+    hi32 = la_hi.float().requires_grad_()
+    got = split_gaussian_log_e_s(lo32, hi32)
+    got.sum().backward()
+    assert float((got.double() - want).abs().max()) < 1e-5
+    assert torch.isfinite(lo32.grad).all() and torch.isfinite(hi32.grad).all()
+
 def test_production_grid_error_is_bounded():
     lo, hi = _inputs(4000, 0)
     grid = log_e_s_gengauss(lo, torch.full_like(lo, 2.0), log_alpha_hi=hi)

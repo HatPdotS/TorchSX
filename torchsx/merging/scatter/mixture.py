@@ -65,11 +65,15 @@ def split_gaussian_log_e_s(log_alpha_lo: Tensor, log_alpha_hi: Tensor) -> Tensor
 
     The symmetric case reduces to ``alpha^2 / 4``.  Same value as
     :func:`log_e_s_gengauss` at ``beta = 2`` without its ``(n, 257)`` grid.
+
+    The lower side is evaluated as ``exp(s^2 / 2) Phi(-s) = erfcx(s / sqrt 2) / 2``:
+    written as ``s^2 / 2 + log_ndtr(-s)`` it cancels two terms of size ``s^2``,
+    which in float32 loses every digit (and returns NaN gradients) once the
+    lower width is in the thousands.  The upper side has no cancellation.
     """
     log_norm = torch.logaddexp(log_alpha_lo, log_alpha_hi) - math.log(2.0)
-    s_lo = log_alpha_lo.exp() * math.sqrt(0.5)
     s_hi = log_alpha_hi.exp() * math.sqrt(0.5)
-    lo = log_alpha_lo - log_norm + 0.5 * s_lo * s_lo + torch.special.log_ndtr(-s_lo)
+    lo = log_alpha_lo - log_norm + torch.log(torch.special.erfcx(0.5 * log_alpha_lo.exp())) - math.log(2.0)
     hi = log_alpha_hi - log_norm + 0.5 * s_hi * s_hi + torch.special.log_ndtr(s_hi)
     return torch.logaddexp(lo, hi)
 
