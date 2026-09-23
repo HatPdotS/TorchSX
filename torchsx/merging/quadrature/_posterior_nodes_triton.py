@@ -33,18 +33,21 @@ if HAVE_TRITON:
 
     @triton.jit
     def _nodes_kernel(
-        Mu, Counts, Bg, Mix, Sig2, Peak, L0,
+        Mu, Counts, Bg, Mix, Sig2, Peak, L0, Lout,
         Xlo, H1, Dlo, Hd, Dhi, H2, N1, N1d,
-        Hkl, V, S, G, Gmu, Gmix, Gz,
-        M, KN, l1m, lpi, sig_z,
+        Hkl, V, S, G, Gmu, Gmix, Gz, Gr,
+        M, KN, l1m, lpi, sig_z, l1r, lr, sig_r,
         C: tl.constexpr, NI: tl.constexpr, BG_VAR: tl.constexpr, MISS: tl.constexpr,
-        GRAD: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr,
+        OUTLIER: tl.constexpr, GRAD: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr,
         KO: tl.constexpr, J: tl.constexpr,
     ):
         # J = KO * BC columns: (outer node, component) pairs, node-major.
         l1m = l1m.to(tl.float32)
         lpi = lpi.to(tl.float32)
         sig_z = sig_z.to(tl.float32)
+        l1r = l1r.to(tl.float32)
+        lr = lr.to(tl.float32)
+        sig_r = sig_r.to(tl.float32)
         m = tl.program_id(0) * BM + tl.arange(0, BM)
         valid = m < M
         mu = tl.load(Mu + m, valid, other=0.0)
@@ -52,6 +55,8 @@ if HAVE_TRITON:
         bg = tl.load(Bg + m, valid, other=1.0)
         peak = tl.load(Peak + m, valid, other=0.0)
         l0 = tl.load(L0 + m, valid, other=0.0)
+        if OUTLIER:
+            lo = tl.load(Lout + m, valid, other=0.0)
         xlo = tl.load(Xlo + m, valid, other=0.0)
         h1 = tl.load(H1 + m, valid, other=1.0)
         dlo = tl.load(Dlo + m, valid, other=0.0)
@@ -85,6 +90,7 @@ if HAVE_TRITON:
             acc_lo = tl.zeros((BM, J), tl.float32)
             acc_hi = tl.zeros((BM, J), tl.float32)
             gz = tl.zeros((BM,), tl.float32)
+            gr = tl.zeros((BM,), tl.float32)
 
         for kb in range(0, KN, KO):
             kj = kb + ko
@@ -160,8 +166,19 @@ if HAVE_TRITON:
                 lpm = tl.maximum(lkeep, lmiss) + libdevice.log1p(tl.exp(-tl.abs(lkeep - lmiss)))
             else:
                 lpm = lp
+            if OUTLIER:
+                # detector outliers: (1 - rho) p_miss + rho p_out, p_out per observation
+                lin = l1r + lpm
+                lout = lr + lo[:, None]
+                lpo = tl.maximum(lin, lout) + libdevice.log1p(tl.exp(-tl.abs(lin - lout)))
+            else:
+                lpo = lpm
             if GRAD:
                 gk = tl.load(G + hkl[:, None] * KN + kk[None, :], omask, other=0.0)
+                if OUTLIER:
+                    rin = tl.exp(lin - lpo)
+                    gr += tl.sum(tl.where(omask, gk * (1.0 - rin - sig_r), 0.0), axis=1)
+                    gk = gk * rin
                 if MISS:
                     r1 = tl.exp(l1m + lp - lpm)
                     gz += tl.sum(tl.where(omask, gk * (1.0 - r1 - sig_z), 0.0), axis=1)
@@ -184,7 +201,7 @@ if HAVE_TRITON:
                 acc_lo += wr * comp_lo
                 acc_hi += wr * comp_hi
             else:
-                tl.atomic_add(S + hkl[:, None] * KN + kk[None, :], lpm, mask=omask)
+                tl.atomic_add(S + hkl[:, None] * KN + kk[None, :], lpo, mask=omask)
 
         if GRAD:
             g_pi = tl.sum(tl.reshape(acc_pi, (BM, KO, BC)), axis=1)
@@ -202,6 +219,8 @@ if HAVE_TRITON:
             tl.store(Gmix + dst + 4 * C, tl.zeros((BM, BC), tl.float32), m2)
             if MISS:
                 tl.atomic_add(Gz, tl.sum(gz, axis=0))
+            if OUTLIER:
+                tl.atomic_add(Gr, tl.sum(gr, axis=0))
 
 
 #: ``(observations per program, outer nodes per inner-grid pass, warps)`` by the
@@ -220,26 +239,31 @@ def _config(n_nodes: int) -> tuple[int, int, int]:
     return _CONFIG_MANY if n_nodes >= 16 else _CONFIG_FEW
 
 
-def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, S=None, G=None):
+def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, outlier=None,
+            S=None, G=None):
     M, KN = mu.numel(), v_nodes.shape[1]
     C = mix.shape[1] // 5
     dummy = mu
     out = {}
     if grad:
         out = {"gmu": torch.empty_like(mu), "gmix": torch.empty_like(mix),
-               "gz": torch.zeros(1, device=mu.device, dtype=torch.float32)}
+               "gz": torch.zeros(1, device=mu.device, dtype=torch.float32),
+               "gr": torch.zeros(1, device=mu.device, dtype=torch.float32)}
     l1m, lpi, sig_z = miss if miss is not None else (0.0, 0.0, 0.0)
+    (l1r, lr, sig_r), lout = outlier if outlier is not None else ((0.0, 0.0, 0.0), None)
     bc = triton.next_power_of_2(C)
     bm, ko, warps = _config(KN)
     if M:
         _nodes_kernel[(triton.cdiv(M, bm),)](
             mu, n_ph, p["bg_model"], mix,
             sig_b2 if sig_b2 is not None else dummy, p["logpeak"], p["log_L0"],
+            lout if lout is not None else dummy,
             *(p[k] for k in ("x_lo", "h1", "d_lo", "h_d", "d_hi", "h2", "n1", "n1d")),
             hkl, v_nodes, S if S is not None else dummy, G if G is not None else dummy,
             out.get("gmu", dummy), out.get("gmix", dummy), out.get("gz", dummy),
-            M, KN, l1m, lpi, sig_z,
-            C, int(nodes), sig_b2 is not None, miss is not None, bool(grad),
+            out.get("gr", dummy),
+            M, KN, l1m, lpi, sig_z, l1r, lr, sig_r,
+            C, int(nodes), sig_b2 is not None, miss is not None, outlier is not None, bool(grad),
             bm, 8, bc, ko, ko * bc,
             num_warps=warps,
         )
@@ -248,16 +272,17 @@ def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, S=None, G
 
 class _NodeSums(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, mu, mix, miss_logit, v_nodes, hkl, n_ph, p, nodes, sig_b2, n_hkl):
-        if miss_logit is not None:
-            miss = (float(F.logsigmoid(-miss_logit)), float(F.logsigmoid(miss_logit)),
-                    float(torch.sigmoid(miss_logit)))
-        else:
-            miss = None
+    def forward(ctx, mu, mix, miss_logit, outlier_logit, log_out, v_nodes, hkl, n_ph, p, nodes,
+                sig_b2, n_hkl):
+        def _mix(logit):
+            return (float(F.logsigmoid(-logit)), float(F.logsigmoid(logit)), float(torch.sigmoid(logit)))
+        miss = _mix(miss_logit) if miss_logit is not None else None
+        outlier = ((_mix(outlier_logit), log_out.contiguous().float())
+                   if outlier_logit is not None else None)
         S = torch.zeros(n_hkl, v_nodes.shape[1], device=mu.device, dtype=torch.float32)
-        _launch(False, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, S=S)
+        _launch(False, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, outlier, S=S)
         ctx.save_for_backward(mu, mix, v_nodes, hkl, n_ph)
-        ctx.p, ctx.nodes, ctx.sig_b2, ctx.miss = p, nodes, sig_b2, miss
+        ctx.p, ctx.nodes, ctx.sig_b2, ctx.miss, ctx.outlier = p, nodes, sig_b2, miss, outlier
         return S
 
     @staticmethod
@@ -265,23 +290,25 @@ class _NodeSums(torch.autograd.Function):
     def backward(ctx, gS):
         mu, mix, v_nodes, hkl, n_ph = ctx.saved_tensors
         out = _launch(True, mu, mix, v_nodes, hkl, n_ph, ctx.p, ctx.nodes, ctx.sig_b2,
-                      ctx.miss, G=gS.contiguous())
+                      ctx.miss, ctx.outlier, G=gS.contiguous())
         need = ctx.needs_input_grad
         return (out["gmu"] if need[0] else None, out["gmix"] if need[1] else None,
                 out["gz"].reshape(()) if need[2] else None,
-                None, None, None, None, None, None, None)
+                out["gr"].reshape(()) if need[3] else None,
+                None, None, None, None, None, None, None, None)
 
 
 def posterior_node_sums(mu, mix, miss_logit, v_nodes, hkl, n_ph, p, nodes, *,
-                        sig_b2=None, n_hkl: int):
+                        sig_b2=None, n_hkl: int, outlier_logit=None, log_out=None):
     """``S[h, k] = sum_{j: hkl_j = h} log p_miss(n_j | v[h, k] + mu_j)``, ``(n_hkl, K)``.
 
     CUDA float32; ``mix`` is the packed ``(M, 5C)`` fixed-Gaussian mixture,
     ``p`` the split-grid parameters of ``(n_ph, bg)`` and ``miss_logit`` the
-    objective's miss logit or ``None``.  Differentiable in ``mu``, ``mix`` and
-    ``miss_logit``.  Summation into ``S`` uses atomics, so the last bits vary
+    objective's miss logit or ``None``.  ``outlier_logit`` with ``log_out``
+    (``(M,)``, :meth:`MarginalNLL.log_outlier`) adds the detector-outlier
+    component.  Differentiable in ``mu``, ``mix`` and both logits.  Summation into ``S`` uses atomics, so the last bits vary
     from run to run.
     """
-    return _NodeSums.apply(mu.contiguous(), mix.contiguous(), miss_logit,
+    return _NodeSums.apply(mu.contiguous(), mix.contiguous(), miss_logit, outlier_logit, log_out,
                            v_nodes.contiguous().float(), hkl.contiguous(), n_ph.contiguous(),
                            p, int(nodes), sig_b2, int(n_hkl))

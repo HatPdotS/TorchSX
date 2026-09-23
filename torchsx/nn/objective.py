@@ -160,6 +160,7 @@ class MarginalNLL(nn.Module):
         self, quadrature, likelihood, *,
         chunk_size: int | None = None, renormalize: bool = False,
         checkpoint_chunks: bool = True, miss_frac: float = 0.0,
+        outlier_frac: float = 0.0, outlier_scale: float = 3.0,
     ) -> None:
         super().__init__()
         self.quadrature = quadrature
@@ -184,6 +185,35 @@ class MarginalNLL(nn.Module):
             if not (0.0 < miss_frac < 1.0):
                 raise ValueError(f"miss_frac must be in (0, 1), got {miss_frac}")
             self.miss_logit = nn.Parameter(torch.tensor(math.log(miss_frac / (1.0 - miss_frac))))
+        #: Detector-outlier component.  A small fraction of observations carry
+        #: count errors no intensity can explain -- a zinger or a neighbouring
+        #: spot in the peak, a contaminated annulus, a broken pedestal: at zero
+        #: predicted signal 0.04-0.2 % of the small-molecule observations lie
+        #: beyond 5 robust SDs of the detector law, ~10^3 x a Gaussian rate.
+        #: Without this term only the scatter can absorb them, and it does, with
+        #: a heavy upper tail that carried half of E[S].  With
+        #: ``outlier_frac > 0`` the likelihood is
+        #: ``(1 - rho) p_miss(n | S) + rho p_out(n)``, ``p_out`` a Cauchy about
+        #: the background mean with ``outlier_scale`` times the detector SD at
+        #: zero signal, ``rho`` learnable.  Independent of the intensity, so like
+        #: the miss term it is an additive per-observation constant on the
+        #: posterior grid.  0 disables it exactly.
+        self.outlier_logit: nn.Parameter | None = None
+        self.outlier_scale = float(outlier_scale)
+        if outlier_frac > 0.0:
+            if not (0.0 < outlier_frac < 1.0):
+                raise ValueError(f"outlier_frac must be in (0, 1), got {outlier_frac}")
+            self.outlier_logit = nn.Parameter(torch.tensor(math.log(outlier_frac / (1.0 - outlier_frac))))
+
+    def log_outlier(self, n_ph: Tensor, bg: Tensor) -> Tensor:
+        """``log p_out(n)``: a Cauchy about the detection background mean, scale
+        ``outlier_scale`` times the detector SD at zero signal."""
+        bg_mean, sig_b2 = self.likelihood.detection_params(bg)
+        lam0 = bg_mean.clamp(min=1e-6)
+        var0 = lam0 + (sig_b2 if sig_b2 is not None else 0.0)
+        gamma = self.outlier_scale * var0.sqrt()
+        t = (n_ph.to(lam0.dtype) - lam0) / gamma
+        return -math.log(math.pi) - gamma.log() - torch.log1p(t * t)
 
     def _log_miss(self, n_ph: Tensor, bg: Tensor) -> Tensor:
         """``log p(n | S = 0)`` on the kernel's scale (Poisson about its peak,
@@ -201,11 +231,16 @@ class MarginalNLL(nn.Module):
         return poisson_log_prob_at_zero_signal(n_ph, bg_mean, sig_b2)
 
     def _mix_miss(self, lp: Tensor, n_ph: Tensor, bg: Tensor) -> Tensor:
-        if self.miss_logit is None:
-            return lp
-        log_pi = torch.nn.functional.logsigmoid(self.miss_logit)
-        log_1m = torch.nn.functional.logsigmoid(-self.miss_logit)
-        return torch.logaddexp(log_1m + lp, log_pi + self._log_miss(n_ph, bg))
+        if self.miss_logit is not None:
+            log_pi = torch.nn.functional.logsigmoid(self.miss_logit)
+            log_1m = torch.nn.functional.logsigmoid(-self.miss_logit)
+            lp = torch.logaddexp(log_1m + lp, log_pi + self._log_miss(n_ph, bg))
+        if self.outlier_logit is not None:
+            log_r = torch.nn.functional.logsigmoid(self.outlier_logit)
+            log_1r = torch.nn.functional.logsigmoid(-self.outlier_logit)
+            lo = self.log_outlier(n_ph, bg)
+            lp = torch.logaddexp(log_1r + lp, log_r + lo)
+        return lp
 
     def _grid_bounds(self) -> tuple[float, float] | None:
         g = getattr(self.quadrature, "log_S_grid", None)

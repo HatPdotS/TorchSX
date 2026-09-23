@@ -526,9 +526,11 @@ class PosteriorMergeTarget(nn.Module):
             q, lik = objective.quadrature, objective.likelihood
             sig_b2 = q._sig_b2(lik, bg)
             p = q.grid_params(n_ph, bg, sig_b2, q._bg_mean_offset(lik))
+            olog = getattr(objective, "outlier_logit", None)
             return posterior_node_sums(
                 base, scatter.mixture_obs(meta), objective.miss_logit, v_nodes, hkl_id,
-                n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=self.n_hkl,
+                n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=self.n_hkl, outlier_logit=olog,
+                log_out=objective.log_outlier(n_ph, bg) if olog is not None else None,
             )
 
         # Fused path -- OFF by default; measured, not deprecated.  One launch

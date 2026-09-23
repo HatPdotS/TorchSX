@@ -648,7 +648,7 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 DEFAULTS = dict(
     d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
-    obs_self_layers=2, skew=True, miss=0.03, inner_points=192,
+    obs_self_layers=2, skew=True, miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
     scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
@@ -658,6 +658,9 @@ DEFAULTS = dict(
 def add_model_args(p: argparse.ArgumentParser) -> None:
     """Flags shared by every command that builds the merge stack."""
     p.add_argument("--device", default=None, help="cuda | cpu")
+    p.add_argument("--outlier-frac", type=float, default=None,
+                   help="initial fraction of the learnable detector-outlier component "
+                        "(0 disables; merge inherits the checkpoint)")
     p.add_argument("--prior", choices=("none", "wilson", "joined-wilson"), default=None,
                    help="intensity prior: wilson (separate, default), joined-wilson (shared), or none "
                         "(flat in positive intensity); merge inherits the checkpoint unless set")
@@ -759,14 +762,23 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                          "support SplitLogGrid checkpoints only")
     miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
             else (0.5 if scat.get("miss_logit") is not None else 0.0))
+    if ck:
+        outlier = 0.5 if scat.get("outlier_logit") is not None else 0.0
+    else:
+        outlier = (getattr(args, "outlier_frac", None) if getattr(args, "outlier_frac", None) is not None
+                   else DEFAULTS["outlier"])
     obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev),
                       Poisson(bg_var_factor=float(bvf),
                               bg_mean_offset=bg_mean_offset),
-                      miss_frac=float(miss)).to(dev)
+                      miss_frac=float(miss), outlier_frac=float(outlier)).to(dev)
     if scat.get("miss_logit") is not None and obj.miss_logit is not None:
         with torch.no_grad():
             obj.miss_logit.fill_(float(scat["miss_logit"]))
         miss = float(obj.miss_logit.detach().sigmoid())
+    if scat.get("outlier_logit") is not None and obj.outlier_logit is not None:
+        with torch.no_grad():
+            obj.outlier_logit.fill_(float(scat["outlier_logit"]))
+        outlier = float(obj.outlier_logit.detach().sigmoid())
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at
@@ -809,7 +821,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         prior=prior,
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
-        skew=bool(skew), miss=float(miss),
+        skew=bool(skew), miss=float(miss), outlier=float(outlier),
         wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
         scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
     )
@@ -824,7 +836,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         print(f"stack: amortised scale, "
               f"{'two-width' if skew else 'symmetric'} "
               f"{f'{n_components}-component {scatter_shape}-shape mixture ' if scatter_family == 'mixture' else ''}scatter, "
-              f"miss {miss:.3f}, SplitLogGrid({n_points}), "
+              f"miss {miss:.3f}, " + (f"outlier {outlier:.4f}, " if outlier else "")
+              + f"SplitLogGrid({n_points}), "
               f"outer {settings['k_coarse']}/{settings['m_fine']} "
               f"n_sigma {settings['n_sigma']:g}, "
               f"Poisson(bg_var={bvf:.4f}"

@@ -43,9 +43,9 @@ def problem(n=20000, n_hkl=700, K=31, c=4, seed=5):
     return f(counts), f(bg), f(mu), f(mix), hkl.cuda(), f(v)
 
 
-def build(bvf: float, miss: float):
+def build(bvf: float, miss: float, outlier: float = 0.0):
     lik = Poisson(bg_var_factor=bvf, bg_mean_offset=bvf)
-    obj = MarginalNLL(SplitLogGrid(n_points=192), lik, miss_frac=miss).cuda()
+    obj = MarginalNLL(SplitLogGrid(n_points=192), lik, miss_frac=miss, outlier_frac=outlier).cuda()
     return obj, PredictedMixtureScatter(4, fixed_gaussian=True)
 
 
@@ -61,24 +61,33 @@ def fused(obj, scatter, mu, n_ph, bg, meta, v, n_hkl):
     q, lik = obj.quadrature, obj.likelihood
     sig_b2 = q._sig_b2(lik, bg)
     p = q.grid_params(n_ph, bg, sig_b2, q._bg_mean_offset(lik))
+    olog = obj.outlier_logit
     return posterior_node_sums(mu, scatter.mixture_obs(meta), obj.miss_logit, v, meta.hkl_idx,
-                               n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=n_hkl)
+                               n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=n_hkl, outlier_logit=olog,
+                               log_out=obj.log_outlier(n_ph, bg) if olog is not None else None)
 
 
-@pytest.mark.parametrize("bvf,miss", [(1.16, 0.03), (0.0, 0.0)])
-def test_values_and_gradients_match_node_loop(bvf, miss):
+@pytest.mark.parametrize("bvf,miss,outlier", [(1.16, 0.03, 0.0), (0.0, 0.0, 0.0), (1.16, 0.03, 0.01),
+                                               (1.16, 0.0, 0.01)])
+def test_values_and_gradients_match_node_loop(bvf, miss, outlier):
     n_ph, bg, mu0, mix0, hkl, v = problem()
+    if outlier:
+        # a few gross count errors, both signs, so the component carries weight
+        n_ph = n_ph.clone()
+        n_ph[8:208:2] += 4000.0
+        n_ph[9:209:2] = (n_ph[9:209:2] - 3000.0).clamp(min=0.0)
     n_hkl = v.shape[0]
     meta = Meta(torch.arange(len(mu0), device="cuda"), hkl)
     out = {}
     for name, fn in (("loop", node_loop), ("fused", fused)):
-        obj, scatter = build(bvf, miss)
+        obj, scatter = build(bvf, miss, outlier)
         mu = mu0.clone().requires_grad_()
         mix = mix0.clone().requires_grad_()
         scatter.set_prediction(meta.obs_id, mix)
         S = fn(obj, scatter, mu, n_ph, bg, meta, v, n_hkl)
         W = torch.randn(S.shape, generator=torch.Generator().manual_seed(3)).cuda()
-        params = [mu, mix] + ([obj.miss_logit] if obj.miss_logit is not None else [])
+        params = ([mu, mix] + ([obj.miss_logit] if obj.miss_logit is not None else [])
+                  + ([obj.outlier_logit] if obj.outlier_logit is not None else []))
         out[name] = (S.detach(), torch.autograd.grad((S * W).sum(), params))
     S_ref, g_ref = out["loop"]
     S_new, g_new = out["fused"]
@@ -101,3 +110,23 @@ def test_accumulate_dispatches_to_the_kernel(monkeypatch):
     monkeypatch.setattr(pt, "_NODE_LOOP", True)
     want = target.accumulate(obj, scatter, None, Pred, n_ph, bg, hkl, meta, v)
     torch.testing.assert_close(got, want, rtol=1e-5, atol=2e-3)
+
+
+def test_outlier_component_absorbs_a_gross_count_error():
+    # with the component one gross count error barely moves the reflection's curve; without it,
+    # it dominates
+    n_ph, bg, mu, mix, hkl, v = problem(n=4000, n_hkl=100, K=9)
+    meta = Meta(torch.arange(len(mu), device="cuda"), hkl)
+    bad = n_ph.clone()
+    j0 = int((hkl == 0).nonzero()[0])
+    bad[j0] = bad[j0] + 20000.0                     # one zinger among the reflection's observations
+    shift = {}
+    for outlier in (0.0, 0.01):
+        obj, scatter = build(1.16, 0.03, outlier)
+        scatter.set_prediction(meta.obs_id, mix)
+        a = fused(obj, scatter, mu, n_ph, bg, meta, v, 100)
+        b = fused(obj, scatter, mu, bad, bg, meta, v, 100)
+        # where the corrupted reflection's posterior sits on its nodes (flat prior)
+        mean = lambda c: float((torch.softmax(c, 0) * v[0]).sum())
+        shift[outlier] = abs(mean(b[0]) - mean(a[0]))
+    assert shift[0.01] < 0.2 * shift[0.0], shift

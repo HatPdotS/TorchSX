@@ -1121,6 +1121,9 @@ class AmortizedTrainer:
                     "miss_logit": (None if getattr(self.objective, "miss_logit", None) is None
                                    else float((getattr(self, "_best_obj_state", None) or {}).get(
                                        "miss_logit", self.objective.miss_logit.detach()))),
+                    "outlier_logit": (None if getattr(self.objective, "outlier_logit", None) is None
+                                      else float((getattr(self, "_best_obj_state", None) or {}).get(
+                                          "outlier_logit", self.objective.outlier_logit.detach()))),
                 },
                 "best_step": self.best_step,
                 "best_heldout": self.best_heldout,
