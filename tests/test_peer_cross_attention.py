@@ -158,3 +158,74 @@ def test_state_dict_refuses_a_different_attention_depth():
     plain.load_state_dict(sd)
     with pytest.raises(RuntimeError, match="architecture mismatch"):
         att.load_state_dict(sd, strict=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
+def test_compiled_stack_matches_eager_and_keeps_the_exclusion():
+    torch.manual_seed(0)
+    kw = dict(d_model=32, n_layers=2, context_folds=2, peer_attention_layers=2, peer_heads=4, peer_bf16=False)
+    eager = DeepSetsEncoder(6, 9, peer_compile=False, **kw).cuda()
+    for prm in eager.parameters():
+        if prm.dim() > 1:
+            torch.nn.init.normal_(prm, std=0.2)
+    comp = DeepSetsEncoder(6, 9, peer_compile=True, **kw).cuda()
+    comp.load_state_dict(eager.state_dict())
+    sizes = torch.tensor([1, 5, 12, 30, 7, 64, 3, 19])
+    gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes).cuda()
+    xs, xc = torch.randn(gid.numel(), 6, device="cuda"), torch.randn(gid.numel(), 9, device="cuda")
+    for enc in (eager, comp):
+        enc.peer_budget = 2048                       # several buckets
+        enc.train()
+    outs, grads = [], []
+    for enc in (eager, comp):
+        enc.zero_grad(set_to_none=True)
+        z = enc(xs, xc, gid, sizes.numel())
+        z.square().sum().backward()
+        outs.append(z.detach())
+        grads.append(torch.cat([p.grad.flatten() for p in enc.parameters() if p.grad is not None]))
+    torch.testing.assert_close(outs[1], outs[0], rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(grads[1], grads[0], rtol=1e-3, atol=5e-5)
+    comp.eval()
+    j = int(sizes[:5].sum()) + 2                     # a row of the 64-row crystal
+    own, peers = _exclusion_on_cuda(comp, xs, xc, gid, sizes.numel(), j)
+    assert own < 1e-5 and peers > 1e-2, (own, peers)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="bfloat16 attention runs on CUDA only")
+def test_bf16_attention_is_close_and_keeps_the_exclusion():
+    torch.manual_seed(1)
+    kw = dict(d_model=32, n_layers=2, context_folds=2, peer_attention_layers=2, peer_heads=4, peer_compile=True)
+    ref = DeepSetsEncoder(6, 9, peer_bf16=False, **kw).cuda().eval()
+    for prm in ref.parameters():
+        if prm.dim() > 1:
+            torch.nn.init.normal_(prm, std=0.2)
+    low = DeepSetsEncoder(6, 9, peer_bf16=True, **kw).cuda().eval()
+    low.load_state_dict(ref.state_dict())
+    sizes = torch.tensor([2, 40, 9, 120, 1, 33])
+    gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes).cuda()
+    xs, xc = torch.randn(gid.numel(), 6, device="cuda"), torch.randn(gid.numel(), 9, device="cuda")
+    with torch.no_grad():
+        a, b = ref(xs, xc, gid, sizes.numel()), low(xs, xc, gid, sizes.numel())
+    rel = (b - a).norm() / a.norm()
+    assert rel < 2e-2, f"bf16 attention moved the embedding by {rel:.3g}"
+    j = int(sizes[:3].sum()) + 5                     # a row of the 120-row crystal
+    own, peers = _exclusion_on_cuda(low, xs, xc, gid, sizes.numel(), j)
+    assert own < 1e-5 and peers > 1e-2, (own, peers)
+
+
+def _exclusion_on_cuda(enc, xs, xc, gid, n_groups, j):
+    """``(own, peers)``: how far row ``j`` and its crystal's other rows move when ``x_ctx[j]`` moves.
+
+    Bit-exactness is a CPU statement (the tests above).  On CUDA the pools sum
+    by atomics, so every call rounds differently: an unrelated crystal's input
+    moves row ``j`` by ~1e-6 in every configuration, eager float32 included.
+    A real leak of a 30-unit input would move it by orders of magnitude more.
+    """
+    with torch.no_grad():
+        base = enc(xs, xc, gid, n_groups)
+        xc2 = xc.clone()
+        xc2[j] -= 30.0
+        moved = enc(xs, xc2, gid, n_groups)
+    same = gid == gid[j]
+    same[j] = False
+    return (moved[j] - base[j]).abs().max().item(), (moved[same] - base[same]).abs().max().item()

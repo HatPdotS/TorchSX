@@ -94,6 +94,7 @@ the heads, the objective, or the merge target.
 
 from __future__ import annotations
 
+import os
 from typing import Protocol, runtime_checkable
 
 import torch
@@ -102,7 +103,8 @@ from torch import Tensor
 
 from torchsx.nn.pooling import fold_ids, leave_fold_out_mean, leave_one_out_mean
 
-__all__ = ["ScaleEncoder", "ResidualFF", "DeepSetsEncoder", "PeerCrossAttention", "peer_layout"]
+__all__ = ["ScaleEncoder", "ResidualFF", "DeepSetsEncoder", "PeerCrossAttention", "peer_layout",
+           "peer_masks"]
 
 
 @runtime_checkable
@@ -200,22 +202,42 @@ def peer_layout(group_id: Tensor, budget: int = 1 << 24) -> list[tuple[Tensor, T
     return blocks
 
 
+def peer_masks(valid: Tensor) -> tuple[Tensor, Tensor]:
+    """``(allow, empty)`` of one packed block: keys a slot may attend to, and slots with none.
+
+    ``allow`` is ``(B, 1, L, L)``: valid slots of the same crystal, never the
+    slot itself.  A slot with no peer (a single-row crystal, or padding) is
+    allowed only itself, so its softmax stays finite; ``empty`` (``(B, L, 1)``)
+    marks it for zeroing.
+    """
+    L = valid.shape[1]
+    eye = torch.eye(L, dtype=torch.bool, device=valid.device)
+    allow = valid[:, None, :] & ~eye[None]
+    empty = ~allow.any(dim=-1)
+    allow = allow | (empty[:, :, None] & eye[None])
+    return allow[:, None], empty[..., None]
+
+
 class PeerCrossAttention(nn.Module):
     """Pre-norm cross-attention of the query stream onto the peers, plus a residual FF.
 
-    ``forward(q, kv, blocks)``: ``q`` the ``(n, D)`` query stream, ``kv`` the
-    ``(n, D)`` per-observation peer encodings, ``blocks`` from
-    :func:`peer_layout`.  Row ``j`` attends to the valid rows of its crystal
-    except itself; a crystal with a single row gets no attention output.  The
-    output projection is zero-initialised, so the block starts as the identity.
+    ``forward(q, kv, allow, empty)`` on packed ``(B, L, D)`` blocks (one
+    crystal per row, :func:`peer_layout`), masks from :func:`peer_masks`: each
+    slot attends to the valid slots of its crystal except itself, and a slot
+    with no peer gets no attention output.  The output projection is
+    zero-initialised, so the block starts as the identity.
     """
 
     def __init__(self, d_model: int, n_heads: int, d_hidden: int | None = None, *,
-                 activation: type[nn.Module] = nn.SiLU, dropout: float = 0.0) -> None:
+                 activation: type[nn.Module] = nn.SiLU, dropout: float = 0.0,
+                 bf16: bool = False) -> None:
         super().__init__()
         if d_model % n_heads:
             raise ValueError(f"d_model {d_model} not divisible by n_heads {n_heads}")
         self.n_heads, self.d_head = int(n_heads), d_model // n_heads
+        #: attention in bfloat16 on CUDA (tensor cores); projections, norms and
+        #: the residual stream stay float32, and the mask keeps the exclusion exact
+        self.bf16 = bool(bf16)
         self.norm_q = nn.RMSNorm(d_model)
         self.norm_kv = nn.RMSNorm(d_model)
         self.w_q = nn.Linear(d_model, d_model, bias=False)
@@ -226,25 +248,17 @@ class PeerCrossAttention(nn.Module):
         nn.init.zeros_(self.w_o.bias)
         self.ff = ResidualFF(d_model, d_hidden, activation=activation, dropout=dropout)
 
-    def forward(self, q: Tensor, kv: Tensor, blocks: list[tuple[Tensor, Tensor]]) -> Tensor:
-        n, D = q.shape
+    def forward(self, q: Tensor, kv: Tensor, allow: Tensor, empty: Tensor) -> Tensor:
+        B, L, D = q.shape
         H, dh = self.n_heads, self.d_head
-        Q = self.w_q(self.norm_q(q))
+        heads = lambda x: x.view(B, L, H, dh).transpose(1, 2)   # noqa: E731
         kvn = self.norm_kv(kv)
-        K, V = self.w_k(kvn), self.w_v(kvn)
-        att = q.new_zeros(n, D)
-        for idx, valid in blocks:
-            B, L = idx.shape
-            eye = torch.eye(L, dtype=torch.bool, device=q.device)
-            allow = valid[:, None, :] & ~eye[None]
-            empty = ~allow.any(dim=-1)                       # no peer to attend to
-            allow = allow | (empty[:, :, None] & eye[None])  # finite softmax; zeroed below
-            heads = lambda x: x[idx].view(B, L, H, dh).transpose(1, 2)   # noqa: E731
-            a = torch.nn.functional.scaled_dot_product_attention(
-                heads(Q), heads(K), heads(V), attn_mask=allow[:, None])
-            a = a.transpose(1, 2).reshape(B, L, D).masked_fill(empty[..., None], 0.0)
-            att = att.index_put((idx[valid],), a[valid])
-        return self.ff(q + self.w_o(att))
+        Q, K, V = heads(self.w_q(self.norm_q(q))), heads(self.w_k(kvn)), heads(self.w_v(kvn))
+        if self.bf16 and q.is_cuda:
+            Q, K, V = Q.to(torch.bfloat16), K.to(torch.bfloat16), V.to(torch.bfloat16)
+        a = torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=allow).to(q.dtype)
+        a = a.transpose(1, 2).reshape(B, L, D).masked_fill(empty, 0.0)
+        return self.ff(q + self.w_o(a))
 
 
 class DeepSetsEncoder(nn.Module):
@@ -284,6 +298,13 @@ class DeepSetsEncoder(nn.Module):
         observations of its crystal (module docstring), their head count, and
         the ``B * L * L`` element budget of one packed attention call.  ``0``
         layers is the encoder without attention.
+    peer_compile, peer_bf16
+        Run the packed attention stack through ``torch.compile(dynamic=True)``
+        on CUDA (the stack is many small elementwise ops around one attention
+        call per layer), and the attention itself in bfloat16 on CUDA.
+        ``None`` reads ``TORCHSX_PEER_COMPILE`` / ``TORCHSX_PEER_BF16``
+        (default on).  Runtime choices, not part of the architecture or the
+        state dict.
     pool_accum_dtype
         Accumulation dtype for the pooled mean.  ``None`` (default) keeps
         float32; see :mod:`torchsx.nn.pooling` on what that costs.
@@ -314,6 +335,8 @@ class DeepSetsEncoder(nn.Module):
         peer_attention_layers: int = 0,
         peer_heads: int = 8,
         peer_budget: int = 1 << 24,
+        peer_compile: bool | None = None,
+        peer_bf16: bool | None = None,
         pool_accum_dtype: torch.dtype | None = None,
         checkpoint: bool = True,
     ) -> None:
@@ -373,8 +396,15 @@ class DeepSetsEncoder(nn.Module):
             raise ValueError(f"peer_attention_layers must be >= 0, got {peer_attention_layers}")
         self.peer_heads = int(peer_heads) if self.peer_attention_layers else 0
         self.peer_budget = int(peer_budget)
+        if peer_compile is None:
+            peer_compile = os.environ.get("TORCHSX_PEER_COMPILE", "1") != "0"
+        self.peer_compile = bool(peer_compile)
+        self._peer_compiled = None
+        if peer_bf16 is None:
+            peer_bf16 = os.environ.get("TORCHSX_PEER_BF16", "1") != "0"
         self.peer_blocks = nn.ModuleList(
-            PeerCrossAttention(d_model, self.peer_heads, d_hidden, activation=activation, dropout=dropout)
+            PeerCrossAttention(d_model, self.peer_heads, d_hidden, activation=activation,
+                               dropout=dropout, bf16=peer_bf16)
             for _ in range(self.peer_attention_layers)
         )
         # The architecture travels WITH the weights.  Both pooling modes and
@@ -492,13 +522,27 @@ class DeepSetsEncoder(nn.Module):
         z = self.input_self(x_self) + ctx
         if self.peer_attention_layers:
             # keys/values: the per-observation encodings h, which have seen no
-            # other row; only the query stream z is updated
-            blocks = peer_layout(group_id, self.peer_budget)
+            # other row; only the query stream z is updated.  Each bucket is
+            # packed once and runs every layer before it is unpacked.
+            run = self._peer_stack
+            if self.peer_compile and z.is_cuda:
+                if self._peer_compiled is None:
+                    self._peer_compiled = torch.compile(self._peer_stack, dynamic=True)
+                run = self._peer_compiled
             use_ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
-            for blk in self.peer_blocks:
-                z = (torch.utils.checkpoint.checkpoint(blk, z, h, blocks, use_reentrant=False)
-                     if use_ckpt else blk(z, h, blocks))
+            for idx, valid in peer_layout(group_id, self.peer_budget):
+                zq, hk = z[idx], h[idx]
+                zq = (torch.utils.checkpoint.checkpoint(run, zq, hk, valid, use_reentrant=False)
+                      if use_ckpt else run(zq, hk, valid))
+                z = z.index_put((idx[valid],), zq[valid])
         return self._run(self.self_blocks[self.n_layers - L_s:], z, obs=True)
+
+    def _peer_stack(self, zq: Tensor, hk: Tensor, valid: Tensor) -> Tensor:
+        """Every peer-attention layer on one packed ``(B, L, D)`` block."""
+        allow, empty = peer_masks(valid)
+        for blk in self.peer_blocks:
+            zq = blk(zq, hk, allow, empty)
+        return zq
 
     def _crystal_head(self, crys: Tensor | None, count: Tensor) -> Tensor:
         logc = torch.log(count.to(self.input_crystal.weight.dtype).clamp(min=1.0))[:, None]
