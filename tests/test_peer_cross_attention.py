@@ -270,3 +270,35 @@ def test_state_dict_refuses_a_different_attention_width():
     sd = wide.state_dict()
     sd["encoder._arch"] = sd["encoder._arch"][:5].clone()
     wide.load_state_dict(sd)
+
+
+def test_tapered_stack_wide_then_narrow():
+    prep = _toy_prep_with_crystal_feat()
+    taper = _scale(prep, layers=3, dim=[16, 8, 8], heads=4)
+    enc = taper.encoder
+    assert [b.d_attn for b in enc.peer_blocks] == [16, 8, 8]
+    assert [b.n_heads for b in enc.peer_blocks] == [4, 1, 1]
+    assert enc.peer_dim == [16, 8, 8] and enc._arch.tolist()[5:] == [16, 8, 8]
+    _randomise(taper)
+    meta = prep.obs_info
+    base = taper.predict(meta).log_K.detach().clone()
+    j = 7
+    taper.features._I[j] += 500.0
+    moved = taper.predict(meta).log_K.detach()
+    assert torch.equal(moved[j], base[j])
+    uniform = _scale(prep, layers=3, dim=8, heads=4)
+    with pytest.raises(RuntimeError, match="architecture mismatch"):
+        uniform.load_state_dict(taper.state_dict(), strict=False)
+    with pytest.raises(ValueError, match="attention widths"):
+        _scale(prep, layers=2, dim=[16, 8, 8])
+
+
+def test_peer_dim_flag_parses_a_taper():
+    from types import SimpleNamespace
+    from torchsx.cli._pipeline import _peer_dims, _peer_layers
+    assert _peer_dims(SimpleNamespace(peer_dim="128,128,32,32")) == [128, 128, 32, 32]
+    assert _peer_layers(SimpleNamespace(peer_dim="128,128,32,32", peer_attention=None)) == 4
+    assert _peer_dims(SimpleNamespace(peer_dim="64")) == 64
+    assert _peer_layers(SimpleNamespace(peer_dim="64", peer_attention=4)) == 4
+    with pytest.raises(SystemExit):
+        _peer_layers(SimpleNamespace(peer_dim="128,32", peer_attention=3))

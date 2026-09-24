@@ -303,7 +303,9 @@ class DeepSetsEncoder(nn.Module):
     peer_attention_layers, peer_heads, peer_dim, peer_budget
         Cross-attention blocks from each observation onto the other
         observations of its crystal (module docstring), their head count, their
-        internal width (``None`` = ``d_model``; see :class:`PeerCrossAttention`),
+        internal width (``None`` = ``d_model``; one width, or one per layer for a
+        tapered stack, wide first; see :class:`PeerCrossAttention`; a narrow layer
+        runs ``min(peer_heads, width // 8)`` heads, so heads stay 8 wide),
         and the ``B * L * L`` element budget of one packed attention call.
         ``0`` layers is the encoder without attention.
     peer_compile, peer_bf16
@@ -342,7 +344,7 @@ class DeepSetsEncoder(nn.Module):
         obs_self_layers: int | None = None,
         peer_attention_layers: int = 0,
         peer_heads: int = 8,
-        peer_dim: int | None = None,
+        peer_dim: int | list[int] | None = None,
         peer_budget: int = 1 << 24,
         peer_compile: bool | None = None,
         peer_bf16: bool | None = None,
@@ -404,7 +406,14 @@ class DeepSetsEncoder(nn.Module):
         if self.peer_attention_layers < 0:
             raise ValueError(f"peer_attention_layers must be >= 0, got {peer_attention_layers}")
         self.peer_heads = int(peer_heads) if self.peer_attention_layers else 0
-        self.peer_dim = int(peer_dim or d_model) if self.peer_attention_layers else 0
+        N = self.peer_attention_layers
+        dims = ([int(v) for v in peer_dim] if isinstance(peer_dim, (list, tuple))
+                else [int(peer_dim or d_model)] * N)
+        if len(dims) != N:
+            raise ValueError(f"{len(dims)} attention widths for {N} attention layers")
+        self.peer_dims = dims
+        #: the width record: one int for a uniform stack, the per-layer list for a tapered one
+        self.peer_dim = (dims[0] if len(set(dims)) == 1 else list(dims)) if N else 0
         self.peer_budget = int(peer_budget)
         if peer_compile is None:
             peer_compile = os.environ.get("TORCHSX_PEER_COMPILE", "1") != "0"
@@ -413,9 +422,9 @@ class DeepSetsEncoder(nn.Module):
         if peer_bf16 is None:
             peer_bf16 = os.environ.get("TORCHSX_PEER_BF16", "1") != "0"
         self.peer_blocks = nn.ModuleList(
-            PeerCrossAttention(d_model, self.peer_heads, d_hidden, activation=activation,
-                               dropout=dropout, bf16=peer_bf16, d_attn=self.peer_dim)
-            for _ in range(self.peer_attention_layers)
+            PeerCrossAttention(d_model, self.peer_heads if w == d_model else min(self.peer_heads, max(1, w // 8)),
+                               d_hidden, activation=activation, dropout=dropout, bf16=peer_bf16, d_attn=w)
+            for w in dims
         )
         # The architecture travels WITH the weights.  Both pooling modes and
         # every depth split share the same parameter names, so a state dict
@@ -426,7 +435,7 @@ class DeepSetsEncoder(nn.Module):
             "_arch",
             torch.tensor([self.context_folds, self.obs_context_layers,
                           self.obs_self_layers, self.peer_attention_layers,
-                          self.peer_heads, self.peer_dim], dtype=torch.long),
+                          self.peer_heads, *self.peer_dims], dtype=torch.long),
         )
 
     # ── checkpoint compatibility ───────────────────────────────────────
@@ -448,15 +457,21 @@ class DeepSetsEncoder(nn.Module):
         if len(have) == 3:
             # written before peer attention existed: no attention blocks
             have = have + [0, 0]
-        if len(have) == 5:
-            # written before the attention width existed: full width
-            have = have + [self.d_model if have[3] else 0]
+        # (folds, L_c, L_s, N, heads, width per layer); older records carry no
+        # width (full width) or one width for every layer
+        n_att, widths = have[3], have[5:]
+        if n_att == 0:
+            have = have[:5]
+        elif not widths:
+            have = have[:5] + [self.d_model] * n_att
+        elif len(widths) == 1 and n_att > 1:
+            have = have[:5] + widths * n_att
         state_dict[key] = torch.tensor(have, dtype=torch.long)
         if have != want:
             raise RuntimeError(
                 "DeepSetsEncoder architecture mismatch: checkpoint has "
                 "(context_folds, obs_context_layers, obs_self_layers, "
-                f"peer_attention_layers, peer_heads, peer_dim)={tuple(have)} "
+                f"peer_attention_layers, peer_heads, width per layer)={tuple(have)} "
                 f"but this encoder is {tuple(want)}. Build the encoder with the "
                 "checkpoint's settings (to_mtz reads them from ckpt['encoder'])."
             )

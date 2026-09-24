@@ -144,7 +144,7 @@ class AmortizedScale(ScaleModel):
         obs_self_layers: int | None = None,
         peer_attention_layers: int = 0,
         peer_heads: int = 8,
-        peer_dim: int | None = None,
+        peer_dim: int | list[int] | None = None,
         w_init: float = 1.65,
         beta_init: float = 2.0,
         predict_width: bool = True,

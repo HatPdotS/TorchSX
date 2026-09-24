@@ -694,6 +694,26 @@ def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
     return float(bvf) if any(corrected) else 0.0
 
 
+def _peer_dims(args):
+    """``--peer-dim``: None, one width, or a comma-separated width per layer (a tapered stack)."""
+    v = getattr(args, "peer_dim", None)
+    if v is None:
+        return None
+    dims = [int(x) for x in str(v).split(",") if x.strip()]
+    return dims if len(dims) > 1 else dims[0]
+
+
+def _peer_layers(args) -> int:
+    """``--peer-attention``, or the length of a per-layer ``--peer-dim`` list; they must agree."""
+    n = getattr(args, "peer_attention", None)
+    dims = _peer_dims(args)
+    if isinstance(dims, list):
+        if n is not None and int(n) != len(dims):
+            raise SystemExit(f"--peer-attention {n} but --peer-dim gives {len(dims)} widths")
+        return len(dims)
+    return DEFAULTS["peer_attention"] if n is None else int(n)
+
+
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                 verbose: bool = True):
     """Build the production model, preserving recorded checkpoint geometry."""
@@ -734,14 +754,12 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         obs_self_layers=enc.get("obs_self_layers", DEFAULTS["obs_self_layers"]),
         # a checkpoint's own record wins; a checkpoint written before the key
         # existed has no attention blocks
-        peer_attention_layers=(enc.get("peer_attention_layers") or 0) if ck else
-                              (DEFAULTS["peer_attention"] if getattr(args, "peer_attention", None) is None
-                               else int(args.peer_attention)),
+        peer_attention_layers=(enc.get("peer_attention_layers") or 0) if ck else _peer_layers(args),
         # heads are 8 wide (or at most DEFAULTS["peer_heads"] of them) at any attention width
-        peer_dim=(enc.get("peer_dim") or None) if ck else getattr(args, "peer_dim", None),
+        peer_dim=(enc.get("peer_dim") or None) if ck else _peer_dims(args),
         peer_heads=(enc.get("peer_heads") or DEFAULTS["peer_heads"]) if ck else
-                   min(DEFAULTS["peer_heads"], max(1, int(getattr(args, "peer_dim", None)
-                                                          or DEFAULTS["d_model"]) // 8)),
+                   (DEFAULTS["peer_heads"] if isinstance(_peer_dims(args), list) else
+                    min(DEFAULTS["peer_heads"], max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
         scatter_family=scatter_family, n_components=n_components,
         component_shape=scatter_shape,
     )
