@@ -11,10 +11,11 @@ from torchsx.nn.pooling import fold_ids
 from tests.test_amortized_scale import _randomise, _toy_prep_with_crystal_feat
 
 
-def _scale(prep, *, folds=2, layers=2, budget=None, seed=3):
+def _scale(prep, *, folds=2, layers=2, budget=None, seed=3, dim=None, heads=4):
     torch.manual_seed(seed)
     s = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_log_k=False,
-                                 context_folds=folds, peer_attention_layers=layers, peer_heads=4)
+                                 context_folds=folds, peer_attention_layers=layers, peer_heads=heads,
+                                 peer_dim=dim)
     if budget is not None:
         s.encoder.peer_budget = budget
     return s
@@ -229,3 +230,43 @@ def _exclusion_on_cuda(enc, xs, xc, gid, n_groups, j):
     same = gid == gid[j]
     same[j] = False
     return (moved[j] - base[j]).abs().max().item(), (moved[same] - base[same]).abs().max().item()
+
+
+def test_narrow_deep_attention_keeps_the_exclusion_and_starts_as_the_identity():
+    prep = _toy_prep_with_crystal_feat()
+    narrow = _scale(prep, layers=4, dim=8, heads=2)
+    blk = narrow.encoder.peer_blocks[0]
+    assert (blk.w_q.out_features, blk.w_o.in_features, blk.ff.fc1.out_features) == (8, 8, 16)
+    per_layer = sum(p.numel() for p in blk.parameters())
+    assert per_layer < 0.6 * sum(p.numel() for p in _scale(prep, layers=1).encoder.peer_blocks[0].parameters())
+    # step 0: the encoder without attention
+    plain = _scale(prep, layers=0)
+    _randomise(plain)
+    sd = plain.state_dict()
+    for k, v in narrow.state_dict().items():
+        if k not in sd or k.endswith("_arch"):
+            sd[k] = v
+    narrow.load_state_dict(sd)
+    meta = prep.obs_info
+    torch.testing.assert_close(narrow.predict(meta).log_K, plain.predict(meta).log_K, rtol=0, atol=1e-6)
+    # the exclusion, bit for bit under the fold pool, with every weight random
+    _randomise(narrow)
+    base = narrow.predict(meta).log_K.detach().clone()
+    j = 7
+    narrow.features._I[j] += 500.0
+    moved = narrow.predict(meta).log_K.detach()
+    same = meta.crystal_id == meta.crystal_id[j]
+    assert torch.equal(moved[j], base[j])
+    same[j] = False
+    assert (moved[same] - base[same]).abs().max() > 1e-4
+
+
+def test_state_dict_refuses_a_different_attention_width():
+    prep = _toy_prep_with_crystal_feat()
+    wide, narrow = _scale(prep, layers=2), _scale(prep, layers=2, dim=8, heads=4)
+    with pytest.raises(RuntimeError, match="architecture mismatch"):
+        narrow.load_state_dict(wide.state_dict(), strict=False)
+    # a 5-entry record (before the width existed) is full width
+    sd = wide.state_dict()
+    sd["encoder._arch"] = sd["encoder._arch"][:5].clone()
+    wide.load_state_dict(sd)

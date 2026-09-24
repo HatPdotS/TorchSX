@@ -230,27 +230,34 @@ class PeerCrossAttention(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, d_hidden: int | None = None, *,
                  activation: type[nn.Module] = nn.SiLU, dropout: float = 0.0,
-                 bf16: bool = False) -> None:
+                 bf16: bool = False, d_attn: int | None = None) -> None:
         super().__init__()
-        if d_model % n_heads:
-            raise ValueError(f"d_model {d_model} not divisible by n_heads {n_heads}")
-        self.n_heads, self.d_head = int(n_heads), d_model // n_heads
+        #: width inside the block: queries, keys and values are projected from
+        #: ``d_model`` down to ``d_attn`` and the output back up, and the block's
+        #: feed-forward is ``2 d_attn`` wide -- about ``8 d_model d_attn``
+        #: parameters, so a narrow block buys depth at a fixed budget
+        d_attn = int(d_attn or d_model)
+        if d_attn % n_heads:
+            raise ValueError(f"attention width {d_attn} not divisible by n_heads {n_heads}")
+        self.d_attn = d_attn
+        self.n_heads, self.d_head = int(n_heads), d_attn // n_heads
         #: attention in bfloat16 on CUDA (tensor cores); projections, norms and
         #: the residual stream stay float32, and the mask keeps the exclusion exact
         self.bf16 = bool(bf16)
         self.norm_q = nn.RMSNorm(d_model)
         self.norm_kv = nn.RMSNorm(d_model)
-        self.w_q = nn.Linear(d_model, d_model, bias=False)
-        self.w_k = nn.Linear(d_model, d_model, bias=False)
-        self.w_v = nn.Linear(d_model, d_model, bias=False)
-        self.w_o = nn.Linear(d_model, d_model)
+        self.w_q = nn.Linear(d_model, d_attn, bias=False)
+        self.w_k = nn.Linear(d_model, d_attn, bias=False)
+        self.w_v = nn.Linear(d_model, d_attn, bias=False)
+        self.w_o = nn.Linear(d_attn, d_model)
         nn.init.zeros_(self.w_o.weight)
         nn.init.zeros_(self.w_o.bias)
-        self.ff = ResidualFF(d_model, d_hidden, activation=activation, dropout=dropout)
+        self.ff = ResidualFF(d_model, d_hidden if d_attn == d_model else 2 * d_attn,
+                             activation=activation, dropout=dropout)
 
     def forward(self, q: Tensor, kv: Tensor, allow: Tensor, empty: Tensor) -> Tensor:
-        B, L, D = q.shape
-        H, dh = self.n_heads, self.d_head
+        B, L, _ = q.shape
+        H, dh, D = self.n_heads, self.d_head, self.d_attn
         heads = lambda x: x.view(B, L, H, dh).transpose(1, 2)   # noqa: E731
         kvn = self.norm_kv(kv)
         Q, K, V = heads(self.w_q(self.norm_q(q))), heads(self.w_k(kvn)), heads(self.w_v(kvn))
@@ -293,11 +300,12 @@ class DeepSetsEncoder(nn.Module):
         observation *after* the geometry is added.  The rest run on the pooled
         context.  Defaults: all of them when ``context_folds == 0`` (the
         original architecture, bit-identical), ``2`` and ``2`` otherwise.
-    peer_attention_layers, peer_heads, peer_budget
+    peer_attention_layers, peer_heads, peer_dim, peer_budget
         Cross-attention blocks from each observation onto the other
-        observations of its crystal (module docstring), their head count, and
-        the ``B * L * L`` element budget of one packed attention call.  ``0``
-        layers is the encoder without attention.
+        observations of its crystal (module docstring), their head count, their
+        internal width (``None`` = ``d_model``; see :class:`PeerCrossAttention`),
+        and the ``B * L * L`` element budget of one packed attention call.
+        ``0`` layers is the encoder without attention.
     peer_compile, peer_bf16
         Run the packed attention stack through ``torch.compile(dynamic=True)``
         on CUDA (the stack is many small elementwise ops around one attention
@@ -334,6 +342,7 @@ class DeepSetsEncoder(nn.Module):
         obs_self_layers: int | None = None,
         peer_attention_layers: int = 0,
         peer_heads: int = 8,
+        peer_dim: int | None = None,
         peer_budget: int = 1 << 24,
         peer_compile: bool | None = None,
         peer_bf16: bool | None = None,
@@ -395,6 +404,7 @@ class DeepSetsEncoder(nn.Module):
         if self.peer_attention_layers < 0:
             raise ValueError(f"peer_attention_layers must be >= 0, got {peer_attention_layers}")
         self.peer_heads = int(peer_heads) if self.peer_attention_layers else 0
+        self.peer_dim = int(peer_dim or d_model) if self.peer_attention_layers else 0
         self.peer_budget = int(peer_budget)
         if peer_compile is None:
             peer_compile = os.environ.get("TORCHSX_PEER_COMPILE", "1") != "0"
@@ -404,7 +414,7 @@ class DeepSetsEncoder(nn.Module):
             peer_bf16 = os.environ.get("TORCHSX_PEER_BF16", "1") != "0"
         self.peer_blocks = nn.ModuleList(
             PeerCrossAttention(d_model, self.peer_heads, d_hidden, activation=activation,
-                               dropout=dropout, bf16=peer_bf16)
+                               dropout=dropout, bf16=peer_bf16, d_attn=self.peer_dim)
             for _ in range(self.peer_attention_layers)
         )
         # The architecture travels WITH the weights.  Both pooling modes and
@@ -416,7 +426,7 @@ class DeepSetsEncoder(nn.Module):
             "_arch",
             torch.tensor([self.context_folds, self.obs_context_layers,
                           self.obs_self_layers, self.peer_attention_layers,
-                          self.peer_heads], dtype=torch.long),
+                          self.peer_heads, self.peer_dim], dtype=torch.long),
         )
 
     # ── checkpoint compatibility ───────────────────────────────────────
@@ -438,12 +448,15 @@ class DeepSetsEncoder(nn.Module):
         if len(have) == 3:
             # written before peer attention existed: no attention blocks
             have = have + [0, 0]
-            state_dict[key] = torch.tensor(have, dtype=torch.long)
+        if len(have) == 5:
+            # written before the attention width existed: full width
+            have = have + [self.d_model if have[3] else 0]
+        state_dict[key] = torch.tensor(have, dtype=torch.long)
         if have != want:
             raise RuntimeError(
                 "DeepSetsEncoder architecture mismatch: checkpoint has "
                 "(context_folds, obs_context_layers, obs_self_layers, "
-                f"peer_attention_layers, peer_heads)={tuple(have)} "
+                f"peer_attention_layers, peer_heads, peer_dim)={tuple(have)} "
                 f"but this encoder is {tuple(want)}. Build the encoder with the "
                 "checkpoint's settings (to_mtz reads them from ckpt['encoder'])."
             )

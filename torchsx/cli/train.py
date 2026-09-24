@@ -51,6 +51,9 @@ def _build_parser():
     p.add_argument("--peer-attention", type=int, default=None,
                    help="cross-attention layers from each observation onto the other observations "
                         "of its crystal (default 0 = mean pool only); the merge inherits the checkpoint")
+    p.add_argument("--peer-dim", type=int, default=None,
+                   help="width inside each peer-attention layer (default: the encoder width); "
+                        "narrower layers are cheaper, so more of them fit a budget")
     p.add_argument("--context-folds", type=int, default=None,
                    help="crystal context pooling: K >= 2 folds (context from the other K-1 folds of "
                         "the crystal, default 2), or 0 = leave-one-out (all other reflections, "

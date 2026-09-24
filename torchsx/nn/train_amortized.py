@@ -1087,7 +1087,7 @@ class AmortizedTrainer:
                     for k in ("context_folds", "obs_context_layers",
                               "obs_self_layers", "d_model", "n_layers",
                               "n_crystal_features", "peer_attention_layers",
-                              "peer_heads")
+                              "peer_heads", "peer_dim")
                 },
                 # everything a merge must not have to guess: the likelihood it
                 # was fitted under, the data recipe, and the scale geometry.  A

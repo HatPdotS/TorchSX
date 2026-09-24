@@ -737,7 +737,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         peer_attention_layers=(enc.get("peer_attention_layers") or 0) if ck else
                               (DEFAULTS["peer_attention"] if getattr(args, "peer_attention", None) is None
                                else int(args.peer_attention)),
-        peer_heads=(enc.get("peer_heads") or DEFAULTS["peer_heads"]) if ck else DEFAULTS["peer_heads"],
+        # heads are 8 wide (or at most DEFAULTS["peer_heads"] of them) at any attention width
+        peer_dim=(enc.get("peer_dim") or None) if ck else getattr(args, "peer_dim", None),
+        peer_heads=(enc.get("peer_heads") or DEFAULTS["peer_heads"]) if ck else
+                   min(DEFAULTS["peer_heads"], max(1, int(getattr(args, "peer_dim", None)
+                                                          or DEFAULTS["d_model"]) // 8)),
         scatter_family=scatter_family, n_components=n_components,
         component_shape=scatter_shape,
     )
