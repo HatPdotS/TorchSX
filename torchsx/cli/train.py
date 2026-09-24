@@ -48,6 +48,10 @@ def _build_parser():
     p.add_argument("--outlier-frac", type=float, default=None,
                    help="initial fraction of the learnable detector-outlier component "
                         "(default 0 = off; the merge inherits the checkpoint)")
+    p.add_argument("--context-folds", type=int, default=None,
+                   help="crystal context pooling: K >= 2 folds (context from the other K-1 folds of "
+                        "the crystal, default 2), or 0 = leave-one-out (all other reflections, "
+                        "every context block per observation); the merge inherits the checkpoint")
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
