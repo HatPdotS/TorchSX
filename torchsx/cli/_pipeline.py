@@ -648,7 +648,7 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 DEFAULTS = dict(
     d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
-    obs_self_layers=2, skew=True, miss=0.03, outlier=0.0, inner_points=192,
+    obs_self_layers=2, peer_attention=0, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
     scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
@@ -694,6 +694,26 @@ def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
     return float(bvf) if any(corrected) else 0.0
 
 
+def _peer_dims(args):
+    """``--peer-dim``: None, one width, or a comma-separated width per layer (a tapered stack)."""
+    v = getattr(args, "peer_dim", None)
+    if v is None:
+        return None
+    dims = [int(x) for x in str(v).split(",") if x.strip()]
+    return dims if len(dims) > 1 else dims[0]
+
+
+def _peer_layers(args) -> int:
+    """``--peer-attention``, or the length of a per-layer ``--peer-dim`` list; they must agree."""
+    n = getattr(args, "peer_attention", None)
+    dims = _peer_dims(args)
+    if isinstance(dims, list):
+        if n is not None and int(n) != len(dims):
+            raise SystemExit(f"--peer-attention {n} but --peer-dim gives {len(dims)} widths")
+        return len(dims)
+    return DEFAULTS["peer_attention"] if n is None else int(n)
+
+
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                 verbose: bool = True):
     """Build the production model, preserving recorded checkpoint geometry."""
@@ -732,6 +752,14 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                               else int(args.context_folds)),
         obs_context_layers=enc.get("obs_context_layers", DEFAULTS["obs_context_layers"]),
         obs_self_layers=enc.get("obs_self_layers", DEFAULTS["obs_self_layers"]),
+        # a checkpoint's own record wins; a checkpoint written before the key
+        # existed has no attention blocks
+        peer_attention_layers=(enc.get("peer_attention_layers") or 0) if ck else _peer_layers(args),
+        # heads are 8 wide (or at most DEFAULTS["peer_heads"] of them) at any attention width
+        peer_dim=(enc.get("peer_dim") or None) if ck else _peer_dims(args),
+        peer_heads=(enc.get("peer_heads") or DEFAULTS["peer_heads"]) if ck else
+                   (DEFAULTS["peer_heads"] if isinstance(_peer_dims(args), list) else
+                    min(DEFAULTS["peer_heads"], max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
         scatter_family=scatter_family, n_components=n_components,
         component_shape=scatter_shape,
     )
