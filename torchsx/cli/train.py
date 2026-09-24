@@ -48,6 +48,9 @@ def _build_parser():
     p.add_argument("--outlier-frac", type=float, default=None,
                    help="initial fraction of the learnable detector-outlier component "
                         "(default 0 = off; the merge inherits the checkpoint)")
+    p.add_argument("--peer-attention", type=int, default=None,
+                   help="cross-attention layers from each observation onto the other observations "
+                        "of its crystal (default 0 = mean pool only); the merge inherits the checkpoint")
     p.add_argument("--context-folds", type=int, default=None,
                    help="crystal context pooling: K >= 2 folds (context from the other K-1 folds of "
                         "the crystal, default 2), or 0 = leave-one-out (all other reflections, "

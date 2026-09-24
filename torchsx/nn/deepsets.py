@@ -61,6 +61,30 @@ Ported from abismal's ``ImageScaler``.  The ragged-tensor plumbing that
 dominates the TensorFlow version collapses to an ``index_add_`` here, because
 torchsx already represents observations as flat tensors plus a ``crystal_id``.
 
+Peer cross-attention
+--------------------
+``peer_attention_layers = N > 0`` adds ``N`` cross-attention blocks between the
+self input and the last self blocks.  Each observation's **query** -- its own
+geometry plus the pooled context above -- reads the **keys and values** of the
+other observations of its crystal, which are their per-observation context
+encodings (the output of the ``obs_context_layers`` blocks, before any pool).
+
+The mean pool gives every member of a fold the same summary of its crystal, so
+anything specific to where ``j`` sits (whether the peers that need nearly the
+same wavelength as ``j`` came out strong, say) has to survive the averaging.
+Attention lets the weights depend on ``j``.
+
+The exclusion is exact, and needs no folds: keys and values are functions of
+one observation each and never see another token, only the query stream is
+updated from layer to layer, and the diagonal is masked.  So no path leads
+from ``x_ctx[j]`` to output ``j`` -- the same bit-exact guarantee as the fold
+pool, over all ``n - 1`` peers.  (Updating the peers' own representations by
+attention among themselves would break it: peer ``i`` would carry ``x_ctx[j]``
+back to ``j``.)  Crystals are packed into padded ``(B, L)`` blocks, bucketed
+by size so that ``B * L * L`` stays within ``peer_budget`` whatever the batch.
+The output projection is zero-initialised: at step 0 the encoder is exactly
+the one without attention.
+
 Swapping the encoder
 --------------------
 :class:`ScaleEncoder` is the seam.  Anything with that ``forward`` signature
@@ -78,7 +102,7 @@ from torch import Tensor
 
 from torchsx.nn.pooling import fold_ids, leave_fold_out_mean, leave_one_out_mean
 
-__all__ = ["ScaleEncoder", "ResidualFF", "DeepSetsEncoder"]
+__all__ = ["ScaleEncoder", "ResidualFF", "DeepSetsEncoder", "PeerCrossAttention", "peer_layout"]
 
 
 @runtime_checkable
@@ -139,6 +163,90 @@ class ResidualFF(nn.Module):
         return x + self.dropout(self.fc2(h))
 
 
+def peer_layout(group_id: Tensor, budget: int = 1 << 24) -> list[tuple[Tensor, Tensor]]:
+    """Pack each crystal's rows into padded ``(B, L)`` index blocks for attention.
+
+    Crystals are sorted by size and dealt into buckets.  A bucket's padded
+    length ``L`` is its largest crystal rounded up to a multiple of 8, and a
+    bucket closes before ``B * L * L`` would exceed ``budget``, so the
+    ``(B, 1, L, L)`` mask is bounded whatever the batch (a crystal too large
+    for the budget gets a bucket of its own).  Rows need not be grouped by
+    crystal.  Returns ``[(idx, valid)]``: ``idx`` the ``(B, L)`` flat row of
+    each slot (a valid row of the same crystal where padded), ``valid`` the
+    ``(B, L)`` slots that hold a row.  Every row appears in exactly one valid
+    slot.
+    """
+    order = torch.argsort(group_id, stable=True)
+    _, counts = torch.unique_consecutive(group_id[order], return_counts=True)
+    starts = torch.cumsum(counts, 0) - counts
+    by_size = torch.argsort(counts, stable=True)
+    sizes = counts[by_size].tolist()             # one host sync per forward
+    blocks: list[tuple[Tensor, Tensor]] = []
+    i, G = 0, len(sizes)
+    while i < G:
+        j, L = i, 0
+        while j < G:
+            L_j = -(-sizes[j] // 8) * 8
+            if j > i and (j - i + 1) * L_j * L_j > budget:
+                break
+            L, j = L_j, j + 1
+        sel = by_size[i:j]
+        c, st = counts[sel], starts[sel]
+        ar = torch.arange(L, device=group_id.device)
+        valid = ar[None, :] < c[:, None]
+        pos = st[:, None] + torch.minimum(ar[None, :], (c - 1)[:, None])
+        blocks.append((order[pos], valid))
+        i = j
+    return blocks
+
+
+class PeerCrossAttention(nn.Module):
+    """Pre-norm cross-attention of the query stream onto the peers, plus a residual FF.
+
+    ``forward(q, kv, blocks)``: ``q`` the ``(n, D)`` query stream, ``kv`` the
+    ``(n, D)`` per-observation peer encodings, ``blocks`` from
+    :func:`peer_layout`.  Row ``j`` attends to the valid rows of its crystal
+    except itself; a crystal with a single row gets no attention output.  The
+    output projection is zero-initialised, so the block starts as the identity.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_hidden: int | None = None, *,
+                 activation: type[nn.Module] = nn.SiLU, dropout: float = 0.0) -> None:
+        super().__init__()
+        if d_model % n_heads:
+            raise ValueError(f"d_model {d_model} not divisible by n_heads {n_heads}")
+        self.n_heads, self.d_head = int(n_heads), d_model // n_heads
+        self.norm_q = nn.RMSNorm(d_model)
+        self.norm_kv = nn.RMSNorm(d_model)
+        self.w_q = nn.Linear(d_model, d_model, bias=False)
+        self.w_k = nn.Linear(d_model, d_model, bias=False)
+        self.w_v = nn.Linear(d_model, d_model, bias=False)
+        self.w_o = nn.Linear(d_model, d_model)
+        nn.init.zeros_(self.w_o.weight)
+        nn.init.zeros_(self.w_o.bias)
+        self.ff = ResidualFF(d_model, d_hidden, activation=activation, dropout=dropout)
+
+    def forward(self, q: Tensor, kv: Tensor, blocks: list[tuple[Tensor, Tensor]]) -> Tensor:
+        n, D = q.shape
+        H, dh = self.n_heads, self.d_head
+        Q = self.w_q(self.norm_q(q))
+        kvn = self.norm_kv(kv)
+        K, V = self.w_k(kvn), self.w_v(kvn)
+        att = q.new_zeros(n, D)
+        for idx, valid in blocks:
+            B, L = idx.shape
+            eye = torch.eye(L, dtype=torch.bool, device=q.device)
+            allow = valid[:, None, :] & ~eye[None]
+            empty = ~allow.any(dim=-1)                       # no peer to attend to
+            allow = allow | (empty[:, :, None] & eye[None])  # finite softmax; zeroed below
+            heads = lambda x: x[idx].view(B, L, H, dh).transpose(1, 2)   # noqa: E731
+            a = torch.nn.functional.scaled_dot_product_attention(
+                heads(Q), heads(K), heads(V), attn_mask=allow[:, None])
+            a = a.transpose(1, 2).reshape(B, L, D).masked_fill(empty[..., None], 0.0)
+            att = att.index_put((idx[valid],), a[valid])
+        return self.ff(q + self.w_o(att))
+
+
 class DeepSetsEncoder(nn.Module):
     """abismal's ``ImageScaler`` trunk: context pool → self stack.
 
@@ -171,6 +279,11 @@ class DeepSetsEncoder(nn.Module):
         observation *after* the geometry is added.  The rest run on the pooled
         context.  Defaults: all of them when ``context_folds == 0`` (the
         original architecture, bit-identical), ``2`` and ``2`` otherwise.
+    peer_attention_layers, peer_heads, peer_budget
+        Cross-attention blocks from each observation onto the other
+        observations of its crystal (module docstring), their head count, and
+        the ``B * L * L`` element budget of one packed attention call.  ``0``
+        layers is the encoder without attention.
     pool_accum_dtype
         Accumulation dtype for the pooled mean.  ``None`` (default) keeps
         float32; see :mod:`torchsx.nn.pooling` on what that costs.
@@ -198,6 +311,9 @@ class DeepSetsEncoder(nn.Module):
         context_folds: int = 0,
         obs_context_layers: int | None = None,
         obs_self_layers: int | None = None,
+        peer_attention_layers: int = 0,
+        peer_heads: int = 8,
+        peer_budget: int = 1 << 24,
         pool_accum_dtype: torch.dtype | None = None,
         checkpoint: bool = True,
     ) -> None:
@@ -252,6 +368,15 @@ class DeepSetsEncoder(nn.Module):
 
         self.context_blocks = _stack()
         self.self_blocks = _stack()
+        self.peer_attention_layers = int(peer_attention_layers)
+        if self.peer_attention_layers < 0:
+            raise ValueError(f"peer_attention_layers must be >= 0, got {peer_attention_layers}")
+        self.peer_heads = int(peer_heads) if self.peer_attention_layers else 0
+        self.peer_budget = int(peer_budget)
+        self.peer_blocks = nn.ModuleList(
+            PeerCrossAttention(d_model, self.peer_heads, d_hidden, activation=activation, dropout=dropout)
+            for _ in range(self.peer_attention_layers)
+        )
         # The architecture travels WITH the weights.  Both pooling modes and
         # every depth split share the same parameter names, so a state dict
         # loads silently into the wrong forward -- which is exactly what
@@ -260,7 +385,8 @@ class DeepSetsEncoder(nn.Module):
         self.register_buffer(
             "_arch",
             torch.tensor([self.context_folds, self.obs_context_layers,
-                          self.obs_self_layers], dtype=torch.long),
+                          self.obs_self_layers, self.peer_attention_layers,
+                          self.peer_heads], dtype=torch.long),
         )
 
     # ── checkpoint compatibility ───────────────────────────────────────
@@ -279,10 +405,15 @@ class DeepSetsEncoder(nn.Module):
             state_dict[key] = self._arch.clone()
         want = self._arch.tolist()
         have = state_dict[key].tolist()
+        if len(have) == 3:
+            # written before peer attention existed: no attention blocks
+            have = have + [0, 0]
+            state_dict[key] = torch.tensor(have, dtype=torch.long)
         if have != want:
             raise RuntimeError(
                 "DeepSetsEncoder architecture mismatch: checkpoint has "
-                f"(context_folds, obs_context_layers, obs_self_layers)={tuple(have)} "
+                "(context_folds, obs_context_layers, obs_self_layers, "
+                f"peer_attention_layers, peer_heads)={tuple(have)} "
                 f"but this encoder is {tuple(want)}. Build the encoder with the "
                 "checkpoint's settings (to_mtz reads them from ckpt['encoder'])."
             )
@@ -358,8 +489,16 @@ class DeepSetsEncoder(nn.Module):
             table = self._run(self.self_blocks[: self.n_layers - L_s], table, obs=False)
             ctx = table.index_select(0, lid * K + fold)
 
-        return self._run(self.self_blocks[self.n_layers - L_s:],
-                         self.input_self(x_self) + ctx, obs=True)
+        z = self.input_self(x_self) + ctx
+        if self.peer_attention_layers:
+            # keys/values: the per-observation encodings h, which have seen no
+            # other row; only the query stream z is updated
+            blocks = peer_layout(group_id, self.peer_budget)
+            use_ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
+            for blk in self.peer_blocks:
+                z = (torch.utils.checkpoint.checkpoint(blk, z, h, blocks, use_reentrant=False)
+                     if use_ckpt else blk(z, h, blocks))
+        return self._run(self.self_blocks[self.n_layers - L_s:], z, obs=True)
 
     def _crystal_head(self, crys: Tensor | None, count: Tensor) -> Tensor:
         logc = torch.log(count.to(self.input_crystal.weight.dtype).clamp(min=1.0))[:, None]

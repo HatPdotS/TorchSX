@@ -142,6 +142,8 @@ class AmortizedScale(ScaleModel):
         context_folds: int = 0,
         obs_context_layers: int | None = None,
         obs_self_layers: int | None = None,
+        peer_attention_layers: int = 0,
+        peer_heads: int = 8,
         w_init: float = 1.65,
         beta_init: float = 2.0,
         predict_width: bool = True,
@@ -163,6 +165,8 @@ class AmortizedScale(ScaleModel):
             context_folds=context_folds,
             obs_context_layers=obs_context_layers,
             obs_self_layers=obs_self_layers,
+            peer_attention_layers=peer_attention_layers,
+            peer_heads=peer_heads,
         )
         heads = ScaleHeads(
             d_model,

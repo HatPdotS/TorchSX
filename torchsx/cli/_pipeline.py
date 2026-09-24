@@ -648,7 +648,7 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 DEFAULTS = dict(
     d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
-    obs_self_layers=2, skew=True, miss=0.03, outlier=0.0, inner_points=192,
+    obs_self_layers=2, peer_attention=0, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
     scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
@@ -732,6 +732,12 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                               else int(args.context_folds)),
         obs_context_layers=enc.get("obs_context_layers", DEFAULTS["obs_context_layers"]),
         obs_self_layers=enc.get("obs_self_layers", DEFAULTS["obs_self_layers"]),
+        # a checkpoint's own record wins; a checkpoint written before the key
+        # existed has no attention blocks
+        peer_attention_layers=(enc.get("peer_attention_layers") or 0) if ck else
+                              (DEFAULTS["peer_attention"] if getattr(args, "peer_attention", None) is None
+                               else int(args.peer_attention)),
+        peer_heads=(enc.get("peer_heads") or DEFAULTS["peer_heads"]) if ck else DEFAULTS["peer_heads"],
         scatter_family=scatter_family, n_components=n_components,
         component_shape=scatter_shape,
     )
