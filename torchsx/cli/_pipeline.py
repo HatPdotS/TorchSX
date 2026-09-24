@@ -645,10 +645,15 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 #: is deliberate.  ``lam_spread`` is absent on purpose -- the -0.25 carried by
 #: every scored run was a silent no-op (``_lam_spread`` returns 0 for <= 0), so
 #: shipping it as if it did something would be a lie in the config.
+#: ``peer_attention=2``: two full-width cross-attention layers from each
+#: observation onto the other observations of its crystal (gym NOTES
+#: 2026-09-24, smded72k: light - dark F CC 0.362 vs 0.337 without, dark per-state
+#: ln(N/S) -6.62 vs -6.05, held-out NLL -0.03; +0.5 s per update, ~+1 GiB).
+#: Deeper, narrower and tapered stacks were not better.
 DEFAULTS = dict(
     d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
-    obs_self_layers=2, peer_attention=0, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
+    obs_self_layers=2, peer_attention=2, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
     scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",

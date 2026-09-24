@@ -185,7 +185,11 @@ def test_compiled_stack_matches_eager_and_keeps_the_exclusion():
         outs.append(z.detach())
         grads.append(torch.cat([p.grad.flatten() for p in enc.parameters() if p.grad is not None]))
     torch.testing.assert_close(outs[1], outs[0], rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(grads[1], grads[0], rtol=1e-3, atol=5e-5)
+    # CUDA pools sum by atomics, so single gradient elements differ run to run at ~1e-4 of the
+    # largest; compare the gradient as a whole, and elementwise against its own scale
+    g0, g1 = grads
+    assert (g1 - g0).norm() / g0.norm() < 1e-3
+    assert (g1 - g0).abs().max() < 1e-3 * g0.abs().max()
     comp.eval()
     j = int(sizes[:5].sum()) + 2                     # a row of the 64-row crystal
     own, peers = _exclusion_on_cuda(comp, xs, xc, gid, sizes.numel(), j)

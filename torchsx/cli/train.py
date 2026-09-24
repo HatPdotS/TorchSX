@@ -50,7 +50,7 @@ def _build_parser():
                         "(default 0 = off; the merge inherits the checkpoint)")
     p.add_argument("--peer-attention", type=int, default=None,
                    help="cross-attention layers from each observation onto the other observations "
-                        "of its crystal (default 0 = mean pool only); the merge inherits the checkpoint")
+                        "of its crystal (default 2; 0 = mean pool only); the merge inherits the checkpoint")
     p.add_argument("--peer-dim", default=None,
                    help="width inside each peer-attention layer (default: the encoder width), or a "
                         "comma-separated width per layer for a tapered stack, e.g. 128,128,32,32")
