@@ -161,6 +161,22 @@ class CrystalIndex:
             yield sel, self.rows(sel)
 
 
+def lr_factor(step: int, *, warmup: int, total: int, schedule: str = "constant",
+              min_frac: float = 0.0) -> float:
+    """Learning-rate multiplier at update ``step`` (0-based).
+
+    Linear warm-up over ``warmup`` updates; then 1 (``"constant"``) or a cosine
+    from 1 at the end of the warm-up to ``min_frac`` at update ``total``.
+    """
+    if schedule not in ("constant", "cosine"):
+        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {schedule!r}")
+    f = min(1.0, (step + 1) / warmup) if warmup > 0 else 1.0
+    if schedule == "cosine" and total > warmup:
+        t = min(max((step - warmup) / (total - warmup), 0.0), 1.0)
+        f *= min_frac + (1.0 - min_frac) * 0.5 * (1.0 + math.cos(math.pi * t))
+    return f
+
+
 @dataclass
 class TrainConfig:
     #: Warn when the hkl-permutation sensitivity exceeds this.  A scale that
@@ -191,6 +207,12 @@ class TrainConfig:
     #: 4161 at step 0 against ~1 later) and a constant LR spends the first
     #: steps taking large, badly-scaled steps.  0 disables.
     warmup_steps: int = 0
+    #: Learning rate after the warm-up: ``"constant"``, or ``"cosine"`` decay
+    #: from the base rate at the end of the warm-up to ``min_lr_frac`` of it at
+    #: ``total_steps``.
+    lr_schedule: str = "constant"
+    total_steps: int = 0
+    min_lr_frac: float = 0.0
     #: Decoupled (AdamW) weight decay.  Applied to matrix parameters ONLY --
     #: norm gains and biases are excluded, because decaying an RMSNorm gain
     #: shrinks the network's effective scale rather than regularising it.
@@ -264,6 +286,9 @@ class TrainConfig:
     #: Posterior mode averages detached batch posterior means, not densities.
     reference_estimator: str = "wls"
     reference_ema_decay: float = 0.99
+    #: Normalise the running reference by its accumulated weight, so the
+    #: unscaled seed merge drops out (see ``PosteriorMergeTarget``).
+    reference_bias_correction: bool = False
     #: How the Wilson prior's Sigma is estimated from the running merge:
     #: ``"shells"`` (equal-count resolution shells) or ``"smooth"`` (a
     #: symmetry-adapted surface on a reciprocal-space basis, see
@@ -408,6 +433,7 @@ class AmortizedTrainer:
                            else self.cfg.posterior_prior),
                     reference_estimator=self.cfg.reference_estimator,
                     ema_decay=self.cfg.reference_ema_decay,
+                    bias_correct=self.cfg.reference_bias_correction,
                     max_halfwidth=self.cfg.posterior_max_halfwidth,
                 ).to(self.device)
                 t.checkpoint_nodes = bool(self.cfg.posterior_checkpoint_nodes)
@@ -443,6 +469,7 @@ class AmortizedTrainer:
                            else self.cfg.posterior_prior),
                         reference_estimator=self.cfg.reference_estimator,
                         ema_decay=self.cfg.reference_ema_decay,
+                        bias_correct=self.cfg.reference_bias_correction,
                         max_halfwidth=self.cfg.posterior_max_halfwidth,
                     ).to(self.device)
                     for _ in range(self.n_conditions)
@@ -763,8 +790,9 @@ class AmortizedTrainer:
 
     def step(self, rows: Tensor) -> dict:
         self.scale.train()
-        if self.cfg.warmup_steps > 0:
-            scale_lr = min(1.0, (self.step_i + 1) / self.cfg.warmup_steps)
+        if self.cfg.warmup_steps > 0 or self.cfg.lr_schedule != "constant":
+            scale_lr = lr_factor(self.step_i, warmup=self.cfg.warmup_steps, total=self.cfg.total_steps,
+                                 schedule=self.cfg.lr_schedule, min_frac=self.cfg.min_lr_frac)
             for grp in self.opt.param_groups:
                 grp["lr"] = self._base_lr * scale_lr * grp.get("lr_mult", 1.0)
         t0 = time.time()

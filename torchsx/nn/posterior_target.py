@@ -110,6 +110,21 @@ class PosteriorOut:
     n_floored: int
 
 
+@torch.no_grad()
+def ema_update_corrected(value: Tensor, num: Tensor, wt: Tensor, batch: Tensor,
+                         seen: Tensor, decay: float) -> None:
+    """In place: ``value[seen] = num / wt`` with ``num`` and ``wt`` the
+    decay-weighted sums of the batch estimates and of their weights.
+
+    The bias correction of an exponential moving average started at zero:
+    after the first update ``value`` is that batch's estimate, and the seed
+    ``value`` held before never enters.  Unseen entries keep their value.
+    """
+    num[seen] = decay * num[seen] + (1.0 - decay) * batch[seen]
+    wt[seen] = decay * wt[seen] + (1.0 - decay)
+    value[seen] = num[seen] / wt[seen]
+
+
 class PosteriorMergeTarget(nn.Module):
     """Differentiable posterior mean + marginal likelihood over I0.
 
@@ -171,6 +186,7 @@ class PosteriorMergeTarget(nn.Module):
         node_placement: str = "laplace",
         ema_decay: float = 0.99,
         reference_estimator: str = "wls",
+        bias_correct: bool = False,
         floor: float = 1e-3,
         sigma_bounds: tuple[float, float] = (0.02, 4.0),
         scan_points: int = 9,
@@ -230,6 +246,14 @@ class PosteriorMergeTarget(nn.Module):
 
         self.register_buffer("ema_I0", I0_init.detach().clone().float().clamp(min=floor))
         self.register_buffer("ema_den", torch.zeros(self.n_hkl))
+        #: Bias-corrected running reference: ``ema_I0`` is the decay-weighted
+        #: mean of the batch estimates only, normalised by the weight they have
+        #: accumulated, so the seed (the unscaled starting merge) drops out at a
+        #: reflection's first update instead of keeping ``decay^n`` of the
+        #: weight (13 % after 200 updates at 0.99).  Training-only state.
+        self.bias_correct = bool(bias_correct)
+        self.register_buffer("ema_num", torch.zeros(self.n_hkl), persistent=False)
+        self.register_buffer("ema_wt", torch.zeros(self.n_hkl), persistent=False)
         self.register_buffer("_den_seeded", torch.zeros((), dtype=torch.bool))
         # Grid width, learned from the OBSERVED posterior rather than predicted
         # from the Laplace approximation.  The Laplace sigma comes from the
@@ -808,5 +832,8 @@ class PosteriorMergeTarget(nn.Module):
         if not bool(seen.any()):
             return
         d = self.ema_decay
-        self.ema_I0[seen] = d * self.ema_I0[seen] + (1 - d) * batch[seen]
+        if self.bias_correct:
+            ema_update_corrected(self.ema_I0, self.ema_num, self.ema_wt, batch, seen, d)
+        else:
+            self.ema_I0[seen] = d * self.ema_I0[seen] + (1 - d) * batch[seen]
         self.ema_den[seen] = d * self.ema_den[seen] + (1 - d) * den[seen]

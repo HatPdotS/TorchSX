@@ -65,6 +65,14 @@ def _build_parser():
                    help="estimate averaged into the running reference (default wls)")
     p.add_argument("--reference-ema-decay", type=_decay, default=0.99,
                    help="exponential decay of the running reference (default 0.99)")
+    p.add_argument("--reference-bias-correction", action="store_true",
+                   help="normalise the running reference by its accumulated weight, so the "
+                        "unscaled starting merge drops out at a reflection's first update")
+    p.add_argument("--warmup", type=int, default=None,
+                   help="learning-rate warm-up in updates per state (default 100)")
+    p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
+                   help="learning rate after the warm-up: constant (default) or a cosine "
+                        "decay to zero at the last update")
     return p
 
 
@@ -164,7 +172,10 @@ def main(argv=None):
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
         target_redundancy=args.redundancy, epochs=0, lr=1e-3,
-        lam0=10.0, lam_halflife_steps=400 * n_states, warmup_steps=100 * n_states,
+        lam0=10.0, lam_halflife_steps=400 * n_states,
+        warmup_steps=(100 if args.warmup is None else args.warmup) * n_states,
+        lr_schedule=args.lr_schedule, total_steps=args.steps,
+        reference_bias_correction=args.reference_bias_correction,
         grad_clip=20.0, log_every=25, merge_target="posterior", loss="evidence",
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
         posterior_max_halfwidth=settings["max_halfwidth"],
