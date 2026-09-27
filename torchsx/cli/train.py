@@ -69,7 +69,7 @@ def _build_parser():
                    help="normalise the running reference by its accumulated weight, so the "
                         "unscaled starting merge drops out at a reflection's first update")
     p.add_argument("--warmup", type=int, default=None,
-                   help="learning-rate warm-up in updates per state (default 100)")
+                   help="learning-rate warm-up in updates per state (default 25)")
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
                    help="learning rate after the warm-up: constant (default) or a cosine "
                         "decay to zero at the last update")
@@ -173,7 +173,11 @@ def main(argv=None):
     cfg = TrainConfig(
         target_redundancy=args.redundancy, epochs=0, lr=1e-3,
         lam0=10.0, lam_halflife_steps=400 * n_states,
-        warmup_steps=(100 if args.warmup is None else args.warmup) * n_states,
+        # 25 updates per state: on smded72k (two states, 400 updates) against 100,
+        # held-out NLL -0.007 to -0.009 and dark per-state ln(N/S) -0.3 to -0.4 on two
+        # seed pairs, difference maps unchanged (gym NOTES 2026-09-27).  No update was
+        # ever clipped, so the long ramp only cost updates at the full rate.
+        warmup_steps=(25 if args.warmup is None else args.warmup) * n_states,
         lr_schedule=args.lr_schedule, total_steps=args.steps,
         reference_bias_correction=args.reference_bias_correction,
         grad_clip=20.0, log_every=25, merge_target="posterior", loss="evidence",
