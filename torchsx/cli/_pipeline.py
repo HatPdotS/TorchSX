@@ -748,8 +748,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     scatter_shape = str(scat.get("component_shape") or ("shared" if ck else DEFAULTS["scatter_shape"]))
     beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
     kw = dict(
-        d_model=enc.get("d_model") or sc.get("d_model") or DEFAULTS["d_model"],
-        n_layers=enc.get("n_layers") or sc.get("n_layers") or DEFAULTS["n_layers"],
+        d_model=enc.get("d_model") or sc.get("d_model") or getattr(args, "d_model", None) or DEFAULTS["d_model"],
+        n_layers=enc.get("n_layers") or sc.get("n_layers") or getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
         include_hkl=bool(sc.get("include_hkl", DEFAULTS["include_hkl"])),
         predict_shape=bool(sc.get("predict_shape", DEFAULTS["predict_shape"])),
         beta_init=beta_init, w_init=w_init,

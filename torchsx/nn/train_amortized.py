@@ -322,6 +322,12 @@ class TrainConfig:
     #: delay.  ``None`` pools all conditions and is only allowed when the
     #: data carries a single one.
     heldout_condition: int | None = 0
+    #: Explicit held-out crystals (indices into the prepared data), e.g. a fixed
+    #: external held-out stream shared by many runs so their held-out NLL is on
+    #: the same crystals.  They must belong to ``heldout_condition``; they are
+    #: scored, never trained on, and the export leaves them out
+    #: (``external_heldout``).  None: a random ``heldout_frac`` of that condition.
+    heldout_crystal_ids: object = None
     #: Crystals scored from the TRAINING set under the same conditions as the
     #: held-out set (eval_lam, no spread penalty).  Without this the logged
     #: train and heldout numbers differ in both the penalty and lambda, so
@@ -504,9 +510,19 @@ class AmortizedTrainer:
             in_ref = self.condition[pool] == hc
             ref_pool, other = pool[in_ref], pool[~in_ref]
         perm = ref_pool[torch.randperm(ref_pool.numel(), generator=self.gen)]
-        n_held = int(self.cfg.heldout_frac * perm.numel())
-        self.heldout_crystals = perm[:n_held]
-        ref_train = perm[n_held:]
+        self.external_heldout: Tensor | None = None
+        if self.cfg.heldout_crystal_ids is not None:
+            ids = torch.as_tensor(self.cfg.heldout_crystal_ids, dtype=torch.long).cpu()
+            if hc is not None and bool((self.condition[ids] != hc).any()):
+                raise ValueError(f"heldout_crystal_ids must all belong to condition {hc}")
+            held = torch.isin(perm, ids)
+            self.heldout_crystals = perm[held]
+            ref_train = perm[~held]
+            self.external_heldout = ids
+        else:
+            n_held = int(self.cfg.heldout_frac * perm.numel())
+            self.heldout_crystals = perm[:n_held]
+            ref_train = perm[n_held:]
         self.train_crystals = torch.cat([ref_train, other])
 
         decay, no_decay, mixture = [], [], []

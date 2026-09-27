@@ -68,6 +68,15 @@ def _build_parser():
     p.add_argument("--reference-bias-correction", action="store_true",
                    help="normalise the running reference by its accumulated weight, so the "
                         "unscaled starting merge drops out at a reflection's first update")
+    p.add_argument("--d-model", type=int, default=None, help="encoder width (default 128)")
+    p.add_argument("--n-layers", type=int, default=None, help="encoder blocks (default 5)")
+    p.add_argument("--eval-every", type=int, default=100,
+                   help="held-out evaluation and checkpoint every this many updates per state (default 100)")
+    p.add_argument("--patience", type=int, default=0,
+                   help="stop after this many evaluations without a new held-out minimum (default 0 = never)")
+    p.add_argument("--heldout-stream", type=Path, default=None,
+                   help="patterns of the first split scored as the held-out set -- never trained on, never "
+                        "merged into the outputs; one file across runs puts their held-out NLL on the same crystals")
     p.add_argument("--warmup", type=int, default=None,
                    help="learning-rate warm-up in updates per state (default 25)")
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
@@ -119,9 +128,37 @@ def _save_current(tr, path):
             setattr(tr, key, value)
 
 
-def run_updates(tr, steps):
-    """Run a fixed update budget, with refresh/evaluation cadence per state."""
-    refresh_every, evaluate_every = 25 * tr.n_conditions, 100 * tr.n_conditions
+def attach_heldout_stream(bundle, name: str = "heldout"):
+    """Fold the ``name`` split into the first one and return its crystal indices.
+
+    The held-out stream is loaded as one more split so every input shares one
+    reflection index; its crystals then become crystals of the first split
+    (the held-out condition) and the split itself disappears.
+    """
+    names = list(bundle.split_names)
+    if name not in names:
+        raise ValueError(f"no {name!r} split to attach")
+    h = names.index(name)
+    oi = bundle.prep.obs_info
+    lab = oi.delay_bin_idx.clone()
+    ext = lab == h
+    ids = ext.nonzero(as_tuple=True)[0]
+    lab[ext] = 0
+    lab[lab > h] -= 1
+    oi.delay_bin_idx = lab
+    if getattr(oi, "unique_timepoints", None) is not None:
+        keep = [i for i in range(len(names)) if i != h]
+        oi.unique_timepoints = oi.unique_timepoints[keep]
+    bundle.split_names = [n for i, n in enumerate(names) if i != h]
+    return ids
+
+
+def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
+    """Run a fixed update budget, with refresh/evaluation cadence per state;
+    with ``patience`` > 0, stop after that many evaluations without a new
+    held-out minimum."""
+    refresh_every, evaluate_every = 25 * tr.n_conditions, max(1, int(eval_every)) * tr.n_conditions
+    stale = 0
     updates = [0] * tr.n_conditions
     has_validation = bool(tr.heldout_crystals.numel())
     if has_validation:
@@ -145,8 +182,13 @@ def run_updates(tr, steps):
             if has_validation:
                 result = tr.evaluate(tr.heldout_crystals)
                 print(f"  validation state 0: nll/obs {result['nll_per_obs']:.5f}", flush=True)
+                stale = 0 if tr.best_step == tr.step_i else stale + 1
             tr.save_best()
             _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
+            if patience > 0 and stale >= patience:
+                print(f"early stop at update {tr.step_i}: {stale} evaluations without a new "
+                      f"held-out minimum (best at {tr.best_step})", flush=True)
+                break
     if not steps:
         tr.save_best()
         _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
@@ -167,7 +209,12 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    if args.heldout_stream is not None:
+        if not args.split:
+            raise SystemExit("--heldout-stream needs named inputs (--split NAME=PATH)")
+        args.split = list(args.split) + [f"heldout={args.heldout_stream}"]
     bundle = P.load_prep(args)
+    heldout_ids = attach_heldout_stream(bundle) if args.heldout_stream is not None else None
     prep, params, scale, obj, settings = P.build_stack(bundle, args)
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
@@ -190,22 +237,26 @@ def main(argv=None):
         posterior_checkpoint_nodes=True, encoder_chunk_crystals=400,
         stream_batches=True, split_half_every=0, heldout_frac=0.05,
         device=settings["device"], outdir=str(args.out), seed=args.seed,
+        heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     try:
         if settings.get("basis") is not None:
             tr.set_reciprocal_basis(settings["basis"], smooth_prior=settings["wilson_basis"] == "smooth")
         tr.split_names = bundle.split_names
-        recipe = dict(version=1, steps=args.steps, config=asdict(cfg),
+        config = asdict(cfg)
+        if heldout_ids is not None:
+            config["heldout_crystal_ids"] = f"{heldout_ids.numel()} crystals of {args.heldout_stream}"
+        recipe = dict(version=1, steps=args.steps, config=config,
                       checkpoint_selection="minimum validation NLL in state 0; last.pt retains endpoint",
                       validation="5% of condition-zero crystals; all observations retained for export",
-                      refresh_every=25 * n_states, evaluate_every=100 * n_states,
+                      refresh_every=25 * n_states, evaluate_every=args.eval_every * n_states,
                       readout={k: v for k, v in settings.items() if k != "basis"})
         tr.data_recipe = dict(bundle.recipe, training=recipe)
         (args.out / "run.json").write_text(json.dumps(tr.data_recipe, indent=2) + "\n")
         print(f"train {tr.train_crystals.numel():,}, validation {tr.heldout_crystals.numel():,} crystals; "
               f"{args.steps} total updates across {tr.n_conditions} states", flush=True)
-        updates = run_updates(tr, args.steps)
+        updates = run_updates(tr, args.steps, eval_every=args.eval_every, patience=args.patience)
         (args.out / "training_summary.json").write_text(json.dumps(dict(
             steps=args.steps, updates_per_state=updates, best_step=tr.best_step,
             elapsed_seconds=time.time()-t0), indent=2) + "\n")
