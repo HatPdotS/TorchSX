@@ -48,12 +48,14 @@ def _build_parser():
     p.add_argument("--outlier-frac", type=float, default=None,
                    help="initial fraction of the learnable detector-outlier component "
                         "(default 0 = off; the merge inherits the checkpoint)")
-    p.add_argument("--detector-noise", choices=("off", "panel", "mean", "panel+mean"), default="off",
-                   help="learned dispersion of the counting term, fitted with the network: per detector "
-                        "panel, as a function of the expected count, or both (default off; the merge "
-                        "inherits the checkpoint)")
-    p.add_argument("--noise-lr-mult", type=float, default=20.0,
-                   help="learning-rate multiplier of the detector-noise parameters (default 20)")
+    p.add_argument("--detector-noise", choices=("off", "panel"), default="off",
+                   help="learned detector variance A + B (lam + sig_b2) + C lam^2 per detector panel, "
+                        "fitted with the network (default off; the merge inherits the checkpoint)")
+    p.add_argument("--noise-terms", default="ABC",
+                   help="which of the detector-noise terms A, B, C are fitted (default ABC; "
+                        "B alone is a per-panel gain correction)")
+    p.add_argument("--noise-lr-mult", type=float, default=30.0,
+                   help="learning-rate multiplier of the detector-noise parameters (default 30)")
     p.add_argument("--peer-attention", type=int, default=None,
                    help="cross-attention layers from each observation onto the other observations "
                         "of its crystal (default 2; 0 = mean pool only); the merge inherits the checkpoint")

@@ -811,7 +811,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             obj.outlier_logit.fill_(float(scat["outlier_logit"]))
         outlier = float(obj.outlier_logit.detach().sigmoid())
     # Learned detector noise: a checkpoint restores what it fitted; a new run
-    # builds it from --detector-noise (panel groups from the stream's panel ids).
+    # builds it from --detector-noise / --noise-terms (panels from the stream's panel ids).
     noise_rec = ck.get("detector_noise") if ck else None
     noise_mode = None if ck else getattr(args, "detector_noise", None)
     if noise_rec or (noise_mode and noise_mode != "off"):
@@ -823,12 +823,12 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             noise_mode = "checkpoint"
         else:
             pid = prep.obs_info.panel_id
-            n_groups = int(pid.max()) + 1 if (pid is not None and "panel" in noise_mode) else 1
-            dn = DetectorNoise.default(n_groups, mean_specific="mean" in noise_mode)
+            n_groups = int(pid.max()) + 1 if pid is not None else 1
+            dn = DetectorNoise(n_groups, terms=str(getattr(args, "noise_terms", "ABC") or "ABC"))
         obj.detector_noise = dn.to(dev)
         if verbose:
-            print(f"detector noise: {noise_mode}, {dn.n_groups} group(s), "
-                  f"{'mean-specific' if dn.mean_specific else 'flat in the count'}")
+            print(f"detector noise: {noise_mode}, {dn.n_groups} panel(s), "
+                  f"V = A + B (lam + sig_b2) + C lam^2, fitted terms {dn.terms}")
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at

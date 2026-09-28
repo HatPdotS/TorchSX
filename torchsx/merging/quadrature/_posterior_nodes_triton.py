@@ -16,11 +16,13 @@ Backward recomputes the same pass with the three gradient statistics of
 size ``(M, K)`` is ever stored: the saved state is the inputs.  The integrand,
 tails and derivatives are those of ``_mixture_fwd``, line for line.
 
-Detector noise (``log_u = -log phi`` per observation, optional): the scaled
-deviance is multiplied by ``u`` and ``1/2 log u`` joins the normaliser, at the
-inner nodes and in ``log L(0)`` (tail and miss).  Its gradient is the
-posterior mean over (node, tail, miss) of ``u * scaled deviance + 1/2``, with
-the window part accumulated as one more mass-weighted statistic.
+Detector noise (optional, ``(A, B, C)`` per observation): the counting variance at
+each inner node is ``V = A + B (lam + sig_b2) + C lam^2`` and the deviance is scaled
+by ``iphi = lam / V`` (``log L(0)`` of tail and miss likewise, from ``grid_params``).
+Its gradient is the posterior mean over (node, tail, miss) of
+``d log p / d V = -D_raw lam / V^2 - 1 / (2 V)`` times ``dV/dA = 1``,
+``dV/dB = lam + sig_b2`` and ``dV/dC = lam^2``: three more mass-weighted statistics in
+the window, closed forms at ``S = 0`` for tail and miss.
 """
 from __future__ import annotations
 
@@ -41,7 +43,7 @@ if HAVE_TRITON:
     def _nodes_kernel(
         Mu, Counts, Bg, Mix, Sig2, Peak, L0, Lout,
         Xlo, H1, Dlo, Hd, Dhi, H2, N1, N1d,
-        Hkl, V, S, G, Gmu, Gmix, Gz, Gr, LogU, D0, Gu,
+        Hkl, V, S, G, Gmu, Gmix, Gz, Gr, NA, NB, NC, G0, GA, GB, GC,
         M, KN, l1m, lpi, sig_z, l1r, lr, sig_r,
         C: tl.constexpr, NI: tl.constexpr, BG_VAR: tl.constexpr, MISS: tl.constexpr,
         OUTLIER: tl.constexpr, GRAD: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr,
@@ -75,10 +77,18 @@ if HAVE_TRITON:
         if BG_VAR:
             sig2 = tl.load(Sig2 + m, valid, other=0.0)
         if NOISE:
-            lu = tl.load(LogU + m, valid, other=0.0)
-            uu = tl.exp(lu)
-            d0 = tl.load(D0 + m, valid, other=0.0)
-            peak = peak + 0.5 * lu            # l0 already carries u (grid_params)
+            na = tl.load(NA + m, valid, other=0.0)
+            nb = tl.load(NB + m, valid, other=1.0)
+            nc = tl.load(NC + m, valid, other=0.0)
+            # tail and miss use L(0) (grid_params carries the noise in l0):
+            # d log L(0) / d{A, B, C} = g0 * {1, lam0 + sig_b2, lam0^2}
+            g0 = tl.load(G0 + m, valid, other=0.0)
+            lam0 = tl.maximum(bg, 1e-6)
+            if BG_VAR:
+                tb0 = g0 * (lam0 + sig2)
+            else:
+                tb0 = g0 * lam0
+            tc0 = g0 * lam0 * lam0
         nn = tl.maximum(n, 1e-12)
 
         j = tl.arange(0, J)
@@ -103,8 +113,12 @@ if HAVE_TRITON:
             gz = tl.zeros((BM,), tl.float32)
             gr = tl.zeros((BM,), tl.float32)
             if NOISE:
-                acc_u = tl.zeros((BM, J), tl.float32)
-                gu = tl.zeros((BM,), tl.float32)
+                acc_a = tl.zeros((BM, J), tl.float32)
+                acc_b = tl.zeros((BM, J), tl.float32)
+                acc_c = tl.zeros((BM, J), tl.float32)
+                ga = tl.zeros((BM,), tl.float32)
+                gb = tl.zeros((BM,), tl.float32)
+                gc = tl.zeros((BM,), tl.float32)
 
         for kb in range(0, KN, KO):
             kj = kb + ko
@@ -118,7 +132,9 @@ if HAVE_TRITON:
                 slo = tl.zeros((BM, J), tl.float32)
                 shi = tl.zeros((BM, J), tl.float32)
                 if NOISE:
-                    sdv = tl.zeros((BM, J), tl.float32)
+                    sa = tl.zeros((BM, J), tl.float32)
+                    sb = tl.zeros((BM, J), tl.float32)
+                    sc = tl.zeros((BM, J), tl.float32)
             for start in range(0, NI, BK):
                 k = start + tl.arange(0, BK)[None, :]
                 x = _node(k, xlo[:, None], h1[:, None], dlo[:, None], hd[:, None],
@@ -138,16 +154,18 @@ if HAVE_TRITON:
                 dev = tl.where(near, nn[:, None] * small * small * poly,
                                nn[:, None] * tl.log(lam / nn[:, None]) - (lam - nn[:, None]))
                 dev = tl.where(n[:, None] > 0, dev, -lam)
-                if BG_VAR:
-                    iphi = lam / (lam + sig2[:, None])
-                    if NOISE:
-                        dsc = dev * iphi
-                        dev = dsc * uu[:, None] + 0.5 * tl.log(iphi)
+                if NOISE:
+                    if BG_VAR:
+                        lb = lam + sig2[:, None]
                     else:
-                        dev = dev * iphi + 0.5 * tl.log(iphi)
-                elif NOISE:
-                    dsc = dev
-                    dev = dsc * uu[:, None]
+                        lb = lam
+                    var = na[:, None] + nb[:, None] * lb + nc[:, None] * lam * lam
+                    iphi = lam / var
+                    gv = -dev * lam / (var * var) - 0.5 / var      # d log p / d V
+                    dev = dev * iphi + 0.5 * tl.log(iphi)
+                elif BG_VAR:
+                    iphi = lam / (lam + sig2[:, None])
+                    dev = dev * iphi + 0.5 * tl.log(iphi)
                 log_lik = dev + peak[:, None]
                 eps = x[:, None, :] - center[:, :, None]
                 ia = tl.where(eps > 0, inv_ah[:, :, None], inv_a[:, :, None])
@@ -163,7 +181,9 @@ if HAVE_TRITON:
                     slo = slo * scale + 2.0 * tl.sum(tl.where(eps > 0, 0.0, mass * z2), axis=2)
                     shi = shi * scale + 2.0 * tl.sum(tl.where(eps > 0, mass * z2, 0.0), axis=2)
                     if NOISE:
-                        sdv = sdv * scale + tl.sum(mass * dsc[:, None, :], axis=2)
+                        sa = sa * scale + tl.sum(mass * gv[:, None, :], axis=2)
+                        sb = sb * scale + tl.sum(mass * (gv * lb)[:, None, :], axis=2)
+                        sc = sc * scale + tl.sum(mass * (gv * lam * lam)[:, None, :], axis=2)
                 mx = new_mx
             # FLT_MIN, not 1e-38: a Python float below it becomes an fp64
             # constant and would promote everything downstream to fp64
@@ -209,13 +229,13 @@ if HAVE_TRITON:
                     gz += tl.sum(tl.where(omask, gk * (1.0 - r1 - sig_z), 0.0), axis=1)
                     w = gk * r1
                     if NOISE:
-                        # every class but the outlier carries 1/2 log u; the miss uses L(0)
-                        gu += tl.sum(tl.where(omask, 0.5 * w + gk * (1.0 - r1)
-                                              * (uu[:, None] * d0[:, None] + 0.5), 0.0), axis=1)
+                        # the miss component is L(0)
+                        mw = tl.sum(tl.where(omask, gk * (1.0 - r1), 0.0), axis=1)
+                        ga += mw * g0
+                        gb += mw * tb0
+                        gc += mw * tc0
                 else:
                     w = gk
-                    if NOISE:
-                        gu += tl.sum(tl.where(omask, 0.5 * w, 0.0), axis=1)
                 resp = tl.reshape(e3 / tot3[:, :, None], (BM, J))
                 wj = tl.reshape(tl.broadcast_to(w[:, :, None], (BM, KO, BC)), (BM, J))
                 pw, pt = tl.exp(win - lp_c), tl.exp(tail - lp_c)
@@ -232,7 +252,9 @@ if HAVE_TRITON:
                 acc_lo += wr * comp_lo
                 acc_hi += wr * comp_hi
                 if NOISE:
-                    acc_u += wr * (uu[:, None] * (pw * sdv / total + pt * d0[:, None]))
+                    acc_a += wr * (pw * sa / total + pt * g0[:, None])
+                    acc_b += wr * (pw * sb / total + pt * tb0[:, None])
+                    acc_c += wr * (pw * sc / total + pt * tc0[:, None])
             else:
                 tl.atomic_add(S + hkl[:, None] * KN + kk[None, :], lpo, mask=omask)
 
@@ -255,7 +277,9 @@ if HAVE_TRITON:
             if OUTLIER:
                 tl.atomic_add(Gr, tl.sum(gr, axis=0))
             if NOISE:
-                tl.store(Gu + m, tl.sum(acc_u, axis=1) + gu, valid)
+                tl.store(GA + m, tl.sum(acc_a, axis=1) + ga, valid)
+                tl.store(GB + m, tl.sum(acc_b, axis=1) + gb, valid)
+                tl.store(GC + m, tl.sum(acc_c, axis=1) + gc, valid)
 
 
 #: ``(observations per program, outer nodes per inner-grid pass, warps)`` by the
@@ -285,7 +309,7 @@ def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, outlier=N
                "gz": torch.zeros(1, device=mu.device, dtype=torch.float32),
                "gr": torch.zeros(1, device=mu.device, dtype=torch.float32)}
         if noise:
-            out["gu"] = torch.empty_like(mu)
+            out.update(ga=torch.empty_like(mu), gb=torch.empty_like(mu), gc=torch.empty_like(mu))
     l1m, lpi, sig_z = miss if miss is not None else (0.0, 0.0, 0.0)
     (l1r, lr, sig_r), lout = outlier if outlier is not None else ((0.0, 0.0, 0.0), None)
     bc = triton.next_power_of_2(C)
@@ -299,7 +323,8 @@ def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, outlier=N
             hkl, v_nodes, S if S is not None else dummy, G if G is not None else dummy,
             out.get("gmu", dummy), out.get("gmix", dummy), out.get("gz", dummy),
             out.get("gr", dummy),
-            p["log_u"] if noise else dummy, p["d0"] if noise else dummy, out.get("gu", dummy),
+            *(p["noise"] if noise else (dummy, dummy, dummy)), p["g0"] if noise else dummy,
+            out.get("ga", dummy), out.get("gb", dummy), out.get("gc", dummy),
             M, KN, l1m, lpi, sig_z, l1r, lr, sig_r,
             C, int(nodes), sig_b2 is not None, miss is not None, outlier is not None, bool(grad),
             bm, 8, bc, ko, ko * bc, bool(noise),
@@ -311,14 +336,14 @@ def _launch(grad, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, outlier=N
 class _NodeSums(torch.autograd.Function):
     @staticmethod
     def forward(ctx, mu, mix, miss_logit, outlier_logit, log_out, v_nodes, hkl, n_ph, p, nodes,
-                sig_b2, n_hkl, log_u):
+                sig_b2, n_hkl, nA, nB, nC):
         def _mix(logit):
             return (float(F.logsigmoid(-logit)), float(F.logsigmoid(logit)), float(torch.sigmoid(logit)))
         miss = _mix(miss_logit) if miss_logit is not None else None
         outlier = ((_mix(outlier_logit), log_out.contiguous().float())
                    if outlier_logit is not None else None)
         S = torch.zeros(n_hkl, v_nodes.shape[1], device=mu.device, dtype=torch.float32)
-        noise = log_u is not None
+        noise = nA is not None
         _launch(False, mu, mix, v_nodes, hkl, n_ph, p, nodes, sig_b2, miss, outlier, S=S, noise=noise)
         ctx.save_for_backward(mu, mix, v_nodes, hkl, n_ph)
         ctx.p, ctx.nodes, ctx.sig_b2, ctx.miss, ctx.outlier = p, nodes, sig_b2, miss, outlier
@@ -336,26 +361,29 @@ class _NodeSums(torch.autograd.Function):
                 out["gz"].reshape(()) if need[2] else None,
                 out["gr"].reshape(()) if need[3] else None,
                 None, None, None, None, None, None, None, None,
-                out["gu"] if ctx.noise and need[12] else None)
+                out["ga"] if ctx.noise and need[12] else None,
+                out["gb"] if ctx.noise and need[13] else None,
+                out["gc"] if ctx.noise and need[14] else None)
 
 
 def posterior_node_sums(mu, mix, miss_logit, v_nodes, hkl, n_ph, p, nodes, *,
-                        sig_b2=None, n_hkl: int, outlier_logit=None, log_out=None, log_u=None):
+                        sig_b2=None, n_hkl: int, outlier_logit=None, log_out=None, noise=None):
     """``S[h, k] = sum_{j: hkl_j = h} log p_miss(n_j | v[h, k] + mu_j)``, ``(n_hkl, K)``.
 
     CUDA float32; ``mix`` is the packed ``(M, 5C)`` fixed-Gaussian mixture,
     ``p`` the split-grid parameters of ``(n_ph, bg)`` and ``miss_logit`` the
     objective's miss logit or ``None``.  ``outlier_logit`` with ``log_out``
     (``(M,)``, :meth:`MarginalNLL.log_outlier`) adds the detector-outlier
-    component.  ``log_u`` (``(M,)``) is the detector noise; ``p`` must then be the
-    grid built with the same values (``grid_params(..., log_u)``).  Differentiable
-    in ``mu``, ``mix``, both logits and ``log_u``.  Summation into ``S`` uses atomics,
-    so the last bits vary from run to run.
+    component.  ``noise = (A, B, C)`` (each ``(M,)``) is the detector noise; ``p`` must
+    then be the grid built with the same values (``grid_params(..., noise)``); the
+    kernel reads the grid's detached copies and returns the gradients to these.
+    Differentiable in ``mu``, ``mix``, both logits and the noise terms.  Summation
+    into ``S`` uses atomics, so the last bits vary from run to run.
     """
-    if log_u is not None and p.get("log_u") is None:
-        raise ValueError("log_u given but the grid was built without it")
-    if log_u is None and p.get("log_u") is not None:
-        raise ValueError("the grid carries detector noise; pass the same log_u")
+    if (noise is None) != (p.get("noise") is None):
+        raise ValueError("the grid and the call disagree about detector noise; build the grid "
+                         "with grid_params(..., noise) and pass the same terms")
+    nA, nB, nC = noise if noise is not None else (None, None, None)
     return _NodeSums.apply(mu.contiguous(), mix.contiguous(), miss_logit, outlier_logit, log_out,
                            v_nodes.contiguous().float(), hkl.contiguous(), n_ph.contiguous(),
-                           p, int(nodes), sig_b2, int(n_hkl), log_u)
+                           p, int(nodes), sig_b2, int(n_hkl), nA, nB, nC)

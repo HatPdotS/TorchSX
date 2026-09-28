@@ -201,10 +201,12 @@ class TrainConfig:
     #: the initial state; the head reads the full embedding like the other
     #: heads, and at 10 it drove lower widths to alpha ~ 1e5 within 200 updates.
     mixture_lr_mult: float = 1.0
-    #: Learning-rate multiplier for the learned detector noise (a handful of
-    #: scalars that may have to move by ~2 nats -- a gain off by 10x -- within the
-    #: update budget; at the base rate Adam moves them ~0.4 in 400 updates).
-    noise_lr_mult: float = 20.0
+    #: Learning-rate multiplier for the learned detector noise (per-panel log A,
+    #: log B, log C).  They may have to move by several nats within the budget --
+    #: B by 2.3 for a gain off by 10x, A and C up from their near-zero start -- and
+    #: Adam moves a parameter by at most ~lr per update.  Each is projected into
+    #: its bounds after every step, so a persistent push cannot run away.
+    noise_lr_mult: float = 30.0
     #: Linear LR warmup.  Matters once the encoder is a deep stack of exchange
     #: blocks: the zero-initialised output projections make every block start
     #: as the identity, so all early gradient lands on the heads (measured
@@ -775,10 +777,13 @@ class AmortizedTrainer:
         bvf = float(getattr(getattr(self.objective, "likelihood", None),
                             "bg_var_factor", 0.0) or 0.0)
         var_count = sigma**2 + bvf * bg.clamp(min=0.0)
-        log_u = (self.objective.noise_log_u(meta)
-                 if hasattr(self.objective, "noise_log_u") else None)
-        if log_u is not None:
-            var_count = var_count * (-log_u.detach()).exp()   # the learned dispersion
+        noise = (self.objective.noise_terms(meta)
+                 if hasattr(self.objective, "noise_terms") else None)
+        if noise is not None:
+            # the learned detector variance A + B (counting) + C lam^2
+            nA, nB, nC = (t.detach() for t in noise)
+            lam = (K * I0 + bg).clamp(min=0.0)
+            var_count = nA + nB * var_count + nC * lam * lam
         var = (var_count + var_scatter).clamp(min=1e-12)
         # Same argument for the mean: under a bg_mean_offset the model claims
         # E[n] = K*I0 + bg + offset, so the residual this metric standardises
@@ -861,6 +866,9 @@ class AmortizedTrainer:
                 self.scale.parameters(), self.cfg.grad_clip
             )
             self.opt.step()
+            dn = getattr(self.objective, "detector_noise", None)
+            if dn is not None:
+                dn.project()          # the noise terms stay inside their bounds
         gn["gradnorm_total"] = float(total_norm)          # pre-clip global norm
         gn["grad_was_clipped"] = bool(float(total_norm) > self.cfg.grad_clip)
         gn["step_skipped"] = skipped
@@ -1089,11 +1097,9 @@ class AmortizedTrainer:
         }
         dn = getattr(self.objective, "detector_noise", None)
         if dn is not None:
-            # log phi per panel, and the count dependence at the knots
-            with torch.no_grad():
-                rec["noise_log_phi_panel"] = (dn.bound * torch.tanh(dn.a / dn.bound)).cpu().tolist()
-                if dn.f is not None:
-                    rec["noise_f_knots"] = [0.0] + dn.f.detach().cpu().tolist()
+            # the fitted variance terms per panel
+            for t, v in dn.values().items():
+                rec[f"noise_{t}"] = v
         if (
             self.cfg.keep_best and phase == "heldout"
             and rec["nll_per_obs"] == rec["nll_per_obs"]
