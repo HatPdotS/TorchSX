@@ -89,6 +89,26 @@ checkpoint's network weights and fitted feature standardization. Any number of
 bins can be exported under their current labels. Exact checkpoint replay through
 the Python API still requires recorded inference context and matching data.
 
+### Scale encoder
+
+Each observation's scale is predicted from its own features and those of the
+other observations of its crystal. `--peer-attention N` sets the number of
+cross-attention layers onto these peers (default 2; `0` pools by mean only).
+`--peer-dim` sets the width inside each layer, by default the encoder width; a
+comma-separated list gives one width per layer, for example `128,128,32,32`.
+`--context-folds K` splits each crystal into K folds and takes an observation's
+context from the other K−1 (default 2); `0` takes it from all other reflections
+of the crystal. Checkpoint readout inherits all three.
+
+`--outlier-frac F` adds a learnable detector-outlier component to the
+likelihood, starting at fraction F (default 0, off). Readout inherits it.
+
+### Training schedule
+
+The learning rate warms up over `--warmup` updates per state (default 25) and
+then stays constant. `--lr-schedule cosine` decays it to zero at the last
+update instead.
+
 ### Running intensity reference
 
 `torchsx-train --reference-estimator posterior --reference-ema-decay 0.99`
@@ -104,6 +124,9 @@ prior fitting and integration-grid placement. Posterior densities are not reused
 as priors. Validation does not update any running reference. Checkpoints record
 the estimator and decay as well as the running state. The default estimator
 remains `wls` for comparison; both estimators use decay 0.99 by default.
+`--reference-bias-correction` normalises the running reference by its
+accumulated weight, so the unscaled starting merge drops out at a reflection's
+first update.
 
 ### Intensity prior
 
