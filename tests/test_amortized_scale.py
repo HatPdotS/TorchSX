@@ -13,7 +13,6 @@ import math
 import pytest
 import torch
 
-from torchsx.merging.hkl import build_adjacency
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
 from torchsx.merging.scale import AmortizedScale
@@ -69,10 +68,6 @@ def _toy_prep(n_crystals: int = 12, obs_per_crystal: int = 9, n_hkl: int = 20):
         bg=bg,
         obs_counts=torch.bincount(hkl_id, minlength=n_hkl),
         n_obs_total=n,
-        mu_init=torch.full((n_hkl,), math.log(30.0)),
-        alpha_init=torch.full((n_hkl,), 1.65),
-        beta_perhkl=torch.full((n_hkl,), 2.0),
-        adjacency=build_adjacency(hkl_valid),
         obs_info=obs_info,
         partiality=None,
         shell_id_fw=torch.arange(n_hkl) % 4,
@@ -81,10 +76,11 @@ def _toy_prep(n_crystals: int = 12, obs_per_crystal: int = 9, n_hkl: int = 20):
 
 
 def _params(prep) -> Parameters:
+    n = prep.n_valid
     return Parameters(
-        log_I0_init=prep.mu_init.clone(),
+        log_I0_init=torch.full((n,), math.log(30.0)),
         scatter_shape=FreePerHKLShape(
-            prep.alpha_init.log(), prep.beta_perhkl.log()
+            torch.full((n,), 1.65).log(), torch.full((n,), 2.0).log()
         ),
     )
 

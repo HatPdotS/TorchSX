@@ -27,6 +27,9 @@ def _build_parser():
 
 def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
+    # TF32 for the encoder's float32 matmuls; the likelihood and posterior
+    # integrals are elementwise and Triton code, which this does not touch.
+    torch.set_float32_matmul_precision("high")
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)

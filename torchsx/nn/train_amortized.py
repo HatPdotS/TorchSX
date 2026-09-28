@@ -45,8 +45,10 @@ from torchsx.nn.metrics import (
     condition_auc,
     grad_norms,
     hkl_permutation_sensitivity,
+    hkl_permutation_sensitivity_shape,
     scale_metrics,
 )
+from torchsx.nn.shape_prior import pack_single, shape_prior_kl
 
 __all__ = ["CrystalIndex", "TrainConfig", "AmortizedTrainer"]
 
@@ -159,6 +161,22 @@ class CrystalIndex:
             yield sel, self.rows(sel)
 
 
+def lr_factor(step: int, *, warmup: int, total: int, schedule: str = "constant",
+              min_frac: float = 0.0) -> float:
+    """Learning-rate multiplier at update ``step`` (0-based).
+
+    Linear warm-up over ``warmup`` updates; then 1 (``"constant"``) or a cosine
+    from 1 at the end of the warm-up to ``min_frac`` at update ``total``.
+    """
+    if schedule not in ("constant", "cosine"):
+        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {schedule!r}")
+    f = min(1.0, (step + 1) / warmup) if warmup > 0 else 1.0
+    if schedule == "cosine" and total > warmup:
+        t = min(max((step - warmup) / (total - warmup), 0.0), 1.0)
+        f *= min_frac + (1.0 - min_frac) * 0.5 * (1.0 + math.cos(math.pi * t))
+    return f
+
+
 @dataclass
 class TrainConfig:
     #: Warn when the hkl-permutation sensitivity exceeds this.  A scale that
@@ -178,9 +196,10 @@ class TrainConfig:
     target_redundancy: float | None = None
     epochs: int = 10
     lr: float = 1e-3
-    #: Learning-rate multiplier for the mixture conditioner's parameters: its
-    #: outputs enter the likelihood through a softmax and a mean correction
-    #: whose gradients are small near the initial state.
+    #: Learning-rate multiplier for the mixture head's parameters.  10 suited
+    #: the old three-input conditioner, whose outputs had small gradients near
+    #: the initial state; the head reads the full embedding like the other
+    #: heads, and at 10 it drove lower widths to alpha ~ 1e5 within 200 updates.
     mixture_lr_mult: float = 1.0
     #: Linear LR warmup.  Matters once the encoder is a deep stack of exchange
     #: blocks: the zero-initialised output projections make every block start
@@ -188,6 +207,12 @@ class TrainConfig:
     #: 4161 at step 0 against ~1 later) and a constant LR spends the first
     #: steps taking large, badly-scaled steps.  0 disables.
     warmup_steps: int = 0
+    #: Learning rate after the warm-up: ``"constant"``, or ``"cosine"`` decay
+    #: from the base rate at the end of the warm-up to ``min_lr_frac`` of it at
+    #: ``total_steps``.
+    lr_schedule: str = "constant"
+    total_steps: int = 0
+    min_lr_frac: float = 0.0
     #: Decoupled (AdamW) weight decay.  Applied to matrix parameters ONLY --
     #: norm gains and biases are excluded, because decaying an RMSNorm gain
     #: shrinks the network's effective scale rather than regularising it.
@@ -261,6 +286,9 @@ class TrainConfig:
     #: Posterior mode averages detached batch posterior means, not densities.
     reference_estimator: str = "wls"
     reference_ema_decay: float = 0.99
+    #: Normalise the running reference by its accumulated weight, so the
+    #: unscaled seed merge drops out (see ``PosteriorMergeTarget``).
+    reference_bias_correction: bool = False
     #: How the Wilson prior's Sigma is estimated from the running merge:
     #: ``"shells"`` (equal-count resolution shells) or ``"smooth"`` (a
     #: symmetry-adapted surface on a reciprocal-space basis, see
@@ -274,6 +302,16 @@ class TrainConfig:
     #: Halflife of the spread penalty in steps; ``0`` disables the ramp and
     #: holds ``lam_spread`` constant for the whole run.
     lam_spread_halflife_steps: int = 400
+    #: Hierarchical prior on each observation's scatter density
+    #: (:mod:`torchsx.nn.shape_prior`): ``lam_shape_prior`` pseudo-observations
+    #: per observation drawn from the batch's population density, i.e.
+    #: ``lam * mean_j KL(p_bar || p_j)`` added to the per-observation loss.
+    #: Weak observations, whose likelihood barely depends on their scatter
+    #: shape, take the population shape; strong ones keep what their data say.
+    #: Constant over the run (it is a prior, not an escape schedule).
+    lam_shape_prior: float = 0.0
+    #: observations sampled per update to estimate the prior term
+    shape_prior_sample: int = 2048
     log_every: int = 10
     eval_lam: float = 0.0
     heldout_frac: float = 0.05
@@ -395,6 +433,7 @@ class AmortizedTrainer:
                            else self.cfg.posterior_prior),
                     reference_estimator=self.cfg.reference_estimator,
                     ema_decay=self.cfg.reference_ema_decay,
+                    bias_correct=self.cfg.reference_bias_correction,
                     max_halfwidth=self.cfg.posterior_max_halfwidth,
                 ).to(self.device)
                 t.checkpoint_nodes = bool(self.cfg.posterior_checkpoint_nodes)
@@ -430,6 +469,7 @@ class AmortizedTrainer:
                            else self.cfg.posterior_prior),
                         reference_estimator=self.cfg.reference_estimator,
                         ema_decay=self.cfg.reference_ema_decay,
+                        bias_correct=self.cfg.reference_bias_correction,
                         max_halfwidth=self.cfg.posterior_max_halfwidth,
                     ).to(self.device)
                     for _ in range(self.n_conditions)
@@ -551,12 +591,20 @@ class AmortizedTrainer:
         #: unnamed split).  Travels to the checkpoint and names the outputs.
         self.split_names: list[str] = []
 
-        # Resolution shell per observation, for the calibration breakdown.
-        d = prep.d_spacing[prep.hkl_id]
-        rank = d.argsort().argsort().float() / max(d.numel(), 1)
-        self.shell_of_obs = (rank * self.cfg.shell_bins).long().clamp(
-            max=self.cfg.shell_bins - 1
-        )
+        # Resolution shell per observation (equal observation count, low d
+        # first), for the calibration breakdown.  Every observation of a
+        # reflection shares its d, so the ranking is done over reflections
+        # weighted by multiplicity instead of by sorting all observations
+        # twice; stored as int16 because it is one entry per observation.
+        bins = self.cfg.shell_bins
+        hid = prep.hkl_id
+        counts = torch.bincount(hid, minlength=prep.n_valid).double()
+        order = prep.d_spacing.to(hid.device).argsort()
+        below = counts[order].cumsum(0) - counts[order]
+        shell_h = torch.empty(prep.n_valid, dtype=torch.int16, device=hid.device)
+        shell_h[order] = (below / max(hid.numel(), 1) * bins).floor().clamp(
+            max=bins - 1).to(torch.int16)
+        self.shell_of_obs = shell_h[hid]
 
     # ── condition-indexed state ────────────────────────────────────────
 
@@ -742,8 +790,9 @@ class AmortizedTrainer:
 
     def step(self, rows: Tensor) -> dict:
         self.scale.train()
-        if self.cfg.warmup_steps > 0:
-            scale_lr = min(1.0, (self.step_i + 1) / self.cfg.warmup_steps)
+        if self.cfg.warmup_steps > 0 or self.cfg.lr_schedule != "constant":
+            scale_lr = lr_factor(self.step_i, warmup=self.cfg.warmup_steps, total=self.cfg.total_steps,
+                                 schedule=self.cfg.lr_schedule, min_frac=self.cfg.min_lr_frac)
             for grp in self.opt.param_groups:
                 grp["lr"] = self._base_lr * scale_lr * grp.get("lr_mult", 1.0)
         t0 = time.time()
@@ -755,6 +804,13 @@ class AmortizedTrainer:
         lam_s = self._lam_spread()
         if lam_s > 0:
             loss = loss + lam_s * pred.log_w.mean()
+        shape_rec = {}
+        if self.cfg.lam_shape_prior > 0:
+            mix = pred.mix if pred.mix is not None else pack_single(pred.log_alpha, pred.beta, pred.log_alpha_hi)
+            kl, sd_bar, out_bar = shape_prior_kl(mix, pred.log_e_s, n_sample=self.cfg.shape_prior_sample)
+            loss = loss + self.cfg.lam_shape_prior * kl
+            shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar,
+                         "shape_prior_off_grid": out_bar}
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = grad_norms(self.scale)
@@ -815,6 +871,7 @@ class AmortizedTrainer:
             "n_floored": tgt.n_floored,
             "lam": self.target.lam,
             "lam_spread": lam_s,
+            **shape_rec,
             "lr": float(self.opt.param_groups[0]["lr"]),
             "sec": time.time() - t0,
             **gn,
@@ -877,7 +934,7 @@ class AmortizedTrainer:
         # stream_batches, while ``rows`` and z come off the device -- so the
         # index has to go to the table, not the table to the index.
         out.update(calibration_metrics(
-            z, shell_id=self.shell_of_obs[rows.to(self.shell_of_obs.device)].to(z.device),
+            z, shell_id=self.shell_of_obs[rows.to(self.shell_of_obs.device)].to(z.device).long(),
             n_shells=self.cfg.shell_bins, i_over_sigma=ios,
         ))
         # Is the width head actually using its per-observation freedom?  var_z
@@ -1057,7 +1114,8 @@ class AmortizedTrainer:
                     k: getattr(self.scale.encoder, k, None)
                     for k in ("context_folds", "obs_context_layers",
                               "obs_self_layers", "d_model", "n_layers",
-                              "n_crystal_features")
+                              "n_crystal_features", "peer_attention_layers",
+                              "peer_heads", "peer_dim")
                 },
                 # everything a merge must not have to guess: the likelihood it
                 # was fitted under, the data recipe, and the scale geometry.  A
@@ -1087,13 +1145,14 @@ class AmortizedTrainer:
                     "predict_skew": bool(getattr(self.scale.heads, "predict_skew", False)),
                     "family": getattr(self.scale.heads, "scatter_family", "gengauss"),
                     "n_components": int(getattr(self.scale.heads, "n_components", 1)),
-                    "conditioner_hidden": (int(self.scale.heads.mixture.hidden)
-                                           if getattr(self.scale.heads, "scatter_family", "gengauss") == "mixture" else None),
                     "component_shape": (self.scale.heads.mixture.shape
                                         if getattr(self.scale.heads, "scatter_family", "gengauss") == "mixture" else None),
                     "miss_logit": (None if getattr(self.objective, "miss_logit", None) is None
                                    else float((getattr(self, "_best_obj_state", None) or {}).get(
                                        "miss_logit", self.objective.miss_logit.detach()))),
+                    "outlier_logit": (None if getattr(self.objective, "outlier_logit", None) is None
+                                      else float((getattr(self, "_best_obj_state", None) or {}).get(
+                                          "outlier_logit", self.objective.outlier_logit.detach()))),
                 },
                 "best_step": self.best_step,
                 "best_heldout": self.best_heldout,
@@ -1619,8 +1678,10 @@ class AmortizedTrainer:
             # D. a scale that depends on hkl is degenerate with I0 and is the
             # one channel that can manufacture a difference peak.
             "hkl_permutation_frac": hkl_permutation_sensitivity(self.scale, meta),
+            # the same test on the predicted width and mixture shape
+            "hkl_permutation_frac_shape": hkl_permutation_sensitivity_shape(self.scale, meta),
         }
-        frac = rec["hkl_permutation_frac"]
+        frac = max(rec["hkl_permutation_frac"], rec["hkl_permutation_frac_shape"])
         if frac == frac and frac > self.cfg.hkl_permutation_warn:
             warnings.warn(
                 f"hkl-permutation sensitivity {frac:.3f} exceeds "

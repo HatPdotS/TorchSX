@@ -36,6 +36,7 @@ __all__ = [
     "calibration_metrics",
     "scale_metrics",
     "hkl_permutation_sensitivity",
+    "hkl_permutation_sensitivity_shape",
     "condition_auc",
     "spearman",
     "grad_norms",
@@ -223,6 +224,38 @@ def hkl_permutation_sensitivity(scale, meta, *, seed: int = 0) -> float:
         # it should read zero (e.g. an untrained or collapsed model).
         return 0.0 if numer <= 1e-12 else float("inf")
     return numer / denom
+
+
+@torch.no_grad()
+def hkl_permutation_sensitivity_shape(scale, meta, *, seed: int = 0) -> float:
+    """The same self-branch permutation test for the predicted scatter shape.
+
+    Largest variance fraction that moves, over ``log w`` and every column of
+    the packed mixture ``mix`` (when present).  A shape predicted from the
+    embedding inherits the feature contract, but a width or tail that tracks a
+    reflection's own identity would still let hkl leak into the merge weights,
+    so this is watched alongside :func:`hkl_permutation_sensitivity`.
+    """
+    import dataclasses
+
+    if not hasattr(scale, "predict_split"):
+        return float("nan")
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    perm = torch.randperm(meta.hkl_idx.numel(), generator=g).to(meta.hkl_idx.device)
+    shuffled = dataclasses.replace(meta, hkl_idx=meta.hkl_idx[perm])
+    base = scale.predict_split(meta, meta)
+    moved = scale.predict_split(shuffled, meta)
+    cols = [(base.log_w, moved.log_w)]
+    if base.mix is not None:
+        cols += [(base.mix[:, j], moved.mix[:, j]) for j in range(base.mix.shape[1])]
+    worst = 0.0
+    for b, m in cols:
+        denom, numer = float(b.var().item()), float((m - b).var().item())
+        if denom > 1e-12:
+            worst = max(worst, numer / denom)
+        elif numer > 1e-12:
+            return float("inf")
+    return worst
 
 
 def condition_auc(log_K: Tensor, is_light: Tensor) -> float:

@@ -142,6 +142,9 @@ class AmortizedScale(ScaleModel):
         context_folds: int = 0,
         obs_context_layers: int | None = None,
         obs_self_layers: int | None = None,
+        peer_attention_layers: int = 0,
+        peer_heads: int = 8,
+        peer_dim: int | list[int] | None = None,
         w_init: float = 1.65,
         beta_init: float = 2.0,
         predict_width: bool = True,
@@ -152,7 +155,6 @@ class AmortizedScale(ScaleModel):
         dropout: float = 0.0,
         scatter_family: str = "gengauss",
         n_components: int = 3,
-        conditioner_hidden: int = 8,
         component_shape: str = "shared",
     ) -> "AmortizedScale":
         features = ObsFeatureSpec(prep, include_hkl=include_hkl)
@@ -164,6 +166,9 @@ class AmortizedScale(ScaleModel):
             context_folds=context_folds,
             obs_context_layers=obs_context_layers,
             obs_self_layers=obs_self_layers,
+            peer_attention_layers=peer_attention_layers,
+            peer_heads=peer_heads,
+            peer_dim=peer_dim,
         )
         heads = ScaleHeads(
             d_model,
@@ -174,7 +179,6 @@ class AmortizedScale(ScaleModel):
             predict_skew=predict_skew,
             scatter_family=scatter_family,
             n_components=n_components,
-            conditioner_hidden=conditioner_hidden,
             component_shape=component_shape,
         )
         return cls(

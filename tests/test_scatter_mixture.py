@@ -151,7 +151,7 @@ def test_addressing_dominant_component_and_split():
 # ---------------------------------------------------------------- heads and scale model
 
 def test_mixture_heads_start_at_the_single_family_and_expose_components():
-    from torchsx.nn.heads import MixtureConditioner, ScaleHeads
+    from torchsx.nn.heads import MixtureHead, ScaleHeads
     torch.manual_seed(2)
     z = torch.randn(64, 16)
     base = ScaleHeads(16, w_init=1.65, beta_init=1.0, predict_skew=True)(z)
@@ -168,16 +168,31 @@ def test_mixture_heads_start_at_the_single_family_and_expose_components():
     # the reported width stay close to the single family but are not identical
     assert (p.log_e_s - base.log_e_s).abs().max() < 0.3
     assert (p.log_w - base.log_w).abs().max() < 0.2
-    # zero-init conditioner: the raw output is exactly the bias, independent of the input
-    cond = MixtureConditioner(3)
-    logits, offset, d_lo, d_hi, d_beta = cond(torch.randn(10), torch.rand(10) + 1, torch.randn(10))
-    bias = MixtureConditioner.init_bias(3)
+    # zero-init head: the raw output is exactly the bias, independent of the embedding
+    head = MixtureHead(16, 3)
+    logits, offset, d_lo, d_hi, d_beta = head(torch.randn(10, 16))
+    bias = MixtureHead.init_bias(3)
     torch.testing.assert_close(logits, bias[:3].expand(10, -1)); torch.testing.assert_close(offset, bias[3:6].expand(10, -1))
     torch.testing.assert_close(d_lo, bias[6:9].expand(10, -1)); assert (d_beta == 0).all()
     assert (d_hi[:, 0] == 0).all() and (d_hi[:, 1:] < 0).all()      # extra components only narrow the upper side
     # the single family is untouched by the new field
     assert base.mix is None and base.detach().mix is None and p.detach().mix is not None
 
+
+
+def test_gaussian_components_may_be_wider_above_than_the_base():
+    from torchsx.nn.heads import MixtureHead
+    torch.manual_seed(0)
+    z = torch.randn(200, 16)
+    for shape, free in (("gaussian", True), ("shared", False)):
+        head = MixtureHead(16, 3, shape=shape)
+        d0 = head(z)[3]
+        torch.testing.assert_close(d0[:, 1:], -torch.nn.functional.softplus(head._hi_init[1:]).expand(200, -1))
+        with torch.no_grad():
+            head.l2.weight.normal_(0.0, 1.0)
+        d_hi = head(z)[3]
+        assert (d_hi[:, 0] == 0).all()
+        assert bool((d_hi[:, 1:] > 0).any()) is free
 
 def test_mixture_scale_model_primes_the_mixture_scatter_and_chunks_exactly():
     from tests.test_amortized_training import _synthetic
@@ -288,7 +303,7 @@ def test_objective_mixture_triton_matches_eager():
     torch.testing.assert_close(g_fast, g_slow, atol=5e-2, rtol=5e-2)
 
 
-def test_mixture_trainer_step_runs_and_trains_the_conditioner(tmp_path):
+def test_mixture_trainer_step_runs_and_trains_the_mixture_head(tmp_path):
     from tests.test_amortized_training import _synthetic
     from torchsx.merging.likelihood import Poisson
     from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
@@ -306,11 +321,40 @@ def test_mixture_trainer_step_runs_and_trains_the_conditioner(tmp_path):
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     before = scale.heads.mixture.l2.weight.detach().clone()
     tr.run()
-    assert not torch.equal(scale.heads.mixture.l2.weight.detach(), before), "conditioner did not move"
+    assert not torch.equal(scale.heads.mixture.l2.weight.detach(), before), "mixture head did not move"
     res = tr.merge(estimator="posterior")
     assert torch.isfinite(res["F"]).all() and torch.isfinite(res["I0"]).all()
     pooled = tr.merge(estimator="pooled")
     assert torch.isfinite(pooled["I"]).all()
+
+
+
+def test_shape_permutation_check_separates_hkl_free_and_hkl_fed_shapes(tmp_path):
+    from tests.test_amortized_training import _synthetic
+    from torchsx.merging.likelihood import Poisson
+    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
+    from torchsx.merging.scale import AmortizedScale
+    from torchsx.nn.metrics import hkl_permutation_sensitivity_shape
+    from torchsx.nn.objective import MarginalNLL
+    from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
+    torch.manual_seed(0)
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=16)
+    obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1), miss_frac=0.03)
+    cfg = TrainConfig(max_obs_per_batch=6000, epochs=0, device="cpu", outdir=str(tmp_path), split_half_every=0)
+    fracs = {}
+    for include_hkl in (False, True):
+        scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=include_hkl, predict_shape=False,
+                                         beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture",
+                                         n_components=3)
+        with torch.no_grad():                        # give the zero-initialised head an input dependence
+            scale.heads.mixture.l2.weight.normal_(0.0, 0.3)
+        tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
+        rows = tr.index.rows(tr.train_crystals[:8])
+        if not include_hkl:
+            assert tr.audit(rows)["hkl_permutation_frac_shape"] < 1e-6
+        meta, *_ = tr._batch(rows)
+        fracs[include_hkl] = hkl_permutation_sensitivity_shape(scale, meta)
+    assert fracs[False] < 1e-6 and fracs[True] > 1e-3
 
 
 # ---------------------------------------------------------------- CLI and checkpoint
@@ -320,6 +364,7 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path, monkeypatch
     from torchsx.cli.merge_nn import _build_parser as merge_parser
     from torchsx.cli.train import _build_parser as train_parser
     from torchsx.nn.checkpoint_context import load_checkpoint_context, verify_probes
+    from torchsx.nn.heads import MixtureHead
     from tests.test_amortized_training import _synthetic
     from tests.test_cli_pipeline import _trainer_from_stack
 
@@ -336,12 +381,12 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path, monkeypatch
     targs = train_parser().parse_args(base)
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
     assert S["scatter_family"] == "mixture" and S["scatter_components"] == 4
-    assert scale.heads.scatter_family == "mixture" and scale.heads.n_components == 4 and scale.heads.mixture.hidden == 8
+    assert scale.heads.scatter_family == "mixture" and scale.heads.n_components == 4 and isinstance(scale.heads.mixture, MixtureHead)
     assert isinstance(scale.scatter, PredictedMixtureScatter)
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
     tr.data_recipe = dict(recipe)
     ck = torch.load(tr.save_best(tmp_path / "mix.pt"), weights_only=False)
-    assert ck["scatter"]["family"] == "mixture" and ck["scatter"]["n_components"] == 4 and ck["scatter"]["conditioner_hidden"] == 8 and ck["scatter"]["component_shape"] == "gaussian"
+    assert ck["scatter"]["family"] == "mixture" and ck["scatter"]["n_components"] == 4 and ck["scatter"]["component_shape"] == "gaussian"
     assert any(k.startswith("heads.mixture.") for k in ck["state_dict"])
     assert "mix" in ck["inference_context"]["probes"] or any("mix" in str(k) for k in ck["inference_context"]["probes"])
     # merge side rebuilds the family from the checkpoint with no flags
@@ -355,7 +400,7 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path, monkeypatch
     # a checkpoint written before the family existed rebuilds the single family and loads strictly
     tr0 = _trainer_from_stack(_p, _q, scale0, _o, S0); tr0.data_recipe = dict(recipe)
     ck0 = torch.load(tr0.save_best(tmp_path / "old.pt"), weights_only=False)
-    for key in ("family", "n_components", "conditioner_hidden", "component_shape"):
+    for key in ("family", "n_components", "component_shape"):
         del ck0["scatter"][key]
     _a, _b, old, _c, S3 = P.build_stack(bundle, margs, ckpt=ck0, verbose=False)
     assert S3["scatter_family"] == "gengauss" and old.heads.scatter_family == "gengauss"

@@ -53,6 +53,7 @@ resolution, not truncation).
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -71,6 +72,30 @@ except ImportError:                                  # pragma: no cover
 
 __all__ = ["PosteriorOut", "PosteriorMergeTarget"]
 
+#: TORCHSX_NODE_LOOP=1 forces the node-by-node accumulation (A/B timing, tests).
+_NODE_LOOP = os.environ.get("TORCHSX_NODE_LOOP", "") == "1"
+
+
+def _all_nodes_kernel(objective, scatter, n_ph: Tensor, bg: Tensor) -> bool:
+    """Whether ``accumulate`` can take every outer node in one fused pass.
+
+    That kernel is the split-grid fixed-Gaussian mixture marginal of the
+    production model (with its optional miss component); anything else keeps
+    the node-by-node loop.
+    """
+    if _NODE_LOOP or not n_ph.is_cuda or bg.requires_grad or bg.dtype != torch.float32:
+        return False
+    from torchsx.merging.likelihood import Poisson
+    from torchsx.merging.quadrature import split_log_grid as slg
+    from torchsx.merging.scatter.mixture import PredictedMixtureScatter
+    from torchsx.nn.objective import MarginalNLL
+    return (slg.HAVE_TRITON and not slg._DISABLE_TRITON
+            and isinstance(objective, MarginalNLL) and objective.chunk_size is None
+            and isinstance(objective.quadrature, slg.SplitLogGrid)
+            and isinstance(objective.likelihood, Poisson)
+            and isinstance(scatter, PredictedMixtureScatter) and scatter.fixed_gaussian
+            and 1 <= scatter.n_components <= 8)
+
 
 @dataclass
 class PosteriorOut:
@@ -83,6 +108,21 @@ class PosteriorOut:
     seen: Tensor         # (n_hkl,) bool
     edge_mass: Tensor    # (n_hkl,) truncation check, ~0 is healthy
     n_floored: int
+
+
+@torch.no_grad()
+def ema_update_corrected(value: Tensor, num: Tensor, wt: Tensor, batch: Tensor,
+                         seen: Tensor, decay: float) -> None:
+    """In place: ``value[seen] = num / wt`` with ``num`` and ``wt`` the
+    decay-weighted sums of the batch estimates and of their weights.
+
+    The bias correction of an exponential moving average started at zero:
+    after the first update ``value`` is that batch's estimate, and the seed
+    ``value`` held before never enters.  Unseen entries keep their value.
+    """
+    num[seen] = decay * num[seen] + (1.0 - decay) * batch[seen]
+    wt[seen] = decay * wt[seen] + (1.0 - decay)
+    value[seen] = num[seen] / wt[seen]
 
 
 class PosteriorMergeTarget(nn.Module):
@@ -146,6 +186,7 @@ class PosteriorMergeTarget(nn.Module):
         node_placement: str = "laplace",
         ema_decay: float = 0.99,
         reference_estimator: str = "wls",
+        bias_correct: bool = False,
         floor: float = 1e-3,
         sigma_bounds: tuple[float, float] = (0.02, 4.0),
         scan_points: int = 9,
@@ -205,6 +246,14 @@ class PosteriorMergeTarget(nn.Module):
 
         self.register_buffer("ema_I0", I0_init.detach().clone().float().clamp(min=floor))
         self.register_buffer("ema_den", torch.zeros(self.n_hkl))
+        #: Bias-corrected running reference: ``ema_I0`` is the decay-weighted
+        #: mean of the batch estimates only, normalised by the weight they have
+        #: accumulated, so the seed (the unscaled starting merge) drops out at a
+        #: reflection's first update instead of keeping ``decay^n`` of the
+        #: weight (13 % after 200 updates at 0.99).  Training-only state.
+        self.bias_correct = bool(bias_correct)
+        self.register_buffer("ema_num", torch.zeros(self.n_hkl), persistent=False)
+        self.register_buffer("ema_wt", torch.zeros(self.n_hkl), persistent=False)
         self.register_buffer("_den_seeded", torch.zeros((), dtype=torch.bool))
         # Grid width, learned from the OBSERVED posterior rather than predicted
         # from the Laplace approximation.  The Laplace sigma comes from the
@@ -494,6 +543,20 @@ class PosteriorMergeTarget(nn.Module):
         """
         base = pred.log_K - pred.log_e_s
 
+        if _all_nodes_kernel(objective, scatter, n_ph, bg):
+            from torchsx.merging.quadrature._posterior_nodes_triton import (
+                posterior_node_sums,
+            )
+            q, lik = objective.quadrature, objective.likelihood
+            sig_b2 = q._sig_b2(lik, bg)
+            p = q.grid_params(n_ph, bg, sig_b2, q._bg_mean_offset(lik))
+            olog = getattr(objective, "outlier_logit", None)
+            return posterior_node_sums(
+                base, scatter.mixture_obs(meta), objective.miss_logit, v_nodes, hkl_id,
+                n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=self.n_hkl, outlier_logit=olog,
+                log_out=objective.log_outlier(n_ph, bg) if olog is not None else None,
+            )
+
         # Fused path -- OFF by default; measured, not deprecated.  One launch
         # for all C nodes instead of C, hoisting the Poisson factor out of the
         # node loop and replacing the online-logsumexp maximum with a
@@ -769,5 +832,8 @@ class PosteriorMergeTarget(nn.Module):
         if not bool(seen.any()):
             return
         d = self.ema_decay
-        self.ema_I0[seen] = d * self.ema_I0[seen] + (1 - d) * batch[seen]
+        if self.bias_correct:
+            ema_update_corrected(self.ema_I0, self.ema_num, self.ema_wt, batch, seen, d)
+        else:
+            self.ema_I0[seen] = d * self.ema_I0[seen] + (1 - d) * batch[seen]
         self.ema_den[seen] = d * self.ema_den[seen] + (1 - d) * den[seen]

@@ -40,7 +40,7 @@ from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 
 __all__ = [
     "PredictedMixtureScatter", "split_mix", "mixture_log_e_s",
-    "two_width_moments", "mixture_log_sd", "N_BLOCKS",
+    "split_gaussian_log_e_s", "two_width_moments", "mixture_log_sd", "N_BLOCKS",
 ]
 
 
@@ -55,15 +55,44 @@ def split_mix(mix: Tensor, n_components: int) -> tuple[Tensor, Tensor, Tensor, T
     return tuple(mix[:, i * K:(i + 1) * K] for i in range(N_BLOCKS))
 
 
+def split_gaussian_log_e_s(log_alpha_lo: Tensor, log_alpha_hi: Tensor) -> Tensor:
+    """``log E[exp(eps)]`` of a two-width Gaussian (GenGauss at ``beta = 2``), exact.
+
+    Each side is a half normal with ``sigma = alpha / sqrt(2)`` carrying mass
+    ``alpha_side / (alpha_lo + alpha_hi)``, so::
+
+        E[exp(eps)] = 2 w_lo exp(s_lo^2 / 2) Phi(-s_lo) + 2 w_hi exp(s_hi^2 / 2) Phi(s_hi)
+
+    The symmetric case reduces to ``alpha^2 / 4``.  Same value as
+    :func:`log_e_s_gengauss` at ``beta = 2`` without its ``(n, 257)`` grid.
+
+    The lower side is evaluated as ``exp(s^2 / 2) Phi(-s) = erfcx(s / sqrt 2) / 2``:
+    written as ``s^2 / 2 + log_ndtr(-s)`` it cancels two terms of size ``s^2``,
+    which in float32 loses every digit (and returns NaN gradients) once the
+    lower width is in the thousands.  The upper side has no cancellation.
+    """
+    log_norm = torch.logaddexp(log_alpha_lo, log_alpha_hi) - math.log(2.0)
+    s_hi = log_alpha_hi.exp() * math.sqrt(0.5)
+    lo = log_alpha_lo - log_norm + torch.log(torch.special.erfcx(0.5 * log_alpha_lo.exp())) - math.log(2.0)
+    hi = log_alpha_hi - log_norm + 0.5 * s_hi * s_hi + torch.special.log_ndtr(s_hi)
+    return torch.logaddexp(lo, hi)
+
+
 def mixture_log_e_s(
     log_pi: Tensor, offset: Tensor, log_alpha_lo: Tensor, log_alpha_hi: Tensor, beta: Tensor,
+    *, gaussian: bool = False,
 ) -> Tensor:
     """``log E[exp(eps)]`` of the mixture, per observation.
 
     ``E[exp(eps)] = sum_k pi_k exp(offset_k) E_k[exp(eps_k)]`` with the
     per-component expectation from :func:`log_e_s_gengauss`.  ``beta`` is
-    ``(n, K)`` per component or ``(n,)`` shared.
+    ``(n, K)`` per component or ``(n,)`` shared.  ``gaussian=True`` asserts
+    that every component has ``beta = 2`` and uses the closed form
+    :func:`split_gaussian_log_e_s`; ``beta`` is then not read.
     """
+    if gaussian:
+        return torch.logsumexp(
+            log_pi + offset + split_gaussian_log_e_s(log_alpha_lo, log_alpha_hi), dim=1)
     terms = [
         log_pi[:, k] + offset[:, k]
         + log_e_s_gengauss(log_alpha_lo[:, k], beta[:, k] if beta.dim() == 2 else beta,
@@ -73,7 +102,8 @@ def mixture_log_e_s(
     return torch.logsumexp(torch.stack(terms, dim=1), dim=1)
 
 
-def two_width_moments(log_alpha_lo: Tensor, log_alpha_hi: Tensor, beta: Tensor) -> tuple[Tensor, Tensor]:
+def two_width_moments(log_alpha_lo: Tensor, log_alpha_hi: Tensor,
+                      beta: Tensor | None) -> tuple[Tensor, Tensor]:
     """First and second raw moments of a two-width GenGauss centred at zero.
 
     With side widths ``a_lo`` below and ``a_hi`` above the centre and one
@@ -83,9 +113,12 @@ def two_width_moments(log_alpha_lo: Tensor, log_alpha_hi: Tensor, beta: Tensor) 
         E[eps^2] = (a_hi^3 + a_lo^3) / (a_lo + a_hi) * G(3/b) / G(1/b)
     """
     a_lo, a_hi = log_alpha_lo.exp(), log_alpha_hi.exp()
-    g1 = torch.lgamma(1.0 / beta)
-    r2 = torch.exp(torch.lgamma(2.0 / beta) - g1)
-    r3 = torch.exp(torch.lgamma(3.0 / beta) - g1)
+    if beta is None:                      # beta = 2: G(1)/G(1/2), G(3/2)/G(1/2)
+        r2, r3 = 1.0 / math.sqrt(math.pi), 0.5
+    else:
+        g1 = torch.lgamma(1.0 / beta)
+        r2 = torch.exp(torch.lgamma(2.0 / beta) - g1)
+        r3 = torch.exp(torch.lgamma(3.0 / beta) - g1)
     s = a_lo + a_hi
     m1 = (a_hi * a_hi - a_lo * a_lo) / s * r2
     m2 = (a_hi ** 3 + a_lo ** 3) / s * r3
@@ -94,10 +127,13 @@ def two_width_moments(log_alpha_lo: Tensor, log_alpha_hi: Tensor, beta: Tensor) 
 
 def mixture_log_sd(
     log_pi: Tensor, offset: Tensor, log_alpha_lo: Tensor, log_alpha_hi: Tensor, beta: Tensor,
+    *, gaussian: bool = False,
 ) -> Tensor:
-    """Log standard deviation of the mixture in log space, per observation."""
+    """Log standard deviation of the mixture in log space, per observation.
+
+    ``gaussian=True`` asserts ``beta = 2`` for every component (not read)."""
     pi = log_pi.exp()
-    b = beta if beta.dim() == 2 else beta[:, None].expand_as(log_alpha_lo)
+    b = None if gaussian else (beta if beta.dim() == 2 else beta[:, None].expand_as(log_alpha_lo))
     m1, m2 = two_width_moments(log_alpha_lo, log_alpha_hi, b)
     mean_k = m1 + offset
     var_k = m2 - m1 * m1

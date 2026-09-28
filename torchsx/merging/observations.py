@@ -11,22 +11,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 from torch import Tensor
 
 from torchsx.measurement import ResolvedMeasurement
 from torchsx.merging.config import MergeConfig
-from torchsx.merging.hkl import (
-    Adjacency,
-    PoissonNoiseModel,
-    build_adjacency,
-    compute_hkl_index,
-    fit_shell_gengauss_gauss,
-)
+from torchsx.merging.hkl import PoissonNoiseModel, compute_hkl_index
 
 # Prepared caches must have passed this policy, even when settings are trusted.
-OBSERVATION_FILTER_VERSION = 1
+# 2: the per-HKL initial parameters (mu/alpha/beta) and the Miller adjacency are
+# no longer prepared -- the predicted scatter never read them.
+OBSERVATION_FILTER_VERSION = 2
 
 
 # ── Per-observation metadata ───────────────────────────────────────────
@@ -351,14 +346,6 @@ class PreparedObs:
     obs_counts: Tensor
     n_obs_total: int
 
-    # Initial per-HKL parameter values
-    mu_init: Tensor
-    alpha_init: Tensor
-    beta_perhkl: Tensor
-
-    # Miller-graph adjacency
-    adjacency: Adjacency
-
     # Per-observation metadata for scale corrections
     obs_info: ObsInfo
 
@@ -388,10 +375,6 @@ class PreparedObs:
             bg=self.bg.to(device),
             obs_counts=self.obs_counts.to(device),
             n_obs_total=self.n_obs_total,
-            mu_init=self.mu_init.to(device),
-            alpha_init=self.alpha_init.to(device),
-            beta_perhkl=self.beta_perhkl.to(device),
-            adjacency=self.adjacency.to(device),
             obs_info=self.obs_info.to(device),
             partiality=None if self.partiality is None else self.partiality.to(device),
             shell_id_fw=self.shell_id_fw.to(device),
@@ -557,84 +540,7 @@ def prepare_observations(
     I_obs_stream = core_I
     median_cell = core.cell.median(dim=0).values
 
-    # ── Per-HKL statistics (for shell β fit / SNR) ──
-    counts = torch.bincount(hkl_id_raw, minlength=n_unique)
-    order = hkl_id_raw.argsort()
-    groups_I = I_obs_stream[order].split(counts.tolist())
-    _lap("argsort + group split")
-
-    mean_I = torch.zeros(n_unique)
-    var_I = torch.zeros(n_unique)
-    mult = torch.zeros(n_unique, dtype=torch.long)
-    for h, gI in enumerate(groups_I):
-        if len(gI) == 0:
-            continue
-        mean_I[h] = gI.mean()
-        mult[h] = len(gI)
-        if len(gI) > 1:
-            var_I[h] = gI.var(correction=1)
-
-    snr = mean_I.abs() * mult.float().clamp(min=1).sqrt() / var_I.clamp(min=1e-6).sqrt()
-    _lap("per-HKL mean/var loop")
     d_spacing_all = get_d_spacing(unique_hkl.float(), median_cell)
-
-    # ── Shell β estimation (pooled GenGauss+Gauss mixture) ──
-    rank = d_spacing_all.argsort().argsort()
-    hkl_shell = (rank.float() / n_unique * config.n_shells).long().clamp(
-        max=config.n_shells - 1
-    )
-    keep_pool = (mean_I > 0) & (snr > config.snr_thresh)
-    shell_beta: dict[int, float] = {}
-    for sid in range(config.n_shells):
-        hm = keep_pool & (hkl_shell == sid)
-        if hm.sum() < 10:
-            continue
-        hkl_indices = torch.where(hm)[0]
-        if config.beta_pool_cap:
-            # Take an evenly spaced subset rather than the first N: the first N
-            # would be the shell's lowest Miller indices.  A stride keeps the
-            # indices ASCENDING, so the reads into groups_I stay sequential --
-            # a shuffle costs more in lost locality than the cap saves when the
-            # data is small enough that the cap never bites.
-            n_obs_shell = int(counts[hkl_indices].sum())
-            stride = max(1, -(-n_obs_shell // config.beta_pool_cap))
-            hkl_indices = hkl_indices[::stride]
-        pooled = []
-        n_pooled = 0
-        for h_idx in hkl_indices.tolist():
-            g = groups_I[h_idx]
-            pos = g[g > 0]
-            if len(pos) < 5:
-                continue
-            mu_h = pos.mean()
-            if mu_h > 0:
-                pooled.append(pos / mu_h)
-                n_pooled += pos.numel()
-                if config.beta_pool_cap and n_pooled >= config.beta_pool_cap:
-                    break
-        if len(pooled) < 5:
-            continue
-        pooled_t = torch.cat(pooled)
-        pooled_t = pooled_t[pooled_t > 0]
-        if len(pooled_t) < 500:
-            continue
-        result = fit_shell_gengauss_gauss(torch.log(pooled_t))
-        if result is not None:
-            shell_beta[sid] = result[0]
-
-    # Smooth β across shells (simple Gaussian kernel over shell index).
-    if shell_beta:
-        sids = sorted(shell_beta.keys())
-        betas = np.array([shell_beta[s] for s in sids])
-        idx_arr = np.array(sids, dtype=float)
-        smoothed = np.zeros_like(betas)
-        for k in range(len(betas)):
-            w = np.exp(-0.5 * ((idx_arr - idx_arr[k]) / 1.5) ** 2)
-            smoothed[k] = np.average(betas, weights=w)
-        for k, sid in enumerate(sids):
-            shell_beta[sid] = float(smoothed[k])
-    default_beta = float(np.median(list(shell_beta.values()))) if shell_beta else 1.5
-    _lap("shell beta fit")
 
     # ── Valid-HKL filter (min positive obs) ──
     pos_mask = I_obs_stream > 0
@@ -665,44 +571,6 @@ def prepare_observations(
     bg = bg_per_pixel * poisson_noise.n_peak
     _lap("gather I/bg")
 
-    # ── Initial log-space MLE for μ and α (positive obs per HKL) ──
-    pos_in_sorted = I_obs > 0
-    hkl_id_pos_sorted = hkl_id[pos_in_sorted]
-    log_I_pos = torch.log(I_obs[pos_in_sorted].clamp(min=1e-8))
-    obs_counts_pos = torch.bincount(hkl_id_pos_sorted, minlength=n_valid)
-    offsets_pos = torch.zeros(n_valid + 1, dtype=torch.long)
-    offsets_pos[1:] = obs_counts_pos.cumsum(0)
-
-    mu_init = torch.zeros(n_valid)
-    alpha_init = torch.zeros(n_valid)
-    hkl_shell_valid = hkl_shell[valid_indices]
-    for i in range(n_valid):
-        s, e = int(offsets_pos[i]), int(offsets_pos[i + 1])
-        vals = log_I_pos[s:e]
-        n_h = e - s
-        if n_h == 0:
-            mu_init[i] = 0.0
-            alpha_init[i] = 1.0
-            continue
-        beta_i = shell_beta.get(int(hkl_shell_valid[i].item()), default_beta)
-        mu_i = vals.median()
-        if abs(beta_i - 1.0) > 0.05:
-            w = (vals - mu_i).abs().clamp(min=1e-8).pow(beta_i - 2)
-            mu_i = (w * vals).sum() / w.sum().clamp(min=1e-12)
-        mu_init[i] = mu_i
-        r = (vals - mu_i).abs().clamp(min=1e-8)
-        alpha_init[i] = (
-            (beta_i / n_h * r.pow(beta_i).sum()).clamp(min=1e-6).pow(1.0 / beta_i)
-        )
-    alpha_init.clamp_(min=0.01)
-    _lap("mu/alpha loop")
-
-    beta_perhkl = torch.full((n_valid,), default_beta)
-    for sid, bval in shell_beta.items():
-        m = hkl_shell_valid == sid
-        if m.any():
-            beta_perhkl[m] = bval
-
     hkl_valid = unique_hkl[valid_indices]
     d_valid = d_spacing_all[valid_indices]
 
@@ -729,9 +597,7 @@ def prepare_observations(
             print(f"  [FW] centric detection failed ({exc!r}); treating all as acentric")
             is_centric = torch.zeros(n_valid, dtype=torch.bool)
 
-    # ── Adjacency graph (±1 Miller) ──
-    adjacency = build_adjacency(hkl_valid)
-    _lap("adjacency")
+    _lap("centric flags")
 
     # ── Per-obs metadata for corrections ──
     s_sq_per_obs = 1.0 / (4.0 * d_spacing_all[hkl_id_raw].clamp(min=0.1) ** 2)
@@ -812,10 +678,6 @@ def prepare_observations(
         bg=bg,
         obs_counts=obs_counts,
         n_obs_total=n_obs_total,
-        mu_init=mu_init,
-        alpha_init=alpha_init,
-        beta_perhkl=beta_perhkl,
-        adjacency=adjacency,
         obs_info=obs_info,
         partiality=partiality_sorted,
         shell_id_fw=shell_id_fw,

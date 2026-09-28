@@ -42,7 +42,7 @@ from torchsx.merging.scatter.gengauss import (
 )
 from torchsx.merging.scatter.mixture import mixture_log_e_s, mixture_log_sd
 
-__all__ = ["ScalePrediction", "ScaleHeads", "MixtureConditioner"]
+__all__ = ["ScalePrediction", "ScaleHeads", "MixtureHead"]
 
 
 @dataclass
@@ -87,34 +87,38 @@ class ScalePrediction:
         )
 
 
-class MixtureConditioner(nn.Module):
-    """Mixture parameters from the predicted scatter scalars.
+class MixtureHead(nn.Module):
+    """Mixture parameters predicted directly from the encoder embedding.
 
-    A small network reads the per-observation ``(log w, beta, s)`` the heads
-    already produce and returns, per component, a weight logit, an offset in
-    log space and lower/upper log-width deltas relative to the base two-width
-    component.  Component 0 is the base family itself (offset and deltas fixed
-    at zero); the other components may be wider or narrower below the centre
-    but only narrower above it, because the mean multiplicative factor of a
+    One linear map from ``z`` returns, per component, a weight logit, an offset
+    in log space and lower/upper log-width deltas relative to the base
+    two-width component (plus a shape-logit delta for ``"free"``), so every
+    observation's scatter shape -- how much weight a tail carries, where it
+    sits -- can follow its own context rather than only its predicted width.
+    Component 0 is the base family itself (offset and deltas fixed at zero);
+    the other components may be wider or narrower below the centre but only
+    narrower above it, because the mean multiplicative factor of a
     heavy-tailed component that is wide on the upper side is not finite, and
-    the mixture is centred on that mean.  The output layer is zero-initialised,
-    so the first forward returns the biases: component 0 carries most of the
-    weight and the others start at a small but non-negligible weight with
-    distinct offsets and widths, large enough that their weight logits receive
-    usable gradients from the start.
+    the mixture is centred on that mean.  Gaussian components (``"gaussian"``)
+    have a finite mean at any width, so there the upper delta takes either
+    sign: bounding every component's upper width by the base's made the base
+    component itself carry the widest upper side any component needed (seen:
+    alpha_hi ~ 4 nats at 1-2 % weight, half of E[S]).  The weights are zero-initialised, so
+    the first forward returns the biases for every observation: component 0
+    carries most of the weight and the others start at a small but
+    non-negligible weight with distinct offsets and widths, large enough that
+    their weight logits receive usable gradients from the start.
     """
 
     SHAPES = ("shared", "gaussian", "free", "partiality")
 
-    def __init__(self, n_components: int, hidden: int = 8, *, log_w_ref: float = 0.5,
-                 shape: str = "shared") -> None:
+    def __init__(self, d_model: int, n_components: int, *, shape: str = "shared") -> None:
         super().__init__()
         if n_components < 1:
             raise ValueError("n_components must be positive")
         if shape not in self.SHAPES:
             raise ValueError(f"shape must be one of {self.SHAPES}, got {shape!r}")
         self.n_components = int(n_components)
-        self.hidden = int(hidden)
         #: Component shapes: ``"shared"`` -- every component takes the base
         #: beta; ``"gaussian"`` -- every component is Gaussian in log space
         #: (beta = 2), so the mixture is smooth and its mean is finite for any
@@ -126,15 +130,16 @@ class MixtureConditioner(nn.Module):
         #: the distribution of the partial fraction.
         self.shape = shape
         self.register_buffer("_grid", torch.linspace(0.0, 1.0, self.n_components))
-        self.register_buffer("_in_loc", torch.tensor([log_w_ref, 2.0, 0.0]))
-        self.register_buffer("_in_scale", torch.tensor([0.5, 1.0, 0.5]))
-        self.l1 = nn.Linear(3, self.hidden)
-        self.l2 = nn.Linear(self.hidden, 5 * self.n_components)
+        self.l2 = nn.Linear(d_model, 5 * self.n_components)
         nn.init.zeros_(self.l2.weight)
         #: pre-softplus grid extent of the partiality support (softplus(raw) nats at init)
         self.lambda_init_raw = math.log(math.expm1(3.0))
         with torch.no_grad():
             self.l2.bias.copy_(self.init_bias(self.n_components, shape))
+        #: the upper-width delta is free in sign for Gaussian components (see above)
+        self.free_upper = shape == "gaussian"
+        K = self.n_components
+        self.register_buffer("_hi_init", self.init_bias(K, shape)[3 * K:4 * K].clone())
 
     @staticmethod
     def init_bias(n_components: int, shape: str = "shared") -> Tensor:
@@ -158,18 +163,22 @@ class MixtureConditioner(nn.Module):
             raw_hi[k] = math.log(math.expm1(hi_narrow[(k - 1) % len(hi_narrow)]))
         return torch.cat([logits, offsets, d_lo, raw_hi, d_beta])
 
-    def forward(self, log_w: Tensor, beta: Tensor, s: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def forward(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """``(logits, offset, d_lo, d_hi, d_beta)``, each ``(n, K)``; component 0 has
         zero offset and width deltas.  ``d_beta`` is the per-component shape-logit
         offset (used by the ``"free"`` shape mode; zero for component 0)."""
-        x = (torch.stack([log_w, beta, s], dim=1) - self._in_loc) / self._in_scale
-        raw = self.l2(torch.nn.functional.silu(self.l1(x)))
+        raw = self.l2(z)
         K = self.n_components
         keep = torch.ones(K, device=raw.device, dtype=raw.dtype); keep[0] = 0.0
         logits = raw[:, :K]
         offset = raw[:, K:2 * K] * keep
         d_lo = raw[:, 2 * K:3 * K] * keep
-        d_hi = -torch.nn.functional.softplus(raw[:, 3 * K:4 * K]) * keep
+        raw_hi = raw[:, 3 * K:4 * K]
+        if self.free_upper:
+            # same value and orientation as -softplus at the initial bias, no sign limit
+            d_hi = (-torch.nn.functional.softplus(self._hi_init) - (raw_hi - self._hi_init)) * keep
+        else:
+            d_hi = -torch.nn.functional.softplus(raw_hi) * keep
         d_beta = raw[:, 4 * K:] * keep
         return logits, offset, d_lo, d_hi, d_beta
 
@@ -217,7 +226,6 @@ class ScaleHeads(nn.Module):
         predict_skew: bool = False,
         scatter_family: str = "gengauss",
         n_components: int = 3,
-        conditioner_hidden: int = 8,
         component_shape: str = "shared",
     ) -> None:
         super().__init__()
@@ -261,14 +269,14 @@ class ScaleHeads(nn.Module):
             )
         if predict_skew:
             self.head_log_skew = self._zero_head(d_model, 0.0)
-        #: Scatter family.  ``"mixture"`` adds a conditioner that turns the
-        #: predicted (log w, beta, s) into K two-width components; the family
-        #: is centred on its mean and ``log_w`` reports the mixture's log-SD.
+        #: Scatter family.  ``"mixture"`` adds a head that predicts K two-width
+        #: components from the embedding, relative to the base (log w, beta,
+        #: s); the family is centred on its mean and ``log_w`` reports the
+        #: mixture's log-SD.
         self.scatter_family = scatter_family
         self.n_components = int(n_components) if scatter_family == "mixture" else 1
         if scatter_family == "mixture":
-            self.mixture = MixtureConditioner(self.n_components, conditioner_hidden, log_w_ref=log_w_init,
-                                              shape=component_shape)
+            self.mixture = MixtureHead(d_model, self.n_components, shape=component_shape)
 
     @staticmethod
     def _zero_head(d_model: int, bias: float) -> nn.Linear:
@@ -301,7 +309,7 @@ class ScaleHeads(nn.Module):
             s = torch.zeros_like(log_w)
             log_alpha_lo, log_alpha_hi = log_alpha, None
         if self.scatter_family == "mixture":
-            return self._mixture_prediction(log_K, log_w, beta, beta_raw, s, log_alpha_lo,
+            return self._mixture_prediction(z, log_K, log_w, beta, beta_raw, s, log_alpha_lo,
                                             log_alpha if log_alpha_hi is None else log_alpha_hi)
         if skew:
             return ScalePrediction(
@@ -317,8 +325,8 @@ class ScaleHeads(nn.Module):
             log_e_s=log_e_s_gengauss(log_alpha, beta),
         )
 
-    def _mixture_prediction(self, log_K, log_w, beta, beta_raw, s, log_alpha_lo, log_alpha_hi) -> ScalePrediction:
-        logits, offset, d_lo, d_hi, d_beta = self.mixture(log_w, beta, s)
+    def _mixture_prediction(self, z, log_K, log_w, beta, beta_raw, s, log_alpha_lo, log_alpha_hi) -> ScalePrediction:
+        logits, offset, d_lo, d_hi, d_beta = self.mixture(z)
         log_pi = torch.log_softmax(logits, dim=1)
         K = self.n_components
         if self.mixture.shape == "partiality":
@@ -332,10 +340,10 @@ class ScaleHeads(nn.Module):
             mix = torch.cat([log_pi, offset, la, la, beta_k.log()], dim=1)
             return ScalePrediction(
                 log_K=log_K,
-                log_w=mixture_log_sd(log_pi, offset, la, la, beta_k),
+                log_w=mixture_log_sd(log_pi, offset, la, la, beta_k, gaussian=True),
                 beta=beta_k[:, 0],
                 log_alpha=la[:, 0],
-                log_e_s=mixture_log_e_s(log_pi, offset, la, la, beta_k),
+                log_e_s=mixture_log_e_s(log_pi, offset, la, la, beta_k, gaussian=True),
                 log_alpha_hi=la[:, 0],
                 mix=mix,
             )
@@ -352,12 +360,13 @@ class ScaleHeads(nn.Module):
         la_lo = base_lo + d_lo
         la_hi = base_hi + d_hi
         mix = torch.cat([log_pi, offset, la_lo, la_hi, beta_k.log()], dim=1)
+        gaussian = self.mixture.shape == "gaussian"
         return ScalePrediction(
             log_K=log_K,
-            log_w=mixture_log_sd(log_pi, offset, la_lo, la_hi, beta_k),
+            log_w=mixture_log_sd(log_pi, offset, la_lo, la_hi, beta_k, gaussian=gaussian),
             beta=beta_k[:, 0],
             log_alpha=la_lo[:, 0],
-            log_e_s=mixture_log_e_s(log_pi, offset, la_lo, la_hi, beta_k),
+            log_e_s=mixture_log_e_s(log_pi, offset, la_lo, la_hi, beta_k, gaussian=gaussian),
             log_alpha_hi=la_hi[:, 0],
             mix=mix,
         )

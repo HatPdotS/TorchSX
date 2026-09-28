@@ -645,13 +645,18 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 #: is deliberate.  ``lam_spread`` is absent on purpose -- the -0.25 carried by
 #: every scored run was a silent no-op (``_lam_spread`` returns 0 for <= 0), so
 #: shipping it as if it did something would be a lie in the config.
+#: ``peer_attention=2``: two full-width cross-attention layers from each
+#: observation onto the other observations of its crystal (gym NOTES
+#: 2026-09-24, smded72k: light - dark F CC 0.362 vs 0.337 without, dark per-state
+#: ln(N/S) -6.62 vs -6.05, held-out NLL -0.03; +0.5 s per update, ~+1 GiB).
+#: Deeper, narrower and tapered stacks were not better.
 DEFAULTS = dict(
     d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
-    obs_self_layers=2, skew=True, miss=0.03, inner_points=192,
+    obs_self_layers=2, peer_attention=2, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
-    scatter_family="mixture", scatter_components=4, scatter_hidden=8, scatter_shape="gaussian",
+    scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
 )
 
 
@@ -694,23 +699,41 @@ def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
     return float(bvf) if any(corrected) else 0.0
 
 
+def _peer_dims(args):
+    """``--peer-dim``: None, one width, or a comma-separated width per layer (a tapered stack)."""
+    v = getattr(args, "peer_dim", None)
+    if v is None:
+        return None
+    dims = [int(x) for x in str(v).split(",") if x.strip()]
+    return dims if len(dims) > 1 else dims[0]
+
+
+def _peer_layers(args) -> int:
+    """``--peer-attention``, or the length of a per-layer ``--peer-dim`` list; they must agree."""
+    n = getattr(args, "peer_attention", None)
+    dims = _peer_dims(args)
+    if isinstance(dims, list):
+        if n is not None and int(n) != len(dims):
+            raise SystemExit(f"--peer-attention {n} but --peer-dim gives {len(dims)} widths")
+        return len(dims)
+    return DEFAULTS["peer_attention"] if n is None else int(n)
+
+
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                 verbose: bool = True):
     """Build the production model, preserving recorded checkpoint geometry."""
     from torchsx.merging.likelihood import Poisson
-    from torchsx.merging.parameters import Parameters
     from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
     from torchsx.merging.scale import AmortizedScale
-    from torchsx.merging.scatter_shape import FreePerHKLShape
     from torchsx.nn.objective import MarginalNLL
 
     ck = ckpt or {}
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     prep = bundle.prep  # Host residency bounds device memory independently of dataset size.
-    params = Parameters(
-        log_I0_init=prep.mu_init.clone(),
-        scatter_shape=FreePerHKLShape(prep.alpha_init.log(), prep.beta_perhkl.log()),
-    ).to(dev)
+    # The predicted scatter families carry every per-observation shape parameter;
+    # there are no per-HKL parameters to fit, so the objective's ``params`` slot
+    # is empty.
+    params = None
 
     enc = dict(ck.get("encoder") or {})
     sc = dict(ck.get("scale") or {})
@@ -722,7 +745,6 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # checkpoint written before the key existed is the single family)
     scatter_family = scat.get("family", "gengauss") if ck else DEFAULTS["scatter_family"]
     n_components = int(scat.get("n_components") or DEFAULTS["scatter_components"])
-    scatter_hidden = int(scat.get("conditioner_hidden") or DEFAULTS["scatter_hidden"])
     scatter_shape = str(scat.get("component_shape") or ("shared" if ck else DEFAULTS["scatter_shape"]))
     beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
     kw = dict(
@@ -731,10 +753,19 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         include_hkl=bool(sc.get("include_hkl", DEFAULTS["include_hkl"])),
         predict_shape=bool(sc.get("predict_shape", DEFAULTS["predict_shape"])),
         beta_init=beta_init, w_init=w_init,
-        context_folds=enc.get("context_folds", DEFAULTS["context_folds"]),
+        context_folds=enc.get("context_folds", DEFAULTS["context_folds"] if getattr(args, "context_folds", None) is None
+                              else int(args.context_folds)),
         obs_context_layers=enc.get("obs_context_layers", DEFAULTS["obs_context_layers"]),
         obs_self_layers=enc.get("obs_self_layers", DEFAULTS["obs_self_layers"]),
-        scatter_family=scatter_family, n_components=n_components, conditioner_hidden=scatter_hidden,
+        # a checkpoint's own record wins; a checkpoint written before the key
+        # existed has no attention blocks
+        peer_attention_layers=(enc.get("peer_attention_layers") or 0) if ck else _peer_layers(args),
+        # heads are 8 wide (or at most DEFAULTS["peer_heads"] of them) at any attention width
+        peer_dim=(enc.get("peer_dim") or None) if ck else _peer_dims(args),
+        peer_heads=(enc.get("peer_heads") or DEFAULTS["peer_heads"]) if ck else
+                   (DEFAULTS["peer_heads"] if isinstance(_peer_dims(args), list) else
+                    min(DEFAULTS["peer_heads"], max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
+        scatter_family=scatter_family, n_components=n_components,
         component_shape=scatter_shape,
     )
     # A checkpoint's own head geometry wins over the defaults: rebuilding it
@@ -762,14 +793,23 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                          "support SplitLogGrid checkpoints only")
     miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
             else (0.5 if scat.get("miss_logit") is not None else 0.0))
+    if ck:
+        outlier = 0.5 if scat.get("outlier_logit") is not None else 0.0
+    else:
+        outlier = (getattr(args, "outlier_frac", None) if getattr(args, "outlier_frac", None) is not None
+                   else DEFAULTS["outlier"])
     obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev),
                       Poisson(bg_var_factor=float(bvf),
                               bg_mean_offset=bg_mean_offset),
-                      miss_frac=float(miss)).to(dev)
+                      miss_frac=float(miss), outlier_frac=float(outlier)).to(dev)
     if scat.get("miss_logit") is not None and obj.miss_logit is not None:
         with torch.no_grad():
             obj.miss_logit.fill_(float(scat["miss_logit"]))
         miss = float(obj.miss_logit.detach().sigmoid())
+    if scat.get("outlier_logit") is not None and obj.outlier_logit is not None:
+        with torch.no_grad():
+            obj.outlier_logit.fill_(float(scat["outlier_logit"]))
+        outlier = float(obj.outlier_logit.detach().sigmoid())
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at
@@ -812,7 +852,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         prior=prior,
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
-        skew=bool(skew), miss=float(miss),
+        skew=bool(skew), miss=float(miss), outlier=float(outlier),
         wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
         scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
     )
@@ -827,7 +867,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         print(f"stack: amortised scale, "
               f"{'two-width' if skew else 'symmetric'} "
               f"{f'{n_components}-component {scatter_shape}-shape mixture ' if scatter_family == 'mixture' else ''}scatter, "
-              f"miss {miss:.3f}, SplitLogGrid({n_points}), "
+              f"miss {miss:.3f}, " + (f"outlier {outlier:.4f}, " if outlier else "")
+              + f"SplitLogGrid({n_points}), "
               f"outer {settings['k_coarse']}/{settings['m_fine']} "
               f"n_sigma {settings['n_sigma']:g}, "
               f"Poisson(bg_var={bvf:.4f}"
