@@ -143,13 +143,13 @@ def fused_noise(obj, scatter, mu, n_ph, bg, meta, v, n_hkl):
 
 
 def with_noise(obj, meta, logs):
-    """One detector panel per observation, with the given ``(log A, log B, log C)``."""
+    """One detector panel per observation, with the given ``(log A, log B)``."""
     from torchsx.merging.likelihood.detector_noise import DetectorNoise
     M = meta.hkl_idx.numel()
     meta.panel_id = torch.arange(M, device="cuda")
     obj.detector_noise = DetectorNoise(M).cuda()
     with torch.no_grad():
-        for t, x in zip("ABC", logs):
+        for t, x in zip("AB", logs):
             getattr(obj.detector_noise, f"log_{t}").copy_(x)
     return obj
 
@@ -157,7 +157,7 @@ def with_noise(obj, meta, logs):
 def random_noise(M, seed=11):
     g = torch.Generator().manual_seed(seed)
     u = lambda lo, hi: (torch.rand(M, generator=g) * (math.log(hi) - math.log(lo)) + math.log(lo)).cuda()
-    return u(1e-2, 50.0), u(0.3, 5.0), u(1e-5, 2e-2)
+    return u(1e-2, 50.0), u(0.3, 5.0)
 
 
 @pytest.mark.parametrize("bvf,miss", [(1.16, 0.03), (0.0, 0.0), (1.16, 0.0), (0.0, 0.03)])
@@ -177,7 +177,7 @@ def test_detector_noise_values_and_gradients_match_node_loop(bvf, miss):
              else fused_noise(obj, scatter, mu, n_ph, bg, meta, v, n_hkl))
         W = torch.randn(S.shape, generator=torch.Generator().manual_seed(3)).cuda()
         dn = obj.detector_noise
-        params = ([mu, mix, dn.log_A, dn.log_B, dn.log_C]
+        params = ([mu, mix, dn.log_A, dn.log_B]
                   + ([obj.miss_logit] if obj.miss_logit is not None else []))
         out[name] = (S.detach(), torch.autograd.grad((S * W).sum(), params))
     S_ref, g_ref = out["loop"]
@@ -201,7 +201,7 @@ def test_detector_noise_at_poisson_is_the_plain_kernel():
     scatter.set_prediction(meta.obs_id, mix)
     plain = fused(obj, scatter, mu, n_ph, bg, meta, v, 200)
     tiny = torch.full((M,), math.log(1e-12), device="cuda")
-    obj = with_noise(obj, meta, (tiny, torch.zeros(M, device="cuda"), tiny))    # A ~ 0, B = 1, C ~ 0
+    obj = with_noise(obj, meta, (tiny, torch.zeros(M, device="cuda")))    # A ~ 0, B = 1
     noisy = fused_noise(obj, scatter, mu, n_ph, bg, meta, v, 200)
     torch.testing.assert_close(noisy, plain, rtol=1e-6, atol=1e-3)
 
@@ -225,8 +225,8 @@ def test_detector_noise_projection_bounds_the_terms():
     from torchsx.merging.likelihood.detector_noise import BOUNDS, DetectorNoise
     dn = DetectorNoise(3)
     with torch.no_grad():
-        dn.log_C.fill_(5.0)
+        dn.log_A.fill_(20.0)
         dn.log_B.fill_(-20.0)
     dn.project()
-    assert torch.allclose(dn.log_C.exp(), torch.full((3,), BOUNDS["C"][1]))
+    assert torch.allclose(dn.log_A.exp(), torch.full((3,), BOUNDS["A"][1]))
     assert torch.allclose(dn.log_B.exp(), torch.full((3,), BOUNDS["B"][0]))

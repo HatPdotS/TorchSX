@@ -78,11 +78,11 @@ __all__ = ["SplitLogGrid"]
 
 def noise_variance(lam: Tensor, s2, noise) -> Tensor:
     """Counting variance at expected count ``lam``: ``lam + s2``, or with detector
-    noise ``(A, B, C)`` (broadcast against ``lam``) ``A + B (lam + s2) + C lam^2``."""
+    noise ``(A, B)`` (broadcast against ``lam``) ``A + B (lam + s2)``."""
     if noise is None:
         return lam + s2
-    A, B, C = noise
-    return A + B * (lam + s2) + C * lam * lam
+    A, B = noise
+    return A + B * (lam + s2)
 
 
 def _l0_with_grad(p: dict, noise) -> Tensor:
@@ -90,7 +90,7 @@ def _l0_with_grad(p: dict, noise) -> Tensor:
 
     ``grid_params`` is ``no_grad``; ``log L(0) = N0 lam0 / V0 + 1/2 log(lam0 / V0) +
     logpeak`` is rebuilt here from its stored pieces with ``V0`` a function of
-    ``(A, B, C)`` (same value, now with the gradient).
+    ``(A, B)`` (same value, now with the gradient).
     """
     lam0 = p["lam0"]
     V0 = noise_variance(lam0, p["s2"], noise)
@@ -164,15 +164,13 @@ class SplitLogGrid(Quadrature):
         both miss this cache and re-open the address-recycling window it is
         pinning ``bg`` against).
 
-        ``noise`` is the learned detector noise, ``(A, B, C)`` per observation
+        ``noise`` is the learned detector noise, ``(A, B)`` per observation
         (:class:`~torchsx.merging.likelihood.detector_noise.DetectorNoise`): the
-        counting variance becomes ``V = A + B (lam + sig_b2) + C lam^2``, so the
-        window, the dense zone and ``log L(0)`` follow ``V``.  The terms enter
-        detached -- node positions are data here, as they are for the other
-        parameters.  ``g0 = d log L(0) / d V0`` and the pieces of ``log L(0)``
-        (``N0``, ``lam0``, ``s2``) are returned for the gradients.  With ``C > 0`` the
-        likelihood levels off at ``-1/(2C)`` for large ``lam``, so the window's upper
-        end is also bounded by the depth that the ``C`` term can reach.
+        counting variance becomes ``V = A + B (lam + sig_b2)``, so the window, the
+        dense zone and ``log L(0)`` follow ``V``.  The terms enter detached -- node
+        positions are data here, as they are for the other parameters.
+        ``g0 = d log L(0) / d V0`` and the pieces of ``log L(0)`` (``N0``, ``lam0``,
+        ``s2``) are returned for the gradients.
         """
         # sig_b2 is a fresh tensor on every call; key on its *coefficient*
         bvf = None if sig_b2 is None else float(self._last_bvf)
@@ -192,7 +190,7 @@ class SplitLogGrid(Quadrature):
         s0 = (n - bg_model).clamp(min=0.0)
         nz = None if noise is None else tuple(t.detach().to(bg.dtype) for t in noise)
         V0 = noise_variance(lam0, s2, nz)                       # at S = 0
-        dV0 = torch.ones_like(lam0) if nz is None else nz[1] + 2.0 * nz[2] * lam0   # dV/dS at S = 0
+        dV0 = torch.ones_like(lam0) if nz is None else nz[1]   # dV/dS
         V_n = noise_variance(n.clamp(min=1.0), s2, nz)          # at the peak, lam ~ n
         sig_S = V_n.sqrt()
 
@@ -215,13 +213,6 @@ class SplitLogGrid(Quadrature):
                              lam0 * (2.0 * self.tau / n.clamp(min=1.0)).sqrt())
         S_hi = (s0 + (2.0 * self.lam_hi * V_n).sqrt()
                 + self.lam_hi * V0 / lam0)
-        if nz is not None:
-            # the C term: -(n - lam)^2 / (2 C lam^2) -> depth 1/(2C) as lam grows,
-            # so close the window where the reachable depth is used up
-            C = nz[2]
-            lam_c = torch.clamp(0.45 / C.clamp(min=1e-30), max=self.lam_hi)
-            r = (2.0 * lam_c * C).sqrt().clamp(max=0.95)
-            S_hi = torch.maximum(S_hi, n.clamp(min=1.0) / (1.0 - r) - bg_model)
         x_hi = S_hi.log()
         x_anchor = torch.maximum(s0, sig_S).log()
         x_lo = torch.maximum(S_lo.clamp(min=1e-30).log(), x_anchor - self.delta_cap)
@@ -345,7 +336,7 @@ class SplitLogGrid(Quadrature):
         params: Parameters,
         meta: ObsInfo,
         obs_range: tuple[int, int] | None = None,
-        noise=None,  # (A, B, C) per observation: detector noise
+        noise=None,  # (A, B) per observation: detector noise
     ) -> Tensor:                  # (M,)
         if not isinstance(scatter, GenGaussLogScatter):
             raise NotImplementedError("SplitLogGrid needs a GenGauss scatter (tail CDF)")
@@ -387,7 +378,7 @@ class SplitLogGrid(Quadrature):
             neg_half_D = torch.where(n[:, None] > 0, nn_ * torch.log(lam / nn_) - (lam - nn_), -lam)
             half_log_iphi = 0.0
             if noise is not None:
-                # detector noise: V = A + B (lam + sig_b2) + C lam^2 at every node
+                # detector noise: V = A + B (lam + sig_b2) at every node
                 s2 = sig_b2[:, None] if sig_b2 is not None else 0.0
                 inv_phi = lam / noise_variance(lam, s2, tuple(t[:, None] for t in noise))
                 neg_half_D = neg_half_D * inv_phi

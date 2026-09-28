@@ -829,11 +829,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         else:
             pid = prep.obs_info.panel_id
             n_groups = int(pid.max()) + 1 if pid is not None else 1
-            dn = DetectorNoise(n_groups, terms=str(getattr(args, "noise_terms", "ABC") or "ABC"))
+            dn = DetectorNoise(n_groups, terms=str(getattr(args, "noise_terms", "AB") or "AB"))
         obj.detector_noise = dn.to(dev)
         if verbose:
             print(f"detector noise: {noise_mode}, {dn.n_groups} panel(s), "
-                  f"V = A + B (lam + sig_b2) + C lam^2, fitted terms {dn.terms}")
+                  f"V = A + B (lam + sig_b2), fitted terms {dn.terms}")
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at

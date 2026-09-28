@@ -202,8 +202,8 @@ class TrainConfig:
     #: heads, and at 10 it drove lower widths to alpha ~ 1e5 within 200 updates.
     mixture_lr_mult: float = 1.0
     #: Learning-rate multiplier for the learned detector noise (per-panel log A,
-    #: log B, log C).  They may have to move by several nats within the budget --
-    #: B by 2.3 for a gain off by 10x, A and C up from their near-zero start -- and
+    #: log B).  They may have to move by several nats within the budget -- B by 2.3
+    #: for a gain off by 10x, A up from its near-zero start -- and
     #: Adam moves a parameter by at most ~lr per update.  Each is projected into
     #: its bounds after every step, so a persistent push cannot run away.
     noise_lr_mult: float = 30.0
@@ -780,10 +780,9 @@ class AmortizedTrainer:
         noise = (self.objective.noise_terms(meta)
                  if hasattr(self.objective, "noise_terms") else None)
         if noise is not None:
-            # the learned detector variance A + B (counting) + C lam^2
-            nA, nB, nC = (t.detach() for t in noise)
-            lam = (K * I0 + bg).clamp(min=0.0)
-            var_count = nA + nB * var_count + nC * lam * lam
+            # the learned detector variance A + B (counting)
+            nA, nB = (t.detach() for t in noise)
+            var_count = nA + nB * var_count
         var = (var_count + var_scatter).clamp(min=1e-12)
         # Same argument for the mean: under a bg_mean_offset the model claims
         # E[n] = K*I0 + bg + offset, so the residual this metric standardises

@@ -53,10 +53,11 @@ def _build_parser():
                    help="initial fraction of the learnable detector-outlier component "
                         "(default 0 = off; the merge inherits the checkpoint)")
     p.add_argument("--detector-noise", choices=("off", "panel"), default="off",
-                   help="learned detector variance A + B (lam + sig_b2) + C lam^2 per detector panel, "
-                        "fitted with the network (default off; the merge inherits the checkpoint)")
-    p.add_argument("--noise-terms", default="ABC",
-                   help="which of the detector-noise terms A, B, C are fitted (default ABC; "
+                   help="learned detector variance A + B (lam + sig_b2) per detector panel: additive "
+                        "(read noise) and gain dispersion, fitted with the network (default off; the "
+                        "merge inherits the checkpoint)")
+    p.add_argument("--noise-terms", default="AB",
+                   help="which of the detector-noise terms A, B are fitted (default AB; "
                         "B alone is a per-panel gain correction)")
     p.add_argument("--noise-lr-mult", type=float, default=30.0,
                    help="learning-rate multiplier of the detector-noise parameters (default 30)")

@@ -1,4 +1,4 @@
-"""Learned detector noise: a per-panel variance polynomial in the count.
+"""Learned detector noise: a per-panel additive term and gain dispersion of the counts.
 
 The detection likelihood is a deviance-scaled Poisson in the counts,
 ``log p = (-D/2) * iphi + 1/2 log iphi + logpeak`` with ``iphi = lam / V`` and
@@ -8,26 +8,31 @@ order the Poisson saddlepoint holds this is a Gaussian of variance ``V`` in the
 counts, with the Poisson's skew at low counts.  Everything a detector does beyond
 Poisson at its declared gain is absent from it.  This module replaces ``V`` by::
 
-    V = A_p + B_p (lam + sig_b2) + C_p lam^2          (p = the observation's panel)
+    V = A_p + B_p (lam + sig_b2)          (p = the observation's panel)
 
 - ``A``  additive variance (read noise, pedestal; photons^2);
-- ``B``  dispersion of the counting term: a gain that is off (B = true/declared);
-- ``C``  relative variance proportional to the count squared (gain nonuniformity).
+- ``B``  dispersion of the counting term: a gain that is off (B = true/declared).
 
 The variance depends on the observation's **count** and **panel** only: nothing
 per shot, crystal or geometry.  The count is the expected count ``lam`` at each
 node of the signal integral, i.e. the detector's variance given the true count --
 never the measured ``n``, whose use in a variance biases the fit the way
 count-dependent weights bias a weighted mean.  It is condition-blind by
-construction.  ``A = 0, B = 1, C = 0`` is the plain model; the initial values are
-that up to negligible ``A0``, ``C0``.
+construction.  ``A = 0, B = 1`` is the plain model; the initial values are that up
+to a negligible ``A0``.
 
-Parameters are ``log A, log B, log C`` per panel, **projected** into bounds after
-every optimizer step (:meth:`project`), not squashed by a saturating function:
-Adam normalises a small persistent gradient to a full step, and behind a
-saturating map the raw value then walks without limit.  ``C <= 0.04`` (20 %
-relative SD) also keeps the likelihood's decay in ``lam`` (it levels off at
-``-1/(2C)``) deep enough for the split grid's window.
+There is deliberately no term in ``lam^2``.  Tested on 28 Sep 2026 (53734bf): it
+follows the multiplicative scatter's law, so the optimizer splits that variance
+between the two.  C drifted to its bound on some small-molecule panels and pulled B
+to 0.1-0.3 and A to ~26 photons^2, and its apparent difference-map gain did not
+reproduce across seed pairs.  A + B alone gives physical values (small molecule:
+~0.27 photons read noise per pixel, per-panel gains 0.57-1.13; BR: A ~ 0, B ~ 1.03)
+and the reproducible gains in the weak shells and held-out NLL.
+
+Parameters are ``log A, log B`` per panel, **projected** into bounds after every
+optimizer step (:meth:`project`), not squashed by a saturating function: Adam
+normalises a small persistent gradient to a full step, and behind a saturating map
+the raw value then walks without limit.
 """
 from __future__ import annotations
 
@@ -39,32 +44,33 @@ from torch import Tensor
 
 __all__ = ["DetectorNoise"]
 
-#: ``(min, max)`` of each term: A in photons^2, B and C dimensionless
-BOUNDS = {"A": (1e-4, 1e4), "B": (0.02, 100.0), "C": (1e-8, 0.04)}
-INIT = {"A": 1e-2, "B": 1.0, "C": 1e-5}
+#: ``(min, max)`` of each term: A in photons^2, B dimensionless
+BOUNDS = {"A": (1e-4, 1e4), "B": (0.02, 100.0)}
+INIT = {"A": 1e-2, "B": 1.0}
+TERMS = "AB"
 
 
 class DetectorNoise(nn.Module):
-    """``V = A[p] + B[p] (lam + sig_b2) + C[p] lam^2`` per detector panel ``p``.
+    """``V = A[p] + B[p] (lam + sig_b2)`` per detector panel ``p``.
 
     Parameters
     ----------
     n_groups
         Detector panels; observations carry ``panel_id`` in ``[0, n_groups)``.
     terms
-        Which of ``"A"``, ``"B"``, ``"C"`` are fitted; the others stay at their
-        initial value (``"B"`` alone is a per-panel gain correction).
+        Which of ``"A"``, ``"B"`` are fitted; the other stays at its initial value
+        (``"B"`` alone is a per-panel gain correction).
     """
 
-    def __init__(self, n_groups: int = 1, *, terms: str = "ABC") -> None:
+    def __init__(self, n_groups: int = 1, *, terms: str = TERMS) -> None:
         super().__init__()
         if n_groups < 1:
             raise ValueError("n_groups must be positive")
-        bad = set(terms) - set("ABC")
+        bad = set(terms) - set(TERMS)
         if bad or not terms:
-            raise ValueError(f"terms must be a non-empty subset of 'ABC', got {terms!r}")
-        self.n_groups, self.terms = int(n_groups), "".join(t for t in "ABC" if t in terms)
-        for t in "ABC":
+            raise ValueError(f"terms must be a non-empty subset of {TERMS!r}, got {terms!r}")
+        self.n_groups, self.terms = int(n_groups), "".join(t for t in TERMS if t in terms)
+        for t in TERMS:
             p = nn.Parameter(torch.full((self.n_groups,), math.log(INIT[t])), requires_grad=t in self.terms)
             self.register_parameter(f"log_{t}", p)
 
@@ -73,7 +79,7 @@ class DetectorNoise(nn.Module):
 
     @classmethod
     def from_config(cls, cfg: dict) -> "DetectorNoise":
-        return cls(int(cfg["n_groups"]), terms=str(cfg.get("terms", "ABC")))
+        return cls(int(cfg["n_groups"]), terms=str(cfg.get("terms", TERMS)))
 
     @torch.no_grad()
     def project(self) -> None:
@@ -81,13 +87,13 @@ class DetectorNoise(nn.Module):
         for t, (lo, hi) in BOUNDS.items():
             getattr(self, f"log_{t}").clamp_(math.log(lo), math.log(hi))
 
-    def terms_obs(self, group: Tensor | None, n: int, device=None) -> tuple[Tensor, Tensor, Tensor]:
-        """``(A, B, C)`` per observation, differentiable in the fitted terms."""
+    def terms_obs(self, group: Tensor | None, n: int, device=None) -> tuple[Tensor, Tensor]:
+        """``(A, B)`` per observation, differentiable in the fitted terms."""
         if group is None:
             group = torch.zeros(n, dtype=torch.long, device=device or self.log_A.device)
         g = group.long()
-        return self.log_A[g].exp(), self.log_B[g].exp(), self.log_C[g].exp()
+        return self.log_A[g].exp(), self.log_B[g].exp()
 
     def values(self) -> dict:
-        """Current ``A, B, C`` per panel, for logging."""
-        return {t: getattr(self, f"log_{t}").detach().exp().cpu().tolist() for t in "ABC"}
+        """Current ``A, B`` per panel, for logging."""
+        return {t: getattr(self, f"log_{t}").detach().exp().cpu().tolist() for t in TERMS}
