@@ -161,6 +161,7 @@ class MarginalNLL(nn.Module):
         chunk_size: int | None = None, renormalize: bool = False,
         checkpoint_chunks: bool = True, miss_frac: float = 0.0,
         outlier_frac: float = 0.0, outlier_scale: float = 3.0,
+        detector_noise=None,
     ) -> None:
         super().__init__()
         self.quadrature = quadrature
@@ -204,6 +205,41 @@ class MarginalNLL(nn.Module):
             if not (0.0 < outlier_frac < 1.0):
                 raise ValueError(f"outlier_frac must be in (0, 1), got {outlier_frac}")
             self.outlier_logit = nn.Parameter(torch.tensor(math.log(outlier_frac / (1.0 - outlier_frac))))
+        #: Learned detector noise (:class:`~torchsx.merging.likelihood.detector_noise.DetectorNoise`):
+        #: a per-observation dispersion ``phi`` of the counting term, fitted with
+        #: the network.  ``None`` is the plain detection model.  Installed per
+        #: batch by :meth:`prime_noise`; every likelihood evaluation of those
+        #: observations then carries it.  The outlier Cauchy keeps the
+        #: noise-free detector SD as its scale.
+        self.detector_noise = detector_noise
+
+    def prime_noise(self, meta, log_K: Tensor, I_ref: Tensor, bg: Tensor, *, key=None) -> Tensor | None:
+        """Install the detector noise for this batch; ``log u = -log phi`` or ``None``.
+
+        ``I_ref`` is the reference intensity per observation (the running
+        merge), so ``lam_hat = K I_ref + bg_model`` is the model's own expected
+        count, detached.  ``key`` lets repeated calls within one step share the
+        installed tensor.
+        """
+        dn = self.detector_noise
+        if dn is None:
+            return None
+        if dn.matches(key):
+            return dn._log_u
+        with torch.no_grad():
+            bg_model = self.likelihood.detection_params(bg)[0]
+            lam_hat = (log_K.detach().exp() * I_ref.detach().clamp(min=0.0) + bg_model).clamp(min=1.0)
+        group = getattr(meta, "panel_id", None)
+        if group is not None and dn.n_groups == 1:
+            group = None
+        return dn.prime(meta.obs_id, group, lam_hat.log(), key=key)
+
+    def noise_log_u(self, meta) -> Tensor | None:
+        """The installed ``log u`` of ``meta``'s observations, or ``None``."""
+        dn = self.detector_noise
+        if dn is None or not dn.active:
+            return None
+        return dn.log_u_obs(meta.obs_id)
 
     def log_outlier(self, n_ph: Tensor, bg: Tensor) -> Tensor:
         """``log p_out(n)``: a Cauchy about the detection background mean, scale
@@ -215,7 +251,7 @@ class MarginalNLL(nn.Module):
         t = (n_ph.to(lam0.dtype) - lam0) / gamma
         return -math.log(math.pi) - gamma.log() - torch.log1p(t * t)
 
-    def _log_miss(self, n_ph: Tensor, bg: Tensor) -> Tensor:
+    def _log_miss(self, n_ph: Tensor, bg: Tensor, log_u: Tensor | None = None) -> Tensor:
         """``log p(n | S = 0)`` on the kernel's scale (Poisson about its peak,
         with the background-variance term when the likelihood carries one).
 
@@ -225,16 +261,18 @@ class MarginalNLL(nn.Module):
         analytic tail, at no cost, on the same cached grid.
         """
         q = getattr(self, "quadrature", None)
+        if log_u is not None:
+            return q.log_miss(self.likelihood, n_ph, bg, log_u=log_u)
         if q is not None and hasattr(q, "log_miss"):
             return q.log_miss(self.likelihood, n_ph, bg)
         bg_mean, sig_b2 = self.likelihood.detection_params(bg)
         return poisson_log_prob_at_zero_signal(n_ph, bg_mean, sig_b2)
 
-    def _mix_miss(self, lp: Tensor, n_ph: Tensor, bg: Tensor) -> Tensor:
+    def _mix_miss(self, lp: Tensor, n_ph: Tensor, bg: Tensor, log_u: Tensor | None = None) -> Tensor:
         if self.miss_logit is not None:
             log_pi = torch.nn.functional.logsigmoid(self.miss_logit)
             log_1m = torch.nn.functional.logsigmoid(-self.miss_logit)
-            lp = torch.logaddexp(log_1m + lp, log_pi + self._log_miss(n_ph, bg))
+            lp = torch.logaddexp(log_1m + lp, log_pi + self._log_miss(n_ph, bg, log_u))
         if self.outlier_logit is not None:
             log_r = torch.nn.functional.logsigmoid(self.outlier_logit)
             log_1r = torch.nn.functional.logsigmoid(-self.outlier_logit)
@@ -260,18 +298,21 @@ class MarginalNLL(nn.Module):
         self.last_grid_mass = log_mass.detach().exp()
         return log_p - log_mass
 
-    def _marginal(self, scatter, params, log_mean, n_ph, bg, meta, obs_range) -> Tensor:
+    def _marginal(self, scatter, params, log_mean, n_ph, bg, meta, obs_range, log_u=None) -> Tensor:
         """``log p(n | log_mean)`` with the scatter integrated out.
 
         The quadrature owns mixture integration, including any fused path.
+        ``log_u`` (detector noise) is passed only when installed, so quadratures
+        that do not implement it refuse rather than drop it.
         """
+        kw = {} if log_u is None else {"log_u": log_u}
         if isinstance(scatter, PredictedMixtureScatter):
             return self.quadrature.marginalize_mixture(
                 scatter, self.likelihood, log_mean, n_ph, bg, params, meta,
-                obs_range=obs_range,
+                obs_range=obs_range, **kw,
             )
         lp = self.quadrature.marginalize_signal(
-            scatter, self.likelihood, log_mean, n_ph, bg, params, meta, obs_range=obs_range,
+            scatter, self.likelihood, log_mean, n_ph, bg, params, meta, obs_range=obs_range, **kw,
         )
         return self._renorm(lp, scatter, params, meta, log_mean) if self.renormalize else lp
 
@@ -281,16 +322,18 @@ class MarginalNLL(nn.Module):
         n = log_mean.shape[0]
         cs = self.chunk_size or n
         if cs >= n:
-            lp = self._marginal(scatter, params, log_mean, n_ph, bg, meta, (0, n))
-            return self._mix_miss(lp, n_ph, bg)
+            log_u = self.noise_log_u(meta)
+            lp = self._marginal(scatter, params, log_mean, n_ph, bg, meta, (0, n), log_u)
+            return self._mix_miss(lp, n_ph, bg, log_u)
         parts = []
         for s in range(0, n, cs):
             e = min(s + cs, n)
             sub = meta.slice(s, e)
 
             def _chunk(lm, nn, bb, _sub=sub, _s=s, _e=e):
-                lp = self._marginal(scatter, params, lm, nn, bb, _sub, (_s, _e))
-                return self._mix_miss(lp, nn, bb)
+                log_u = self.noise_log_u(_sub)
+                lp = self._marginal(scatter, params, lm, nn, bb, _sub, (_s, _e), log_u)
+                return self._mix_miss(lp, nn, bb, log_u)
 
             args = (log_mean[s:e], n_ph[s:e], bg[s:e])
             if self.checkpoint_chunks and torch.is_grad_enabled():

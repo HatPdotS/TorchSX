@@ -76,6 +76,17 @@ _DISABLE_TRITON = os.environ.get("TORCHSX_FIXEDLOGGRID_NO_TRITON", "") == "1"
 __all__ = ["SplitLogGrid"]
 
 
+def _l0_with_grad(p: dict, log_u: Tensor) -> Tensor:
+    """``log L(0)`` of the grid, differentiable in ``log_u``.
+
+    ``grid_params`` is ``no_grad`` and holds the value at the detached ``log_u``;
+    ``log L(0) = u d0 + 1/2 log u + (terms free of u)``, so adding the change
+    against that point restores the gradient without changing the value.
+    """
+    lu0 = p["log_u"]
+    return p["log_L0"] + p["d0"] * (log_u.exp() - lu0.exp()) + 0.5 * (log_u - lu0)
+
+
 class SplitLogGrid(Quadrature):
     """Analytic GenGauss tail below ``x_lo`` plus a per-observation trapezoid window.
 
@@ -128,7 +139,7 @@ class SplitLogGrid(Quadrature):
 
     @torch.no_grad()
     def grid_params(self, n_ph: Tensor, bg: Tensor, sig_b2: Tensor | None,
-                    bg_mean_offset: float = 0.0) -> dict:
+                    bg_mean_offset: float = 0.0, log_u: Tensor | None = None) -> dict:
         """Per-observation window and dense-zone parameters, plus ``log L(0)``.
 
         Returns float ``(M,)`` tensors ``x_lo, h1, d_lo, h_d, d_hi, h2, log_L0``
@@ -142,10 +153,19 @@ class SplitLogGrid(Quadrature):
         held by the cache, so callers never allocate their own (which would
         both miss this cache and re-open the address-recycling window it is
         pinning ``bg`` against).
+
+        ``log_u`` is the learned detector noise, ``log u = -log phi`` per
+        observation (:class:`~torchsx.merging.likelihood.detector_noise.DetectorNoise`):
+        the counting variance becomes ``phi (lam + sig_b2)``, so the Poisson
+        factor is ``sqrt(phi)`` wider and the window follows it.  It enters the
+        geometry detached -- node positions are data here, as they are for the
+        other parameters -- and ``log_L0`` carries its value.  ``d0`` (the S = 0
+        scaled deviance) is returned for the kernel's ``d/d log u``.
         """
         # sig_b2 is a fresh tensor on every call; key on its *coefficient*
         bvf = None if sig_b2 is None else float(self._last_bvf)
-        key = (id(n_ph), id(bg), bvf, float(bg_mean_offset), n_ph.numel())
+        key = (id(n_ph), id(bg), bvf, float(bg_mean_offset), n_ph.numel(),
+               None if log_u is None else id(log_u))
         if self._cache_key == key and self._cache_val is not None:
             return self._cache_val
 
@@ -158,7 +178,11 @@ class SplitLogGrid(Quadrature):
         lam0 = bg_model.clamp(min=1e-6)
         s2 = sig_b2 if sig_b2 is not None else torch.zeros_like(lam0)
         s0 = (n - bg_model).clamp(min=0.0)
-        sig_S = (n.clamp(min=1.0) + s2).sqrt()
+        lu = None if log_u is None else log_u.detach().to(bg.dtype)
+        # dispersion of the counting term: 1 without detector noise
+        phi = torch.ones_like(lam0) if lu is None else (-lu).exp()
+        u = 1.0 / phi
+        sig_S = (phi * (n.clamp(min=1.0) + s2)).sqrt()
 
         # Poisson factor about its own peak, on the kernel's scale
         n_pos = n > 0
@@ -166,18 +190,21 @@ class SplitLogGrid(Quadrature):
         A0 = torch.where(n_pos, nn_ * torch.log(lam0 / nn_) - (lam0 - nn_), -lam0)
         iphi = lam0 / (lam0 + s2)
         logpeak = poisson_logpeak(n)
-        log_L0 = A0 * iphi + 0.5 * iphi.log() + logpeak
+        d0 = A0 * iphi
+        log_L0 = d0 * u + 0.5 * iphi.log() + logpeak
+        if lu is not None:
+            log_L0 = log_L0 + 0.5 * lu
 
         # d log L / dS at S = 0 (deviance form; s2 = 0 gives n/bg - 1)
         dA = n / lam0 - 1.0
         diphi = s2 / (lam0 + s2) ** 2
-        dl = dA * iphi + A0 * diphi + 0.5 * (1.0 / lam0 - 1.0 / (lam0 + s2))
+        dl = u * (dA * iphi + A0 * diphi) + 0.5 * (1.0 / lam0 - 1.0 / (lam0 + s2))
         # first-order flatness bound, with the Poisson curvature n/bg^2 as the
         # guard where the slope vanishes (n ~ bg)
         S_lo = torch.minimum(self.tau / dl.abs().clamp(min=1e-30),
                              lam0 * (2.0 * self.tau / n.clamp(min=1.0)).sqrt())
-        S_hi = (s0 + (2.0 * self.lam_hi * (n.clamp(min=1.0) + s2)).sqrt()
-                + self.lam_hi * (1.0 + s2 / lam0))
+        S_hi = (s0 + (2.0 * self.lam_hi * phi * (n.clamp(min=1.0) + s2)).sqrt()
+                + self.lam_hi * phi * (1.0 + s2 / lam0))
         x_hi = S_hi.log()
         x_anchor = torch.maximum(s0, sig_S).log()
         x_lo = torch.maximum(S_lo.clamp(min=1e-30).log(), x_anchor - self.delta_cap)
@@ -214,12 +241,13 @@ class SplitLogGrid(Quadrature):
             n1=n1.to(torch.int32).contiguous(),
             n1d=(n1 + nd).to(torch.int32).contiguous(),
             log_L0=log_L0.contiguous(), x_hi=x_hi, logpeak=logpeak, iphi0=iphi,
-            bg_model=bg_model,
+            bg_model=bg_model, d0=d0.contiguous(),
+            log_u=None if lu is None else lu.contiguous(),
         )
         self._cache_key, self._cache_val = key, out
         # keep the keyed tensors alive so their addresses cannot be recycled
         # under the cache
-        self._cache_ref = (n_ph, bg, sig_b2)
+        self._cache_ref = (n_ph, bg, sig_b2, log_u)
         return out
 
     @staticmethod
@@ -242,7 +270,13 @@ class SplitLogGrid(Quadrature):
 
     def marginalize_mixture(
         self, scatter, likelihood, log_mean, n_ph, bg, params, meta, obs_range=None,
+        log_u: Tensor | None = None,
     ) -> Tensor:
+        if log_u is not None:
+            # the per-component Triton kernel has no detector noise: eager
+            return super().marginalize_mixture(
+                scatter, likelihood, log_mean, n_ph, bg, params, meta, obs_range, log_u=log_u,
+            )
         if (HAVE_TRITON and not _DISABLE_TRITON and scatter.fixed_gaussian
                 and 1 <= scatter.n_components <= 8
                 and log_mean.is_cuda and log_mean.dtype == torch.float32
@@ -267,7 +301,7 @@ class SplitLogGrid(Quadrature):
         return float(getattr(likelihood, "bg_mean_offset", 0.0) or 0.0)
 
     def log_miss(self, likelihood: DetectionLikelihood, n_ph: Tensor,
-                 bg: Tensor) -> Tensor:
+                 bg: Tensor, log_u: Tensor | None = None) -> Tensor:
         """``log L(0)`` -- the same one the analytic tail already uses.
 
         Reuses the cached grid, so the miss component costs nothing on top of
@@ -277,9 +311,12 @@ class SplitLogGrid(Quadrature):
         refuses if the likelihood also carries a background-mean offset).
         """
         if bg.requires_grad:
+            if log_u is not None:
+                raise NotImplementedError("detector noise with a learned background")
             return super().log_miss(likelihood, n_ph, bg)
-        return self.grid_params(n_ph, bg, self._sig_b2(likelihood, bg),
-                                self._bg_mean_offset(likelihood))["log_L0"]
+        p = self.grid_params(n_ph, bg, self._sig_b2(likelihood, bg),
+                             self._bg_mean_offset(likelihood), log_u)
+        return p["log_L0"] if log_u is None else _l0_with_grad(p, log_u)
 
     def marginalize_signal(
         self,
@@ -291,6 +328,7 @@ class SplitLogGrid(Quadrature):
         params: Parameters,
         meta: ObsInfo,
         obs_range: tuple[int, int] | None = None,
+        log_u: Tensor | None = None,  # (M,) detector noise, log u = -log phi
     ) -> Tensor:                  # (M,)
         if not isinstance(scatter, GenGaussLogScatter):
             raise NotImplementedError("SplitLogGrid needs a GenGauss scatter (tail CDF)")
@@ -303,16 +341,17 @@ class SplitLogGrid(Quadrature):
         # The RAW bg goes down to grid_params -- it is what the cache keys on
         # and pins; the shifted background comes back as `p["bg_model"]` and is
         # what the integrand below (and the kernel) must use.
-        p = self.grid_params(n_ph, bg, sig_b2, self._bg_mean_offset(likelihood))
+        p = self.grid_params(n_ph, bg, sig_b2, self._bg_mean_offset(likelihood), log_u)
         bg_model = p["bg_model"]
+        log_L0 = p["log_L0"] if log_u is None else _l0_with_grad(p, log_u)
 
         # analytic tail: L(0) * P(eps <= x_lo - log_mean)
-        log_tail = p["log_L0"] + gengauss_log_cdf_from_obs(
+        log_tail = log_L0 + gengauss_log_cdf_from_obs(
             p["x_lo"] - log_mean, log_alpha_obs, log_beta_obs,
             log_alpha_hi_obs=log_alpha_hi_obs)
 
         if (HAVE_TRITON and not _DISABLE_TRITON and log_mean.is_cuda
-                and log_mean.dtype == torch.float32):
+                and log_mean.dtype == torch.float32 and log_u is None):
             log_win = marginalize_signal_split_triton(
                 log_mean, n_ph, bg_model, log_alpha_obs, log_beta_obs, p, K,
                 sig_b2=sig_b2, log_alpha_hi_obs=log_alpha_hi_obs,
@@ -329,9 +368,14 @@ class SplitLogGrid(Quadrature):
             nn_ = n.clamp(min=1e-12)[:, None]
             lam = (x.exp() + bg_model[:, None]).clamp(min=1e-6)
             neg_half_D = torch.where(n[:, None] > 0, nn_ * torch.log(lam / nn_) - (lam - nn_), -lam)
+            half_log_iphi = 0.0
             if sig_b2 is not None:
                 inv_phi = lam / (lam + sig_b2[:, None])
-                neg_half_D = neg_half_D * inv_phi + 0.5 * inv_phi.log()
-            log_lik = neg_half_D + p["logpeak"][:, None]
+                neg_half_D = neg_half_D * inv_phi
+                half_log_iphi = 0.5 * inv_phi.log()
+            if log_u is not None:
+                # detector noise: Var = phi (lam + sig_b2), deviance / phi, - 1/2 log phi
+                neg_half_D = neg_half_D * log_u.exp()[:, None] + 0.5 * log_u[:, None]
+            log_lik = neg_half_D + half_log_iphi + p["logpeak"][:, None]
             log_win = torch.logsumexp(log_scatter + log_lik + log_w, dim=1)
         return torch.logaddexp(log_tail, log_win)

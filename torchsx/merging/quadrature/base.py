@@ -31,13 +31,17 @@ class Quadrature(nn.Module):
 
 
     def marginalize_mixture(
-        self, scatter, likelihood, log_mean, n_ph, bg, params, meta, obs_range=None,
+        self, scatter, likelihood, log_mean, n_ph, bg, params, meta, obs_range=None, **kw,
     ) -> Tensor:
-        """Weighted component marginals; quadratures may fuse this operation."""
+        """Weighted component marginals; quadratures may fuse this operation.
+
+        Extra keywords (the detector noise ``log_u``) go to ``marginalize_signal``,
+        so a quadrature that does not take them refuses instead of dropping them.
+        """
         terms = [
             log_pi + self.marginalize_signal(
                 view, likelihood, log_mean + offset, n_ph, bg, params, meta,
-                obs_range=obs_range,
+                obs_range=obs_range, **kw,
             )
             for log_pi, offset, view in scatter.components(meta)
         ]

@@ -810,6 +810,25 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         with torch.no_grad():
             obj.outlier_logit.fill_(float(scat["outlier_logit"]))
         outlier = float(obj.outlier_logit.detach().sigmoid())
+    # Learned detector noise: a checkpoint restores what it fitted; a new run
+    # builds it from --detector-noise (panel groups from the stream's panel ids).
+    noise_rec = ck.get("detector_noise") if ck else None
+    noise_mode = None if ck else getattr(args, "detector_noise", None)
+    if noise_rec or (noise_mode and noise_mode != "off"):
+        from torchsx.merging.likelihood.detector_noise import DetectorNoise
+        if noise_rec:
+            dn = DetectorNoise.from_config(noise_rec["config"])
+            dn.load_state_dict({k: torch.tensor(v, dtype=torch.float32)
+                                for k, v in noise_rec["state"].items()})
+            noise_mode = "checkpoint"
+        else:
+            pid = prep.obs_info.panel_id
+            n_groups = int(pid.max()) + 1 if (pid is not None and "panel" in noise_mode) else 1
+            dn = DetectorNoise.default(n_groups, mean_specific="mean" in noise_mode)
+        obj.detector_noise = dn.to(dev)
+        if verbose:
+            print(f"detector noise: {noise_mode}, {dn.n_groups} group(s), "
+                  f"{'mean-specific' if dn.mean_specific else 'flat in the count'}")
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at
@@ -852,7 +871,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         prior=prior,
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
-        skew=bool(skew), miss=float(miss), outlier=float(outlier),
+        skew=bool(skew), miss=float(miss), outlier=float(outlier), detector_noise=noise_mode or "off",
         wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
         scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
     )
