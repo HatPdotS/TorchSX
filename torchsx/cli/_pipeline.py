@@ -791,8 +791,13 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS):
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
                          "support SplitLogGrid checkpoints only")
-    miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
-            else (0.5 if scat.get("miss_logit") is not None else 0.0))
+    if ck:
+        # a checkpoint decides: its miss logit is restored below, None means off
+        miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
+                else (0.5 if scat.get("miss_logit") is not None else 0.0))
+    else:
+        miss = (getattr(args, "miss_frac", None) if getattr(args, "miss_frac", None) is not None
+                else DEFAULTS["miss"])
     if ck:
         outlier = 0.5 if scat.get("outlier_logit") is not None else 0.0
     else:

@@ -45,6 +45,10 @@ def _build_parser():
     p.add_argument("-o", "--out", type=Path, required=True, help="run directory")
     p.add_argument("--steps", type=_steps, default=800,
                    help="total optimizer updates, balanced across states (default 800)")
+    p.add_argument("--miss-frac", type=float, default=None,
+                   help="initial fraction of the learnable miss component (a predicted reflection "
+                        "that recorded no signal); 0 = off (default 0.03; the merge inherits the "
+                        "checkpoint)")
     p.add_argument("--outlier-frac", type=float, default=None,
                    help="initial fraction of the learnable detector-outlier component "
                         "(default 0 = off; the merge inherits the checkpoint)")
