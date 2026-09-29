@@ -149,10 +149,12 @@ class PoissonNoiseModel:
         self,
         z: Tensor,
         *,
+        lo: float = -math.inf,
         max_iter: int = 200,
     ) -> tuple[float, float]:
         """Inner LBFGS MLE: fit Normal(μ, σ) to a sample of z-values that
-        have already been truncated to z < 0.  Returns (sigma, mu)."""
+        have already been truncated to ``lo < z < 0``; both truncation points
+        are in the likelihood.  Returns (sigma, mu)."""
         device = z.device
         sigma0 = (z.std(unbiased=False) / math.sqrt(1.0 - 2.0 / math.pi)).clamp(min=1e-3)
         mu = torch.zeros((), device=device, dtype=z.dtype, requires_grad=True)
@@ -174,6 +176,10 @@ class PoissonNoiseModel:
             zc = (z - mu) / sigma
             ll_point = -0.5 * zc.pow(2) - 0.5 * math.log(2.0 * math.pi) - log_sigma
             log_trunc = _log_phi_cdf(-mu / sigma)
+            if math.isfinite(lo):
+                # log(Phi(-mu/s) - Phi((lo-mu)/s)) = log Phi(-mu/s) + log1p(-Phi((lo-mu)/s) / Phi(-mu/s))
+                log_trunc = log_trunc + torch.log1p(
+                    -torch.exp(_log_phi_cdf((lo - mu) / sigma) - log_trunc).clamp(max=1 - 1e-12))
             nll = -(ll_point.sum() - z.numel() * log_trunc)
             nll.backward()
             return nll
@@ -187,7 +193,7 @@ class PoissonNoiseModel:
         background: Tensor,
         *,
         bg_min: float = 0.1,
-        z_min: float = -20.0,
+        tail_cut: float = 3.0,
         max_pool: int = 1_000_000,
         max_iter: int = 200,
         seed: int = 0,
@@ -196,22 +202,24 @@ class PoissonNoiseModel:
 
         Each negative ``I_j`` is whitened by its predicted σ at g=1,
         ``z_j = I_j / sqrt(bg_j · n_peak · (1 + n_peak/n_bg))``. The pool of
-        ``z`` values truncated to (-∞, 0) is fit by MLE to a Normal(μ, σ);
-        the gain is ``g = σ²``. The bias is absorbed into μ instead of
-        inflating σ as in the naive Mandel estimator.  It needs no off-Bragg
-        predictions, which CrystFEL streams do not carry.
+        ``z`` values in (-tail_cut·s0, 0), s0 their robust scale, is fit by MLE
+        to a Normal(μ, σ) truncated to that interval; the gain is ``g = σ²``.
+        Signal contamination is absorbed into μ instead of inflating σ as in
+        the naive Mandel estimator.  It needs no off-Bragg predictions, which
+        CrystFEL streams do not carry.
 
         The estimate is biased.  On the BR (Eiger) and small-molecule
-        (JUNGFRAU) example streams it reads 0.73 and 0.86 against a declared
+        (JUNGFRAU) example streams it reads 0.72 and 0.87 against a declared
         1, which the likelihood (fitted B 1.03-1.10) and the difference maps
         (both worse at the calibrated value) show to be right; on TD1 it reads
-        38.8 against a declared 4.0 that is ~10x off.  So ``auto`` uses it only
-        to detect a wrong declaration (tolerance 50 %), and a gain it replaces
-        is refined in training by one global B (``--detector-noise auto``).
+        40.6-41.1 against a declared 4.0 that is ~10x off (the maps are best at
+        38.8).  So ``auto`` uses it only to detect a wrong declaration
+        (tolerance 50 %), and a gain it replaces is refined in training by one
+        global B (``--detector-noise auto``).
 
         Returns
         -------
-        (gain, mu_bias_in_sigma_units)
+        (gain, mu_bias in z units)
         """
         device = I_obs.device
         dtype = torch.float64
@@ -230,12 +238,15 @@ class PoissonNoiseModel:
         sigma_pred_g1 = (bg_neg * self.n_peak * (1.0 + self.n_peak / self.n_bg)).sqrt()
         z = I_neg / sigma_pred_g1.clamp(min=1e-12)
         z = z[z < 0.0]
-        # The outlier cut is in units of the negatives' own robust scale (half-normal
-        # median |z| = 0.6745 sigma): a fixed cut in z, whose unit is sigma at gain 1,
-        # clips the tail once the gain is large (-20 is -3.2 sigma at 38.8 ADU/photon,
-        # a 5 % underestimate).
+        # Over-subtracted outliers (a strong neighbour in the ring) give the negatives
+        # a heavy tail: on TD1 the 99.99th percentile sits 4x beyond the half-normal,
+        # and fitted with them the gain reads 61 instead of ~40.  So the fit keeps
+        # z > -tail_cut * s0 (s0 = median |z| / 0.6745, the negatives' robust scale)
+        # and models that cut in the likelihood: unbiased for a Normal at any gain.
+        lo = -math.inf
         if z.numel():
-            z = z[z > z_min * float(z.abs().median()) / 0.6745]
+            lo = -tail_cut * float(z.abs().median()) / 0.6745
+            z = z[z > lo]
         if z.numel() < 100:
             self.gain_calibration_info["n_observations"] = int(z.numel())
             return float("nan"), 0.0
@@ -245,7 +256,7 @@ class PoissonNoiseModel:
             idx = torch.randperm(z.numel(), generator=gen, device=device)[:max_pool]
             z = z[idx]
 
-        sigma_hat, mu_hat = self._fit_truncnorm_z(z, max_iter=max_iter)
+        sigma_hat, mu_hat = self._fit_truncnorm_z(z, lo=lo, max_iter=max_iter)
         gain = sigma_hat ** 2
         self.gain_calibration_info.update(valid=math.isfinite(gain) and gain > 0,
                                           n_observations=int(z.numel()), mu_bias=mu_hat)

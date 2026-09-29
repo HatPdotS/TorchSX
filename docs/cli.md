@@ -33,9 +33,12 @@ recipe alias for `trust_input`.
 Calibration uses background-binned off-Bragg variance when the input predicts
 reflections far from the Ewald sphere. CrystFEL streams do not, so calibration
 then falls back to a truncated normal fitted to the negative integrated
-intensities. That estimate is biased: on the example streams it reads 0.73 (BR)
-and 0.86 (small molecule) against a declared gain of 1 that the likelihood and the
-difference maps confirm, and 38.8 against TD1's declared 4.0, which is ~10x off.
+intensities, cut to the core of their distribution (above -3 robust standard
+deviations, the cut modelled in the fit) against over-subtracted outliers. That
+estimate is biased: on the example streams it reads 0.72 (BR) and 0.87 (small
+molecule) against a declared gain of 1 that the likelihood and the difference maps
+confirm, and ~41 against TD1's declared 4.0, which is ~10x off (its maps are best
+at 38.8).
 `auto` therefore replaces a declared gain only past the 50% tolerance. If neither
 estimator is usable, `auto` retains a valid declared gain, while `calibrate`
 fails. New `auto`/`calibrate` requests require prepared caches built with the

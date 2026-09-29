@@ -509,6 +509,18 @@ def test_truncnorm_recovers_known_gain_at_high_background():
     assert abs(mu) < 0.05 * gain ** 0.5 and info["mu_bias"] == mu   # mu is in z units
 
 
+def test_truncnorm_ignores_a_heavy_negative_tail():
+    # TD1-like: 0.1 % of the observations over-subtracted far into the negative tail.
+    noise = PoissonNoiseModel(r_peak=2, r_gap=3, r_bg=6)
+    rng = torch.Generator().manual_seed(94)
+    bg = torch.logspace(1.5, 3.0, 200000, dtype=torch.float64)
+    sigma = (38.8 * bg * noise.n_peak * (1 + noise.n_peak / noise.n_bg)).sqrt()
+    I = sigma * torch.randn(bg.shape, dtype=bg.dtype, generator=rng)
+    I[:200] = -15 * sigma[:200]
+    gain, _ = noise.calibrate_gain_truncnorm(I, bg)
+    assert gain == pytest.approx(38.8, rel=0.03)
+
+
 def test_truncnorm_without_negatives_is_unavailable():
     import math
     noise = PoissonNoiseModel(gain=7.0)
