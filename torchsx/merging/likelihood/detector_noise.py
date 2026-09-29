@@ -21,23 +21,18 @@ count-dependent weights bias a weighted mean.  It is condition-blind by
 construction.  ``A = 0, B = 1`` is the plain model; the initial values are that up
 to a negligible ``A0``.
 
-There is deliberately no term in ``lam^2``.  Tested on 28 Sep 2026 (53734bf): it
-follows the multiplicative scatter's law, so the optimizer splits that variance
-between the two.  C drifted to its bound on some small-molecule panels and pulled B
-to 0.1-0.3 and A to ~26 photons^2, and its apparent difference-map gain did not
-reproduce across seed pairs.
+There is no term in ``lam^2``: that is the multiplicative scatter's variance law,
+and the two cannot be told apart.
 
 Per panel, A and B are not hardware constants.  Within one panel the observations
-span a narrow range of V, so only ``A + B V`` is identified and the two trade; on the
-small molecule the fitted B (0.56-1.12) follows the panel's radius, i.e. its count
-level and resolution, which the panels confound; A is ~0.01 on the inner panels and
-10-20 photons^2 at mid radius.  With the gain right the per-panel terms gave no
-reproducible map gain (28 Sep 2026).
+span a narrow range of V, so only ``A + B V`` is identified and the two trade; and
+a panel's position fixes its count level and resolution, which a per-panel term
+therefore absorbs as well.
 
-What the model is used for by default is **one global B** (``n_groups = 1``,
-``terms = "B"``, ``--detector-noise auto``): when preparation replaced a wrong
-declared gain by its calibration, whose estimate is biased, B corrects the gain on
-the integrated sums.  ``V = B (lam + sig_b2)`` is exactly a global gain error.
+The default use is **one global B** (``n_groups = 1``, ``terms = "B"``,
+``--detector-noise auto``): when preparation replaced a wrong declared gain by its
+calibration, whose estimate is biased, B corrects the gain on the integrated sums.
+``V = B (lam + sig_b2)`` is exactly a global gain error.
 
 Parameters are ``log A, log B`` per panel, **projected** into bounds after every
 optimizer step (:meth:`project`), not squashed by a saturating function: Adam

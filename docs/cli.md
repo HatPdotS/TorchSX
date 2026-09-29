@@ -35,11 +35,8 @@ reflections far from the Ewald sphere. CrystFEL streams do not, so calibration
 then falls back to a truncated normal fitted to the negative integrated
 intensities, cut to the core of their distribution (above -3 robust standard
 deviations, the cut modelled in the fit) against over-subtracted outliers. That
-estimate is biased: on the example streams it reads 0.72 (BR) and 0.87 (small
-molecule) against a declared gain of 1 that the likelihood and the difference maps
-confirm, and ~41 against TD1's declared 4.0, which is ~10x off (its maps are best
-at 38.8).
-`auto` therefore replaces a declared gain only past the 50% tolerance. If neither
+estimate is biased, so `auto` replaces a declared gain only past the 50%
+tolerance. If neither
 estimator is usable, `auto` retains a valid declared gain, while `calibrate`
 fails. New `auto`/`calibrate` requests require prepared caches built with the
 current gain policy; checkpoint readout still reuses its recorded numeric gain.

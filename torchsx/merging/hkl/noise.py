@@ -208,14 +208,11 @@ class PoissonNoiseModel:
         the naive Mandel estimator.  It needs no off-Bragg predictions, which
         CrystFEL streams do not carry.
 
-        The estimate is biased.  On the BR (Eiger) and small-molecule
-        (JUNGFRAU) example streams it reads 0.72 and 0.87 against a declared
-        1, which the likelihood (fitted B 1.03-1.10) and the difference maps
-        (both worse at the calibrated value) show to be right; on TD1 it reads
-        40.6-41.1 against a declared 4.0 that is ~10x off (the maps are best at
-        38.8).  So ``auto`` uses it only to detect a wrong declaration
-        (tolerance 50 %), and a gain it replaces is refined in training by one
-        global B (``--detector-noise auto``).
+        The estimate is biased: the integrated negatives are not a clean
+        zero-signal sample.  So ``auto``
+        uses it only to detect a wrong declaration (tolerance 50 %), and a gain
+        it replaces is refined in training by one global B
+        (``--detector-noise auto``).
 
         Returns
         -------
@@ -239,10 +236,9 @@ class PoissonNoiseModel:
         z = I_neg / sigma_pred_g1.clamp(min=1e-12)
         z = z[z < 0.0]
         # Over-subtracted outliers (a strong neighbour in the ring) give the negatives
-        # a heavy tail: on TD1 the 99.99th percentile sits 4x beyond the half-normal,
-        # and fitted with them the gain reads 61 instead of ~40.  So the fit keeps
-        # z > -tail_cut * s0 (s0 = median |z| / 0.6745, the negatives' robust scale)
-        # and models that cut in the likelihood: unbiased for a Normal at any gain.
+        # a heavy tail that inflates sigma.  So the fit keeps z > -tail_cut * s0
+        # (s0 = median |z| / 0.6745, the negatives' robust scale) and models that cut
+        # in the likelihood: unbiased for a Normal at any gain.
         lo = -math.inf
         if z.numel():
             lo = -tail_cut * float(z.abs().median()) / 0.6745

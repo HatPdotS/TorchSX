@@ -510,7 +510,7 @@ def test_truncnorm_recovers_known_gain_at_high_background():
 
 
 def test_truncnorm_ignores_a_heavy_negative_tail():
-    # TD1-like: 0.1 % of the observations over-subtracted far into the negative tail.
+    # 0.1 % of the observations over-subtracted far into the negative tail.
     noise = PoissonNoiseModel(r_peak=2, r_gap=3, r_bg=6)
     rng = torch.Generator().manual_seed(94)
     bg = torch.logspace(1.5, 3.0, 200000, dtype=torch.float64)
