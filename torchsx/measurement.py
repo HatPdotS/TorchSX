@@ -11,7 +11,9 @@ import math
 
 
 MEASUREMENT_KEY = "_torchsx_measurement"
-GAIN_POLICY_VERSION = 2  # Off-Bragg calibration only; no truncated-normal fallback.
+# 3: off-Bragg calibration, else a truncated normal on the negative sums; a gain the
+# calibration replaced is refined in training by one global B (--detector-noise auto).
+GAIN_POLICY_VERSION = 3
 DEFAULT_GAIN_TOLERANCE = 0.5
 
 

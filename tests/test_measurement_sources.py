@@ -417,7 +417,8 @@ def test_auto_gain_cache_policy_is_checked(stream_file, python_parser, tmp_path,
     else:
         blob = torch.load(cache, weights_only=False)
         if change == "previous_policy":
-            blob["signature"]["gain_policy_version"] = 1
+            from torchsx.measurement import GAIN_POLICY_VERSION
+            blob["signature"]["gain_policy_version"] = GAIN_POLICY_VERSION - 1
         else:
             blob["signature"].pop("gain_policy_version")
         torch.save(blob, cache)
@@ -465,11 +466,11 @@ def test_insufficient_calibration_does_not_return_initial_gain():
     ("usable", "insufficient usable off-Bragg observations"),
     ("bins", "insufficient background bins"),
 ])
-def test_off_bragg_calibration_never_falls_back_to_truncnorm(monkeypatch, case, reason):
+def test_off_bragg_calibration_reports_why_it_is_unavailable(monkeypatch, case, reason):
     import math
 
     def no_truncnorm(*args, **kwargs):
-        pytest.fail("biased truncated-normal calibration must not be an automatic fallback")
+        pytest.fail("the off-Bragg method reports; prepare_observations decides the fallback")
 
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_gain_truncnorm", no_truncnorm)
     noise = PoissonNoiseModel(gain=7.0, read_var_adu_sq=12.0, sigma2_bg_slope=3.0)
@@ -495,20 +496,51 @@ def test_off_bragg_calibration_never_falls_back_to_truncnorm(monkeypatch, case, 
     assert info["n_observations"] == (0 if case == "off_bragg" else 6000)
 
 
-def test_truncated_normal_gain_emits_visible_deprecation_warning():
-    noise = PoissonNoiseModel()
-    with pytest.warns(FutureWarning, match="deprecated.*systematically biased"):
-        noise.calibrate_gain_truncnorm(torch.ones(20), torch.ones(20))
+def test_truncnorm_recovers_known_gain_at_high_background():
+    noise = PoissonNoiseModel(r_peak=2, r_gap=3, r_bg=6)
+    rng = torch.Generator().manual_seed(93)
+    bg = torch.logspace(1.5, 3.0, 60000, dtype=torch.float64)
+    sigma = (38.8 * bg * noise.n_peak * (1 + noise.n_peak / noise.n_bg)).sqrt()
+    I = sigma * torch.randn(bg.shape, dtype=bg.dtype, generator=rng)
+    gain, mu = noise.calibrate_gain_truncnorm(I, bg)
+    info = noise.gain_calibration_info
+    assert info["valid"] and info["method"] == "negative_truncnorm"
+    assert gain == pytest.approx(38.8, rel=0.02)
+    assert abs(mu) < 0.05 * gain ** 0.5 and info["mu_bias"] == mu   # mu is in z units
 
 
-def test_auto_retains_declared_gain_without_off_bragg_calibration(stream_file, python_parser):
+def test_truncnorm_without_negatives_is_unavailable():
+    import math
+    noise = PoissonNoiseModel(gain=7.0)
+    gain, _ = noise.calibrate_gain_truncnorm(torch.ones(500), torch.ones(500))
+    assert math.isnan(gain) and noise.gain == 7.0
+    assert not noise.gain_calibration_info["valid"]
+
+
+def test_auto_falls_back_to_truncnorm_without_off_bragg(stream_file, python_parser, monkeypatch):
+    def truncnorm(self, *args, **kwargs):
+        self.gain_calibration_info = {"method": "negative_truncnorm", "valid": True,
+                                      "n_observations": 500}
+        return 2.0, 0.1
+    monkeypatch.setattr(PoissonNoiseModel, "calibrate_gain_truncnorm", truncnorm)
+    decision = P.load_prep(_args(stream_file), verbose=False).recipe["measurement"]["gain_selection"]
+    assert decision["selected"] == "calibration" and decision["selected_gain"] == 2.0
+    assert decision["reason"] == "disagreement_exceeds_tolerance"
+    calibration = decision["calibration"]
+    assert calibration["method"] == "negative_truncnorm"
+    assert calibration["fallback_reason"] == "insufficient off-Bragg observations"
+    assert calibration["off_bragg"]["method"] == "off_bragg_variance"
+
+
+def test_auto_retains_declared_gain_when_no_calibration_is_usable(stream_file, python_parser):
+    # The fixture has no negative intensities, so the fallback is unavailable too.
     result = P.load_prep(_args(stream_file), verbose=False)
     decision = result.recipe["measurement"]["gain_selection"]
     assert decision["selected_gain"] == 1.0
     assert decision["reason"] == "calibration_unavailable"
     assert decision["calibrated_gain"] is None
-    assert decision["calibration"]["method"] == "off_bragg_variance"
-    assert decision["calibration"]["reason"] == "insufficient off-Bragg observations"
+    assert decision["calibration"]["method"] == "negative_truncnorm"
+    assert decision["calibration"]["fallback_reason"] == "insufficient off-Bragg observations"
 
 
 @pytest.mark.parametrize("value", ["foo", "empirical", "AUTO", "", 0, -1, True, "nan", "inf"])

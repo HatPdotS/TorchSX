@@ -25,9 +25,19 @@ There is deliberately no term in ``lam^2``.  Tested on 28 Sep 2026 (53734bf): it
 follows the multiplicative scatter's law, so the optimizer splits that variance
 between the two.  C drifted to its bound on some small-molecule panels and pulled B
 to 0.1-0.3 and A to ~26 photons^2, and its apparent difference-map gain did not
-reproduce across seed pairs.  A + B alone gives physical values (small molecule:
-~0.27 photons read noise per pixel, per-panel gains 0.57-1.13; BR: A ~ 0, B ~ 1.03)
-and the reproducible gains in the weak shells and held-out NLL.
+reproduce across seed pairs.
+
+Per panel, A and B are not hardware constants.  Within one panel the observations
+span a narrow range of V, so only ``A + B V`` is identified and the two trade; on the
+small molecule the fitted B (0.56-1.12) follows the panel's radius, i.e. its count
+level and resolution, which the panels confound; A is ~0.01 on the inner panels and
+10-20 photons^2 at mid radius.  With the gain right the per-panel terms gave no
+reproducible map gain (28 Sep 2026).
+
+What the model is used for by default is **one global B** (``n_groups = 1``,
+``terms = "B"``, ``--detector-noise auto``): when preparation replaced a wrong
+declared gain by its calibration, whose estimate is biased, B corrects the gain on
+the integrated sums.  ``V = B (lam + sig_b2)`` is exactly a global gain error.
 
 Parameters are ``log A, log B`` per panel, **projected** into bounds after every
 optimizer step (:meth:`project`), not squashed by a saturating function: Adam

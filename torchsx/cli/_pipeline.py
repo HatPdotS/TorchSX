@@ -816,16 +816,27 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             obj.outlier_logit.fill_(float(scat["outlier_logit"]))
         outlier = float(obj.outlier_logit.detach().sigmoid())
     # Learned detector noise: a checkpoint restores what it fitted; a new run
-    # builds it from --detector-noise / --noise-terms (panels from the stream's panel ids).
+    # builds it from --detector-noise.  auto: one global B when preparation
+    # replaced the declared gain by its calibration, whose estimate is biased
+    # (a global B is exactly a gain correction on the integrated sums), else none;
+    # panel: A and/or B per panel (--noise-terms, panels from the stream's panel ids).
     noise_rec = ck.get("detector_noise") if ck else None
     noise_mode = None if ck else getattr(args, "detector_noise", None)
-    if noise_rec or (noise_mode and noise_mode != "off"):
+    if noise_mode == "auto":
+        selection = (bundle.recipe.get("measurement") or {}).get("gain_selection") or {}
+        noise_mode = "global_B" if selection.get("selected") == "calibration" else "off"
+        if verbose:
+            print(f"detector noise auto: {noise_mode} (gain from "
+                  f"{'calibration' if noise_mode == 'global_B' else 'input'})", flush=True)
+    if noise_rec or noise_mode in ("global_B", "panel"):
         from torchsx.merging.likelihood.detector_noise import DetectorNoise
         if noise_rec:
             dn = DetectorNoise.from_config(noise_rec["config"])
             dn.load_state_dict({k: torch.tensor(v, dtype=torch.float32)
                                 for k, v in noise_rec["state"].items()})
             noise_mode = "checkpoint"
+        elif noise_mode == "global_B":
+            dn = DetectorNoise(1, terms="B")
         else:
             pid = prep.obs_info.panel_id
             n_groups = int(pid.max()) + 1 if pid is not None else 1
@@ -834,6 +845,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         if verbose:
             print(f"detector noise: {noise_mode}, {dn.n_groups} panel(s), "
                   f"V = A + B (lam + sig_b2), fitted terms {dn.terms}")
+    elif noise_mode not in (None, "off"):
+        raise ValueError(f"Unknown detector noise mode {noise_mode!r}; expected auto, off or panel")
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at

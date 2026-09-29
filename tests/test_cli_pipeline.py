@@ -648,4 +648,59 @@ def test_defaults_are_smooth_prior_and_basis_anchor(tmp_path):
     assert TrainConfig().wilson_basis == "smooth"
 
 
+# ── detector noise under the gain policy ───────────────────────────────
+
+
+def _gain_bundle(prep, selected):
+    from torchsx.cli import _pipeline as P
+    recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": "auto", "radii": [7.0, 9.0, 11.0],
+              "measurement": {"gain_selection": {"selected": selected}}}
+    return P.PrepBundle(prep, recipe, [], 0.1)
+
+
+@pytest.mark.parametrize("mode,selected,expected", [
+    (None, "calibration", "global_B"), ("auto", "calibration", "global_B"),
+    ("auto", "input", "off"), ("off", "calibration", "off"), ("panel", "input", "panel")])
+def test_detector_noise_auto_fits_global_B_only_for_a_calibrated_gain(tmp_path, mode, selected, expected):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser as train_parser
+    prep, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    argv = ["x.sfx", "-o", str(tmp_path), "--device", "cpu"]
+    if mode is not None:
+        argv += ["--detector-noise", mode]
+    _p, _q, _s, obj, S = P.build_stack(_gain_bundle(prep, selected), train_parser().parse_args(argv),
+                                       verbose=False)
+    dn = obj.detector_noise
+    assert S["detector_noise"] == expected
+    if expected == "off":
+        assert dn is None
+    elif expected == "panel":
+        assert dn.terms == "AB"
+    else:
+        assert (dn.n_groups, dn.terms) == (1, "B")
+        assert dn.log_B.requires_grad and not dn.log_A.requires_grad
+
+
+def test_detector_noise_checkpoint_record_wins_over_the_gain_selection(tmp_path):
+    """A merge restores the trained global B, whatever the rebuilt preparation selected."""
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.merge_nn import _build_parser as merge_parser
+    from torchsx.cli.train import _build_parser as train_parser
+    prep, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    bundle = _gain_bundle(prep, "calibration")
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
+    prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
+    with torch.no_grad():
+        obj.detector_noise.log_B.fill_(math.log(1.2))
+    tr = _trainer_from_stack(prep_, params_, scale, obj, S)
+    tr.data_recipe = dict(bundle.recipe)
+    ck = torch.load(tr.save_best(tmp_path / "b.pt"), weights_only=False)
+    assert ck["detector_noise"]["config"] == {"n_groups": 1, "terms": "B"}
+    margs = merge_parser().parse_args(["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
+    _p, _q, _r, restored, S2 = P.build_stack(_gain_bundle(prep, "input"), margs, ckpt=ck, verbose=False)
+    assert S2["detector_noise"] == "checkpoint"
+    assert (restored.detector_noise.n_groups, restored.detector_noise.terms) == (1, "B")
+    torch.testing.assert_close(restored.detector_noise.log_B.exp(), torch.tensor([1.2]))
+
+
 # ── merge_nn products ──────────────────────────────────────────────────

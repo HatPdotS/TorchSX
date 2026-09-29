@@ -2,13 +2,12 @@
 
 Provides σ²_poisson per observation from CrystFEL ring-integration geometry
 (peak counts, background, integration radii) and a gain calibration using
-off-Bragg observations.
+off-Bragg observations, or the negative intensities when a source has none.
 """
 
 from __future__ import annotations
 
 import math
-import warnings
 from dataclasses import dataclass, field
 
 import torch
@@ -74,7 +73,8 @@ class PoissonNoiseModel:
         2/3/6, BR (CSPAD) uses 3/4/7.  Mismatch silently corrupts both
         the gain auto-fit AND every per-observation bg-in-peak value.
     gain :
-        ADU-to-photon conversion factor; calibrate via ``calibrate_sigma2_of_bg``.
+        ADU-to-photon conversion factor; calibrate via ``calibrate_sigma2_of_bg``
+        or, without off-Bragg observations, ``calibrate_gain_truncnorm``.
     exact_pixel_counts :
         If ``True`` (default), ``n_peak`` and ``n_bg`` are the exact integer
         pixel counts produced by CrystFEL's mask kernel
@@ -192,34 +192,27 @@ class PoissonNoiseModel:
         max_iter: int = 200,
         seed: int = 0,
     ) -> tuple[float, float]:
-        """Deprecated gain fit retained for reproducing historical results.
-
-        This estimator is systematically biased. Use
-        :meth:`calibrate_sigma2_of_bg` with off-Bragg observations, or supply
-        a declared/explicit detector gain when calibration is unavailable.
+        """Gain from the negative integrated intensities: the stream fallback.
 
         Each negative ``I_j`` is whitened by its predicted σ at g=1,
         ``z_j = I_j / sqrt(bg_j · n_peak · (1 + n_peak/n_bg))``. The pool of
         ``z`` values truncated to (-∞, 0) is fit by MLE to a Normal(μ, σ);
         the gain is ``g = σ²``. The bias is absorbed into μ instead of
-        inflating σ as in the naive Mandel estimator.
+        inflating σ as in the naive Mandel estimator.  It needs no off-Bragg
+        predictions, which CrystFEL streams do not carry.
 
-        Note: this estimator is biased high by signal-leakage contamination of
-        the negatives sample (peaks near a strong neighbour over-subtract
-        bg → strongly negative tail → inflates σ).  See
-        :meth:`calibrate_sigma2_of_bg` for a contamination-aware variant.
+        The estimate is biased.  On the BR (Eiger) and small-molecule
+        (JUNGFRAU) example streams it reads 0.73 and 0.86 against a declared
+        1, which the likelihood (fitted B 1.03-1.10) and the difference maps
+        (both worse at the calibrated value) show to be right; on TD1 it reads
+        38.8 against a declared 4.0 that is ~10x off.  So ``auto`` uses it only
+        to detect a wrong declaration (tolerance 50 %), and a gain it replaces
+        is refined in training by one global B (``--detector-noise auto``).
 
         Returns
         -------
         (gain, mu_bias_in_sigma_units)
         """
-        warnings.warn(
-            "calibrate_gain_truncnorm is deprecated because its gain estimates "
-            "are systematically biased. Use calibrate_sigma2_of_bg with "
-            "off-Bragg observations, or supply a declared/explicit detector gain.",
-            FutureWarning,
-            stacklevel=2,
-        )
         device = I_obs.device
         dtype = torch.float64
 
@@ -236,7 +229,13 @@ class PoissonNoiseModel:
         bg_neg = background[neg].to(dtype=dtype)
         sigma_pred_g1 = (bg_neg * self.n_peak * (1.0 + self.n_peak / self.n_bg)).sqrt()
         z = I_neg / sigma_pred_g1.clamp(min=1e-12)
-        z = z[(z > z_min) & (z < 0.0)]
+        z = z[z < 0.0]
+        # The outlier cut is in units of the negatives' own robust scale (half-normal
+        # median |z| = 0.6745 sigma): a fixed cut in z, whose unit is sigma at gain 1,
+        # clips the tail once the gain is large (-20 is -3.2 sigma at 38.8 ADU/photon,
+        # a 5 % underestimate).
+        if z.numel():
+            z = z[z > z_min * float(z.abs().median()) / 0.6745]
         if z.numel() < 100:
             self.gain_calibration_info["n_observations"] = int(z.numel())
             return float("nan"), 0.0
@@ -249,7 +248,7 @@ class PoissonNoiseModel:
         sigma_hat, mu_hat = self._fit_truncnorm_z(z, max_iter=max_iter)
         gain = sigma_hat ** 2
         self.gain_calibration_info.update(valid=math.isfinite(gain) and gain > 0,
-                                          n_observations=int(z.numel()))
+                                          n_observations=int(z.numel()), mu_bias=mu_hat)
         self.gain = gain
         print(
             f"  PoissonNoiseModel.truncnorm: gain={gain:.4f} ADU/photon  "

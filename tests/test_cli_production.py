@@ -15,7 +15,7 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file, python_parser
 
 
-@pytest.mark.parametrize('module,count', [(train,31), (merge_nn,14)])
+@pytest.mark.parametrize('module,count', [(train,35), (merge_nn,14)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
