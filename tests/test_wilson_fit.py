@@ -117,6 +117,45 @@ def test_evidence_prior_needs_the_smooth_basis():
     assert t.wilson_coef_param is None and "wilson_coef_param" not in t.state_dict()
 
 
+def test_curve_fit_recovers_the_wilson_mean_from_sharp_curves():
+    torch.manual_seed(3)
+    I_true = torch.distributions.Exponential(1 / 50.0).sample((4000,)).clamp(min=0.5)
+    t, S, v = _target(I_true)
+    t.set_wilson_coef(torch.tensor([math.log(10.0)]))          # far from the answer
+    used = t.fit_wilson_to_curves(S, t._loc, torch.ones(4000, dtype=torch.bool),
+                                  torch.zeros(4000, dtype=torch.long), 1)
+    assert 1 <= used < 50
+    assert abs(float(t.wilson_sigma[0]) / float(I_true.mean()) - 1) < 0.02
+
+
+def test_curve_fit_is_the_maximum_of_the_marginal_likelihood():
+    """Broad curves: the prior matters, and EM must land on the evidence maximum."""
+    torch.manual_seed(4)
+    n = 3000
+    I_true = torch.distributions.Exponential(1 / 40.0).sample((n,)).clamp(min=0.5)
+    I_obs = I_true * torch.exp(0.8 * torch.randn(n))
+    t = PosteriorMergeTarget(I_true.clone(), k_coarse=31, m_fine=129, n_sigma=8.0)
+    t.set_basis(torch.ones(n, 1))
+    loc = (I_obs.log(), torch.full((n,), 0.6))
+    v = loc[0][:, None] + loc[1][:, None] * t.u_coarse[None, :]
+    S = -0.5 * ((v - I_obs.log()[:, None]) / 0.8) ** 2
+    seen = torch.ones(n, dtype=torch.bool)
+    t.set_wilson_coef(torch.tensor([math.log(5.0)]))
+    t.fit_wilson_to_curves(S, loc, seen, torch.zeros(n, dtype=torch.long), 1, n_iter=2000, tol=1e-7)
+    c_em = float(t.wilson_coef[0])
+
+    def evidence(c):
+        t.set_wilson_coef(torch.tensor([c]))
+        t._loc = loc
+        return float(t.integrate(S, None)[0].sum())
+
+    grid = [c_em + d for d in (-0.02, -0.005, 0.0, 0.005, 0.02)]
+    values = [evidence(c) for c in grid]
+    assert max(range(5), key=values.__getitem__) == 2
+    # and the answer differs from the plain mean of the noisy point estimates
+    assert abs(math.exp(c_em) / float(I_obs.mean()) - 1) > 0.05
+
+
 def _trainer(tmp_path, basis=False, **cfg_kw):
     prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8, n_cond=2)
     scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
@@ -142,6 +181,7 @@ def _step_state0(tr):
 
 
 @pytest.mark.parametrize("fit,basis", [("batch-em", False), ("batch-em", True),
+                                       ("batch-ml", False), ("batch-ml", True),
                                        ("batch-counts", False), ("batch-counts", True)])
 def test_batch_fits_move_the_trained_state_only_and_survive_a_refresh(tmp_path, fit, basis):
     tr = _trainer(tmp_path, basis=basis, wilson_fit=fit)
@@ -153,6 +193,8 @@ def test_batch_fits_move_the_trained_state_only_and_survive_a_refresh(tmp_path, 
         torch.testing.assert_close(tr.targets[1].wilson_sigma, before[1])
         tr._refresh_wilson_sigma()                         # no refit to the running reference
         torch.testing.assert_close(tr.targets[0].wilson_sigma, after)
+        if fit == "batch-ml":
+            assert tr.targets[0].wilson_em_iters >= 1 and tr.targets[0].last_curves is None
     finally:
         tr.close()
 

@@ -155,7 +155,7 @@ merge of the observations it is given.
 ### Wilson surface
 
 `--wilson-fit` sets how the Wilson prior's surface `log Σ(h) = φ(h)·c` is
-fitted. All four start from the fit to the unity merge.
+fitted. All start from the fit to the unity merge.
 
 - `reference` (the default) refits it to the running reference at every
   refresh.
@@ -163,10 +163,15 @@ fitted. All four start from the fit to the unity merge.
   (type-II maximum likelihood), at ten times the base learning rate.
 - `batch-em` refits it after every update by Wilson maximum likelihood on the
   posterior means of that update's batch.
+- `batch-ml` refits it after every update to the maximum of that batch's
+  marginal likelihood under the full observation model (counts, background,
+  each observation's scatter distribution, the miss component and the Wilson
+  density), with the network held fixed: EM iterated to convergence on the
+  likelihood curves the update already computed.
 - `batch-counts` refits it after every update so that `(1 − miss) K Σ(h)`
   matches that batch's background-subtracted counts at the network's `K`.
 
-The last three keep no per-reflection state. A separate merge of the same
+All but `reference` keep no per-reflection state. A separate merge of the same
 reflections keeps the checkpoint's surface for them; for other reflections it
 refits the surface to the unity merge and warns.
 

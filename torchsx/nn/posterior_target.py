@@ -242,6 +242,12 @@ class PosteriorMergeTarget(nn.Module):
         # cell gets at the same batch size, and that is what it buys back.
         self.checkpoint_nodes = False
         self.use_fused = bool(use_fused)
+        #: Keep each training batch's coarse likelihood curves and grid
+        #: (``last_curves``) so the Wilson surface can be refitted to them
+        #: (:meth:`fit_wilson_to_curves`) without another pass.
+        self.keep_curves = False
+        self.last_curves = None
+        self.wilson_em_iters = 0
         self.lam = 0.0                      # API parity with LOOInBatchTarget
 
         self.register_buffer("ema_I0", I0_init.detach().clone().float().clamp(min=floor))
@@ -476,6 +482,44 @@ class PosteriorMergeTarget(nn.Module):
         self.wilson_coef.copy_(coef)
         self.wilson_sigma.copy_(
             (self.wilson_phi.double() @ self.wilson_coef.double()).exp().float().clamp(min=self.floor))
+
+    @torch.no_grad()
+    def fit_wilson_to_curves(self, S: Tensor, loc: tuple[Tensor, Tensor], seen: Tensor,
+                             shell_id: Tensor, n_shells: int, *,
+                             n_iter: int = 50, tol: float = 1e-4) -> int:
+        """Refit ``Sigma`` by maximising the marginal likelihood of one set of curves.
+
+        ``S`` is the coarse log-likelihood curve per reflection on the grid
+        ``loc = (centre, width)`` -- the full observation model: counts,
+        background, each observation's scatter distribution and the miss
+        component.  With the curves fixed, the marginal likelihood
+        ``sum_h log Z_h(Sigma)`` is maximised over the surface (or the shell
+        means) by EM: posterior means under the current ``Sigma`` from
+        :meth:`integrate`, then a Wilson fit to them on the reflections in
+        ``seen``, until ``log Sigma`` moves by less than ``tol`` on every
+        reflection.  Returns the number of EM iterations.
+        """
+        if self.node_placement != "laplace":
+            raise ValueError("curve refits need the uniform (laplace) grid")
+        saved = getattr(self, "_loc", None)
+        weight = seen.float()
+        used = 0
+        try:
+            self._loc = loc
+            for it in range(n_iter):
+                before = self.wilson_sigma.clone()
+                _, I0_mean, *_ = self.integrate(S, None)
+                self.set_wilson_sigma(shell_id, n_shells,
+                                      reference=I0_mean.clamp(min=self.floor),
+                                      sample_weight=weight)
+                used = it + 1
+                step = (self.wilson_sigma / before).log().abs()[seen].max()
+                if float(step) < tol:
+                    break
+        finally:
+            self._loc = saved
+        self.wilson_em_iters = used
+        return used
 
     @torch.no_grad()
     def set_wilson_sigma_from_counts(self, counts: Tensor, scale: Tensor,
@@ -824,6 +868,8 @@ class PosteriorMergeTarget(nn.Module):
                        device=log_Z.device, dtype=log_Z.dtype),
         )
 
+        if update_state and self.keep_curves and log_w_nodes is None:
+            self.last_curves = (S.detach(), tuple(t.detach() for t in self._loc), seen)
         floored = I0_mean < self.floor
         I0_mean = torch.where(seen, I0_mean.clamp(min=self.floor), self.ema_I0)
         if update_state:

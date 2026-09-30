@@ -180,7 +180,7 @@ def lr_factor(step: int, *, warmup: int, total: int, schedule: str = "constant",
 
 
 #: How the Wilson prior's surface is fitted (``TrainConfig.wilson_fit``).
-WILSON_FITS: tuple[str, ...] = ("reference", "evidence", "batch-em", "batch-counts")
+WILSON_FITS: tuple[str, ...] = ("reference", "evidence", "batch-em", "batch-ml", "batch-counts")
 
 
 @dataclass
@@ -315,6 +315,9 @@ class TrainConfig:
     #: ``wilson_lr_mult`` times the base rate;
     #: ``"batch-em"`` -- after every update, Wilson maximum likelihood on the
     #: posterior means of that update's batch (an EM step on the batch merge);
+    #: ``"batch-ml"`` -- after every update, the surface that maximises that
+    #: batch's marginal likelihood under the full observation model, the
+    #: network held fixed (EM to convergence on the batch's likelihood curves);
     #: ``"batch-counts"`` -- after every update, ``E[n - bg] = (1 - miss) K Sigma``
     #: fitted to that batch's counts at the network's K.
     #: All four start from the fit to the unity merge; the last three keep no
@@ -490,6 +493,9 @@ class AmortizedTrainer:
                              "with the separate Wilson prior")
         #: the last training batch's statistics for a batch Wilson fit
         self._wilson_stash = None
+        if self.cfg.wilson_fit == "batch-ml":
+            for t in self.targets:
+                t.keep_curves = True
         if self.cfg.feature_reference not in ("running", "static"):
             raise ValueError(
                 f"feature_reference must be 'running' or 'static', got "
@@ -1852,7 +1858,8 @@ class AmortizedTrainer:
         b = self.reciprocal_basis
         coef = t.wilson_coef.detach().cpu()
         info = {"wilson_B": wilson_b_equivalent(b.to(coef.device), coef),
-                "wilson_fit_iters": int(t.wilson_fit_iters)}
+                "wilson_fit_iters": int(t.wilson_fit_iters),
+                "wilson_em_iters": int(getattr(t, "wilson_em_iters", 0))}
         for i in range(b.n_aniso):
             info[f"wilson_aniso_{i}"] = float(coef[b.degree + 1 + i])
         return info
@@ -1914,6 +1921,15 @@ class AmortizedTrainer:
         """Refit the Wilson surface of the state just trained on, from that batch alone."""
         if self.cfg.wilson_fit == "evidence":
             self._wilson_fitted = True
+            return
+        if self.cfg.wilson_fit == "batch-ml":
+            sid = self.prep.shell_id_fw.to(self.device)
+            n_shells = int(sid.max().item()) + 1
+            for t in self.targets:
+                curves, t.last_curves = t.last_curves, None
+                if curves is not None:
+                    t.fit_wilson_to_curves(*curves, sid, n_shells)
+                    self._wilson_fitted = True
             return
         stash, self._wilson_stash = self._wilson_stash, None
         if stash is None:
