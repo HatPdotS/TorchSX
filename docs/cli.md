@@ -152,6 +152,24 @@ static` forms them against the unity merge of the input observations,
 installed once. A separate merge also forms its features against the unity
 merge of the observations it is given.
 
+### Wilson surface
+
+`--wilson-fit` sets how the Wilson prior's surface `log Σ(h) = φ(h)·c` is
+fitted. All four start from the fit to the unity merge.
+
+- `reference` (the default) refits it to the running reference at every
+  refresh.
+- `evidence` trains `c` with the network by the same marginal likelihood
+  (type-II maximum likelihood), at ten times the base learning rate.
+- `batch-em` refits it after every update by Wilson maximum likelihood on the
+  posterior means of that update's batch.
+- `batch-counts` refits it after every update so that `(1 − miss) K Σ(h)`
+  matches that batch's background-subtracted counts at the network's `K`.
+
+The last three keep no per-reflection state. A separate merge of the same
+reflections keeps the checkpoint's surface for them; for other reflections it
+refits the surface to the unity merge and warns.
+
 ### Intensity prior
 
 `torchsx-train ... --prior wilson` is the default. `--prior none` removes the

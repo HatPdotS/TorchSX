@@ -286,6 +286,13 @@ class PosteriorMergeTarget(nn.Module):
         self.register_buffer("wilson_phi", torch.zeros(0, 0))
         self.register_buffer("wilson_coef", torch.zeros(0))
         self.wilson_fit_iters = 0
+        #: Empirical Bayes: with :meth:`enable_evidence_prior` the smooth
+        #: surface's coefficients are a parameter of the evidence itself
+        #: (type-II maximum likelihood, trained with the network).
+        #: ``wilson_coef`` / ``wilson_sigma`` mirror it
+        #: (:meth:`sync_evidence_prior`) for every no-grad consumer and for the
+        #: checkpoint.
+        self.register_parameter("wilson_coef_param", None)
 
         self.set_grid(k_coarse, m_fine, n_sigma)
 
@@ -444,6 +451,57 @@ class PosteriorMergeTarget(nn.Module):
         self.wilson_phi = phi.detach().to(self.ema_I0.device, torch.float32).clone()
         self.wilson_coef = torch.zeros(phi.shape[1], device=self.ema_I0.device)
         self.wilson_fit_iters = 0
+
+    def enable_evidence_prior(self) -> nn.Parameter:
+        """Make ``log Sigma = phi @ coef`` a trainable parameter, started at the
+        current fit.  Needs the smooth basis (a shells prior has no surface)."""
+        if not self.has_basis:
+            raise ValueError("an evidence-fitted Wilson prior needs the smooth reciprocal basis")
+        if self.prior != "wilson":
+            raise ValueError("an evidence-fitted Wilson prior needs prior='wilson'")
+        self.wilson_coef_param = nn.Parameter(self.wilson_coef.detach().clone())
+        return self.wilson_coef_param
+
+    @torch.no_grad()
+    def sync_evidence_prior(self) -> None:
+        """Mirror the trained coefficients into ``wilson_coef`` and ``wilson_sigma``."""
+        if self.wilson_coef_param is not None:
+            self.set_wilson_coef(self.wilson_coef_param)
+
+    @torch.no_grad()
+    def set_wilson_coef(self, coef: Tensor) -> None:
+        """Install surface coefficients: ``wilson_sigma = exp(phi @ coef)``."""
+        if not self.has_basis or coef.shape != self.wilson_coef.shape:
+            raise ValueError("coefficients need the installed basis and its width")
+        self.wilson_coef.copy_(coef)
+        self.wilson_sigma.copy_(
+            (self.wilson_phi.double() @ self.wilson_coef.double()).exp().float().clamp(min=self.floor))
+
+    @torch.no_grad()
+    def set_wilson_sigma_from_counts(self, counts: Tensor, scale: Tensor,
+                                     shell_id: Tensor, n_shells: int) -> None:
+        """Refresh ``Sigma`` so that ``scale * Sigma`` matches ``counts``.
+
+        ``counts`` and ``scale`` are per-reflection sums over one set of
+        observations of the background-subtracted signal and of its expected
+        scale.  With a basis, ``log Sigma = phi @ coef`` is fitted by
+        :func:`~torchsx.merging.priors.reciprocal_basis.fit_log_sigma_to_counts`,
+        warm-started; in shells mode each shell gets the ratio of its sums.
+        """
+        if self.has_basis:
+            from torchsx.merging.priors.reciprocal_basis import fit_log_sigma_to_counts
+            coef0 = self.wilson_coef if bool(self.wilson_coef.abs().sum() > 0) else None
+            coef, used = fit_log_sigma_to_counts(self.wilson_phi, counts, scale, coef0)
+            self.set_wilson_coef(coef)
+            self.wilson_fit_iters = int(used)
+            return
+        y = torch.zeros(n_shells, device=counts.device, dtype=torch.float64)
+        m = torch.zeros(n_shells, device=counts.device, dtype=torch.float64)
+        y.index_add_(0, shell_id, counts.double())
+        m.index_add_(0, shell_id, scale.double())
+        ok = (m > 0)[shell_id]
+        fitted = (y / m.clamp(min=1e-30)).float()[shell_id]
+        self.wilson_sigma.copy_(torch.where(ok, fitted, self.wilson_sigma).clamp(min=self.floor))
 
     @torch.no_grad()
     def set_wilson_sigma(self, shell_id: Tensor, n_shells: int, *,
@@ -665,8 +723,16 @@ class PosteriorMergeTarget(nn.Module):
             if self.prior in ("none", "flat_I0"):
                 log_w = log_w + v                       # dI0 = I0 dv
             elif self.prior == "wilson":
-                rate = self._prior_rate()[:, None]
-                log_sig = self.wilson_sigma.clamp(min=self.floor).log()[:, None]
+                # evidence-fitted: the parameter while training; every no-grad
+                # pass (evaluation, merge, readout) reads the mirrored buffers
+                if self.wilson_coef_param is not None and torch.is_grad_enabled():
+                    log_sig = (self.wilson_phi @ self.wilson_coef_param).clamp(
+                        min=math.log(self.floor))[:, None]
+                    inv = (-log_sig).exp()
+                    rate = torch.where(self.is_centric[:, None], 0.5 * inv, inv)
+                else:
+                    rate = self._prior_rate()[:, None]
+                    log_sig = self.wilson_sigma.clamp(min=self.floor).log()[:, None]
                 # v carries the dI = I dv Jacobian; the centric I^(-1/2) eats
                 # half of it, leaving 0.5 * v.
                 log_w = torch.where(

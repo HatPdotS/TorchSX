@@ -50,6 +50,7 @@ from torchsx.nn.metrics import (
     scale_metrics,
 )
 from torchsx.nn.shape_prior import pack_single, shape_prior_kl
+from torchsx.nn.pooling import group_sum
 
 __all__ = ["CrystalIndex", "TrainConfig", "AmortizedTrainer"]
 
@@ -178,6 +179,10 @@ def lr_factor(step: int, *, warmup: int, total: int, schedule: str = "constant",
     return f
 
 
+#: How the Wilson prior's surface is fitted (``TrainConfig.wilson_fit``).
+WILSON_FITS: tuple[str, ...] = ("reference", "evidence", "batch-em", "batch-counts")
+
+
 @dataclass
 class TrainConfig:
     #: Warn when the hkl-permutation sensitivity exceeds this.  A scale that
@@ -302,6 +307,20 @@ class TrainConfig:
     #: once and never moved, so training, evaluation and any later merge of
     #: the same data see the same features.
     feature_reference: str = "running"
+    #: How the Wilson prior's surface is fitted:
+    #: ``"reference"`` -- Wilson maximum likelihood on the running reference at
+    #: every refresh;
+    #: ``"evidence"`` -- the surface's coefficients are trained with the
+    #: network by the same evidence (type-II maximum likelihood), at
+    #: ``wilson_lr_mult`` times the base rate;
+    #: ``"batch-em"`` -- after every update, Wilson maximum likelihood on the
+    #: posterior means of that update's batch (an EM step on the batch merge);
+    #: ``"batch-counts"`` -- after every update, ``E[n - bg] = (1 - miss) K Sigma``
+    #: fitted to that batch's counts at the network's K.
+    #: All four start from the fit to the unity merge; the last three keep no
+    #: per-reflection state.
+    wilson_fit: str = "reference"
+    wilson_lr_mult: float = 10.0
     #: How the Wilson prior's Sigma is estimated from the running merge:
     #: ``"shells"`` (equal-count resolution shells) or ``"smooth"`` (a
     #: symmetry-adapted surface on a reciprocal-space basis, see
@@ -463,6 +482,14 @@ class AmortizedTrainer:
                     f"merge_target must be 'loo' or 'posterior', got {self.cfg.merge_target!r}"
                 )
             self.targets.append(t)
+        if self.cfg.wilson_fit not in WILSON_FITS:
+            raise ValueError(f"wilson_fit must be one of {WILSON_FITS}, got {self.cfg.wilson_fit!r}")
+        if self.cfg.wilson_fit != "reference" and (self.cfg.merge_target != "posterior"
+                                                   or self.cfg.posterior_prior != "wilson"):
+            raise ValueError(f"wilson_fit={self.cfg.wilson_fit!r} needs posterior targets "
+                             "with the separate Wilson prior")
+        #: the last training batch's statistics for a batch Wilson fit
+        self._wilson_stash = None
         if self.cfg.feature_reference not in ("running", "static"):
             raise ValueError(
                 f"feature_reference must be 'running' or 'static', got "
@@ -777,6 +804,17 @@ class AmortizedTrainer:
         self.last_edge_mass = post.edge_mass
         I0 = post.I0_obs
         K = pred.log_K.exp().clamp(min=1e-8)
+        if update_state and self.cfg.wilson_fit == "batch-em":
+            self._wilson_stash = (self._cond, post.I0_mean.detach(), post.seen)
+        elif update_state and self.cfg.wilson_fit == "batch-counts":
+            with torch.no_grad():
+                miss = getattr(self.objective, "miss_logit", None)
+                keep = 1.0 if miss is None else float(torch.sigmoid(-miss.detach()))
+                signal = n_ph - bg - _bg_mean_offset(self.objective)
+                n_hkl = self.prep.n_valid
+                self._wilson_stash = (self._cond,
+                                      group_sum(signal.float(), meta.hkl_idx, n_hkl),
+                                      group_sum(keep * K.detach().float(), meta.hkl_idx, n_hkl))
         w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
         var_scatter = (K * I0) ** 2 * torch.expm1(w2)
         # `sigma` is the counting variance alone.  When the likelihood carries
@@ -859,8 +897,15 @@ class AmortizedTrainer:
             shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar,
                          "shape_prior_off_grid": out_bar}
         self.opt.zero_grad(set_to_none=True)
+        if self.cfg.wilson_fit == "evidence" and self.targets[0].wilson_coef_param is None:
+            raise RuntimeError("wilson_fit='evidence' is enabled by set_reciprocal_basis("
+                               "smooth_prior=True); no smooth basis was installed")
         loss.backward()
         gn = grad_norms(self.scale)
+        for t in self.targets:
+            p = getattr(t, "wilson_coef_param", None)
+            if p is not None and p.grad is not None and not bool(torch.isfinite(p.grad).all()):
+                gn["n_nonfinite_grads"] = gn.get("n_nonfinite_grads", 0) + 1
         # A single non-finite batch must not end the run.  Applying an update
         # from NaN gradients makes every later batch NaN -- the whole model is
         # poisoned, n_used goes to 0 and the remaining epochs compute nothing.
@@ -880,6 +925,10 @@ class AmortizedTrainer:
             dn = getattr(self.objective, "detector_noise", None)
             if dn is not None:
                 dn.project()          # the noise terms stay inside their bounds
+            for t in self.targets:
+                if getattr(t, "wilson_coef_param", None) is not None:
+                    t.sync_evidence_prior()
+            self._fit_wilson_from_batch()
         gn["gradnorm_total"] = float(total_norm)          # pre-clip global norm
         gn["grad_was_clipped"] = bool(float(total_norm) > self.cfg.grad_clip)
         gn["step_skipped"] = skipped
@@ -1236,6 +1285,7 @@ class AmortizedTrainer:
                     "estimator": self.cfg.reference_estimator,
                     "ema_decay": self.cfg.reference_ema_decay,
                     "feature_reference": self.cfg.feature_reference,
+                    "wilson_fit": self.cfg.wilson_fit,
                 },
                 # outer-grid geometry, so a later merge integrates on the SAME grid
                 "posterior_grid": {
@@ -1784,6 +1834,14 @@ class AmortizedTrainer:
         if hasattr(self.scale, "set_gauge_basis"):
             self.scale.set_gauge_basis(phi)
         self._refresh_wilson_sigma()
+        if self.cfg.wilson_fit == "evidence":
+            if not smooth_prior:
+                raise ValueError("wilson_fit='evidence' needs the smooth Wilson prior")
+            # started at the fit to the unity merge, then trained by the evidence
+            mult = float(self.cfg.wilson_lr_mult)
+            self.opt.add_param_group({"params": [t.enable_evidence_prior() for t in self.targets],
+                                      "lr": self.cfg.lr * mult, "lr_mult": mult,
+                                      "weight_decay": 0.0})
 
     def wilson_fit_info(self) -> dict:
         """Diagnostics of the smooth Sigma fit on the first target (empty in shells mode)."""
@@ -1807,6 +1865,11 @@ class AmortizedTrainer:
         n_shells = int(sid.max().item()) + 1
         for t in targets:
             t.set_is_centric(self.prep.is_centric.to(self.device))
+        if self.cfg.wilson_fit != "reference" and getattr(self, "_wilson_fitted", False):
+            # trained or refitted per batch since the start: no running reference
+            for t in targets:
+                t.sync_evidence_prior()
+            return
         if self.cfg.posterior_prior != "joined-wilson":
             for t in targets:
                 if t.prior == "wilson":
@@ -1845,6 +1908,25 @@ class AmortizedTrainer:
                 t.wilson_sigma.copy_(first.wilson_sigma)
                 t.wilson_coef.copy_(first.wilson_coef)
                 t.wilson_fit_iters = first.wilson_fit_iters
+
+    @torch.no_grad()
+    def _fit_wilson_from_batch(self) -> None:
+        """Refit the Wilson surface of the state just trained on, from that batch alone."""
+        if self.cfg.wilson_fit == "evidence":
+            self._wilson_fitted = True
+            return
+        stash, self._wilson_stash = self._wilson_stash, None
+        if stash is None:
+            return
+        cond, a, b = stash
+        t = self.targets[cond]
+        sid = self.prep.shell_id_fw.to(self.device)
+        n_shells = int(sid.max().item()) + 1
+        if self.cfg.wilson_fit == "batch-em":
+            t.set_wilson_sigma(sid, n_shells, reference=a, sample_weight=b.float())
+        else:
+            t.set_wilson_sigma_from_counts(a, b, sid, n_shells)
+        self._wilson_fitted = True
 
     def _refresh_feature_reference(self) -> None:
         """Roll the obs_scale reference forward with the running merge."""

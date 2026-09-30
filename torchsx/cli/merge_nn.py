@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
@@ -58,6 +59,7 @@ def main(argv: list[str] | None = None) -> None:
         tr.set_reciprocal_basis(S["basis"], smooth_prior=S["wilson_basis"] == "smooth")
     else:
         tr._refresh_wilson_sigma()
+    _restore_fitted_wilson(tr, prep, ckpt)
     # Checkpoints written before the data buffers were made non-persistent
     # carry the training set's own _I/_bg/_sigma, whose length is that data
     # set's observation count; drop them rather than refuse to merge a
@@ -81,6 +83,31 @@ def main(argv: list[str] | None = None) -> None:
                        spacegroup=bundle.spacegroup, merge_friedel=bundle.merge_friedel)
     finally:
         tr.close()
+
+
+def _restore_fitted_wilson(tr, prep, ckpt) -> None:
+    """Keep a Wilson surface that was fitted with the network rather than to a reference.
+
+    A surface trained by the evidence or refitted per batch belongs to the
+    network's scale convention, so a merge of the same reflections restores it
+    instead of refitting it to the unity merge of the supplied data.
+    """
+    fit = (ckpt.get("reference_update") or {}).get("wilson_fit", "reference")
+    if fit == "reference":
+        return
+    ctx = ckpt.get("inference_context") or {}
+    saved = ctx.get("targets") or []
+    same = ("hkl" in ctx and torch.equal(ctx["hkl"].cpu(), prep.hkl_valid.cpu())
+            and len(saved) == len(tr.targets)
+            and all(getattr(t, "has_basis", False) and "wilson_coef" in s
+                    and s["wilson_coef"].shape == t.wilson_coef.shape
+                    for t, s in zip(tr.targets, saved)))
+    if not same:
+        warnings.warn(f"the checkpoint's Wilson surface (wilson_fit={fit!r}) was fitted on another "
+                      "reflection set; refitting it to the unity merge of these data", RuntimeWarning)
+        return
+    for t, s in zip(tr.targets, saved):
+        t.set_wilson_coef(s["wilson_coef"].to(t.wilson_coef.device))
 
 
 def _export_crystals(tr, k: int):

@@ -86,6 +86,12 @@ def _build_parser():
     p.add_argument("--feature-reference", choices=("running", "static"), default="running",
                    help="per-reflection intensity the peer features are formed against: the "
                         "running reference (default) or the unity merge of the inputs, fixed")
+    p.add_argument("--wilson-fit", choices=("reference", "evidence", "batch-em", "batch-counts"),
+                   default="reference",
+                   help="how the Wilson prior's surface is fitted: to the running reference at every "
+                        "refresh (default); trained by the evidence with the network; after every "
+                        "update, to the posterior means of that update's batch; or to that batch's "
+                        "counts at the network's scale")
     p.add_argument("--peer-scale", choices=("ratio", "rank"), default="ratio",
                    help="a peer's observed scale in the context: its intensity over the reference "
                         "(default) or its rank among the observations of its reflection; the "
@@ -250,6 +256,7 @@ def main(argv=None):
         lr_schedule=args.lr_schedule, total_steps=args.steps,
         reference_bias_correction=args.reference_bias_correction,
         feature_reference=args.feature_reference,
+        wilson_fit=args.wilson_fit,
         grad_clip=20.0, log_every=25, merge_target="posterior", loss="evidence",
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
         posterior_max_halfwidth=settings["max_halfwidth"],
