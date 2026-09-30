@@ -17,7 +17,7 @@ def trainer(values, supports, smooth):
             target.set_basis(torch.ones(len(value), 1))
         targets.append(target)
     tr = SimpleNamespace(targets=targets, _score_targets=None, device="cpu",
-        cfg=SimpleNamespace(posterior_prior="joined-wilson"),
+        cfg=SimpleNamespace(posterior_prior="joined-wilson", wilson_fit="reference"),
         prep=SimpleNamespace(shell_id_fw=torch.zeros(len(values[0]), dtype=torch.long),
                              is_centric=torch.zeros(len(values[0]), dtype=torch.bool)),
         _all_targets=lambda: targets)
