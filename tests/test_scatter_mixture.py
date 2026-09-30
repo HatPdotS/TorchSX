@@ -392,6 +392,7 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path, monkeypatch
     p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
     assert S2["scatter_family"] == "mixture" and rebuilt.heads.n_components == 4 and isinstance(rebuilt.scatter, PredictedMixtureScatter)
     rebuilt.load_state_dict(ck["state_dict"])
+    _trainer_from_stack(p2, q2, rebuilt, o2, S2)      # installs the gauge basis, as merge_nn does
     scale.eval(), rebuilt.eval()
     rows = tr.index.rows(tr.index.nonempty)          # crystal-grouped, as the encoder needs
     with torch.no_grad():
