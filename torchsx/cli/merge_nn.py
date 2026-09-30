@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import warnings
 
 import numpy as np
 import torch
@@ -43,24 +42,16 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg = TrainConfig(
         max_obs_per_batch=P.READOUT_MAX_OBS, epochs=0,
-        merge_target="posterior", loss="evidence",
         posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
         posterior_n_sigma=S["n_sigma"], posterior_max_halfwidth=S["max_halfwidth"],
         stream_batches=True, encoder_chunk_crystals=400,
         locate_windows=(8.0, 1.0, 0.125),
-        posterior_prior=S["prior"],
-        reference_estimator=ckpt.get("reference_update", {}).get("estimator", "wls"),
-        reference_ema_decay=ckpt.get("reference_update", {}).get("ema_decay", 0.99),
-        reference_update=ckpt.get("reference_update", {}).get("update", "ema"),
-        wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
+        posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
         heldout_frac=0.05, device=S["device"], outdir=str(args.out.parent),
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
-    if S.get("basis") is not None:
-        tr.set_reciprocal_basis(S["basis"], smooth_prior=S["wilson_basis"] == "smooth")
-    else:
-        tr._refresh_wilson_sigma()
-    _restore_fitted_wilson(tr, prep, ckpt)
+    tr.set_reciprocal_basis(S["basis"])
+    restore_wilson_surface(tr, prep, ckpt, names=bundle.split_names)
     # Checkpoints written before the data buffers were made non-persistent
     # carry the training set's own _I/_bg/_sigma, whose length is that data
     # set's observation count; drop them rather than refuse to merge a
@@ -72,8 +63,9 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"checkpoint is missing {len(missing)} parameters, "
                          f"first {missing[:3]}")
     scale.load_state_dict(have)
-    # Keep references and merge targets initialized from the supplied data.
-    # Only network weights and fitted feature standardization are restored.
+    # The network weights, the fitted feature standardisation and the Wilson
+    # surface come from the checkpoint; everything per reflection is formed
+    # from the supplied data, as in training.
     scale.eval()
 
     names = bundle.split_names or [""]
@@ -86,39 +78,41 @@ def main(argv: list[str] | None = None) -> None:
         tr.close()
 
 
-def _restore_fitted_wilson(tr, prep, ckpt) -> None:
-    """Keep a Wilson surface that was fitted with the network rather than to a reference.
+def restore_wilson_surface(tr, prep, ckpt, names=None) -> None:
+    """Install the checkpoint's trained Wilson surfaces on these reflections.
 
-    A surface trained by the evidence or refitted per batch belongs to the
-    network's scale convention, so a merge of the same reflections restores it
-    instead of refitting it to the unity merge of the supplied data.
+    A surface belongs to the network's scale convention, so a merge evaluates
+    the stored basis definition on the supplied reflections and applies the
+    trained coefficients, whatever reflection set they were trained on.  Each
+    input state takes the surface of the trained state of the same name
+    (``names`` against the checkpoint's ``splits``), or of the same position
+    when the checkpoint and the inputs carry the same unnamed states; any other
+    state takes the first trained state's surface.
     """
-    fit = (ckpt.get("reference_update") or {}).get("wilson_fit", "reference")
-    if fit == "reference":
+    if tr.cfg.posterior_prior != "wilson":
         return
     surface = ckpt.get("wilson_surface")
-    if surface is not None and all(getattr(t, "has_basis", False) for t in tr.targets) \
-            and len(surface["coef"]) == len(tr.targets):
-        # the checkpoint's surface evaluated on these reflections
-        from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
-        phi = ReciprocalBasis.from_definition(surface["basis"]).evaluate(prep.hkl_valid)
-        for t, c in zip(tr.targets, surface["coef"]):
-            t.set_basis(phi.to(t.wilson_coef.device))
-            t.set_wilson_coef(c.to(t.wilson_coef.device))
-        return
-    ctx = ckpt.get("inference_context") or {}
-    saved = ctx.get("targets") or []
-    same = ("hkl" in ctx and torch.equal(ctx["hkl"].cpu(), prep.hkl_valid.cpu())
-            and len(saved) == len(tr.targets)
-            and all(getattr(t, "has_basis", False) and "wilson_coef" in s
-                    and s["wilson_coef"].shape == t.wilson_coef.shape
-                    for t, s in zip(tr.targets, saved)))
-    if not same:
-        warnings.warn(f"the checkpoint's Wilson surface (wilson_fit={fit!r}) was fitted on another "
-                      "reflection set; refitting it to the unity merge of these data", RuntimeWarning)
-        return
-    for t, s in zip(tr.targets, saved):
-        t.set_wilson_coef(s["wilson_coef"].to(t.wilson_coef.device))
+    if surface is None:
+        raise SystemExit("the checkpoint carries no Wilson surface")
+    coefs, trained = list(surface["coef"]), list(ckpt.get("splits") or [])
+    names = list(names or [])
+    chosen = []
+    for k in range(len(tr.targets)):
+        name = names[k] if k < len(names) else None
+        if name is not None and name in trained:
+            chosen.append(coefs[trained.index(name)])
+        elif not names and not trained and len(coefs) == len(tr.targets):
+            chosen.append(coefs[k])
+        else:
+            chosen.append(coefs[0])
+    from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
+    phi = ReciprocalBasis.from_definition(surface["basis"]).evaluate(prep.hkl_valid)
+    for t, c in zip(tr.targets, chosen):
+        c = c.to(t.wilson_coef.device)
+        t.set_basis(phi.to(t.wilson_coef.device))
+        t.set_wilson_coef(c)
+        if t.wilson_coef_param is not None:
+            t.wilson_coef_param.data.copy_(c)
 
 
 def _export_crystals(tr, k: int):

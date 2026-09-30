@@ -284,55 +284,6 @@ def fit_wilson_log_sigma(
     return c.to(phi.dtype), used
 
 
-def fit_log_sigma_to_counts(
-    phi: Tensor,
-    counts: Tensor,
-    scale: Tensor,
-    coef0: Tensor | None = None,
-    *,
-    n_iter: int = 8,
-    ridge: float = 1e-6,
-    tol: float = 1e-6,
-    max_step: float = 1.0,
-) -> tuple[Tensor, int]:
-    """Mean intensity ``log Sigma(h) = phi(h) @ c`` from counts at a known scale.
-
-    ``counts[h]`` is the summed background-subtracted signal of reflection h
-    and ``scale[h]`` the summed expected scale of the same observations, so
-    ``E[counts_h] = scale_h * Sigma(h)`` averaged over the intensity
-    distribution.  Solves the quasi-Poisson score equation
-    ``sum_h phi_h (scale_h Sigma_h - counts_h) = 0`` by Fisher scoring from
-    ``coef0`` (or the pooled ratio), each step capped at ``max_step`` in every
-    coefficient.  Negative counts are kept.  Reflections with no scale are
-    left out.  Returns ``(coef, n_iterations_used)``.
-    """
-    keep = scale > 0
-    phi64 = phi.detach().to(torch.float64)[keep]
-    y = counts.detach().to(torch.float64)[keep]
-    m = scale.detach().to(torch.float64)[keep]
-    p = phi64.shape[1]
-    if coef0 is None:
-        c = torch.zeros(p, dtype=torch.float64, device=phi64.device)
-        c[0] = (y.sum() / m.sum()).clamp(min=1e-30).log()
-    else:
-        c = coef0.detach().to(torch.float64).clone()
-    eye = torch.eye(p, dtype=torch.float64, device=phi64.device)
-    used = 0
-    for it in range(n_iter):
-        mu = m * torch.exp(phi64 @ c)
-        grad = phi64.T @ (mu - y)
-        H = phi64.T @ (phi64 * mu[:, None]) + ridge * eye
-        step = torch.linalg.solve(H, grad)
-        big = float(step.abs().max())
-        if big > max_step:
-            step = step * (max_step / big)
-        c = c - step
-        used = it + 1
-        if big < tol:
-            break
-    return c.to(phi.dtype), used
-
-
 def wilson_b_equivalent(basis: ReciprocalBasis, coef: Tensor) -> float:
     """Isotropic B (A^2) of the fitted surface: ``log Sigma ~ -2 B s2`` slope over the data range."""
     ls = (basis.phi.to(torch.float64) @ coef.detach().to(torch.float64).to(basis.phi.device))

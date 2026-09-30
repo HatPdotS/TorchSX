@@ -49,8 +49,7 @@ def test_none_is_not_flat_in_log_intensity_and_keeps_legacy_alias():
     means = []
     for t in targets:
         t._loc = (torch.zeros(1, dtype=torch.float64), torch.ones(1, dtype=torch.float64))
-        nodes, _ = t.nodes()
-        means.append(t.integrate(torch.zeros_like(nodes), nodes)[1].item())
+        means.append(t.integrate(torch.zeros(1, t.k_coarse, dtype=torch.float64))[1].item())
     assert means[0] == means[1]
     # On finite [exp(-2), exp(2)], constant likelihood under dI is uniform I.
     assert means[0] == pytest.approx((math.exp(2) + math.exp(-2)) / 2, rel=5e-4)
@@ -58,7 +57,3 @@ def test_none_is_not_flat_in_log_intensity_and_keeps_legacy_alias():
     assert targets[1].prior == 'none'
     assert TrainConfig().posterior_prior == 'wilson'
 
-
-def test_wilson_importance_nodes_cannot_silently_override_none():
-    with pytest.raises(ValueError, match='Wilson node placement requires'):
-        PosteriorMergeTarget(torch.ones(1), prior='none', node_placement='wilson')

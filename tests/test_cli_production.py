@@ -15,7 +15,7 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file, python_parser
 
 
-@pytest.mark.parametrize('module,count', [(train,39), (merge_nn,14)])
+@pytest.mark.parametrize('module,count', [(train,32), (merge_nn,14)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
@@ -89,8 +89,7 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
 
 @pytest.mark.parametrize('saved,requested,expected', [
     ('none',None,'none'), ('wilson','none','none'), ('none','wilson','wilson'),
-    ('joined-wilson',None,'joined-wilson'), ('wilson','joined-wilson','joined-wilson'),
-    ('joined-wilson','wilson','wilson'), ('flat_I0',None,'none'), ('flat_log',None,'flat_log'),
+    ('flat_I0',None,'none'), ('flat_log',None,'flat_log'),
 ])
 def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,requested,expected):
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10)
@@ -141,7 +140,7 @@ def test_small_batch_respects_holdout_and_original_redundancy(requested):
 
 
 @pytest.mark.parametrize("merge_friedel", [True, False])
-@pytest.mark.parametrize("prior", ["none", "wilson", "joined-wilson"])
+@pytest.mark.parametrize("prior", ["none", "wilson"])
 def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,prior):
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10,n_cond=2)
     bundle=P.PrepBundle(prep,{'spacegroup':'P 1','d_min':0.9,'gain':1.0,'radii':[7,9,11],'merge_friedel':merge_friedel},['dark','light'],0.1)
@@ -150,7 +149,6 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
         monkeypatch.setitem(P.DEFAULTS,key,value)
     run=tmp_path/'run'
     train.main(['x.stream','-o',str(run),'--device','cpu','--steps','4','--seed','17',
-                '--reference-estimator','posterior','--reference-ema-decay','0.99',
                 '--prior',prior])
     summary=json.loads((run/'training_summary.json').read_text())
     assert summary['updates_per_state']==[2,2]
@@ -158,11 +156,7 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
     assert ck['scatter']['family']=='mixture' and ck['scatter']['n_components']==4
     assert ck['likelihood']['bg_mean_offset']==0.1
     assert ck['data']['training']['config']['seed']==17
-    assert ck['reference_update']=={'estimator':'posterior','ema_decay':0.99,
-                                   'feature_reference':'running','wilson_fit':'reference',
-                                   'update':'ema'}
-    assert ck['scale']['peer_scale']=='ratio'
-    assert ck['data']['training']['config']['reference_estimator']=='posterior'
+    assert (ck['wilson_surface'] is not None and len(ck['wilson_surface']['coef'])==2)
     assert ck['posterior_grid']['prior']==prior
     assert ck['data']['training']['config']['posterior_prior']==prior
     assert ck['data']['training']['readout']['prior']==prior
@@ -187,8 +181,9 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
         a=np.concatenate([np.asarray(trained.column_with_label(label)) for label in labels])
         b=np.concatenate([np.asarray(mtz.column_with_label(label)) for label in labels])
         np.testing.assert_array_equal(np.isfinite(a), np.isfinite(b))
-        # Separate readout rebuilds the reference from the current data, so
-        # its amplitudes need not reproduce training's running-reference merge.
+        # Separate readout forms every per-reflection input from the same data
+        # and takes the trained Wilson surface: it reproduces training's merge.
+        np.testing.assert_allclose(a[np.isfinite(a)], b[np.isfinite(b)], rtol=1e-4, atol=1e-6)
         np.testing.assert_array_equal(np.sort(b[np.isfinite(b)]), np.sort(F[keep]))
         # Sorting survives ASU reordering and checks the actual per-merge sigma values.
         sigmas=np.concatenate([np.asarray(mtz.column_with_label(c))
@@ -202,7 +197,6 @@ def test_separate_merge_exports_new_bins(tmp_path, monkeypatch):
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=24, per=10, n_cond=2)
     _, _, trainer = _stack(prep, params, tmp_path)
     trainer.split_names = ['dark', 'light']
-    trainer.cfg.wilson_basis = 'shells'
     try:
         checkpoint = trainer.save_best(tmp_path / 'model.pt')
     finally:

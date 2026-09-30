@@ -655,7 +655,7 @@ DEFAULTS = dict(
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
     obs_self_layers=2, peer_attention=2, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
-    wilson_basis="smooth", wilson_degree=4, gauge_anchor="basis",
+    wilson_degree=4, gauge_anchor="basis",
     scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
 )
 
@@ -663,9 +663,10 @@ DEFAULTS = dict(
 def add_model_args(p: argparse.ArgumentParser) -> None:
     """Flags shared by every command that builds the merge stack."""
     p.add_argument("--device", default=None, help="cuda | cpu")
-    p.add_argument("--prior", choices=("none", "wilson", "joined-wilson"), default=None,
-                   help="intensity prior: wilson (separate, default), joined-wilson (shared), or none "
-                        "(flat in positive intensity); merge inherits the checkpoint unless set")
+    p.add_argument("--prior", choices=("none", "wilson"), default=None,
+                   help="intensity prior: wilson (default; one surface per state, trained by the "
+                        "evidence) or none (flat in positive intensity); merge inherits the "
+                        "checkpoint unless set")
 
 
 # Checkpoint ``kind`` markers for the corrected detection stack.  The first of
@@ -767,9 +768,6 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                     min(DEFAULTS["peer_heads"], max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
         scatter_family=scatter_family, n_components=n_components,
         component_shape=scatter_shape,
-        # a checkpoint's own feature set wins; one written before the key
-        # existed used the ratio channels
-        peer_scale=sc.get("peer_scale", "ratio") if ck else getattr(args, "peer_scale", "ratio"),
     )
     # A checkpoint's own head geometry wins over the defaults: rebuilding it
     # with different heads would fail the state_dict load, or load a subset.
@@ -864,25 +862,17 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         prior = str(grid.get("prior", "wilson"))
     if prior == "flat_I0":  # Historical checkpoint spelling.
         prior = "none"
-    if prior not in ("none", "wilson", "joined-wilson", "flat_log"):
-        raise ValueError(f"Invalid checkpoint prior {prior!r}; expected 'none', 'wilson' or 'joined-wilson' "
+    if prior not in ("none", "wilson", "flat_log"):
+        raise ValueError(f"Invalid checkpoint prior {prior!r}; expected 'none' or 'wilson' "
                          "(legacy 'flat_I0' and 'flat_log' are also readable)")
-    # A checkpoint decides its own prior and anchor; one written before the
-    # smooth basis existed (no "wilson_basis" key) is rebuilt as it was trained,
-    # in shells / median mode, not with today's defaults.
-    legacy_ckpt = bool(ck) and "wilson_basis" not in grid
-    wilson_basis = grid.get(
-        "wilson_basis", "shells" if legacy_ckpt else DEFAULTS["wilson_basis"])
     wilson_degree = int(grid.get("wilson_degree", DEFAULTS["wilson_degree"]))
     # One smooth reciprocal-space basis for the prior's Sigma(h) and the scale's
     # gauge pin, built from the prepared reflections, the median cell and the
-    # space group -- so a merge rebuilds exactly the basis the network trained on.
-    basis = None
-    if wilson_basis == "smooth" or getattr(scale, "anchor_stat", None) == "basis":
-        from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
-        basis = ReciprocalBasis.from_hkl(
-            prep.hkl_valid.long(), prep.median_cell, bundle.spacegroup, degree=wilson_degree,
-        )
+    # space group.
+    from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
+    basis = ReciprocalBasis.from_hkl(
+        prep.hkl_valid.long(), prep.median_cell, bundle.spacegroup, degree=wilson_degree,
+    )
     settings = dict(
         device=dev, max_obs=READOUT_MAX_OBS,
         k_coarse=int(DEFAULTS["k_coarse"]),
@@ -893,7 +883,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
         skew=bool(skew), miss=float(miss), outlier=float(outlier), detector_noise=noise_mode or "off",
-        wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
+        wilson_degree=wilson_degree, basis=basis,
         scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
     )
     if verbose:
@@ -922,7 +912,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         if basis is not None:
             print(f"  smooth reciprocal basis: Chebyshev degree {wilson_degree} + "
                   f"{basis.n_aniso} invariant anisotropy tensor(s) ({bundle.spacegroup}), "
-                  f"p = {basis.p}; prior Sigma {wilson_basis}, log K anchor "
+                  f"p = {basis.p}; log K anchor "
                   f"{getattr(scale, 'anchor_stat', None)}", flush=True)
         if grid:
             print(f"  (checkpoint trained on outer grid "

@@ -29,7 +29,11 @@ Two tiers, and the split is load-bearing:
     evaluate it at ``j``.  Both halves of the pair must therefore be present —
     geometry alone says nothing, and raw intensity alone conflates "this
     reflection is intrinsically strong" (I0) with "this reflection was well
-    positioned" (partiality).  ``obs_scale`` separates them.
+    positioned" (partiality).  ``rank_score`` separates them: the peer's rank
+    among all observations of its own reflection, in which that reflection's
+    intrinsic brightness drops out.  Every context channel is a fixed function
+    of the observations, so no merge has to be kept, refreshed or stored to
+    form them.
 
 Both guards are enforced in ``__init__``, not left to convention.
 
@@ -60,8 +64,6 @@ from torchsx.merging.observations import CRYSTAL_FEAT_COLUMNS, ObsInfo, Prepared
 __all__ = [
     "SELF_FEATURES",
     "CONTEXT_ONLY_FEATURES",
-    "RANK_CONTEXT_FEATURES",
-    "PEER_SCALES",
     "CRYSTAL_FEATURES",
     "FORBIDDEN_IN_SELF",
     "CONDITION_FEATURES",
@@ -92,39 +94,18 @@ CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
     "log_sigma",
     "i_over_sigma",    # the dimensionless one that actually carries weight
     "log_bg",
-    # n'/I0 — the peer's *observed scale*, K.S, with the reflection's intrinsic
-    # brightness divided out.  This is the channel that carries partiality:
-    # raw intensity only tells the network how bright the crystal is, which is
-    # why a raw-intensity context learns G and nothing else (between_frac 0.96,
-    # within_frac 0.04).  Linear, so the 32.4 % negative observations survive.
-    "obs_scale",
-    "obs_scale_over_sigma",
-    "log_I0_ref",      # how bright the peer's reflection should be
-)
-
-#: The measurement channels with the peer's observed scale given as a RANK:
-#: the normal score of the observation's position among all observations of
-#: its reflection.  It needs no per-reflection intensity estimate, so nothing
-#: has to be merged, refreshed or carried in a checkpoint to form it; it is
-#: bounded, keeps the negative observations, and is unchanged by any monotone
-#: rescaling of a reflection (its intrinsic brightness drops out).  The ratio
-#: channels are replaced; ``log_I0_ref`` stays so the network can tell how
-#: informative a peer's rank is.
-RANK_CONTEXT_FEATURES: tuple[str, ...] = (
-    "signed_log_I",
-    "log_sigma",
-    "i_over_sigma",
-    "log_bg",
+    # The peer's *observed scale*: the normal score of its position among all
+    # observations of its reflection.  This is the channel that carries
+    # partiality -- raw intensity only tells the network how bright the crystal
+    # is.  Bounded, keeps the negative observations, and unchanged by any
+    # monotone rescaling of a reflection, so its intrinsic brightness drops out.
     "rank_score",
-    "log_I0_ref",
+    # How bright the peer's reflection is: the log of the unity merge of the
+    # input observations, so the network can tell how informative a rank is.
+    "log_I_unity",
 )
 
-#: How a peer's observed scale enters the context: ``"ratio"`` -- n'/I0 against
-#: the reference intensity (:data:`CONTEXT_ONLY_FEATURES`); ``"rank"`` -- its
-#: within-reflection rank (:data:`RANK_CONTEXT_FEATURES`).
-PEER_SCALES: tuple[str, ...] = ("ratio", "rank")
-
-FORBIDDEN_IN_SELF: frozenset[str] = frozenset(CONTEXT_ONLY_FEATURES) | {"rank_score"}
+FORBIDDEN_IN_SELF: frozenset[str] = frozenset(CONTEXT_ONLY_FEATURES)
 
 #: Per-CRYSTAL metadata, one row per crystal (``ObsInfo.crystal_feat``).  Read
 #: by the encoder's crystal-level input head, once per crystal rather than once
@@ -159,20 +140,14 @@ class ObsFeatureSpec(nn.Module):
         context_features: tuple[str, ...] | None = None,
         include_hkl: bool = True,
         crystal_features: tuple[str, ...] | None = None,
-        peer_scale: str = "ratio",
     ) -> None:
         super().__init__()
         #: Recorded so a checkpoint can say which feature set it was fitted
         #: under; the flag itself is consumed a few lines below.
         self.include_hkl = bool(include_hkl)
-        if peer_scale not in PEER_SCALES:
-            raise ValueError(f"peer_scale must be one of {PEER_SCALES}, got {peer_scale!r}")
-        self.peer_scale = peer_scale
 
         if context_features is None:
-            context_features = tuple(self_features) + (
-                CONTEXT_ONLY_FEATURES if peer_scale == "ratio" else RANK_CONTEXT_FEATURES
-            )
+            context_features = tuple(self_features) + CONTEXT_ONLY_FEATURES
         if not include_hkl:
             self_features = tuple(f for f in self_features if f not in ("h", "k", "l"))
             context_features = tuple(
@@ -240,18 +215,20 @@ class ObsFeatureSpec(nn.Module):
         self.register_buffer("_sigma", sigma.clamp(min=1e-6), persistent=False)
         self.register_buffer("_hkl", prep.hkl_valid.float(), persistent=False)
         self.has_supplied_sigma = oi.sigma is not None
-        # Reference merged intensity per reflection, used to form obs_scale.
-        # Always detached: it is a lookup, never a gradient path.  Starts flat;
-        # the trainer installs the running merge (set_reference_I0) before the
-        # first forward.
-        self.register_buffer("_I0_ref", torch.ones(prep.n_valid), persistent=False)
-        # Within-reflection rank, fixed by the data alone: computed once over
-        # every observation of the prepared set (all conditions pooled, as the
-        # single reference is), never refreshed.
+        # The per-reflection context channels are fixed by the data alone and
+        # computed once over every observation of the prepared set, all
+        # conditions pooled: one table for every condition, so neither can tell
+        # the network which condition a crystal belongs to.
+        from torchsx.nn.merge_target import unity_merge
         self.register_buffer(
             "_rank_score",
             within_reflection_normal_score(I, oi.hkl_idx, prep.n_valid)
             if "rank_score" in self.context_features else torch.zeros(0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_log_I_unity",
+            unity_merge(I, sigma.clamp(min=1e-6), oi.hkl_idx, prep.n_valid).log(),
             persistent=False,
         )
 
@@ -308,14 +285,7 @@ class ObsFeatureSpec(nn.Module):
 
     @torch.no_grad()
     def _recompute_stats(self) -> None:
-        """Refresh normalisation over the full dataset.
-
-        Must be redone whenever the reference I0 moves: ``obs_scale`` and
-        ``log_I0_ref`` are both defined relative to it, so statistics computed
-        against a stale reference leave those channels badly off-scale.  That
-        is not a cosmetic issue — with the stats frozen at the initial
-        reference, the synthetic recovery test fell from rho = 0.96 to 0.11.
-        """
+        """Normalisation over the full dataset, computed once at construction."""
         # Subsample.  These are per-feature means and standard deviations, and
         # 2 M rows fix them to ~0.07 %; using all 133 M costs a 4 GB host-device
         # transfer every epoch once `prep` is host-resident, because the
@@ -357,21 +327,6 @@ class ObsFeatureSpec(nn.Module):
                 RuntimeWarning, stacklevel=2,
             )
 
-    @torch.no_grad()
-    def set_reference_I0(self, I0: Tensor) -> None:
-        """Update the per-reflection reference used by ``obs_scale``.
-
-        Call with the running merge (the target's EMA).  Detached by
-        construction — this is a feature lookup, not part of the objective.
-        """
-        if I0.shape != self._I0_ref.shape:
-            raise ValueError(
-                f"I0 must have shape {tuple(self._I0_ref.shape)}, "
-                f"got {tuple(I0.shape)}"
-            )
-        self._I0_ref.copy_(I0.detach().clamp(min=1e-3))
-        self._recompute_stats()
-
     # ── raw channels ───────────────────────────────────────────────────
 
     def _raw_columns(self, meta: ObsInfo, names) -> dict[str, Tensor]:
@@ -380,20 +335,10 @@ class ObsFeatureSpec(nn.Module):
         need = set(names)
 
         I = sig = None
-        if {"signed_log_I", "i_over_sigma", "obs_scale",
-            "obs_scale_over_sigma"} & need:
+        if {"signed_log_I", "i_over_sigma"} & need:
             I = self._I[oid.to(self._I.device)]
-        if {"log_sigma", "i_over_sigma", "obs_scale_over_sigma"} & need:
+        if {"log_sigma", "i_over_sigma"} & need:
             sig = self._sigma[oid.to(self._sigma.device)]
-        if {"obs_scale", "obs_scale_over_sigma", "log_I0_ref"} & need:
-            # `_I0_ref` is a buffer and follows the module's device, but the
-            # cached full-dataset meta used by `_recompute_stats` stays on the
-            # host once `prep` is host-resident (stream_batches).  Index on the
-            # meta's device: it is (n_hkl,), so moving it is free, whereas
-            # moving the meta would defeat the point of streaming.
-            I0 = self._I0_ref.to(meta.hkl_idx.device)[meta.hkl_idx]
-            I = I.to(I0.device) if I is not None else I
-            sig = sig.to(I0.device) if sig is not None else sig
 
         for k in need:
             if k == "s_sq":
@@ -428,14 +373,10 @@ class ObsFeatureSpec(nn.Module):
                 out[k] = (I / sig).clamp(-50.0, 50.0)
             elif k == "log_bg":
                 out[k] = torch.log1p(self._bg[oid].clamp(min=0.0))
-            elif k == "obs_scale":
-                # K.S for this peer.  Clipped, not logged: negatives are real.
-                out[k] = (I / I0).clamp(-20.0, 20.0)
-            elif k == "obs_scale_over_sigma":
-                # How well determined that observed scale is.
-                out[k] = (I / sig).clamp(-50.0, 50.0) * (sig / I0).clamp(max=50.0)
-            elif k == "log_I0_ref":
-                out[k] = I0.log()
+            elif k == "log_I_unity":
+                # (n_hkl,) and module-resident; index on the meta's device, which
+                # stays the host for the cached statistics sample
+                out[k] = self._log_I_unity.to(meta.hkl_idx.device)[meta.hkl_idx]
             elif k == "rank_score":
                 out[k] = self._rank_score[oid.to(self._rank_score.device)].to(meta.s_sq.device)
             else:

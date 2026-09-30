@@ -111,8 +111,8 @@ def test_trainer_adds_the_term_and_logs_it(tmp_path):
                                          beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family=family,
                                          n_components=3)
         obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1), miss_frac=0.03)
-        cfg = TrainConfig(max_obs_per_batch=6000, epochs=1, lr=1e-2, lam0=0.0, lam_halflife_steps=0,
-                          log_every=10 ** 9, heldout_frac=0.0, merge_target="posterior", loss="evidence",
+        cfg = TrainConfig(max_obs_per_batch=6000, epochs=1, lr=1e-2,
+                          log_every=10 ** 9, heldout_frac=0.0,
                           posterior_k_coarse=9, posterior_m_fine=33, device="cpu", outdir=str(tmp_path / family),
                           split_half_every=0, lam_shape_prior=0.3, shape_prior_sample=256)
         tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)

@@ -103,8 +103,7 @@ def test_leave_one_out_context_recovers_a_hidden_per_crystal_scale(tmp_path):
     # before settling at ~0.94), so a short run measures the overshoot, not the
     # answer.  Same endpoint at lr 5e-4, just slower.
     cfg = TrainConfig(
-        max_obs_per_batch=6000, epochs=35, lr=3e-3, lam0=3.0,
-        lam_halflife_steps=60, log_every=5, heldout_frac=0.1,
+        max_obs_per_batch=6000, epochs=35, lr=3e-3, log_every=5, heldout_frac=0.1,
         device="cpu", outdir=str(tmp_path),
     )
     trainer = AmortizedTrainer(prep, scale, obj, params, config=cfg)
@@ -247,9 +246,9 @@ def _two_condition_trainer(tmp_path, **cfg_kw):
     scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, include_hkl=False)
     obj = MarginalNLL(wide_log_grid(), Poisson())
     cfg = TrainConfig(
-        max_obs_per_batch=1000, epochs=1, lr=1e-3, lam0=3.0, log_every=1,
+        max_obs_per_batch=1000, epochs=1, lr=1e-3, log_every=1,
         heldout_frac=0.2, device="cpu", outdir=str(tmp_path),
-        merge_target="posterior", loss="evidence", posterior_prior="wilson",
+        posterior_prior="wilson",
         posterior_k_coarse=9, posterior_m_fine=33, posterior_n_sigma=8.0,
         split_half_every=0, **cfg_kw,
     )
@@ -299,31 +298,27 @@ def test_per_condition_targets_keep_the_difference(tmp_path):
     assert 1.3 < ratio[shifted].median() < 1.7, ratio[shifted].median()
     assert 0.85 < ratio[~shifted].median() < 1.15, ratio[~shifted].median()
 
-    # (b) the running merges converge to their own condition, not to the pool
-    for t in tr.targets:
-        t.ema_decay = 0.8
+    # (b) after training, each condition's merge keeps its own intensities
     tr.cfg.epochs = 6
     tr.run()
-    ema = torch.stack([t.ema_I0.cpu() for t in tr.targets])
-    r = ema[1] / ema[0]
+    merged = [tr.merge(condition=b)["I0"].cpu() for b in (0, 1)]
+    r = merged[1] / merged[0]
     assert 1.3 < r[shifted].median() < 1.7, r[shifted].median()
     assert 0.85 < r[~shifted].median() < 1.15, r[~shifted].median()
     # condition AUC is logged and the (condition-independent) G gives ~0.5
     rec = tr.step(tr.index.rows(tr.train_crystals[:10]))
     assert "condition_auc" in rec
     assert 0.3 < rec["condition_auc"] < 0.7, rec["condition_auc"]
-    # checkpoint carries one merge per condition
+    # checkpoint carries one Wilson surface per condition
     tr.evaluate(tr.heldout_crystals)
     ck = torch.load(tr.save_best(), weights_only=False)
-    assert tuple(ck["ema_I0"].shape) == (2, n_hkl)
+    assert len(ck["wilson_surface"]["coef"]) == 2
     assert ck["n_conditions"] == 2 and ck["timepoints"] == [-1.0, 0.0]
     tr.close()
 
 
-@pytest.mark.parametrize("prior", ["wilson", "joined-wilson"])
-@pytest.mark.parametrize("merge_target", ["posterior", "loo"])
-@pytest.mark.parametrize("reference_estimator", ["wls", "posterior"])
-def test_evaluation_preserves_running_references(tmp_path, merge_target, reference_estimator, prior):
+@pytest.mark.parametrize("prior", ["wilson", "none"])
+def test_evaluation_changes_no_state(tmp_path, prior):
     """Scoring held-out data must not feed its intensities into later training."""
     prep, params, *_ = _synthetic(n_hkl=12, n_xtal=24, per=12, n_cond=2)
     scale = AmortizedScale.from_prep(
@@ -332,34 +327,28 @@ def test_evaluation_preserves_running_references(tmp_path, merge_target, referen
     tr = AmortizedTrainer(
         prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
         config=TrainConfig(
-            max_obs_per_batch=24, heldout_frac=0.25, device="cpu",
-            outdir=str(tmp_path), merge_target=merge_target,
-            loss="evidence" if merge_target == "posterior" else "per_obs",
+            max_obs_per_batch=24, heldout_frac=0.25, device="cpu", outdir=str(tmp_path),
             posterior_prior=prior, posterior_k_coarse=5, posterior_m_fine=17,
-            reference_estimator=reference_estimator,
             split_half_every=0,
         ),
     )
 
     def state():
         refs = {f"target_{i}.{name}": value.detach().clone()
-                for i, target in enumerate(tr._all_targets())
-                for name, value in target.named_buffers()}
+                for i, target in enumerate(tr.targets)
+                for name, value in [*target.named_buffers(), *target.named_parameters()]}
         refs.update({f"features.{name}": getattr(scale.features, name).clone()
-                     for name in ("_I0_ref", "_mean", "_std")})
+                     for name in ("_rank_score", "_log_I_unity", "_mean", "_std")})
         return refs
 
     try:
-        # Cover both initial validation and validation after a training update,
-        # with several batches and best-checkpoint context capture enabled.
+        # Both before and after a training update, over several batches and
+        # with the best-checkpoint snapshot enabled.
         for trained in (False, True):
             if trained:
                 crystals = tr.train_crystals[tr.condition[tr.train_crystals] == 0][:2]
-                before_train = tr.targets[0].ema_I0.clone()
-                tr._forward(tr.index.rows(crystals), grad=True)
-                tr.scale.clear()
-                assert not torch.equal(tr.targets[0].ema_I0, before_train)
-
+                rec = tr.step(tr.index.rows(crystals))
+                assert not rec.get("step_skipped")
             before = state()
             first = tr.evaluate(tr.heldout_crystals)
             second = tr.evaluate(tr.heldout_crystals)
@@ -372,54 +361,6 @@ def test_evaluation_preserves_running_references(tmp_path, merge_target, referen
         tr.close()
 
 
-def test_posterior_reference_follows_integrated_mean_during_optimizer_steps(tmp_path):
-    """Use actual quadrature and backward; missing HKLs and other states stay put."""
-    prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8, n_cond=2)
-    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
-    tr = AmortizedTrainer(
-        prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
-        config=TrainConfig(
-            device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
-            merge_target="posterior", loss="evidence", reference_estimator="posterior",
-            reference_ema_decay=0.99, posterior_prior="wilson",
-            posterior_k_coarse=5, posterior_m_fine=17, split_half_every=0,
-        ),
-    )
-    captured = []
-    def capture(module, args, kwargs, out):
-        if kwargs.get("update_state", True):
-            captured.append((out.I0_mean.detach().clone(), out.seen.clone()))
-    hook = tr.targets[0].register_forward_hook(capture, with_kwargs=True)
-    try:
-        other = tr.targets[1].ema_I0.clone()
-        crystals = tr.train_crystals[tr.condition[tr.train_crystals] == 0][:2]
-        for crystal in crystals:
-            before = tr.targets[0].ema_I0.clone()
-            rec = tr.step(tr.index.rows(crystal.reshape(1)))
-            assert not rec.get("step_skipped") and rec["n_used"] > 0
-            mean, seen = captured[-1]
-            assert seen.any() and (~seen).any()
-            expected = before.clone()
-            expected[seen] = 0.99 * before[seen] + 0.01 * mean[seen]
-            torch.testing.assert_close(tr.targets[0].ema_I0, expected)
-            assert torch.equal(tr.targets[0].ema_I0[~seen], before[~seen])
-            assert torch.equal(tr.targets[1].ema_I0, other)
-            assert tr.targets[0].ema_I0.grad_fn is None
-    finally:
-        hook.remove()
-        tr.close()
-
-
-@pytest.mark.parametrize("kwargs", [
-    {"ema_decay": -0.1}, {"ema_decay": 1.0}, {"ema_decay": float("nan")},
-    {"ema_decay": float("inf")}, {"reference_estimator": "unknown"},
-])
-def test_invalid_reference_update_is_rejected(kwargs):
-    from torchsx.nn.posterior_target import PosteriorMergeTarget
-    with pytest.raises(ValueError):
-        PosteriorMergeTarget(torch.ones(4), **kwargs)
-
-
 def test_posterior_integrate_is_finite_for_flat_curves():
     """A flat curve at n_sigma=24 puts nodes ~96 nats above the centre.
 
@@ -430,20 +371,20 @@ def test_posterior_integrate_is_finite_for_flat_curves():
     n_hkl = 8
     tgt = PosteriorMergeTarget(torch.full((n_hkl,), 0.1), k_coarse=31, m_fine=129,
                                n_sigma=24.0, prior="wilson")
-    tgt.set_wilson_sigma(torch.zeros(n_hkl, dtype=torch.long), 1)
+    tgt.wilson_sigma.fill_(0.1)
     centre = torch.linspace(-7.0, 6.0, n_hkl)
     sd = torch.full((n_hkl,), 4.0)                      # the flat-curve fallback
     tgt._loc = (centre, sd)
     v = centre[:, None] + sd[:, None] * tgt.u_coarse[None, :]
     S = torch.full((n_hkl, 31), -92.5)                  # flat: no information
-    log_Z, I0, I0_sd, w_post, vf, edge = tgt.integrate(S, v, None)
+    log_Z, I0, I0_sd, w_post, vf, edge = tgt.integrate(S)
     assert torch.isfinite(log_Z).all() and torch.isfinite(I0).all() and torch.isfinite(I0_sd).all()
     # with a flat likelihood the posterior IS the Wilson prior: mean ~ Sigma
     # (129 fine nodes over 192 nats: the prior mean is resolved to ~6 %)
     assert torch.allclose(I0, torch.full_like(I0, float(tgt.wilson_sigma[0])), rtol=0.1)
     # and a peaked curve still gives the peak
     S2 = -0.5 * ((v - centre[:, None]) / 0.3) ** 2
-    _, I0b, sdb, *_ = tgt.integrate(S2, v, None)
+    _, I0b, sdb, *_ = tgt.integrate(S2)
     assert torch.isfinite(I0b).all() and torch.all(sdb > 0)
 
 
@@ -462,16 +403,17 @@ def test_one_sided_curve_is_integrated_on_its_support(k_coarse, m_fine, tol):
     n_hkl, bound = 6, torch.tensor([-2.0, -1.0, 0.0, 0.5, 1.0, 2.0])
     tgt = PosteriorMergeTarget(torch.full((n_hkl,), 1.0), k_coarse=k_coarse, m_fine=m_fine,
                                n_sigma=24.0, prior="wilson")
-    tgt.set_wilson_sigma(torch.zeros(n_hkl, dtype=torch.long), 1)     # Sigma = 1
+    tgt.wilson_sigma.fill_(1.0)
     # log-likelihood: 0 below the bound, then a steep cliff (an upper bound on I0)
     def curve(v):
         return -0.5 * (torch.relu(v - bound[:, None]) / 0.15) ** 2
-    scan = tgt.scan_grid()
-    c, sd = tgt.peak_from_scan(curve(scan))
+    start = tgt.start_centre()
+    scan = tgt.scan_grid(start)
+    c, sd = tgt.peak_from_scan(curve(scan), start)
     assert torch.all(sd <= tgt.max_halfwidth / tgt.n_sigma + 1e-6)
     tgt._loc = (c, sd)
     v = c[:, None] + sd[:, None] * tgt.u_coarse[None, :]
-    _, I0, _, w_post, *_ = tgt.integrate(curve(v), v, None)
+    _, I0, _, w_post, *_ = tgt.integrate(curve(v))
     # brute force on a dense grid with the same prior
     vd = torch.linspace(-30.0, 8.0, 20001)[None, :].expand(n_hkl, -1)
     logp = curve(vd) + vd - vd.exp()                                    # likelihood x Wilson (dI = I dv)

@@ -1,12 +1,9 @@
 """Merge target from the I0 posterior — integrated, never fitted.
 
-The leave-one-out estimator in :mod:`torchsx.nn.merge_target` is the argmin of a
-**Gaussian weighted-least-squares surrogate**, while the objective it feeds is
-the **GenGauss marginal**.  Different optima, and that mismatch is the only
-reason detaching the target is approximate: were I0 the argmax of the *same*
-objective, ``dL/dI0 = 0`` and the envelope theorem would make detaching exact.
-
-This module removes the mismatch from the other end — it never fits I0 at all.
+I0 is never a fitted point estimate: it is integrated out, and the loss is the
+marginal likelihood of each reflection's observations (the evidence).  The
+quantity that is scored is therefore the quantity that is merged, and no
+detached target stands between the network and its objective.
 
 Geometry
 --------
@@ -110,28 +107,19 @@ class PosteriorOut:
     n_floored: int
 
 
-@torch.no_grad()
-def ema_update_corrected(value: Tensor, num: Tensor, wt: Tensor, batch: Tensor,
-                         seen: Tensor, decay: float) -> None:
-    """In place: ``value[seen] = num / wt`` with ``num`` and ``wt`` the
-    decay-weighted sums of the batch estimates and of their weights.
-
-    The bias correction of an exponential moving average started at zero:
-    after the first update ``value`` is that batch's estimate, and the seed
-    ``value`` held before never enters.  Unseen entries keep their value.
-    """
-    num[seen] = decay * num[seen] + (1.0 - decay) * batch[seen]
-    wt[seen] = decay * wt[seen] + (1.0 - decay)
-    value[seen] = num[seen] / wt[seen]
-
-
 class PosteriorMergeTarget(nn.Module):
     """Differentiable posterior mean + marginal likelihood over I0.
 
+    Carries no per-reflection state from one batch to the next: every batch
+    places its own integration grid (:meth:`batch_centre`, :meth:`locate`), and
+    the Wilson surface is a function of hkl with a handful of coefficients
+    trained by the same evidence (:meth:`enable_evidence_prior`).
+
     Parameters
     ----------
-    I0_init
-        ``(n_hkl,)`` seed intensities; the grid centre until the EMA moves.
+    I_start
+        ``(n_hkl,)`` the unity merge of the input observations: the starting
+        point of a merge's locating scan and the initial Wilson fit.
     k_coarse
         Inner-quadrature evaluations per reflection.  The real cost knob.
     m_fine
@@ -144,51 +132,25 @@ class PosteriorMergeTarget(nn.Module):
         ``"none"`` integrates ``dI0`` (weight ``exp(v)``), with no Wilson
         density; ``"flat_I0"`` is its legacy alias. ``"flat_log"``
         integrates ``d log I0``; ``"wilson"`` uses ``p(I) = exp(-I/Sigma)/Sigma``
-        with ``Sigma`` the shell mean.  **Use wilson.**  Where the likelihood is
-        uninformative — and 84 % of observations here are noise-limited — the
-        posterior is whatever the prior says, and a flat-in-I0 prior on a log
-        grid drags those reflections toward the *top of the grid*.  Measured
-        consequence: per-shell CC1/2 improved at low resolution
-        (0.776 -> 0.821) while collapsing at high resolution
+        with ``Sigma(h)`` the smooth Wilson surface.  **Use wilson.**  Where the
+        likelihood is uninformative — and 84 % of observations here are
+        noise-limited — the posterior is whatever the prior says, and a
+        flat-in-I0 prior on a log grid drags those reflections toward the *top
+        of the grid*.  Measured consequence: per-shell CC1/2 improved at low
+        resolution (0.776 -> 0.821) while collapsing at high resolution
         (0.359 -> 0.246, 0.159 -> 0.094), because exactly the weak reflections
         were being inflated.
-    node_placement
-        ``"laplace"`` spaces nodes uniformly in ``log I0`` over
-        ``+- n_sigma * sigma``; ``"wilson"`` places them at quantiles of the
-        **approximate posterior** (Wilson prior x Gaussian likelihood, which is
-        a Gaussian truncated at zero — i.e. French-Wilson).
-
-        **``"wilson"`` is currently BROKEN — do not use.**  It gives a 58-65 %
-        systematic error against the Laplace reference and does *not* improve
-        with node count (0.650 / 0.611 / 0.577 at 9 / 17 / 31), so the fault is
-        in the importance weights ``du * p_W / q``, not the resolution.  Left in
-        place because the idea is right and the bug is findable.
-
-        The idea: nodes drawn through an inverse CDF live on ``u in (0, 1)``, so
-        the grid **cannot truncate**.  That deletes the
-        extent choice, the sigma estimate, and the ratchet that existed only to
-        stop the extent oscillating.  It interpolates correctly between regimes
-        — an uninformative reflection gets prior-like placement, a
-        well-determined one likelihood-like — which pure prior placement would
-        not (with 751 observations per reflection the posterior is far narrower
-        than the Wilson prior, so uniform-in-prior nodes would waste almost all
-        of themselves).
     """
 
     def __init__(
         self,
-        I0_init: Tensor,
+        I_start: Tensor,
         *,
         k_coarse: int = 31,
         m_fine: int = 257,
         n_sigma: float = 8.0,
         prior: str = "wilson",
-        node_placement: str = "laplace",
-        ema_decay: float = 0.99,
-        reference_estimator: str = "wls",
-        bias_correct: bool = False,
         floor: float = 1e-3,
-        sigma_bounds: tuple[float, float] = (0.02, 4.0),
         scan_points: int = 9,
         scan_halfwidth: float = 8.0,
         use_fused: bool = False,
@@ -202,26 +164,12 @@ class PosteriorMergeTarget(nn.Module):
                 f"prior must be 'none' or 'wilson', got {prior!r} "
                 "(legacy 'flat_I0' and 'flat_log' are also accepted)"
             )
-        if node_placement not in ("laplace", "wilson"):
-            raise ValueError(
-                f"node_placement must be 'laplace' or 'wilson', got {node_placement!r}"
-            )
-        if node_placement == "wilson" and prior != "wilson":
-            raise ValueError("Wilson node placement requires prior='wilson'; "
-                             "use Laplace placement for prior='none'")
         if k_coarse < 3 or m_fine < k_coarse:
             raise ValueError("need k_coarse >= 3 and m_fine >= k_coarse")
-        if reference_estimator not in ("wls", "posterior"):
-            raise ValueError("reference_estimator must be 'wls' or 'posterior'")
-        if not 0 <= ema_decay < 1:
-            raise ValueError("ema_decay must be finite and in [0, 1)")
-        self.reference_estimator = reference_estimator
-        self.n_hkl = int(I0_init.shape[0])
+        self.n_hkl = int(I_start.shape[0])
         self.k_coarse, self.m_fine = int(k_coarse), int(m_fine)
         self.n_sigma, self.prior = float(n_sigma), prior
-        self.node_placement = node_placement
-        self.ema_decay, self.floor = float(ema_decay), float(floor)
-        self.sigma_bounds = sigma_bounds
+        self.floor = float(floor)
         self.scan_points, self.scan_halfwidth = int(scan_points), float(scan_halfwidth)
         # Cap on the outer grid HALF-WIDTH in nats.  ``n_sigma`` was raised to
         # 24 to stop truncating sharp posteriors whose Laplace width is
@@ -242,47 +190,15 @@ class PosteriorMergeTarget(nn.Module):
         # cell gets at the same batch size, and that is what it buys back.
         self.checkpoint_nodes = False
         self.use_fused = bool(use_fused)
-        #: Keep each training batch's coarse likelihood curves and grid
-        #: (``last_curves``) so the Wilson surface can be refitted to them
-        #: (:meth:`fit_wilson_to_curves`) without another pass.
-        self.keep_curves = False
-        self.last_curves = None
-        self.wilson_em_iters = 0
-        #: Where the locating scan is centred: ``"reference"`` -- the running
-        #: reference ``ema_I0``; ``"batch"`` -- the batch's own weighted mean at
-        #: the network's scale (:meth:`batch_centre`).  ``track_reference``
-        #: False keeps ``ema_I0`` and the grid-width state at their seeds, so the
-        #: target carries no per-reflection state from one batch to the next.
-        self.centre_mode = "reference"
-        self.track_reference = True
-        #: Lower bound of a batch centre, in nats below the Wilson surface.
+        #: Lower bound of a grid centre, in nats below the Wilson surface.
         self.centre_floor_nats = 4.0
-        self.lam = 0.0                      # API parity with LOOInBatchTarget
 
-        self.register_buffer("ema_I0", I0_init.detach().clone().float().clamp(min=floor))
-        self.register_buffer("ema_den", torch.zeros(self.n_hkl))
-        #: Bias-corrected running reference: ``ema_I0`` is the decay-weighted
-        #: mean of the batch estimates only, normalised by the weight they have
-        #: accumulated, so the seed (the unscaled starting merge) drops out at a
-        #: reflection's first update instead of keeping ``decay^n`` of the
-        #: weight (13 % after 200 updates at 0.99).  Training-only state.
-        self.bias_correct = bool(bias_correct)
-        self.register_buffer("ema_num", torch.zeros(self.n_hkl), persistent=False)
-        self.register_buffer("ema_wt", torch.zeros(self.n_hkl), persistent=False)
-        self.register_buffer("_den_seeded", torch.zeros((), dtype=torch.bool))
-        # Grid width, learned from the OBSERVED posterior rather than predicted
-        # from the Laplace approximation.  The Laplace sigma comes from the
-        # Gaussian variance model; for weak reflections the true posterior is
-        # wider and skewed, and the grid then clips it -- measured edge_mass up
-        # to 0.93 on a minority of reflections even at +-8 sigma, with the
-        # error tracking it exactly.  Measuring the width and rolling it forward
-        # makes the grid self-tuning, and edge_mass reports whether it worked.
-        self.register_buffer("ema_log_sigma", torch.zeros(self.n_hkl))
-        self.register_buffer("_sigma_seeded", torch.zeros((), dtype=torch.bool))
-        # Shell mean intensity Sigma for the Wilson prior; set via
-        # set_wilson_sigma().  Defaults to the seed intensities, which is the
-        # per-reflection rather than per-shell mean — adequate to start.
-        self.register_buffer("wilson_sigma", I0_init.detach().clone().float().clamp(min=floor))
+        self.register_buffer("I_start", I_start.detach().clone().float().clamp(min=floor),
+                             persistent=False)
+        # Mean intensity Sigma(h) of the Wilson prior.  Starts at the unity
+        # merge per reflection; :meth:`fit_wilson_surface` replaces it with the
+        # smooth surface once a basis is installed.
+        self.register_buffer("wilson_sigma", self.I_start.clone())
         # Centric reflections have a different Wilson distribution:
         #     acentric  p(I) = exp(-I/Sigma) / Sigma
         #     centric   p(I) = exp(-I/2Sigma) / sqrt(2 pi Sigma I)
@@ -294,10 +210,8 @@ class PosteriorMergeTarget(nn.Module):
         # merge is unchanged bit-for-bit.
         self.register_buffer("is_centric",
                              torch.zeros_like(self.wilson_sigma, dtype=torch.bool))
-        # Smooth Sigma(h): when a reciprocal-space basis is installed through
-        # set_basis(), set_wilson_sigma() fits log Sigma = phi @ coef by Wilson
-        # maximum likelihood instead of taking equal-count shell means.  Both
-        # buffers stay empty in shells mode so old checkpoints load unchanged.
+        # Smooth Sigma(h): log Sigma = phi @ coef on the reciprocal-space basis
+        # installed through set_basis().
         self.register_buffer("wilson_phi", torch.zeros(0, 0))
         self.register_buffer("wilson_coef", torch.zeros(0))
         self.wilson_fit_iters = 0
@@ -316,7 +230,7 @@ class PosteriorMergeTarget(nn.Module):
         if k_coarse < 3 or m_fine < k_coarse or not math.isfinite(n_sigma) or n_sigma <= 0:
             raise ValueError("need k_coarse >= 3, m_fine >= k_coarse and finite n_sigma > 0")
         self.k_coarse, self.m_fine, self.n_sigma = int(k_coarse), int(m_fine), float(n_sigma)
-        device = self.ema_I0.device
+        device = self.I_start.device
         u_c = torch.linspace(-n_sigma, n_sigma, k_coarse).to(device)
         u_f = torch.linspace(-n_sigma, n_sigma, m_fine).to(device)
         self.register_buffer("u_coarse", u_c)
@@ -332,10 +246,10 @@ class PosteriorMergeTarget(nn.Module):
     @torch.no_grad()
     def locate(
         self, objective, scatter, params, pred,
-        n_ph: Tensor, bg: Tensor, hkl_id: Tensor, meta,
-        centre: Tensor | None = None,
+        n_ph: Tensor, bg: Tensor, hkl_id: Tensor, meta, centre: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Find the peak and width of the log-likelihood curve by MEASURING it.
+        """Find the peak and width of the log-likelihood curve by MEASURING it,
+        scanning around ``centre`` (log intensity per reflection).
 
         Three formulas for the grid width have now failed in three different
         directions -- too narrow (edge_mass 0.93), oscillating (a
@@ -355,9 +269,6 @@ class PosteriorMergeTarget(nn.Module):
             objective, scatter, params, pred, n_ph, bg, hkl_id, meta, v_scan
         )
         return self.peak_from_scan(S, centre)
-
-    def _scan_centre(self, centre: Tensor | None) -> Tensor:
-        return self.ema_I0.clamp(min=self.floor).log() if centre is None else centre
 
     @torch.no_grad()
     def batch_centre(self, pred, n_signal: Tensor, sigma: Tensor, hkl_id: Tensor) -> Tensor:
@@ -384,10 +295,16 @@ class PosteriorMergeTarget(nn.Module):
         return torch.maximum(I2, lo).clamp(min=self.floor).log()
 
     @torch.no_grad()
-    def scan_grid(self, centre: Tensor | None = None) -> Tensor:
+    def start_centre(self) -> Tensor:
+        """``log`` of the unity merge floored ``centre_floor_nats`` below the
+        Wilson surface: where a merge's first locating scan is centred."""
+        lo = self.wilson_sigma.clamp(min=self.floor) * math.exp(-self.centre_floor_nats)
+        return torch.maximum(self.I_start, lo).clamp(min=self.floor).log()
+
+    @torch.no_grad()
+    def scan_grid(self, centre: Tensor) -> Tensor:
         """Generous grid for the locating sweep: ``(n_hkl, scan_points)``,
-        around ``centre`` (log intensity; default the running reference)."""
-        centre = self._scan_centre(centre)
+        around ``centre`` (log intensity)."""
         u = torch.linspace(
             -self.scan_halfwidth, self.scan_halfwidth, self.scan_points,
             device=centre.device,
@@ -395,7 +312,7 @@ class PosteriorMergeTarget(nn.Module):
         return centre[:, None] + u[None, :]
 
     @torch.no_grad()
-    def peak_from_scan(self, S: Tensor, centre: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def peak_from_scan(self, S: Tensor, centre: Tensor) -> tuple[Tensor, Tensor]:
         """Peak location and width read off an accumulated scan curve.
 
         Separate from :meth:`locate` so a caller that spans several batches can
@@ -404,9 +321,8 @@ class PosteriorMergeTarget(nn.Module):
         placed the merge grid by the very formula this replaces, and the merge
         collapsed back onto the grid centre: per-shell CC1/2 read exactly
         1.0000 in five shells, because both halves returned the same shared
-        ``ema_I0`` rather than anything from the data.
+        centre rather than anything from the data.
         """
-        centre = self._scan_centre(centre)
         u = torch.linspace(
             -self.scan_halfwidth, self.scan_halfwidth, self.scan_points,
             device=S.device,
@@ -471,18 +387,6 @@ class PosteriorMergeTarget(nn.Module):
         sd = torch.where(one_sided, torch.full_like(sd, 0.5 * H / self.n_sigma), sd)
         return v_star, sd.clamp(min=1e-3, max=sd_max)
 
-    @torch.no_grad()
-    def _centre_sigma(self) -> tuple[Tensor, Tensor]:
-        I0 = self.ema_I0.clamp(min=self.floor)
-        if not bool(self._sigma_seeded):
-            # Bootstrap from Laplace: Var(I0_hat) ~ 1/den => sigma ~ 1/(I0 sqrt(den))
-            den = self.ema_den.clamp(min=1e-12)
-            self.ema_log_sigma.copy_(
-                (1.0 / (I0 * den.sqrt())).clamp(*self.sigma_bounds).log()
-            )
-            self._sigma_seeded.fill_(True)
-        return I0.log(), self.ema_log_sigma.exp().clamp(*self.sigma_bounds)
-
     @property
     def has_basis(self) -> bool:
         return self.wilson_phi.numel() > 0
@@ -492,8 +396,8 @@ class PosteriorMergeTarget(nn.Module):
         """Install the smooth basis ``phi`` (``n_hkl x p``); Sigma is fitted on it from now on."""
         if phi.shape[0] != self.n_hkl:
             raise ValueError(f"basis has {phi.shape[0]} rows for {self.n_hkl} reflections")
-        self.wilson_phi = phi.detach().to(self.ema_I0.device, torch.float32).clone()
-        self.wilson_coef = torch.zeros(phi.shape[1], device=self.ema_I0.device)
+        self.wilson_phi = phi.detach().to(self.I_start.device, torch.float32).clone()
+        self.wilson_coef = torch.zeros(phi.shape[1], device=self.I_start.device)
         self.wilson_fit_iters = 0
 
     def enable_evidence_prior(self) -> nn.Parameter:
@@ -522,101 +426,17 @@ class PosteriorMergeTarget(nn.Module):
             (self.wilson_phi.double() @ self.wilson_coef.double()).exp().float().clamp(min=self.floor))
 
     @torch.no_grad()
-    def fit_wilson_to_curves(self, S: Tensor, loc: tuple[Tensor, Tensor], seen: Tensor,
-                             shell_id: Tensor, n_shells: int, *,
-                             n_iter: int = 50, tol: float = 1e-4) -> int:
-        """Refit ``Sigma`` by maximising the marginal likelihood of one set of curves.
-
-        ``S`` is the coarse log-likelihood curve per reflection on the grid
-        ``loc = (centre, width)`` -- the full observation model: counts,
-        background, each observation's scatter distribution and the miss
-        component.  With the curves fixed, the marginal likelihood
-        ``sum_h log Z_h(Sigma)`` is maximised over the surface (or the shell
-        means) by EM: posterior means under the current ``Sigma`` from
-        :meth:`integrate`, then a Wilson fit to them on the reflections in
-        ``seen``, until ``log Sigma`` moves by less than ``tol`` on every
-        reflection.  Returns the number of EM iterations.
-        """
-        if self.node_placement != "laplace":
-            raise ValueError("curve refits need the uniform (laplace) grid")
-        saved = getattr(self, "_loc", None)
-        weight = seen.float()
-        used = 0
-        try:
-            self._loc = loc
-            for it in range(n_iter):
-                before = self.wilson_sigma.clone()
-                _, I0_mean, *_ = self.integrate(S, None)
-                self.set_wilson_sigma(shell_id, n_shells,
-                                      reference=I0_mean.clamp(min=self.floor),
-                                      sample_weight=weight)
-                used = it + 1
-                step = (self.wilson_sigma / before).log().abs()[seen].max()
-                if float(step) < tol:
-                    break
-        finally:
-            self._loc = saved
-        self.wilson_em_iters = used
-        return used
-
-    @torch.no_grad()
-    def set_wilson_sigma_from_counts(self, counts: Tensor, scale: Tensor,
-                                     shell_id: Tensor, n_shells: int) -> None:
-        """Refresh ``Sigma`` so that ``scale * Sigma`` matches ``counts``.
-
-        ``counts`` and ``scale`` are per-reflection sums over one set of
-        observations of the background-subtracted signal and of its expected
-        scale.  With a basis, ``log Sigma = phi @ coef`` is fitted by
-        :func:`~torchsx.merging.priors.reciprocal_basis.fit_log_sigma_to_counts`,
-        warm-started; in shells mode each shell gets the ratio of its sums.
-        """
-        if self.has_basis:
-            from torchsx.merging.priors.reciprocal_basis import fit_log_sigma_to_counts
-            coef0 = self.wilson_coef if bool(self.wilson_coef.abs().sum() > 0) else None
-            coef, used = fit_log_sigma_to_counts(self.wilson_phi, counts, scale, coef0)
-            self.set_wilson_coef(coef)
-            self.wilson_fit_iters = int(used)
-            return
-        y = torch.zeros(n_shells, device=counts.device, dtype=torch.float64)
-        m = torch.zeros(n_shells, device=counts.device, dtype=torch.float64)
-        y.index_add_(0, shell_id, counts.double())
-        m.index_add_(0, shell_id, scale.double())
-        ok = (m > 0)[shell_id]
-        fitted = (y / m.clamp(min=1e-30)).float()[shell_id]
-        self.wilson_sigma.copy_(torch.where(ok, fitted, self.wilson_sigma).clamp(min=self.floor))
-
-    @torch.no_grad()
-    def set_wilson_sigma(self, shell_id: Tensor, n_shells: int, *,
-                         reference: Tensor | None = None,
-                         sample_weight: Tensor | None = None) -> None:
-        """Refresh ``Sigma`` from the running merge.
-
-        Shells mode: the equal-count shell mean of ``ema_I0`` (``shell_id`` /
-        ``n_shells``).  With a basis installed the arguments are ignored and
-        ``log Sigma = phi @ coef`` is refitted by Wilson maximum likelihood,
-        warm-started from the previous coefficients.
-        """
-        reference = self.ema_I0 if reference is None else reference
-        if self.has_basis:
-            from torchsx.merging.priors.reciprocal_basis import fit_wilson_log_sigma
-            coef0 = self.wilson_coef if bool(self.wilson_coef.abs().sum() > 0) else None
-            coef, used = fit_wilson_log_sigma(
-                self.wilson_phi, reference.clamp(min=self.floor), self.is_centric, coef0,
-                sample_weight=sample_weight,
-            )
-            self.wilson_coef.copy_(coef)
-            self.wilson_fit_iters = int(used)
-            self.wilson_sigma.copy_(
-                (self.wilson_phi.double() @ coef.double()).exp().float().clamp(min=self.floor)
-            )
-            return
-        m = torch.zeros(n_shells, device=self.ema_I0.device)
-        c = torch.zeros(n_shells, device=self.ema_I0.device)
-        weights = torch.ones_like(reference) if sample_weight is None else sample_weight
-        m.index_add_(0, shell_id, reference * weights)
-        c.index_add_(0, shell_id, weights)
-        fitted = (m / c.clamp(min=1e-30))[shell_id]
-        self.wilson_sigma.copy_(torch.where(c[shell_id] > 0, fitted, self.wilson_sigma).clamp(min=self.floor))
+    def fit_wilson_surface(self, reference: Tensor | None = None) -> None:
+        """Fit ``log Sigma = phi @ coef`` to ``reference`` (default the unity
+        merge) by Wilson maximum likelihood: the start of the evidence fit."""
+        if not self.has_basis:
+            raise ValueError("the Wilson surface needs the smooth reciprocal basis (set_basis)")
+        from torchsx.merging.priors.reciprocal_basis import fit_wilson_log_sigma
+        reference = self.I_start if reference is None else reference
+        coef, used = fit_wilson_log_sigma(
+            self.wilson_phi, reference.clamp(min=self.floor), self.is_centric)
+        self.set_wilson_coef(coef)
+        self.wilson_fit_iters = int(used)
 
     @torch.no_grad()
     def set_is_centric(self, is_centric: Tensor) -> None:
@@ -627,45 +447,6 @@ class PosteriorMergeTarget(nn.Module):
         """``1/Sigma`` acentric, ``1/(2 Sigma)`` centric."""
         sig = self.wilson_sigma.clamp(min=self.floor)
         return torch.where(self.is_centric, 0.5 / sig, 1.0 / sig)
-
-    @torch.no_grad()
-    def _wilson_nodes(self) -> tuple[Tensor, Tensor]:
-        """Nodes at quantiles of the French-Wilson approximate posterior.
-
-        Wilson prior ``exp(-I/Sigma)`` times a Gaussian likelihood ``N(Ihat, s)``
-        is a Gaussian truncated at zero with mean ``Ihat - s^2/Sigma`` and the
-        same ``s``.  Drawing nodes through its inverse CDF means the domain is
-        ``u in (0,1)``: no extent to choose, and no truncation possible.
-        """
-        Ihat = self.ema_I0.clamp(min=self.floor)
-        sd = (1.0 / self.ema_den.clamp(min=1e-12).sqrt()).clamp(min=1e-6)
-        mu = Ihat - sd**2 * self._prior_rate()
-
-        nrm = torch.distributions.Normal(0.0, 1.0)
-        a = (-mu / sd)                                   # lower truncation in z
-        Fa = nrm.cdf(a)
-        # stratified midpoints avoid the u->0/1 endpoints where Phi^-1 diverges
-        u = (torch.arange(self.k_coarse, device=Ihat.device) + 0.5) / self.k_coarse
-        z = nrm.icdf((Fa[:, None] + u[None, :] * (1.0 - Fa[:, None])).clamp(1e-6, 1 - 1e-6))
-        I_nodes = (mu[:, None] + sd[:, None] * z).clamp(min=self.floor)
-        v = I_nodes.log()
-
-        # importance weights: dI-integral of L*p_W with proposal q
-        #   w_k = du * p_W(I_k) / q(I_k)
-        rate = self._prior_rate()[:, None]
-        log_sig = self.wilson_sigma.clamp(min=self.floor).log()[:, None]
-        log_pw = torch.where(
-            self.is_centric[:, None],
-            -I_nodes * rate - 0.5 * (math.log(2 * math.pi) + log_sig
-                                     + I_nodes.clamp(min=1e-30).log()),
-            -I_nodes * rate - log_sig,
-        )
-        log_q = (
-            nrm.log_prob((I_nodes - mu[:, None]) / sd[:, None])
-            - sd.log()[:, None] - torch.log1p(-Fa)[:, None]
-        )
-        log_w = math.log(1.0 / self.k_coarse) + log_pw - log_q
-        return v, log_w
 
     def accumulate(
         self, objective, scatter, params, pred,
@@ -788,45 +569,43 @@ class PosteriorMergeTarget(nn.Module):
         return torch.stack(cols, dim=1)
 
     def integrate(
-        self, S: Tensor, v_nodes: Tensor, log_w_nodes: Tensor | None = None,
+        self, S: Tensor, loc: tuple[Tensor, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Coarse curve -> ``(log_Z, E[I0], posterior weights, v, edge_mass)``.
 
-        Shared by the loss and by the merge, so the quantity being scored is by
-        construction the quantity being minimised.
+        ``loc = (centre, width)`` is the grid ``S`` was accumulated on (default
+        the last one placed, ``_loc``).  Shared by the loss and by the merge, so
+        the quantity being scored is by construction the quantity being
+        minimised.
         """
-        if log_w_nodes is None:
-            # uniform-in-u placement: interpolate to the fine grid, then weight
-            centre, sig_h = getattr(self, "_loc", None) or self._centre_sigma()
-            S_fine = self._interp(S)
-            v = centre[:, None] + sig_h[:, None] * self.u_fine[None, :]
-            du = float(2 * self.n_sigma / (self.m_fine - 1))
-            log_w = (sig_h * du).log()[:, None].expand_as(v).clone()
-            if self.prior in ("none", "flat_I0"):
-                log_w = log_w + v                       # dI0 = I0 dv
-            elif self.prior == "wilson":
-                # evidence-fitted: the parameter while training; every no-grad
-                # pass (evaluation, merge, readout) reads the mirrored buffers
-                if self.wilson_coef_param is not None and torch.is_grad_enabled():
-                    log_sig = (self.wilson_phi @ self.wilson_coef_param).clamp(
-                        min=math.log(self.floor))[:, None]
-                    inv = (-log_sig).exp()
-                    rate = torch.where(self.is_centric[:, None], 0.5 * inv, inv)
-                else:
-                    rate = self._prior_rate()[:, None]
-                    log_sig = self.wilson_sigma.clamp(min=self.floor).log()[:, None]
-                # v carries the dI = I dv Jacobian; the centric I^(-1/2) eats
-                # half of it, leaving 0.5 * v.
-                log_w = torch.where(
-                    self.is_centric[:, None],
-                    log_w + 0.5 * v - v.exp() * rate
-                    - 0.5 * (math.log(2 * math.pi) + log_sig),
-                    log_w + v - v.exp() * rate - log_sig,
-                )
-            log_w[:, 0] -= math.log(2.0)
-            log_w[:, -1] -= math.log(2.0)
-        else:
-            S_fine, v, log_w = S, v_nodes, log_w_nodes
+        centre, sig_h = self._loc if loc is None else loc
+        S_fine = self._interp(S)
+        v = centre[:, None] + sig_h[:, None] * self.u_fine[None, :]
+        du = float(2 * self.n_sigma / (self.m_fine - 1))
+        log_w = (sig_h * du).log()[:, None].expand_as(v).clone()
+        if self.prior in ("none", "flat_I0"):
+            log_w = log_w + v                       # dI0 = I0 dv
+        elif self.prior == "wilson":
+            # the trained parameter while training; every no-grad pass
+            # (evaluation, merge, readout) reads the mirrored buffers
+            if self.wilson_coef_param is not None and torch.is_grad_enabled():
+                log_sig = (self.wilson_phi @ self.wilson_coef_param).clamp(
+                    min=math.log(self.floor))[:, None]
+                inv = (-log_sig).exp()
+                rate = torch.where(self.is_centric[:, None], 0.5 * inv, inv)
+            else:
+                rate = self._prior_rate()[:, None]
+                log_sig = self.wilson_sigma.clamp(min=self.floor).log()[:, None]
+            # v carries the dI = I dv Jacobian; the centric I^(-1/2) eats
+            # half of it, leaving 0.5 * v.
+            log_w = torch.where(
+                self.is_centric[:, None],
+                log_w + 0.5 * v - v.exp() * rate
+                - 0.5 * (math.log(2 * math.pi) + log_sig),
+                log_w + v - v.exp() * rate - log_sig,
+            )
+        log_w[:, 0] -= math.log(2.0)
+        log_w[:, -1] -= math.log(2.0)
 
         logits = S_fine + log_w
         log_Z = torch.logsumexp(logits, dim=1)
@@ -853,13 +632,6 @@ class PosteriorMergeTarget(nn.Module):
         ).detach()
         return log_Z, I0_mean, I0_sd, w_post, v, edge_mass
 
-    def nodes(self) -> tuple[Tensor, Tensor | None]:
-        """Integration nodes ``v`` and their log-weights (``None`` -> uniform)."""
-        if self.node_placement == "wilson":
-            return self._wilson_nodes()
-        centre, sig_h = self._centre_sigma()
-        return centre[:, None] + sig_h[:, None] * self.u_coarse[None, :], None
-
     def _interp(self, S_coarse: Tensor) -> Tensor:
         """``(n_hkl, k_coarse)`` -> ``(n_hkl, m_fine)``, linear on the u axis."""
         lo = S_coarse.index_select(1, self._lo)
@@ -871,35 +643,22 @@ class PosteriorMergeTarget(nn.Module):
     def forward(
         self, objective, scatter, params, pred,
         n_ph: Tensor, bg: Tensor, sigma: Tensor, hkl_id: Tensor, meta,
-        *, update_state: bool = True,
     ) -> PosteriorOut:
-        """Infer this batch; advance running references only for training batches."""
-        if self.node_placement == "wilson":
-            # Importance placement: nodes already sit where the mass is, so the
-            # coarse->fine interpolation that compensates for a badly placed
-            # uniform grid is unnecessary.  Integrate on the nodes directly.
-            v_nodes, log_w_nodes = self._wilson_nodes()
-            interpolate = False
-        else:
-            # Measure the curve, then place the grid on it.  One extra sweep of
-            # scan_points, against three failed attempts at a closed-form width.
-            start = (self.batch_centre(pred, n_ph - bg, sigma, hkl_id)
-                     if self.centre_mode == "batch" else None)
-            centre, sig_h = self.locate(
-                objective, scatter, params, pred, n_ph, bg, hkl_id, meta, start
-            )
-            self._loc = (centre, sig_h)
-            v_nodes = centre[:, None] + sig_h[:, None] * self.u_coarse[None, :]
-            log_w_nodes = None
-            interpolate = True
-
+        """Infer this batch on a grid placed by the batch itself."""
+        # Measure the curve around the batch's own weighted mean, then place
+        # the grid on it.  One extra sweep of scan_points, against three failed
+        # attempts at a closed-form width.
+        start = self.batch_centre(pred, n_ph - bg, sigma, hkl_id)
+        centre, sig_h = self.locate(
+            objective, scatter, params, pred, n_ph, bg, hkl_id, meta, start
+        )
+        self._loc = (centre, sig_h)
+        v_nodes = centre[:, None] + sig_h[:, None] * self.u_coarse[None, :]
         S = self.accumulate(
             objective, scatter, params, pred, n_ph, bg, hkl_id, meta, v_nodes
         )
 
-        log_Z, I0_mean, I0_sd, w_post, v, edge_mass = self.integrate(
-            S, v_nodes, log_w_nodes
-        )
+        log_Z, I0_mean, I0_sd, w_post, v, edge_mass = self.integrate(S)
         seen = torch.zeros(self.n_hkl, dtype=torch.bool, device=n_ph.device)
         seen[hkl_id] = True
         log_Z = torch.where(
@@ -907,89 +666,11 @@ class PosteriorMergeTarget(nn.Module):
             torch.full((self.n_hkl,), float("-inf"),
                        device=log_Z.device, dtype=log_Z.dtype),
         )
-
-        if update_state and self.keep_curves and log_w_nodes is None:
-            self.last_curves = (S.detach(), tuple(t.detach() for t in self._loc), seen)
         floored = I0_mean < self.floor
-        I0_mean = torch.where(seen, I0_mean.clamp(min=self.floor), self.ema_I0)
-        if update_state and self.track_reference:
-            self._update_ema(pred, n_ph - bg, sigma, hkl_id,
-                             posterior_mean=I0_mean, posterior_seen=seen)
-        if update_state and self.track_reference and self.node_placement == "laplace":
-            # Only the uniform-grid path has an extent to maintain.  Wilson
-            # placement draws nodes through an inverse CDF over u in (0,1), so
-            # there is nothing to widen or shrink and nothing to truncate.
-            self._update_width(w_post, v, seen, edge_mass)
-
+        I0_mean = torch.where(seen, I0_mean.clamp(min=self.floor), self.I_start)
         return PosteriorOut(
             log_Z=log_Z, I0_mean=I0_mean, I0_sd=I0_sd,
             I0_obs=I0_mean.index_select(0, hkl_id),
             seen=seen, edge_mass=edge_mass,
             n_floored=int((floored & seen).sum()),
         )
-
-    @torch.no_grad()
-    def _update_width(self, w_post, v, seen, edge_mass) -> None:
-        """Roll the grid width forward from the posterior we just measured.
-
-        Uses the observed posterior sd in ``log I0``, inflated where the grid
-        clipped: if ``edge_mass`` is large the measured sd is itself an
-        underestimate (the tails were cut off), so widen rather than trust it.
-        """
-        mean = (w_post * v).sum(1)
-        sd = ((w_post * (v - mean[:, None]) ** 2).sum(1)).clamp(min=1e-12).sqrt()
-        cur = self.ema_log_sigma.exp()
-
-        # Ratchet, not a symmetric update.  A naive "measure and follow" loop
-        # oscillates (measured edge_mass 0.29 -> 0.03 -> 0.52 -> 0.01 -> 0.53):
-        # a clipped grid under-reports its own width, the correction overshoots,
-        # the now-wide grid measures a small sd, and it clips again.  So widen
-        # hard when clipping is detected and shrink only slowly and only when it
-        # is not, which is monotone enough to settle.
-        clipped = edge_mass > 0.01
-        widened = cur * (1.0 + 2.0 * edge_mass)
-        shrunk = torch.maximum(0.98 * cur, sd)          # never below the measurement
-        target = torch.where(clipped, widened, shrunk).clamp(*self.sigma_bounds)
-        self.ema_log_sigma[seen] = target[seen].log()
-
-    @torch.no_grad()
-    def _update_ema(self, pred, n_signal, sigma, hkl_id, *,
-                    posterior_mean=None, posterior_seen=None) -> None:
-        """Update a detached running mean, once per observed training batch.
-
-        Posterior mode reuses this batch's integrated mean. It averages estimates;
-        it does not multiply old posteriors into the next batch's prior. Missing
-        reflections retain their reference. Decay 0.99 gives each update 1% weight.
-        The WLS denominator remains an auxiliary grid-placement statistic in both
-        modes, so changing the mean estimator does not change its definition.
-        """
-        K = pred.log_K.exp().clamp(min=1e-8)
-        I0_ref = self.ema_I0[hkl_id].clamp(min=self.floor)
-        w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
-        # Preserve the historical auxiliary weights in both modes. They omit
-        # background-estimate variance. Posterior means, in contrast, integrate
-        # the full likelihood. In WLS mode these weights also define the mean
-        # used by network context and Wilson fitting.
-        var = (sigma**2 + (K * I0_ref) ** 2 * torch.expm1(w2)).clamp(min=1e-12)
-        den = group_sum(K * K / var, hkl_id, self.n_hkl)
-        if self.reference_estimator == "posterior":
-            if posterior_mean is None or posterior_seen is None:
-                raise ValueError("posterior reference requires integrated means and seen mask")
-            seen = posterior_seen
-            batch = posterior_mean.detach().clamp(min=self.floor)
-        else:
-            num = group_sum(K * n_signal / var, hkl_id, self.n_hkl)
-            seen = den > 0
-            batch = torch.zeros_like(self.ema_I0)
-            batch[seen] = (num[seen] / den[seen]).clamp(min=self.floor)
-        if not bool(self._den_seeded):
-            self.ema_den.copy_(den)
-            self._den_seeded.fill_(True)
-        if not bool(seen.any()):
-            return
-        d = self.ema_decay
-        if self.bias_correct:
-            ema_update_corrected(self.ema_I0, self.ema_num, self.ema_wt, batch, seen, d)
-        else:
-            self.ema_I0[seen] = d * self.ema_I0[seen] + (1 - d) * batch[seen]
-        self.ema_den[seen] = d * self.ema_den[seen] + (1 - d) * den[seen]

@@ -211,10 +211,10 @@ def hkl_permutation_sensitivity(scale, meta, *, seed: int = 0) -> float:
     hkl from the features before any light/dark work.
 
     Only the **self** branch is permuted.  Once the context carries
-    ``obs_scale = n'/I0``, permuting the whole meta also permutes the *peers'*
-    I0 lookup, and the monitor then reports legitimate use of per-reflection I0
-    as if it were leakage (measured: 0.33 on a model with no hkl feature at
-    all).  The degeneracy that matters is whether ``log_K[j]`` responds to
+    per-reflection channels (the peers' rank within their reflection and its
+    brightness), permuting the whole meta also permutes those lookups, and the
+    monitor then reports legitimate use of them as if it were leakage
+    (measured: 0.33 on a model with no hkl feature at all).  The degeneracy that matters is whether ``log_K[j]`` responds to
     ``j``'s *own* reflection identity, which is a self-branch property.
     """
     import dataclasses

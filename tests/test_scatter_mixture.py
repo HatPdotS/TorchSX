@@ -315,8 +315,8 @@ def test_mixture_trainer_step_runs_and_trains_the_mixture_head(tmp_path):
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, predict_shape=False,
                                      beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture", n_components=3)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1), miss_frac=0.03)
-    cfg = TrainConfig(max_obs_per_batch=6000, epochs=1, lr=1e-2, lam0=0.0, lam_halflife_steps=0, log_every=10 ** 9,
-                      heldout_frac=0.0, merge_target="posterior", loss="evidence", posterior_k_coarse=9, posterior_m_fine=33,
+    cfg = TrainConfig(max_obs_per_batch=6000, epochs=1, lr=1e-2, log_every=10 ** 9,
+                      heldout_frac=0.0, posterior_k_coarse=9, posterior_m_fine=33,
                       device="cpu", outdir=str(tmp_path), split_half_every=0)
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     before = scale.heads.mixture.l2.weight.detach().clone()
@@ -363,7 +363,6 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path, monkeypatch
     from torchsx.cli import _pipeline as P
     from torchsx.cli.merge_nn import _build_parser as merge_parser
     from torchsx.cli.train import _build_parser as train_parser
-    from torchsx.nn.checkpoint_context import load_checkpoint_context, verify_probes
     from torchsx.nn.heads import MixtureHead
     from tests.test_amortized_training import _synthetic
     from tests.test_cli_pipeline import _trainer_from_stack
@@ -388,15 +387,16 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path, monkeypatch
     ck = torch.load(tr.save_best(tmp_path / "mix.pt"), weights_only=False)
     assert ck["scatter"]["family"] == "mixture" and ck["scatter"]["n_components"] == 4 and ck["scatter"]["component_shape"] == "gaussian"
     assert any(k.startswith("heads.mixture.") for k in ck["state_dict"])
-    assert "mix" in ck["inference_context"]["probes"] or any("mix" in str(k) for k in ck["inference_context"]["probes"])
     # merge side rebuilds the family from the checkpoint with no flags
     margs = merge_parser().parse_args(["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
     p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
     assert S2["scatter_family"] == "mixture" and rebuilt.heads.n_components == 4 and isinstance(rebuilt.scatter, PredictedMixtureScatter)
     rebuilt.load_state_dict(ck["state_dict"])
-    tr2 = _trainer_from_stack(p2, q2, rebuilt, o2, S2)
-    load_checkpoint_context(tr2, ck, "exact")
-    verify_probes(tr2, ck["inference_context"])
+    scale.eval(), rebuilt.eval()
+    with torch.no_grad():
+        a, b = scale.predict(prep_.obs_info), rebuilt.predict(p2.obs_info)
+    torch.testing.assert_close(b.log_K, a.log_K)
+    torch.testing.assert_close(b.mix, a.mix)
     # a checkpoint written before the family existed rebuilds the single family and loads strictly
     tr0 = _trainer_from_stack(_p, _q, scale0, _o, S0); tr0.data_recipe = dict(recipe)
     ck0 = torch.load(tr0.save_best(tmp_path / "old.pt"), weights_only=False)
@@ -418,12 +418,12 @@ def test_mixture_lr_multiplier_makes_its_own_param_group(tmp_path):
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, predict_shape=False,
                                      beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture", n_components=3)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
-    cfg = TrainConfig(max_obs_per_batch=6000, epochs=0, lr=1e-3, mixture_lr_mult=10.0, merge_target="posterior", loss="evidence",
+    cfg = TrainConfig(max_obs_per_batch=6000, epochs=0, lr=1e-3, mixture_lr_mult=10.0,
                       posterior_k_coarse=9, posterior_m_fine=33, device="cpu", heldout_frac=0.0, outdir=str(tmp_path), warmup_steps=5)
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     grps = tr.opt.param_groups
     mix_ids = {id(p) for p in scale.heads.mixture.parameters()}
-    mg = [g for g in grps if g.get("lr_mult") == 10.0]
+    mg = [g for g in grps if g.get("lr_mult") == 10.0 and g.get("name") != "wilson_surface"]
     assert len(mg) == 1 and {id(p) for p in mg[0]["params"]} == mix_ids and abs(mg[0]["lr"] - 1e-2) < 1e-12
     assert all(id(p) not in mix_ids for g in grps if "lr_mult" not in g for p in g["params"])
 

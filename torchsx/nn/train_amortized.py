@@ -36,9 +36,7 @@ import torch
 from torch import Tensor
 
 from torchsx.merging.observations import PreparedObs
-from torchsx.nn.merge_target import (
-    LOOInBatchTarget, MergeTargetOut, unity_merge,
-)
+from torchsx.nn.merge_target import MergeTargetOut, unity_merge
 from torchsx.nn.metrics import (
     MetricLogger,
     _diagnostic_quantile,
@@ -50,7 +48,6 @@ from torchsx.nn.metrics import (
     scale_metrics,
 )
 from torchsx.nn.shape_prior import pack_single, shape_prior_kl
-from torchsx.nn.pooling import group_sum
 
 __all__ = ["CrystalIndex", "TrainConfig", "AmortizedTrainer"]
 
@@ -179,10 +176,6 @@ def lr_factor(step: int, *, warmup: int, total: int, schedule: str = "constant",
     return f
 
 
-#: How the Wilson prior's surface is fitted (``TrainConfig.wilson_fit``).
-WILSON_FITS: tuple[str, ...] = ("reference", "evidence", "batch-em", "batch-ml", "batch-counts")
-
-
 @dataclass
 class TrainConfig:
     #: Warn when the hkl-permutation sensitivity exceeds this.  A scale that
@@ -234,9 +227,6 @@ class TrainConfig:
     #: coupled to gradient history rather than being a clean prior.
     weight_decay: float = 0.0
     grad_clip: float = 1.0
-    lam0: float = 10.0            # EMA prior strength at step 0
-    lam_min: float = 0.0
-    lam_halflife_steps: int = 200  # lam decays by 1/2 every this many steps
     #: Penalty on the predicted scatter width, ``lam_spread * mean(log w)``.
     #: The design doc argued no explicit penalty on w is needed because the
     #: GenGauss normaliser already contains -log(alpha).  That is true *at the
@@ -247,29 +237,10 @@ class TrainConfig:
     #: refine K per observation.  This penalty is a tool for escaping that
     #: basin, not a claim about the statistics -- so it is annealed away and
     #: the final w is judged on calibration (var_z), not on this term.
-    #: ``"loo"``   — leave-one-out inverse-variance estimator (Gaussian WLS
-    #:               surrogate; cheap, and the default).
-    #: ``"posterior"`` — integrate I0 out on a local grid.  Never fits I0, so
-    #:               the surrogate/objective mismatch that makes detaching only
-    #:               approximate disappears.  Costs ~k_coarse inner-quadrature
-    #:               passes (measured: one pass is 4.4 % of a step, so k=31 is
-    #:               roughly 2.3x).  Requires a quadrature with the Triton path
-    #:               (a wide ``FixedLogGrid``) to be worth it.
-    merge_target: str = "loo"
-    #: ``"per_obs"``  — score each observation against the merged target.
-    #: ``"evidence"`` — use the per-reflection marginal likelihood directly.
-    #:                  Only valid with ``merge_target="posterior"``.  No target
-    #:                  is involved at all, so no leave-one-out bookkeeping is
-    #:                  needed: what protects it is the *feature* contract, not
-    #:                  target exclusion.
-    loss: str = "per_obs"
-    #: Estimator used to MERGE for the split-half metrics, independent of
-    #: ``merge_target``.  Tying the two confounds the comparison: the estimator
-    #: alone is worth +0.007 CC1/2 at K = 1 (0.9871 WLS vs 0.9944 posterior),
-    #: so scoring a leave-one-out run with WLS and a posterior run with the
-    #: posterior measures both changes at once.  Default posterior for every
-    #: run, so CC1/2 differences reflect the scale model only.
-    merge_estimator: str = "posterior"
+    lam_spread: float = 0.0
+    #: Halflife of the spread penalty in steps; ``0`` disables the ramp and
+    #: holds ``lam_spread`` constant for the whole run.
+    lam_spread_halflife_steps: int = 400
     #: Recompute each outer quadrature node in backward instead of keeping all
     #: ``k_coarse`` node graphs alive at once.  Trades ~2x compute in
     #: ``accumulate`` for a large drop in retained activations.  Only worth it
@@ -293,58 +264,16 @@ class TrainConfig:
     posterior_k_coarse: int = 31
     posterior_m_fine: int = 257
     posterior_n_sigma: float = 8.0
+    #: ``"wilson"``: the Wilson intensity prior on the smooth surface
+    #: ``log Sigma(h) = phi(h) @ c``, whose coefficients are trained with the
+    #: network by the same evidence (type-II maximum likelihood) at
+    #: ``wilson_lr_mult`` times the base rate, started at the Wilson fit to the
+    #: unity merge.  ``"none"``: integrate the likelihood in positive intensity.
     posterior_prior: str = "wilson"
-    #: Running reference for network context, Wilson fitting and grid placement.
-    #: Posterior mode averages detached batch posterior means, not densities.
-    reference_estimator: str = "wls"
-    reference_ema_decay: float = 0.99
-    #: Normalise the running reference by its accumulated weight, so the
-    #: unscaled seed merge drops out (see ``PosteriorMergeTarget``).
-    reference_bias_correction: bool = False
-    #: The per-reflection intensity the peer features are formed against:
-    #: ``"running"`` -- the running reference, reinstalled at every refresh;
-    #: ``"static"`` -- the unity merge of the input observations, installed
-    #: once and never moved, so training, evaluation and any later merge of
-    #: the same data see the same features.
-    feature_reference: str = "running"
-    #: How the Wilson prior's surface is fitted:
-    #: ``"reference"`` -- Wilson maximum likelihood on the running reference at
-    #: every refresh;
-    #: ``"evidence"`` -- the surface's coefficients are trained with the
-    #: network by the same evidence (type-II maximum likelihood), at
-    #: ``wilson_lr_mult`` times the base rate;
-    #: ``"batch-em"`` -- after every update, Wilson maximum likelihood on the
-    #: posterior means of that update's batch (an EM step on the batch merge);
-    #: ``"batch-ml"`` -- after every update, the surface that maximises that
-    #: batch's marginal likelihood under the full observation model, the
-    #: network held fixed (EM to convergence on the batch's likelihood curves);
-    #: ``"batch-counts"`` -- after every update, ``E[n - bg] = (1 - miss) K Sigma``
-    #: fitted to that batch's counts at the network's K.
-    #: All four start from the fit to the unity merge; the last three keep no
-    #: per-reflection state.
-    wilson_fit: str = "reference"
     wilson_lr_mult: float = 10.0
-    #: Per-reflection state carried between batches: ``"ema"`` -- the running
-    #: reference, which also centres the locating scan; ``"none"`` -- none: each
-    #: batch centres its scan on its own weighted mean at the network's scale,
-    #: and the merge starts from the unity merge floored below the Wilson
-    #: surface.  With ``"none"``, pair ``feature_reference="static"`` and a
-    #: Wilson fit other than ``"reference"``, or the features and the prior
-    #: stay at their unity-merge starting values.
-    reference_update: str = "ema"
-    #: How the Wilson prior's Sigma is estimated from the running merge:
-    #: ``"shells"`` (equal-count resolution shells) or ``"smooth"`` (a
-    #: symmetry-adapted surface on a reciprocal-space basis, see
-    #: ``set_reciprocal_basis``).  Recorded in the checkpoint; the basis itself
-    #: is installed by the CLI after construction.
-    wilson_basis: str = "smooth"
     wilson_degree: int = 4
     #: Outer grid half-width cap in nats (see PosteriorMergeTarget.max_halfwidth).
     posterior_max_halfwidth: float = 12.0
-    lam_spread: float = 0.0
-    #: Halflife of the spread penalty in steps; ``0`` disables the ramp and
-    #: holds ``lam_spread`` constant for the whole run.
-    lam_spread_halflife_steps: int = 400
     #: Hierarchical prior on each observation's scatter density
     #: (:mod:`torchsx.nn.shape_prior`): ``lam_shape_prior`` pseudo-observations
     #: per observation drawn from the batch's population density, i.e.
@@ -356,7 +285,6 @@ class TrainConfig:
     #: observations sampled per update to estimate the prior term
     shape_prior_sample: int = 2048
     log_every: int = 10
-    eval_lam: float = 0.0
     heldout_frac: float = 0.05
     #: Condition (``ObsInfo.delay_bin_idx`` value) the held-out crystals and
     #: the split-half merge sets are drawn from, so every validation number is
@@ -372,10 +300,10 @@ class TrainConfig:
     #: (``external_heldout``).  None: a random ``heldout_frac`` of that condition.
     heldout_crystal_ids: object = None
     #: Crystals scored from the TRAINING set under the same conditions as the
-    #: held-out set (eval_lam, no spread penalty).  Without this the logged
-    #: train and heldout numbers differ in both the penalty and lambda, so
-    #: their gap is bookkeeping rather than generalisation — and that gap is
-    #: precisely the diagnostic for whether capacity binds.
+    #: held-out set (no spread penalty).  Without this the logged train and
+    #: heldout numbers differ in the penalty, so their gap is bookkeeping
+    #: rather than generalisation — and that gap is precisely the diagnostic
+    #: for whether capacity binds.
     train_eval_crystals: int = 3500
     #: Keep the parameters that scored best on held-out.  The 300-epoch run
     #: peaked at ~epoch 230 (held-out 5.044) and then degraded to 5.15+ as the
@@ -463,94 +391,29 @@ class AmortizedTrainer:
             oi.sigma if oi.sigma is not None
             else (self.n_ph + prep.bg.clamp(min=0) + 1.0).sqrt()
         )
-        seed_I0 = unity_merge(prep.I_obs, self.sigma, prep.hkl_id, prep.n_valid)
-        # One merge target PER CONDITION: separate EMA centre, grid width and
-        # optional separate Wilson Sigma; dark and light keep their own merge
-        # while the network is shared.  All are seeded from the pooled unity
-        # merge -- the EMA moves within a few steps and ``locate`` rescans
-        # +-8 nats around it, so a per-condition seed buys nothing.
+        if self.cfg.posterior_prior not in ("none", "wilson"):
+            raise ValueError(f"posterior_prior must be 'none' or 'wilson', got "
+                             f"{self.cfg.posterior_prior!r}")
+        # One posterior target PER CONDITION: dark and light keep their own
+        # merge and Wilson surface while the network is shared.  None carries
+        # per-reflection state between batches; the unity merge only starts
+        # each merge's grid search and the Wilson fit.
+        from torchsx.nn.posterior_target import PosteriorMergeTarget
+        I_start = unity_merge(prep.I_obs, self.sigma, prep.hkl_id, prep.n_valid)
         self.targets: list = []
         for _ in range(self.n_conditions):
-            if self.cfg.merge_target == "posterior":
-                from torchsx.nn.posterior_target import PosteriorMergeTarget
-                t = PosteriorMergeTarget(
-                    seed_I0,
-                    k_coarse=self.cfg.posterior_k_coarse,
-                    m_fine=self.cfg.posterior_m_fine,
-                    n_sigma=self.cfg.posterior_n_sigma,
-                    prior=("wilson" if self.cfg.posterior_prior == "joined-wilson"
-                           else self.cfg.posterior_prior),
-                    reference_estimator=self.cfg.reference_estimator,
-                    ema_decay=self.cfg.reference_ema_decay,
-                    bias_correct=self.cfg.reference_bias_correction,
-                    max_halfwidth=self.cfg.posterior_max_halfwidth,
-                ).to(self.device)
-                t.checkpoint_nodes = bool(self.cfg.posterior_checkpoint_nodes)
-            elif self.cfg.merge_target == "loo":
-                t = LOOInBatchTarget(seed_I0, lam=self.cfg.lam0).to(self.device)
-            else:
-                raise ValueError(
-                    f"merge_target must be 'loo' or 'posterior', got {self.cfg.merge_target!r}"
-                )
+            t = PosteriorMergeTarget(
+                I_start,
+                k_coarse=self.cfg.posterior_k_coarse,
+                m_fine=self.cfg.posterior_m_fine,
+                n_sigma=self.cfg.posterior_n_sigma,
+                prior=self.cfg.posterior_prior,
+                max_halfwidth=self.cfg.posterior_max_halfwidth,
+            ).to(self.device)
+            t.checkpoint_nodes = bool(self.cfg.posterior_checkpoint_nodes)
+            t.set_is_centric(prep.is_centric.to(self.device))
             self.targets.append(t)
-        if self.cfg.wilson_fit not in WILSON_FITS:
-            raise ValueError(f"wilson_fit must be one of {WILSON_FITS}, got {self.cfg.wilson_fit!r}")
-        if self.cfg.wilson_fit != "reference" and (self.cfg.merge_target != "posterior"
-                                                   or self.cfg.posterior_prior != "wilson"):
-            raise ValueError(f"wilson_fit={self.cfg.wilson_fit!r} needs posterior targets "
-                             "with the separate Wilson prior")
-        #: the last training batch's statistics for a batch Wilson fit
-        self._wilson_stash = None
-        if self.cfg.wilson_fit == "batch-ml":
-            for t in self.targets:
-                t.keep_curves = True
-        if self.cfg.reference_update not in ("ema", "none"):
-            raise ValueError(f"reference_update must be 'ema' or 'none', got {self.cfg.reference_update!r}")
-        if self.cfg.reference_update == "none":
-            for t in self.targets:
-                if hasattr(t, "track_reference"):
-                    t.centre_mode, t.track_reference = "batch", False
-        if self.cfg.feature_reference not in ("running", "static"):
-            raise ValueError(
-                f"feature_reference must be 'running' or 'static', got "
-                f"{self.cfg.feature_reference!r}"
-            )
-        if self.cfg.loss == "evidence" and self.cfg.merge_target != "posterior":
-            raise ValueError("loss='evidence' requires merge_target='posterior'")
-        if self.cfg.merge_estimator not in ("posterior", "wls"):
-            raise ValueError(
-                f"merge_estimator must be 'posterior' or 'wls', got "
-                f"{self.cfg.merge_estimator!r}"
-            )
-        # Scoring estimator, deliberately independent of the training target.
-        self._score_alias = False
-        self._score_targets: list | None = None
-        if self.cfg.merge_estimator == "posterior":
-            if self.cfg.merge_target == "posterior":
-                self._score_alias = True             # share state, don't duplicate
-            else:
-                from torchsx.nn.posterior_target import PosteriorMergeTarget
-                self._score_targets = [
-                    PosteriorMergeTarget(
-                        seed_I0,
-                        k_coarse=self.cfg.posterior_k_coarse,
-                        m_fine=self.cfg.posterior_m_fine,
-                        n_sigma=self.cfg.posterior_n_sigma,
-                        prior=("wilson" if self.cfg.posterior_prior == "joined-wilson"
-                           else self.cfg.posterior_prior),
-                        reference_estimator=self.cfg.reference_estimator,
-                        ema_decay=self.cfg.reference_ema_decay,
-                        bias_correct=self.cfg.reference_bias_correction,
-                        max_halfwidth=self.cfg.posterior_max_halfwidth,
-                    ).to(self.device)
-                    for _ in range(self.n_conditions)
-                ]
-        # obs_scale = n'/I0 needs a reference merge.  Seed it from the same
-        # unity merge (linear, all observations) rather than exp(mu_init),
-        # which is a log-space MLE over positives only and biased high.
-        feats = getattr(self.scale, "features", None)
-        if feats is not None and hasattr(feats, "set_reference_I0"):
-            feats.set_reference_I0(seed_I0.to(self.device))
+        self._best_wilson: list | None = None
 
         self.gen = torch.Generator().manual_seed(self.cfg.seed)
         pool = self.index.nonempty
@@ -694,6 +557,15 @@ class AmortizedTrainer:
             max=bins - 1).to(torch.int16)
         self.shell_of_obs = shell_h[hid]
 
+        # A Wilson surface from the start, on a basis with no symmetry beyond
+        # the identity; a caller that knows the space group installs its own
+        # (set_reciprocal_basis), which replaces this one.
+        self.reciprocal_basis = None
+        if prep.median_cell is not None:
+            from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
+            self.set_reciprocal_basis(ReciprocalBasis.from_hkl(
+                prep.hkl_valid.long(), prep.median_cell, None, degree=self.cfg.wilson_degree))
+
     # ── condition-indexed state ────────────────────────────────────────
 
     @property
@@ -701,33 +573,7 @@ class AmortizedTrainer:
         """Merge target of the condition currently in flight."""
         return self.targets[self._cond]
 
-    @property
-    def score_target(self):
-        if self._score_alias:
-            return self.target
-        if self._score_targets is None:
-            return None
-        return self._score_targets[self._cond]
-
-    def _all_targets(self) -> list:
-        return [*self.targets, *(self._score_targets or [])]
-
     # ── schedule ───────────────────────────────────────────────────────
-
-    def _lam(self) -> float:
-        hl = self.cfg.lam_halflife_steps
-        if hl <= 0:
-            # No decay -- the same convention ``_lam_spread`` uses, and what
-            # every caller passing 0 has meant by it.  ``max(hl, 1)`` made 0
-            # mean "halve at EVERY step", so lam0=10 was under 1e-9 by step 30
-            # and the in-batch merge target ran with no prior at all.  Harmless
-            # on one big condition; on the 55-split full set it left the small
-            # conditions' targets unsupported, and one such batch produced a
-            # NaN that poisoned the weights for the rest of the run.
-            return self.cfg.lam0
-        return self.cfg.lam_min + (self.cfg.lam0 - self.cfg.lam_min) * (
-            0.5 ** (self.step_i / hl)
-        )
 
     def _lam_spread(self) -> float:
         if self.cfg.lam_spread <= 0:
@@ -783,58 +629,22 @@ class AmortizedTrainer:
             # checkpointing the grad pass is ~3 forward-equivalents, so the
             # redundant pass was ~25 % of the step.
             pred = self.scale.prime(meta)
-            if self.cfg.merge_target == "posterior":
-                tgt, log_Z = self._posterior_step(
-                    pred, n_ph, bg, sigma, meta, update_state=grad,
-                )
-            else:
-                if grad:
-                    self.target.lam = self._lam()
-                log_Z = None
-                with torch.no_grad():
-                    tgt = self.target(
-                        pred.log_K.detach(), pred.log_w.detach(),
-                        n_ph, bg, sigma, meta.hkl_idx,
-                        update_state=grad,
-                    )
-            # log_I0 is a LINEAR (mean) estimate; the GenGauss is centred on
-            # log_mean, i.e. a median.  Shift by -log E[exp(eps)] so the two
-            # agree -- otherwise the target is biased high by a factor that
-            # grows with the width, which is a runaway loop.
-            if self.cfg.loss == "evidence":
-                # The marginal likelihood per reflection.  I0 appears nowhere.
-                nll = -log_Z[self.target.last_seen].sum()
-            else:
-                log_mean = tgt.log_I0 + pred.log_K - pred.log_e_s
-                nll = self.objective(
-                    self.scale.scatter, self.params, log_mean, n_ph, bg, meta,
-                    mask=tgt.valid,
-                )
+            tgt, log_Z = self._posterior_step(pred, n_ph, bg, sigma, meta)
+            # The marginal likelihood per reflection.  I0 appears nowhere.
+            nll = -log_Z[self.target.last_seen].sum()
         return meta, pred, tgt, nll, n_ph, bg, sigma
 
-    def _posterior_step(self, pred, n_ph, bg, sigma, meta, *, update_state: bool):
+    def _posterior_step(self, pred, n_ph, bg, sigma, meta):
         """Posterior merge: returns a ``MergeTargetOut`` plus per-HKL log Z."""
         post = self.target(
             self.objective, self.scale.scatter, self.params, pred,
             n_ph, bg, sigma, meta.hkl_idx, meta,
-            update_state=update_state,
         )
         self.target.last_seen = post.seen
         self.last_n_hkl = int(post.seen.sum())
         self.last_edge_mass = post.edge_mass
         I0 = post.I0_obs
         K = pred.log_K.exp().clamp(min=1e-8)
-        if update_state and self.cfg.wilson_fit == "batch-em":
-            self._wilson_stash = (self._cond, post.I0_mean.detach(), post.seen)
-        elif update_state and self.cfg.wilson_fit == "batch-counts":
-            with torch.no_grad():
-                miss = getattr(self.objective, "miss_logit", None)
-                keep = 1.0 if miss is None else float(torch.sigmoid(-miss.detach()))
-                signal = n_ph - bg - _bg_mean_offset(self.objective)
-                n_hkl = self.prep.n_valid
-                self._wilson_stash = (self._cond,
-                                      group_sum(signal.float(), meta.hkl_idx, n_hkl),
-                                      group_sum(keep * K.detach().float(), meta.hkl_idx, n_hkl))
         w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
         var_scatter = (K * I0) ** 2 * torch.expm1(w2)
         # `sigma` is the counting variance alone.  When the likelihood carries
@@ -870,25 +680,17 @@ class AmortizedTrainer:
 
     @torch.no_grad()
     def _canonical_nll(self, rows: Tensor) -> float:
-        """Data NLL on this batch at **fixed** lambda and with no penalty.
+        """Data NLL on this batch in eval mode and with no penalty.
 
         The optimised loss moves for reasons that have nothing to do with the
-        model getting better: ``lam_spread`` is annealing, and ``lambda``
-        changes the merge target itself (as it decays the target shifts from a
-        stationary EMA to a noisier in-batch merge, which raises the loss on its
-        own).  So the training curve is not comparable across a run.  This is
-        the same batch scored under conditions that never change, which is the
-        number to read for "is the model actually improving".
+        model getting better while ``lam_spread`` anneals, so the training
+        curve is not comparable across a run.  This is the same batch scored
+        under conditions that never change.
         """
         self.scale.eval()
-        sched = [t.lam for t in self.targets]
-        for t in self.targets:
-            t.lam = self.cfg.eval_lam
         try:
             _, _, tgt, nll, *_ = self._forward(rows, grad=False)
         finally:
-            for t, lam in zip(self.targets, sched):
-                t.lam = lam
             self.scale.train()
         self.scale.clear()
         return float(nll.item()) / max(int(tgt.valid.sum()), 1)
@@ -917,9 +719,9 @@ class AmortizedTrainer:
             shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar,
                          "shape_prior_off_grid": out_bar}
         self.opt.zero_grad(set_to_none=True)
-        if self.cfg.wilson_fit == "evidence" and self.targets[0].wilson_coef_param is None:
-            raise RuntimeError("wilson_fit='evidence' is enabled by set_reciprocal_basis("
-                               "smooth_prior=True); no smooth basis was installed")
+        if self.cfg.posterior_prior == "wilson" and self.targets[0].wilson_coef_param is None:
+            raise RuntimeError("the Wilson surface is trained with the network and needs a "
+                               "reciprocal basis: prep.median_cell or set_reciprocal_basis()")
         loss.backward()
         gn = grad_norms(self.scale)
         for t in self.targets:
@@ -946,9 +748,7 @@ class AmortizedTrainer:
             if dn is not None:
                 dn.project()          # the noise terms stay inside their bounds
             for t in self.targets:
-                if getattr(t, "wilson_coef_param", None) is not None:
-                    t.sync_evidence_prior()
-            self._fit_wilson_from_batch()
+                t.sync_evidence_prior()
         gn["gradnorm_total"] = float(total_norm)          # pre-clip global norm
         gn["grad_was_clipped"] = bool(float(total_norm) > self.cfg.grad_clip)
         gn["step_skipped"] = skipped
@@ -981,14 +781,12 @@ class AmortizedTrainer:
             # trend, and use ``evidence_per_hkl`` when comparing sets.
             "evidence_per_hkl": (
                 nll_data * max(n_used, 1) / max(getattr(self, "last_n_hkl", 0), 1)
-                if self.cfg.loss == "evidence" else float("nan")
             ),
             "n_hkl_used": getattr(self, "last_n_hkl", 0),
             "n_obs": int(rows.numel()),
             "n_crystals": int(meta.crystal_id.unique().numel()),
             "n_used": n_used,
             "n_floored": tgt.n_floored,
-            "lam": self.target.lam,
             "lam_spread": lam_s,
             **shape_rec,
             "lr": float(self.opt.param_groups[0]["lr"]),
@@ -996,8 +794,8 @@ class AmortizedTrainer:
             **gn,
         }
         if self.step_i % self.cfg.log_every == 0:
-            # Fixed-lambda, no-penalty score on this same batch: the only
-            # training number that is comparable across the whole run.
+            # No-penalty score on this same batch: the only training number
+            # that is comparable across the whole run.
             rec["nll_canonical"] = self._canonical_nll(rows)
             rec.update(self._diagnostics(meta, pred, tgt, rows))
         self.step_i += 1
@@ -1128,23 +926,11 @@ class AmortizedTrainer:
     def evaluate(self, crystals: Tensor, *, phase: str = "heldout") -> dict:
         """Score crystals the network never trained on.
 
-        Running intensity and width references are not updated: held-out
-        measurements must not feed subsequent context features or prior fits.
-
         In-batch loss falling while this does not is co-adaptation through the
         merge rather than learning — the diagnostic that was missing throughout
         the abismal investigation.
-
-        Scored at a **fixed** ``cfg.eval_lam``, not the current schedule value.
-        The training NLL is not comparable across the λ decay, because λ changes
-        the merge target itself: as λ falls the target moves from a stationary
-        EMA to a noisier in-batch merge, and the loss rises for that reason
-        alone.  Pinning λ here makes the held-out curve an actual yardstick.
         """
         self.scale.eval()
-        sched_lam = [t.lam for t in self.targets]
-        for t in self.targets:
-            t.lam = self.cfg.eval_lam
         tot, n_tot, n_hkl, recs = 0.0, 0, 0, []
         for sel, rows in self.index.batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
@@ -1158,20 +944,15 @@ class AmortizedTrainer:
                 calibration_metrics(torch.where(tgt.valid, tgt.z, torch.nan))
             )
             self.scale.clear()
-        for t, lam in zip(self.targets, sched_lam):
-            t.lam = lam
         rec = {
             "step": self.step_i, "phase": phase,
             "nll_per_obs": tot / max(n_tot, 1),
             # See step(): under loss="evidence" this is a reflection sum over an
             # observation count, so it is comparable along its own curve but not
             # against the training curve, which has a different multiplicity.
-            "evidence_per_hkl": (
-                tot / max(n_hkl, 1) if self.cfg.loss == "evidence" else float("nan")
-            ),
+            "evidence_per_hkl": tot / max(n_hkl, 1),
             "n_hkl_used": n_hkl,
             "n_obs": n_tot,
-            "lam": self.cfg.eval_lam,
             "var_z": _mean_of([r.get("var_z") for r in recs]),
             "frac_gt3": _mean_of([r.get("frac_gt3") for r in recs]),
         }
@@ -1194,8 +975,7 @@ class AmortizedTrainer:
             self._best_obj_state = {
                 k: v.detach().clone() for k, v in self.objective.state_dict().items()
             }
-            from torchsx.nn.checkpoint_context import capture_context
-            self._best_context = capture_context(self)
+            self._best_wilson = [t.wilson_coef.detach().clone() for t in self.targets]
         rec["best_heldout"] = self.best_heldout
         rec.update(self.wilson_fit_info())
         self.logger.log(rec)
@@ -1226,12 +1006,10 @@ class AmortizedTrainer:
             k: v.detach().cpu().clone() for k, v in self.scale.state_dict().items()
         }
         path = Path(path) if path is not None else Path(self.cfg.outdir) / "best.pt"
-        from torchsx.nn.checkpoint_context import capture_context
-        context = getattr(self, '_best_context', None) or capture_context(self)
+        wilson = self._best_wilson or [t.wilson_coef.detach().clone() for t in self.targets]
         torch.save(
             {
                 "state_dict": state,
-                "inference_context": context,
                 # so a later merge builds the SAME inner integral as training
                 "quadrature": {
                     # The "+bgmean" suffix is load-bearing: it is the only thing
@@ -1271,7 +1049,6 @@ class AmortizedTrainer:
                     "predict_shape": bool(getattr(self.scale.heads, "predict_shape", True)),
                     "anchor_log_k": bool(getattr(self.scale, "anchor_log_k", True)),
                     "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
-                    "peer_scale": getattr(self.scale.features, "peer_scale", "ratio"),
                 },
                 "splits": list(self.split_names or []),
                 # scatter family and miss component, so a merge rebuilds the
@@ -1294,33 +1071,19 @@ class AmortizedTrainer:
                 "best_heldout": self.best_heldout,
                 "n_crystals": self.index.n_crystals,
                 "n_hkl": self.prep.n_valid,
-                # one running merge per condition; (n_hkl,) when there is one
-                # condition so single-condition consumers are unchanged
-                "ema_I0": (
-                    context['targets'][0]['ema_I0'] if self.n_conditions == 1
-                    else torch.stack([t['ema_I0'] for t in context['targets']])
-                ),
                 "n_conditions": self.n_conditions,
-                "reference_update": {
-                    "estimator": self.cfg.reference_estimator,
-                    "ema_decay": self.cfg.reference_ema_decay,
-                    "feature_reference": self.cfg.feature_reference,
-                    "wilson_fit": self.cfg.wilson_fit,
-                    "update": self.cfg.reference_update,
-                },
                 # the Wilson surface as a function of hkl: the basis definition
-                # and each state's coefficients, so a merge of any reflection
-                # set can evaluate it
+                # and each state's trained coefficients, so a merge of any
+                # reflection set evaluates the same surface
                 "wilson_surface": (None if getattr(self, "reciprocal_basis", None) is None else {
                     "basis": self.reciprocal_basis.definition(),
-                    "coef": [t["wilson_coef"].clone() for t in context["targets"]],
+                    "coef": [c.cpu() for c in wilson],
                 }),
                 # outer-grid geometry, so a later merge integrates on the SAME grid
                 "posterior_grid": {
                     "k_coarse": self.cfg.posterior_k_coarse, "m_fine": self.cfg.posterior_m_fine,
                     "n_sigma": self.cfg.posterior_n_sigma, "max_halfwidth": self.cfg.posterior_max_halfwidth,
                     "prior": self.cfg.posterior_prior,
-                    "wilson_basis": self.cfg.wilson_basis,
                     "wilson_degree": self.cfg.wilson_degree,
                 },
                 "timepoints": (
@@ -1342,9 +1105,11 @@ class AmortizedTrainer:
         self.scale.load_state_dict(self._best_state)
         if getattr(self, "_best_obj_state", None):
             self.objective.load_state_dict(self._best_obj_state)
-        if getattr(self, '_best_context', None):
-            from torchsx.nn.checkpoint_context import restore_context
-            restore_context(self, self._best_context)
+        if self._best_wilson is not None:
+            for t, c in zip(self.targets, self._best_wilson):
+                t.set_wilson_coef(c)
+                if t.wilson_coef_param is not None:
+                    t.wilson_coef_param.data.copy_(c)
         return True
 
     @torch.no_grad()
@@ -1424,7 +1189,7 @@ class AmortizedTrainer:
             # Moment estimators on the trained K: no scatter shape, no prior,
             # no mean/median correction -- a weighted mean of (n - bg)/K
             # estimates E[I p] whatever the partiality distribution is.
-            I0_ref = tgt.ema_I0.to(dev)
+            I0_ref = tgt.I_start.to(dev)
             floor = float(getattr(tgt, "floor", 1e-6) or 1e-6)
             bvf = float(getattr(self.objective.likelihood, "bg_var_factor", 0.0) or 0.0)
             S = {k: torch.zeros(n_hkl, device=dev, dtype=torch.float64)
@@ -1445,7 +1210,7 @@ class AmortizedTrainer:
                 # observation's own sigma: a weight that depends on the observed
                 # count biases the weighted mean low, by an amount that depends
                 # on multiplicity.  Floors: I0_ref at the target's floor (the
-                # EMA of a weak reflection can be zero or negative) and the
+                # unity merge of a weak reflection can be zero or negative) and the
                 # counting term at one count, so no single zero-background
                 # observation can dominate a reflection.
                 w2 = (pred.log_w.exp().double() ** 2).clamp(max=20.0)
@@ -1502,77 +1267,64 @@ class AmortizedTrainer:
         # Locate the peak on THIS crystal set, then accumulate the same coarse
         # curve the loss uses -- additive over observations, hence over batches.
         n_bad_loc = 0
-        if tgt.node_placement == "wilson":
-            v_nodes, log_w_nodes = tgt.nodes()
-            loc_sd = None
-        else:
-            # Locating rounds, each a full pass: anchor on the previous
-            # estimate and shrink the scan window.
-            #
-            # One round is not enough at this data's multiplicity.  The scan is
-            # 9 nodes over +-scan_halfwidth (2-nat spacing by default) and the
-            # peak is read off a parabola through three of them, but the
-            # accumulated log-likelihood is ``A v - B e^v`` -- exponential above
-            # the peak, linear below -- so the fitted vertex carries a bias of
-            # ~0.59 nats that does NOT shrink with multiplicity (both the
-            # y-differences and the curvature scale with A, so the vertex does
-            # not move).  Meanwhile the grid built around it is n_sigma * sd
-            # wide with sd ~ 1/sqrt(A).  The two cross between 1e3 and 1e4
-            # counts per reflection: below that the grid still covers the peak,
-            # above it every reflection puts all its mass on the grid edge.
-            # Measured on the full SwissFEL set, one round per split: edge_mass
-            # median 3e-13 at 41 k crystals, 0.30 at 195 k, and all-NaN F at
-            # 422 k.  The vertex bias is O(h^2), so each round of a shrinking
-            # window squares it away: 0.374 -> 0.004 -> 0.0002 nats, covered at
-            # every multiplicity from 1e2 to 5e5 counts.
-            hw0 = tgt.scan_halfwidth
-            ema0 = tgt.ema_I0
-            loc_sd = None
-            try:
-                if not getattr(tgt, "track_reference", True):
-                    # no running reference: start from the unity merge, floored
-                    # below the Wilson surface like a batch centre
-                    tgt.ema_I0 = torch.maximum(
-                        ema0, tgt.wilson_sigma * math.exp(-tgt.centre_floor_nats))
-                for hw in self.cfg.locate_windows or (hw0,):
-                    tgt.scan_halfwidth = float(hw)
-                    scan = tgt.scan_grid()
-                    acc_s = torch.zeros(n_hkl, scan.shape[1], device=dev)
-                    for _, rows in batches():
-                        meta, n_ph, bg, _ = self._batch(rows.to(dev))
-                        pred = self.scale.prime(meta)
-                        c = tgt.accumulate(
-                            self.objective, self.scale.scatter, self.params, pred,
-                            n_ph, bg, meta.hkl_idx, meta, scan,
-                        )
-                        bad = ~torch.isfinite(c)
-                        if bool(bad.any()):
-                            n_bad_loc += int(bad.any(1).sum())
-                            c = c.masked_fill(bad, 0.0)
-                        acc_s = acc_s + c
-                        self.scale.clear()
-                    centre, sd_r = tgt.peak_from_scan(acc_s)
-                    if loc_sd is None:
-                        # WIDTH comes from the wide round only.  Its trust /
-                        # one-sided / sd_max logic is scaled to the wide scan:
-                        # at a 0.125-nat window the returned sd is a local
-                        # curvature, which for a weak one-sided reflection is
-                        # tiny and yields a grid far too narrow.  Measured on
-                        # the scored 50 k-crystal baseline, refining the width
-                        # too put 3 % of reflections on the grid edge and moved
-                        # their F by up to 80 %.  The wide round's width is
-                        # already good (it tracks 1/sqrt(A) to ~25 %); only the
-                        # CENTRE carries the parabola bias, so only the centre
-                        # is refined.
-                        loc_sd = sd_r
-                    # the next round scans around this estimate; the EMA itself
-                    # is restored below so the target is left as training left it
-                    tgt.ema_I0 = centre.exp()
-            finally:
-                tgt.scan_halfwidth, tgt.ema_I0 = hw0, ema0
-            tgt._loc = (centre, loc_sd)
-            v_nodes = centre[:, None] + loc_sd[:, None] * tgt.u_coarse[None, :]
-            log_w_nodes = None
+        # Locating rounds, each a full pass: anchor on the previous
+        # estimate and shrink the scan window.
+        #
+        # One round is not enough at this data's multiplicity.  The scan is
+        # 9 nodes over +-scan_halfwidth (2-nat spacing by default) and the
+        # peak is read off a parabola through three of them, but the
+        # accumulated log-likelihood is ``A v - B e^v`` -- exponential above
+        # the peak, linear below -- so the fitted vertex carries a bias of
+        # ~0.59 nats that does NOT shrink with multiplicity (both the
+        # y-differences and the curvature scale with A, so the vertex does
+        # not move).  Meanwhile the grid built around it is n_sigma * sd
+        # wide with sd ~ 1/sqrt(A).  The two cross between 1e3 and 1e4
+        # counts per reflection: below that the grid still covers the peak,
+        # above it every reflection puts all its mass on the grid edge.
+        # Measured on the full SwissFEL set, one round per split: edge_mass
+        # median 3e-13 at 41 k crystals, 0.30 at 195 k, and all-NaN F at
+        # 422 k.  The vertex bias is O(h^2), so each round of a shrinking
+        # window squares it away: 0.374 -> 0.004 -> 0.0002 nats, covered at
+        # every multiplicity from 1e2 to 5e5 counts.
+        hw0 = tgt.scan_halfwidth
+        centre = tgt.start_centre()
+        loc_sd = None
+        try:
+            for hw in self.cfg.locate_windows or (hw0,):
+                tgt.scan_halfwidth = float(hw)
+                scan = tgt.scan_grid(centre)
+                acc_s = torch.zeros(n_hkl, scan.shape[1], device=dev)
+                for _, rows in batches():
+                    meta, n_ph, bg, _ = self._batch(rows.to(dev))
+                    pred = self.scale.prime(meta)
+                    c = tgt.accumulate(
+                        self.objective, self.scale.scatter, self.params, pred,
+                        n_ph, bg, meta.hkl_idx, meta, scan,
+                    )
+                    bad = ~torch.isfinite(c)
+                    if bool(bad.any()):
+                        n_bad_loc += int(bad.any(1).sum())
+                        c = c.masked_fill(bad, 0.0)
+                    acc_s = acc_s + c
+                    self.scale.clear()
+                centre, sd_r = tgt.peak_from_scan(acc_s, centre)
+                if loc_sd is None:
+                    # WIDTH comes from the wide round only.  Its trust /
+                    # one-sided / sd_max logic is scaled to the wide scan:
+                    # at a 0.125-nat window the returned sd is a local
+                    # curvature, which for a weak one-sided reflection is
+                    # tiny and yields a grid far too narrow.  Measured on
+                    # the scored 50 k-crystal baseline, refining the width
+                    # too put 3 % of reflections on the grid edge and moved
+                    # their F by up to 80 %.  The wide round's width is
+                    # already good (it tracks 1/sqrt(A) to ~25 %); only the
+                    # CENTRE carries the parabola bias, so only the centre
+                    # is refined.
+                    loc_sd = sd_r
+        finally:
+            tgt.scan_halfwidth = hw0
+        tgt._loc = (centre, loc_sd)
+        v_nodes = centre[:, None] + loc_sd[:, None] * tgt.u_coarse[None, :]
 
         # A non-finite contribution is dropped where it is non-finite, not
         # summed in.  ``accumulate`` is additive over observations, so a NaN
@@ -1598,7 +1350,7 @@ class AmortizedTrainer:
                 c = c.masked_fill(bad, 0.0)
             acc = acc + c
             self.scale.clear()
-        _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc, v_nodes, log_w_nodes)
+        _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
 
         # F as a posterior moment of sqrt(I0) on the same weights, not the
         # plug-in sqrt(E[I]) -- they differ exactly where the relative
@@ -1634,8 +1386,6 @@ class AmortizedTrainer:
             "condition": self._cond,
         }
         if return_likelihood:
-            if log_w_nodes is not None:
-                raise ValueError('Likelihood export requires Laplace node placement')
             result['log_likelihood'] = tgt._interp(acc).detach().cpu()
             result['log_intensity_grid'] = v.detach().cpu()
             result['wilson_sigma'] = tgt.wilson_sigma.detach().cpu().clone()
@@ -1651,10 +1401,9 @@ class AmortizedTrainer:
         quantity from the one being minimised, and improving the loss need not
         improve the metric.
 
-        For the posterior target that means accumulating the same coarse
-        log-likelihood curve the loss uses (additive over observations, hence
-        over batches) and integrating once.  For the leave-one-out target it is
-        the same inverse-variance sums that target is built from.
+        That means accumulating the same coarse log-likelihood curve the loss
+        uses (additive over observations, hence over batches) and integrating
+        once.
         """
         n_hkl = self.prep.n_valid
         if self.n_conditions > 1:
@@ -1668,69 +1417,43 @@ class AmortizedTrainer:
                     "merge one condition at a time"
                 )
             self._cond = int(cb[0])
-        posterior = self.score_target is not None
-        tgt = self.score_target
-        if posterior:
-            if tgt.node_placement == "wilson":
-                v_nodes, log_w_nodes = tgt.nodes()
-            else:
-                # Locate the peak on THIS crystal subset first.  Using the
-                # closed-form width here instead collapsed the merge onto the
-                # shared ema_I0 (per-shell CC1/2 read exactly 1.0000).
-                scan = tgt.scan_grid()
-                acc_s = torch.zeros(n_hkl, scan.shape[1], device=self.device)
-                for _, r in self.index.batches(
-                    self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
-                ):
-                    r = r.to(self.device)
-                    m, _n, _b, _ = self._batch(r)
-                    pr = self.scale.prime(m)
-                    acc_s = acc_s + tgt.accumulate(
-                        self.objective, self.scale.scatter, self.params, pr,
-                        _n, _b, m.hkl_idx, m, scan,
-                    )
-                    self.scale.clear()
-                c, sd = tgt.peak_from_scan(acc_s)
-                v_nodes = c[:, None] + sd[:, None] * tgt.u_coarse[None, :]
-                log_w_nodes = None
-                tgt._loc = (c, sd)
-            acc = torch.zeros(n_hkl, v_nodes.shape[1], device=self.device)
-        else:
-            num = torch.zeros(n_hkl, device=self.device)
-            den = torch.zeros(n_hkl, device=self.device)
-
+        tgt = self.target
+        # Locate the peak on THIS crystal subset first.  Using a closed-form
+        # width here instead collapsed the merge onto the shared grid centre
+        # (per-shell CC1/2 read exactly 1.0000).
+        start = tgt.start_centre()
+        scan = tgt.scan_grid(start)
+        acc_s = torch.zeros(n_hkl, scan.shape[1], device=self.device)
+        for _, r in self.index.batches(
+            self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
+        ):
+            r = r.to(self.device)
+            m, _n, _b, _ = self._batch(r)
+            pr = self.scale.prime(m)
+            acc_s = acc_s + tgt.accumulate(
+                self.objective, self.scale.scatter, self.params, pr,
+                _n, _b, m.hkl_idx, m, scan,
+            )
+            self.scale.clear()
+        c, sd = tgt.peak_from_scan(acc_s, start)
+        v_nodes = c[:, None] + sd[:, None] * tgt.u_coarse[None, :]
+        tgt._loc = (c, sd)
+        acc = torch.zeros(n_hkl, v_nodes.shape[1], device=self.device)
         for _, rows in self.index.batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         ):
             rows = rows.to(self.device)
             meta, _nph, _bg, _sig = self._batch(rows)
             pred = self.scale.prime(meta)
-            n_signal = _nph - _bg
-            if posterior:
-                acc = acc + tgt.accumulate(
-                    self.objective, self.scale.scatter, self.params, pred,
-                    _nph, _bg, meta.hkl_idx, meta,
-                    v_nodes,
-                )
-            else:
-                K = pred.log_K.exp().clamp(min=1e-8)
-                I0_ref = self.target.ema_I0[meta.hkl_idx].clamp(
-                    min=self.target.floor
-                )
-                w2 = (pred.log_w.exp() ** 2).clamp(max=20.0)
-                V = (
-                    _sig ** 2 + (K * I0_ref) ** 2 * torch.expm1(w2)
-                ).clamp(min=1e-12)
-                num.index_add_(0, meta.hkl_idx, K * n_signal / V)
-                den.index_add_(0, meta.hkl_idx, K * K / V)
+            acc = acc + tgt.accumulate(
+                self.objective, self.scale.scatter, self.params, pred,
+                _nph, _bg, meta.hkl_idx, meta, v_nodes,
+            )
             self.scale.clear()
-
-        if posterior:
-            _, I0, *_ = tgt.integrate(acc, v_nodes, log_w_nodes)
-            seen = (acc.abs().sum(1) > 0).float()
-            # (value, weight) so the caller's ratio form works unchanged
-            return I0 * seen, seen
-        return num, den
+        _, I0, *_ = tgt.integrate(acc)
+        seen = (acc.abs().sum(1) > 0).float()
+        # (value, weight) so the caller's ratio form works unchanged
+        return I0 * seen, seen
 
     @torch.no_grad()
     def split_half_metrics(self, *, n_shells: int = 10, log: bool = True) -> dict:
@@ -1847,37 +1570,41 @@ class AmortizedTrainer:
 
     # ── driver ─────────────────────────────────────────────────────────
 
-    def set_reciprocal_basis(self, basis, *, smooth_prior: bool = True) -> None:
+    def set_reciprocal_basis(self, basis) -> None:
         """Install one smooth reciprocal-space basis on the prior and the gauge pin.
 
         ``basis`` is a :class:`~torchsx.merging.priors.reciprocal_basis.ReciprocalBasis`
-        over ``prep.hkl_valid``.  Every posterior target fits its Wilson Sigma on
-        it from now on, the scale model (when in ``basis`` anchor mode) projects
-        the ensemble-mean component of ``log K`` in its span out, and Sigma is
-        refreshed at once so epoch 0 already runs on the smooth prior.
+        over ``prep.hkl_valid``.  The scale model (when in ``basis`` anchor mode)
+        projects the ensemble-mean component of ``log K`` in its span out.  With
+        the Wilson prior, each target's surface ``log Sigma = phi @ c`` starts
+        at the Wilson fit to the unity merge and ``c`` joins the optimiser, to
+        be trained by the evidence with the network.  Replaces the basis and
+        surface installed before, optimiser group included.
         """
         phi = basis.phi.to(self.device)
         if phi.shape[0] != self.prep.n_valid:
             raise ValueError(f"basis rows {phi.shape[0]} != n_valid {self.prep.n_valid}")
+        old = {id(t.wilson_coef_param) for t in self.targets if t.wilson_coef_param is not None}
+        if old:
+            self.opt.param_groups = [g for g in self.opt.param_groups
+                                     if not any(id(q) in old for q in g["params"])]
+            for q in [q for q in self.opt.state if id(q) in old]:
+                del self.opt.state[q]
         self.reciprocal_basis = basis
-        if smooth_prior:
-            for t in self._all_targets():
-                if hasattr(t, "set_basis"):
-                    t.set_basis(phi)
+        for t in self.targets:
+            t.set_basis(phi)
         if hasattr(self.scale, "set_gauge_basis"):
             self.scale.set_gauge_basis(phi)
-        self._refresh_wilson_sigma()
-        if self.cfg.wilson_fit == "evidence":
-            if not smooth_prior:
-                raise ValueError("wilson_fit='evidence' needs the smooth Wilson prior")
-            # started at the fit to the unity merge, then trained by the evidence
+        if self.cfg.posterior_prior == "wilson":
+            for t in self.targets:
+                t.fit_wilson_surface()
             mult = float(self.cfg.wilson_lr_mult)
             self.opt.add_param_group({"params": [t.enable_evidence_prior() for t in self.targets],
                                       "lr": self.cfg.lr * mult, "lr_mult": mult,
-                                      "weight_decay": 0.0})
+                                      "weight_decay": 0.0, "name": "wilson_surface"})
 
     def wilson_fit_info(self) -> dict:
-        """Diagnostics of the smooth Sigma fit on the first target (empty in shells mode)."""
+        """Diagnostics of the Wilson surface on the first target (empty without a basis)."""
         t = self.targets[0]
         if not getattr(t, "has_basis", False) or getattr(self, "reciprocal_basis", None) is None:
             return {}
@@ -1885,107 +1612,13 @@ class AmortizedTrainer:
         b = self.reciprocal_basis
         coef = t.wilson_coef.detach().cpu()
         info = {"wilson_B": wilson_b_equivalent(b.to(coef.device), coef),
-                "wilson_fit_iters": int(t.wilson_fit_iters),
-                "wilson_em_iters": int(getattr(t, "wilson_em_iters", 0))}
+                "wilson_fit_iters": int(t.wilson_fit_iters)}
         for i in range(b.n_aniso):
             info[f"wilson_aniso_{i}"] = float(coef[b.degree + 1 + i])
         return info
 
-    @torch.no_grad()
-    def _refresh_wilson_sigma(self) -> None:
-        """Refresh separate or equally state-weighted shared Wilson surfaces."""
-        targets = [t for t in self._all_targets() if hasattr(t, "set_wilson_sigma")]
-        sid = self.prep.shell_id_fw.to(self.device)
-        n_shells = int(sid.max().item()) + 1
-        for t in targets:
-            t.set_is_centric(self.prep.is_centric.to(self.device))
-        if self.cfg.wilson_fit != "reference" and getattr(self, "_wilson_fitted", False):
-            # trained or refitted per batch since the start: no running reference
-            for t in targets:
-                t.sync_evidence_prior()
-            return
-        if self.cfg.posterior_prior != "joined-wilson":
-            for t in targets:
-                if t.prior == "wilson":
-                    t.set_wilson_sigma(sid, n_shells)
-            return
-        # Primary posterior targets are one per condition. Research LOO targets
-        # have no Wilson state: in that case use their posterior scoring targets.
-        states = [t for t in self.targets if hasattr(t, "set_wilson_sigma")]
-        if not states:
-            states = list(self._score_targets or [])
-        if not states:
-            raise ValueError("joined-wilson requires posterior targets")
-        first = states[0]
-        if len(states) == 1:
-            first.set_wilson_sigma(sid, n_shells)
-        else:
-            if first.has_basis:
-                # Also order invariant when converting independent saved fits.
-                first.wilson_coef.copy_(torch.stack([t.wilson_coef for t in states]).mean(0))
-            values = torch.stack([t.ema_I0 for t in states])
-            support = torch.stack([t.ema_den > 0 for t in states])
-            support &= torch.isfinite(values) & (values > 0)
-            if not bool(support.any()):
-                # All states start from the same pooled unity merge.
-                first.set_wilson_sigma(sid, n_shells, reference=values.mean(0))
-            else:
-                weights = support.to(values.dtype)
-                weights /= weights.sum(1, keepdim=True).clamp(min=1)
-                total = weights.sum(0)
-                reference = (torch.where(support, values, 0) * weights).sum(0) / total.clamp(min=1e-30)
-                # Keep the objective scale comparable to an ordinary HKL fit.
-                total *= total.numel() / total.sum()
-                first.set_wilson_sigma(sid, n_shells, reference=reference, sample_weight=total)
-        for t in targets:
-            if t is not first:
-                t.wilson_sigma.copy_(first.wilson_sigma)
-                t.wilson_coef.copy_(first.wilson_coef)
-                t.wilson_fit_iters = first.wilson_fit_iters
-
-    @torch.no_grad()
-    def _fit_wilson_from_batch(self) -> None:
-        """Refit the Wilson surface of the state just trained on, from that batch alone."""
-        if self.cfg.wilson_fit == "evidence":
-            self._wilson_fitted = True
-            return
-        if self.cfg.wilson_fit == "batch-ml":
-            sid = self.prep.shell_id_fw.to(self.device)
-            n_shells = int(sid.max().item()) + 1
-            for t in self.targets:
-                curves, t.last_curves = t.last_curves, None
-                if curves is not None:
-                    t.fit_wilson_to_curves(*curves, sid, n_shells)
-                    self._wilson_fitted = True
-            return
-        stash, self._wilson_stash = self._wilson_stash, None
-        if stash is None:
-            return
-        cond, a, b = stash
-        t = self.targets[cond]
-        sid = self.prep.shell_id_fw.to(self.device)
-        n_shells = int(sid.max().item()) + 1
-        if self.cfg.wilson_fit == "batch-em":
-            t.set_wilson_sigma(sid, n_shells, reference=a, sample_weight=b.float())
-        else:
-            t.set_wilson_sigma_from_counts(a, b, sid, n_shells)
-        self._wilson_fitted = True
-
-    def _refresh_feature_reference(self) -> None:
-        """Roll the obs_scale reference forward with the running merge."""
-        if self.cfg.feature_reference == "static":
-            return                      # the unity merge installed at construction
-        # ONE reference for every condition (the first): ``obs_scale`` is an
-        # input feature, and a per-condition reference would let the network
-        # read the condition off it.
-        feats = getattr(self.scale, "features", None)
-        if feats is not None and hasattr(feats, "set_reference_I0"):
-            feats.set_reference_I0(self.targets[0].ema_I0)
-
     def run(self) -> None:
         for epoch in range(self.cfg.epochs):
-            self._refresh_feature_reference()
-            self._refresh_wilson_sigma()
             for _, rows in self.index.batches(
                 self.cfg.max_obs_per_batch,
                 generator=self.gen,

@@ -16,7 +16,6 @@ def _trainer(tmp_path, n_cond=2, **kw):
     scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, include_hkl=False, context_folds=2)
     return prep, AmortizedTrainer(prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
                                   config=TrainConfig(max_obs_per_batch=40, device="cpu", outdir=str(tmp_path),
-                                                     merge_target="posterior", loss="evidence",
                                                      posterior_k_coarse=5, posterior_m_fine=17,
                                                      split_half_every=0, **kw))
 

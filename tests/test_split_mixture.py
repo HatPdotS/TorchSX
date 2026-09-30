@@ -190,12 +190,14 @@ def test_gaussian_network_gradients_through_checkpointed_posterior(monkeypatch):
     target = PosteriorMergeTarget(torch.full((h,), 75.0, device="cuda"),
                                    k_coarse=9, m_fine=33, prior="flat_log").cuda()
     target.checkpoint_nodes = True
-    nodes, _ = target.nodes()
+    target._loc = (torch.full((h,), math.log(75.0), device="cuda"),
+                   torch.full((h,), 4.0, device="cuda"))
+    nodes = target._loc[0][:, None] + target._loc[1][:, None] * target.u_coarse[None, :]
     hid = ids % h
 
     def evidence():
         curve = target.accumulate(obj, scale.scatter, None, pred, counts, bg, hid, meta, nodes)
-        return target.integrate(curve, nodes)[0]
+        return target.integrate(curve)[0]
 
     fast = evidence()
     parameters = tuple(heads.parameters())

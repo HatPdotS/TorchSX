@@ -363,35 +363,22 @@ def test_calibration_metrics_skip_binning_on_length_mismatch():
     assert "var_z_by_shell" not in r
 
 
-def test_obs_scale_is_context_only():
-    """obs_scale = n'/I0 contains the observation's own intensity.
+def test_rank_is_context_only():
+    """The within-reflection rank is built from the observation's own intensity.
 
     It is the channel that carries partiality — raw intensity only tells the
     network how bright the crystal is — but it must never reach the self
-    branch, where K_j = n'_j/I0_j would fit exactly and mean nothing.
+    branch, where it would hand the scale head the observation's own intensity.
     """
     from torchsx.nn.obs_features import CONTEXT_ONLY_FEATURES, ObsFeatureSpec
 
-    assert "obs_scale" in CONTEXT_ONLY_FEATURES
+    assert "rank_score" in CONTEXT_ONLY_FEATURES
     prep = _toy_prep()
     with pytest.raises(ValueError, match="may not be self features"):
-        ObsFeatureSpec(prep, self_features=("s_sq", "obs_scale"))
+        ObsFeatureSpec(prep, self_features=("s_sq", "rank_score"))
 
 
-def test_reference_I0_is_detached_and_updatable():
-    from torchsx.nn.obs_features import ObsFeatureSpec
-
-    prep = _toy_prep()
-    spec = ObsFeatureSpec(prep)
-    new = torch.full((prep.n_valid,), 123.0, requires_grad=True)
-    spec.set_reference_I0(new)
-    assert not spec._I0_ref.requires_grad
-    assert float(spec._I0_ref[0]) == 123.0
-    with pytest.raises(ValueError):
-        spec.set_reference_I0(torch.ones(prep.n_valid + 1))
-
-
-def test_obs_scale_reference_changes_the_context_not_the_self_branch():
+def test_peer_ranks_reach_the_prediction():
     prep = _toy_prep()
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_log_k=False)
     torch.manual_seed(4)
@@ -399,11 +386,9 @@ def test_obs_scale_reference_changes_the_context_not_the_self_branch():
         if p.dim() > 1:
             torch.nn.init.normal_(p, std=0.3)
     base = scale.predict(prep.obs_info).log_K.detach().clone()
-    scale.features.set_reference_I0(
-        scale.features._I0_ref * 3.0
-    )
+    scale.features._rank_score.copy_(-scale.features._rank_score)
     moved = scale.predict(prep.obs_info).log_K.detach()
-    assert not torch.allclose(base, moved), "reference I0 has no effect at all"
+    assert not torch.allclose(base, moved), "the peers' ranks have no effect at all"
 
 
 def test_constant_features_are_zeroed_not_standardised():

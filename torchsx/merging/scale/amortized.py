@@ -156,9 +156,8 @@ class AmortizedScale(ScaleModel):
         scatter_family: str = "gengauss",
         n_components: int = 3,
         component_shape: str = "shared",
-        peer_scale: str = "ratio",
     ) -> "AmortizedScale":
-        features = ObsFeatureSpec(prep, include_hkl=include_hkl, peer_scale=peer_scale)
+        features = ObsFeatureSpec(prep, include_hkl=include_hkl)
         enc = DeepSetsEncoder(
             features.n_self, features.n_context,
             d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
@@ -324,8 +323,9 @@ class AmortizedScale(ScaleModel):
         Used by the hkl-permutation monitor to isolate the degeneracy that
         actually matters: whether ``log_K[j]`` depends on ``j``'s own
         reflection identity.  A whole-meta permutation cannot answer that once
-        the context carries ``obs_scale = n'/I0``, because permuting hkl also
-        permutes the *peers'* I0 lookup — which is legitimate use, not leakage.
+        the context carries per-reflection channels (the peers' rank within
+        their reflection and its brightness), because permuting hkl also
+        permutes those lookups — which is legitimate use, not leakage.
         """
         x_self, _, _ = self.features.build(meta_self)
         _, x_ctx, x_crys = self.features.build(meta_ctx)

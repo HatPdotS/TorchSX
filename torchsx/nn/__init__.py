@@ -12,7 +12,7 @@ itself is :class:`torchsx.merging.scale.AmortizedScale`, because it must be a
 
 from torchsx.nn.deepsets import DeepSetsEncoder, ResidualFF, ScaleEncoder
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
-from torchsx.nn.merge_target import LOOInBatchTarget, MergeTargetOut
+from torchsx.nn.merge_target import MergeTargetOut
 from torchsx.nn.metrics import (
     MetricLogger,
     calibration_metrics,
@@ -33,7 +33,7 @@ __all__ = [
     "ScaleEncoder", "ResidualFF", "DeepSetsEncoder",
     "ScaleHeads", "ScalePrediction",
     "ObsFeatureSpec",
-    "LOOInBatchTarget", "MergeTargetOut",
+    "MergeTargetOut",
     "MarginalNLL", "AgreementNLL",
     "MetricLogger", "calibration_metrics", "scale_metrics",
     "condition_auc", "hkl_permutation_sensitivity",
