@@ -29,9 +29,9 @@ span a narrow range of V, so only ``A + B V`` is identified and the two trade; a
 a panel's position fixes its count level and resolution, which a per-panel term
 therefore absorbs as well.
 
-The default use is **one global B** (``n_groups = 1``, ``terms = "B"``,
-``--detector-noise auto``): when preparation replaced a wrong declared gain by its
-calibration, whose estimate is biased, B corrects the gain on the integrated sums.
+``--detector-noise auto`` fits **one global B** (``n_groups = 1``, ``terms = "B"``)
+when preparation replaced a wrong declared gain by its calibration, whose estimate
+is biased: B corrects the gain on the integrated sums.
 ``V = B (lam + sig_b2)`` is exactly a global gain error.
 
 Parameters are ``log A, log B`` per panel, **projected** into bounds after every

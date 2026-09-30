@@ -41,12 +41,12 @@ estimator is usable, `auto` retains a valid declared gain, while `calibrate`
 fails. New `auto`/`calibrate` requests require prepared caches built with the
 current gain policy; checkpoint readout still reuses its recorded numeric gain.
 
-A gain the calibration selected (by `auto` past the tolerance, or `calibrate`)
-is refined in training by one global B, the counting variance B (lam + sig_b2),
-which is exactly a gain correction on the integrated sums
-(`--detector-noise auto`, the default). With the input gain kept, no detector
-term is fitted. `--detector-noise panel` fits A and/or B per detector panel
-(`--noise-terms`); `off` fits none. Merges inherit the checkpoint's terms.
+`--detector-noise auto` refines a gain the calibration selected (by `auto` past
+the tolerance, or `calibrate`) in training by one global B, the counting variance
+B (lam + sig_b2), which is exactly a gain correction on the integrated sums; with
+the input gain kept, no detector term is fitted. `--detector-noise panel` fits
+A and/or B per detector panel (`--noise-terms`). The default, `off`, fits none.
+Merges inherit the checkpoint's terms.
 
 New training uses the annulus background-mean correction inferred from integration
 metadata and a four-component Gaussian mixture. Gain conversion, background-mean

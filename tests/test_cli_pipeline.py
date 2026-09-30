@@ -659,7 +659,7 @@ def _gain_bundle(prep, selected):
 
 
 @pytest.mark.parametrize("mode,selected,expected", [
-    (None, "calibration", "global_B"), ("auto", "calibration", "global_B"),
+    (None, "calibration", "off"), ("auto", "calibration", "global_B"),
     ("auto", "input", "off"), ("off", "calibration", "off"), ("panel", "input", "panel")])
 def test_detector_noise_auto_fits_global_B_only_for_a_calibrated_gain(tmp_path, mode, selected, expected):
     from torchsx.cli import _pipeline as P
@@ -688,7 +688,7 @@ def test_detector_noise_checkpoint_record_wins_over_the_gain_selection(tmp_path)
     from torchsx.cli.train import _build_parser as train_parser
     prep, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     bundle = _gain_bundle(prep, "calibration")
-    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--detector-noise", "auto"])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
     with torch.no_grad():
         obj.detector_noise.log_B.fill_(math.log(1.2))

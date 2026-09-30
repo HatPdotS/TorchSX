@@ -210,8 +210,8 @@ class PoissonNoiseModel:
 
         The estimate is biased: the integrated negatives are not a clean
         zero-signal sample.  So ``auto``
-        uses it only to detect a wrong declaration (tolerance 50 %), and a gain
-        it replaces is refined in training by one global B
+        uses it only to detect a wrong declaration (tolerance 50 %); a gain it
+        replaces can be refined in training by one global B
         (``--detector-noise auto``).
 
         Returns
