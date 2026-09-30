@@ -94,6 +94,10 @@ def _build_parser():
                         "update, to the posterior means of that update's batch (one EM step), to the "
                         "maximum of that batch's marginal likelihood, or to that batch's counts at "
                         "the network's scale")
+    p.add_argument("--reference-update", choices=("ema", "none"), default="ema",
+                   help="per-reflection state carried between batches: the running reference "
+                        "(default) or none; none needs --feature-reference static and a --wilson-fit "
+                        "other than reference")
     p.add_argument("--peer-scale", choices=("ratio", "rank"), default="ratio",
                    help="a peer's observed scale in the context: its intensity over the reference "
                         "(default) or its rank among the observations of its reflection; the "
@@ -225,8 +229,17 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
     return updates
 
 
+def check_reference_update(args) -> None:
+    """``--reference-update none`` leaves nothing for the features or the prior to follow."""
+    if args.reference_update == "none" and (args.feature_reference != "static"
+                                            or args.wilson_fit == "reference"):
+        raise SystemExit("--reference-update none needs --feature-reference static and a "
+                         "--wilson-fit other than reference")
+
+
 def main(argv=None):
     args = _build_parser().parse_args(argv)
+    check_reference_update(args)
     # TF32 for the encoder's float32 matmuls; the likelihood and posterior
     # integrals are elementwise and Triton code, which this does not touch.
     torch.set_float32_matmul_precision("high")
@@ -259,6 +272,7 @@ def main(argv=None):
         reference_bias_correction=args.reference_bias_correction,
         feature_reference=args.feature_reference,
         wilson_fit=args.wilson_fit,
+        reference_update=args.reference_update,
         grad_clip=20.0, log_every=25, merge_target="posterior", loss="evidence",
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
         posterior_max_halfwidth=settings["max_halfwidth"],

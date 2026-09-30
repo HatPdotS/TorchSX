@@ -248,6 +248,15 @@ class PosteriorMergeTarget(nn.Module):
         self.keep_curves = False
         self.last_curves = None
         self.wilson_em_iters = 0
+        #: Where the locating scan is centred: ``"reference"`` -- the running
+        #: reference ``ema_I0``; ``"batch"`` -- the batch's own weighted mean at
+        #: the network's scale (:meth:`batch_centre`).  ``track_reference``
+        #: False keeps ``ema_I0`` and the grid-width state at their seeds, so the
+        #: target carries no per-reflection state from one batch to the next.
+        self.centre_mode = "reference"
+        self.track_reference = True
+        #: Lower bound of a batch centre, in nats below the Wilson surface.
+        self.centre_floor_nats = 4.0
         self.lam = 0.0                      # API parity with LOOInBatchTarget
 
         self.register_buffer("ema_I0", I0_init.detach().clone().float().clamp(min=floor))
@@ -324,6 +333,7 @@ class PosteriorMergeTarget(nn.Module):
     def locate(
         self, objective, scatter, params, pred,
         n_ph: Tensor, bg: Tensor, hkl_id: Tensor, meta,
+        centre: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Find the peak and width of the log-likelihood curve by MEASURING it.
 
@@ -340,16 +350,44 @@ class PosteriorMergeTarget(nn.Module):
         neighbours gives ``v*`` and ``s = 1/sqrt(-S'')`` with no distributional
         assumption and nothing that can pin at a bound.
         """
-        v_scan = self.scan_grid()
+        v_scan = self.scan_grid(centre)
         S = self.accumulate(
             objective, scatter, params, pred, n_ph, bg, hkl_id, meta, v_scan
         )
-        return self.peak_from_scan(S)
+        return self.peak_from_scan(S, centre)
+
+    def _scan_centre(self, centre: Tensor | None) -> Tensor:
+        return self.ema_I0.clamp(min=self.floor).log() if centre is None else centre
 
     @torch.no_grad()
-    def scan_grid(self) -> Tensor:
-        """Generous grid for the locating sweep: ``(n_hkl, scan_points)``."""
-        centre = self.ema_I0.clamp(min=self.floor).log()
+    def batch_centre(self, pred, n_signal: Tensor, sigma: Tensor, hkl_id: Tensor) -> Tensor:
+        """``log`` of the batch's weighted mean intensity at the network's scale.
+
+        The weighted least-squares estimate ``sum K n' / V`` over ``sum K^2 / V``
+        of each reflection's observations in this batch, with
+        ``V = sigma^2 + (K I)^2 (e^{w^2} - 1)`` evaluated at the counting-only
+        estimate ``I``; floored at ``centre_floor_nats`` below the Wilson surface
+        (reflections without observations sit at the floor).  Only places the
+        locating scan, which spans ``+-scan_halfwidth`` around it.
+        """
+        K = pred.log_K.detach().exp().clamp(min=1e-8)
+        var0 = (sigma ** 2).clamp(min=1e-12)
+        num = group_sum(K * n_signal / var0, hkl_id, self.n_hkl)
+        den = group_sum(K * K / var0, hkl_id, self.n_hkl)
+        lo = self.wilson_sigma.clamp(min=self.floor) * math.exp(-self.centre_floor_nats)
+        I1 = torch.where(den > 0, num / den.clamp(min=1e-30), lo).clamp(min=self.floor)
+        w2 = (pred.log_w.detach().exp() ** 2).clamp(max=20.0)
+        var = (sigma ** 2 + (K * I1[hkl_id]) ** 2 * torch.expm1(w2)).clamp(min=1e-12)
+        num = group_sum(K * n_signal / var, hkl_id, self.n_hkl)
+        den = group_sum(K * K / var, hkl_id, self.n_hkl)
+        I2 = torch.where(den > 0, num / den.clamp(min=1e-30), lo)
+        return torch.maximum(I2, lo).clamp(min=self.floor).log()
+
+    @torch.no_grad()
+    def scan_grid(self, centre: Tensor | None = None) -> Tensor:
+        """Generous grid for the locating sweep: ``(n_hkl, scan_points)``,
+        around ``centre`` (log intensity; default the running reference)."""
+        centre = self._scan_centre(centre)
         u = torch.linspace(
             -self.scan_halfwidth, self.scan_halfwidth, self.scan_points,
             device=centre.device,
@@ -357,7 +395,7 @@ class PosteriorMergeTarget(nn.Module):
         return centre[:, None] + u[None, :]
 
     @torch.no_grad()
-    def peak_from_scan(self, S: Tensor) -> tuple[Tensor, Tensor]:
+    def peak_from_scan(self, S: Tensor, centre: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Peak location and width read off an accumulated scan curve.
 
         Separate from :meth:`locate` so a caller that spans several batches can
@@ -368,7 +406,7 @@ class PosteriorMergeTarget(nn.Module):
         1.0000 in five shells, because both halves returned the same shared
         ``ema_I0`` rather than anything from the data.
         """
-        centre = self.ema_I0.clamp(min=self.floor).log()
+        centre = self._scan_centre(centre)
         u = torch.linspace(
             -self.scan_halfwidth, self.scan_halfwidth, self.scan_points,
             device=S.device,
@@ -845,8 +883,10 @@ class PosteriorMergeTarget(nn.Module):
         else:
             # Measure the curve, then place the grid on it.  One extra sweep of
             # scan_points, against three failed attempts at a closed-form width.
+            start = (self.batch_centre(pred, n_ph - bg, sigma, hkl_id)
+                     if self.centre_mode == "batch" else None)
             centre, sig_h = self.locate(
-                objective, scatter, params, pred, n_ph, bg, hkl_id, meta
+                objective, scatter, params, pred, n_ph, bg, hkl_id, meta, start
             )
             self._loc = (centre, sig_h)
             v_nodes = centre[:, None] + sig_h[:, None] * self.u_coarse[None, :]
@@ -872,10 +912,10 @@ class PosteriorMergeTarget(nn.Module):
             self.last_curves = (S.detach(), tuple(t.detach() for t in self._loc), seen)
         floored = I0_mean < self.floor
         I0_mean = torch.where(seen, I0_mean.clamp(min=self.floor), self.ema_I0)
-        if update_state:
+        if update_state and self.track_reference:
             self._update_ema(pred, n_ph - bg, sigma, hkl_id,
                              posterior_mean=I0_mean, posterior_seen=seen)
-        if update_state and self.node_placement == "laplace":
+        if update_state and self.track_reference and self.node_placement == "laplace":
             # Only the uniform-grid path has an extent to maintain.  Wilson
             # placement draws nodes through an inverse CDF over u in (0,1), so
             # there is nothing to widen or shrink and nothing to truncate.

@@ -175,6 +175,18 @@ All but `reference` keep no per-reflection state. A separate merge of the same
 reflections keeps the checkpoint's surface for them; for other reflections it
 refits the surface to the unity merge and warns.
 
+### No per-reflection running state
+
+`--reference-update none` carries no per-reflection state from one batch to
+the next. Each batch centres its locating scan on its own weighted mean at the
+network's scale (floored 4 nats below the Wilson surface), and the readout merge
+starts from the unity merge with the same floor. It needs `--feature-reference
+static` and a `--wilson-fit` other than `reference`, e.g.
+`--feature-reference static --peer-scale rank --wilson-fit evidence
+--reference-update none`. The checkpoint stores the Wilson surface's basis
+definition and coefficients, so a separate merge evaluates the same surface on
+any reflection set.
+
 ### Intensity prior
 
 `torchsx-train ... --prior wilson` is the default. `--prior none` removes the

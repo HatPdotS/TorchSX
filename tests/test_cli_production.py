@@ -15,7 +15,7 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file, python_parser
 
 
-@pytest.mark.parametrize('module,count', [(train,38), (merge_nn,14)])
+@pytest.mark.parametrize('module,count', [(train,39), (merge_nn,14)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
@@ -159,7 +159,8 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
     assert ck['likelihood']['bg_mean_offset']==0.1
     assert ck['data']['training']['config']['seed']==17
     assert ck['reference_update']=={'estimator':'posterior','ema_decay':0.99,
-                                   'feature_reference':'running','wilson_fit':'reference'}
+                                   'feature_reference':'running','wilson_fit':'reference',
+                                   'update':'ema'}
     assert ck['scale']['peer_scale']=='ratio'
     assert ck['data']['training']['config']['reference_estimator']=='posterior'
     assert ck['posterior_grid']['prior']==prior

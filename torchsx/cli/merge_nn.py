@@ -51,6 +51,7 @@ def main(argv: list[str] | None = None) -> None:
         posterior_prior=S["prior"],
         reference_estimator=ckpt.get("reference_update", {}).get("estimator", "wls"),
         reference_ema_decay=ckpt.get("reference_update", {}).get("ema_decay", 0.99),
+        reference_update=ckpt.get("reference_update", {}).get("update", "ema"),
         wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
         heldout_frac=0.05, device=S["device"], outdir=str(args.out.parent),
     )
@@ -94,6 +95,16 @@ def _restore_fitted_wilson(tr, prep, ckpt) -> None:
     """
     fit = (ckpt.get("reference_update") or {}).get("wilson_fit", "reference")
     if fit == "reference":
+        return
+    surface = ckpt.get("wilson_surface")
+    if surface is not None and all(getattr(t, "has_basis", False) for t in tr.targets) \
+            and len(surface["coef"]) == len(tr.targets):
+        # the checkpoint's surface evaluated on these reflections
+        from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
+        phi = ReciprocalBasis.from_definition(surface["basis"]).evaluate(prep.hkl_valid)
+        for t, c in zip(tr.targets, surface["coef"]):
+            t.set_basis(phi.to(t.wilson_coef.device))
+            t.set_wilson_coef(c.to(t.wilson_coef.device))
         return
     ctx = ckpt.get("inference_context") or {}
     saved = ctx.get("targets") or []

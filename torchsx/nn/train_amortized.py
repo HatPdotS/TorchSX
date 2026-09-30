@@ -324,6 +324,14 @@ class TrainConfig:
     #: per-reflection state.
     wilson_fit: str = "reference"
     wilson_lr_mult: float = 10.0
+    #: Per-reflection state carried between batches: ``"ema"`` -- the running
+    #: reference, which also centres the locating scan; ``"none"`` -- none: each
+    #: batch centres its scan on its own weighted mean at the network's scale,
+    #: and the merge starts from the unity merge floored below the Wilson
+    #: surface.  With ``"none"``, pair ``feature_reference="static"`` and a
+    #: Wilson fit other than ``"reference"``, or the features and the prior
+    #: stay at their unity-merge starting values.
+    reference_update: str = "ema"
     #: How the Wilson prior's Sigma is estimated from the running merge:
     #: ``"shells"`` (equal-count resolution shells) or ``"smooth"`` (a
     #: symmetry-adapted surface on a reciprocal-space basis, see
@@ -496,6 +504,12 @@ class AmortizedTrainer:
         if self.cfg.wilson_fit == "batch-ml":
             for t in self.targets:
                 t.keep_curves = True
+        if self.cfg.reference_update not in ("ema", "none"):
+            raise ValueError(f"reference_update must be 'ema' or 'none', got {self.cfg.reference_update!r}")
+        if self.cfg.reference_update == "none":
+            for t in self.targets:
+                if hasattr(t, "track_reference"):
+                    t.centre_mode, t.track_reference = "batch", False
         if self.cfg.feature_reference not in ("running", "static"):
             raise ValueError(
                 f"feature_reference must be 'running' or 'static', got "
@@ -1292,7 +1306,15 @@ class AmortizedTrainer:
                     "ema_decay": self.cfg.reference_ema_decay,
                     "feature_reference": self.cfg.feature_reference,
                     "wilson_fit": self.cfg.wilson_fit,
+                    "update": self.cfg.reference_update,
                 },
+                # the Wilson surface as a function of hkl: the basis definition
+                # and each state's coefficients, so a merge of any reflection
+                # set can evaluate it
+                "wilson_surface": (None if getattr(self, "reciprocal_basis", None) is None else {
+                    "basis": self.reciprocal_basis.definition(),
+                    "coef": [t["wilson_coef"].clone() for t in context["targets"]],
+                }),
                 # outer-grid geometry, so a later merge integrates on the SAME grid
                 "posterior_grid": {
                     "k_coarse": self.cfg.posterior_k_coarse, "m_fine": self.cfg.posterior_m_fine,
@@ -1507,6 +1529,11 @@ class AmortizedTrainer:
             ema0 = tgt.ema_I0
             loc_sd = None
             try:
+                if not getattr(tgt, "track_reference", True):
+                    # no running reference: start from the unity merge, floored
+                    # below the Wilson surface like a batch centre
+                    tgt.ema_I0 = torch.maximum(
+                        ema0, tgt.wilson_sigma * math.exp(-tgt.centre_floor_nats))
                 for hw in self.cfg.locate_windows or (hw0,):
                     tgt.scan_halfwidth = float(hw)
                     scan = tgt.scan_grid()
