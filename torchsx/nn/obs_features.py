@@ -48,6 +48,7 @@ representation).
 
 from __future__ import annotations
 
+import math
 import warnings
 
 import torch
@@ -59,6 +60,8 @@ from torchsx.merging.observations import CRYSTAL_FEAT_COLUMNS, ObsInfo, Prepared
 __all__ = [
     "SELF_FEATURES",
     "CONTEXT_ONLY_FEATURES",
+    "RANK_CONTEXT_FEATURES",
+    "PEER_SCALES",
     "CRYSTAL_FEATURES",
     "FORBIDDEN_IN_SELF",
     "CONDITION_FEATURES",
@@ -99,7 +102,29 @@ CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
     "log_I0_ref",      # how bright the peer's reflection should be
 )
 
-FORBIDDEN_IN_SELF: frozenset[str] = frozenset(CONTEXT_ONLY_FEATURES)
+#: The measurement channels with the peer's observed scale given as a RANK:
+#: the normal score of the observation's position among all observations of
+#: its reflection.  It needs no per-reflection intensity estimate, so nothing
+#: has to be merged, refreshed or carried in a checkpoint to form it; it is
+#: bounded, keeps the negative observations, and is unchanged by any monotone
+#: rescaling of a reflection (its intrinsic brightness drops out).  The ratio
+#: channels are replaced; ``log_I0_ref`` stays so the network can tell how
+#: informative a peer's rank is.
+RANK_CONTEXT_FEATURES: tuple[str, ...] = (
+    "signed_log_I",
+    "log_sigma",
+    "i_over_sigma",
+    "log_bg",
+    "rank_score",
+    "log_I0_ref",
+)
+
+#: How a peer's observed scale enters the context: ``"ratio"`` -- n'/I0 against
+#: the reference intensity (:data:`CONTEXT_ONLY_FEATURES`); ``"rank"`` -- its
+#: within-reflection rank (:data:`RANK_CONTEXT_FEATURES`).
+PEER_SCALES: tuple[str, ...] = ("ratio", "rank")
+
+FORBIDDEN_IN_SELF: frozenset[str] = frozenset(CONTEXT_ONLY_FEATURES) | {"rank_score"}
 
 #: Per-CRYSTAL metadata, one row per crystal (``ObsInfo.crystal_feat``).  Read
 #: by the encoder's crystal-level input head, once per crystal rather than once
@@ -134,14 +159,20 @@ class ObsFeatureSpec(nn.Module):
         context_features: tuple[str, ...] | None = None,
         include_hkl: bool = True,
         crystal_features: tuple[str, ...] | None = None,
+        peer_scale: str = "ratio",
     ) -> None:
         super().__init__()
         #: Recorded so a checkpoint can say which feature set it was fitted
         #: under; the flag itself is consumed a few lines below.
         self.include_hkl = bool(include_hkl)
+        if peer_scale not in PEER_SCALES:
+            raise ValueError(f"peer_scale must be one of {PEER_SCALES}, got {peer_scale!r}")
+        self.peer_scale = peer_scale
 
         if context_features is None:
-            context_features = tuple(self_features) + CONTEXT_ONLY_FEATURES
+            context_features = tuple(self_features) + (
+                CONTEXT_ONLY_FEATURES if peer_scale == "ratio" else RANK_CONTEXT_FEATURES
+            )
         if not include_hkl:
             self_features = tuple(f for f in self_features if f not in ("h", "k", "l"))
             context_features = tuple(
@@ -214,6 +245,15 @@ class ObsFeatureSpec(nn.Module):
         # the trainer installs the running merge (set_reference_I0) before the
         # first forward.
         self.register_buffer("_I0_ref", torch.ones(prep.n_valid), persistent=False)
+        # Within-reflection rank, fixed by the data alone: computed once over
+        # every observation of the prepared set (all conditions pooled, as the
+        # single reference is), never refreshed.
+        self.register_buffer(
+            "_rank_score",
+            within_reflection_normal_score(I, oi.hkl_idx, prep.n_valid)
+            if "rank_score" in self.context_features else torch.zeros(0),
+            persistent=False,
+        )
 
         # Normalisation stats over the FULL dataset (never per batch — that
         # would leak batch composition into the features).
@@ -396,6 +436,8 @@ class ObsFeatureSpec(nn.Module):
                 out[k] = (I / sig).clamp(-50.0, 50.0) * (sig / I0).clamp(max=50.0)
             elif k == "log_I0_ref":
                 out[k] = I0.log()
+            elif k == "rank_score":
+                out[k] = self._rank_score[oid.to(self._rank_score.device)].to(meta.s_sq.device)
             else:
                 raise KeyError(f"unknown feature {k!r}")
         return out
@@ -437,6 +479,41 @@ class ObsFeatureSpec(nn.Module):
             raise ValueError("ObsFeatureSpec.build needs ObsInfo.obs_id")
         x_ctx = self._matrix(meta, self.context_features)
         return self._matrix(meta, self.self_features), x_ctx, self.crystal_matrix()
+
+
+@torch.no_grad()
+def within_reflection_normal_score(I: Tensor, hkl_id: Tensor, n_hkl: int) -> Tensor:
+    """Normal score of each observation's rank among its reflection's observations.
+
+    With ``c`` observations of a reflection, the one at position ``p`` (0-based,
+    ascending intensity; ties take their mean position) has the rank
+    ``r = (p + 1/2) / c`` and the score ``Phi^-1(r)``.  One sort of a combined
+    ``(reflection, intensity)`` key: the float intensity is mapped to an
+    order-preserving unsigned 32-bit code below the reflection index.
+    """
+    n = int(I.numel())
+    if n == 0:
+        return torch.zeros(0)
+    I = I.detach().float().contiguous().cpu()
+    h = hkl_id.detach().to(torch.int64).cpu()
+    bits = I.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    code = torch.where(bits >= 0x80000000, 0xFFFFFFFF - bits, bits + 0x80000000)
+    key, order = torch.sort(h * (1 << 32) + code)
+    del bits, code
+    new = torch.ones(n, dtype=torch.bool)
+    new[1:] = key[1:] != key[:-1]
+    run = new.cumsum(0) - 1
+    start = new.nonzero().squeeze(1)
+    length = torch.bincount(run)
+    mid = start[run].double() + 0.5 * (length[run] - 1).double()
+    del new, run, start, length
+    h_sorted = key >> 32
+    counts = torch.bincount(h, minlength=n_hkl)
+    first = counts.cumsum(0) - counts
+    r = (mid - first[h_sorted].double() + 0.5) / counts[h_sorted].double()
+    score = torch.empty(n, dtype=torch.float32)
+    score[order] = (math.sqrt(2.0) * torch.erfinv(2.0 * r - 1.0)).float()
+    return score
 
 
 def _or_zeros(t: Tensor | None, meta: ObsInfo) -> Tensor:

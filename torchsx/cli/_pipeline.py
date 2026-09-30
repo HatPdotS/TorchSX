@@ -767,6 +767,9 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                     min(DEFAULTS["peer_heads"], max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
         scatter_family=scatter_family, n_components=n_components,
         component_shape=scatter_shape,
+        # a checkpoint's own feature set wins; one written before the key
+        # existed used the ratio channels
+        peer_scale=sc.get("peer_scale", "ratio") if ck else getattr(args, "peer_scale", "ratio"),
     )
     # A checkpoint's own head geometry wins over the defaults: rebuilding it
     # with different heads would fail the state_dict load, or load a subset.

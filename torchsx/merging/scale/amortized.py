@@ -156,8 +156,9 @@ class AmortizedScale(ScaleModel):
         scatter_family: str = "gengauss",
         n_components: int = 3,
         component_shape: str = "shared",
+        peer_scale: str = "ratio",
     ) -> "AmortizedScale":
-        features = ObsFeatureSpec(prep, include_hkl=include_hkl)
+        features = ObsFeatureSpec(prep, include_hkl=include_hkl, peer_scale=peer_scale)
         enc = DeepSetsEncoder(
             features.n_self, features.n_context,
             d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,

@@ -296,6 +296,12 @@ class TrainConfig:
     #: Normalise the running reference by its accumulated weight, so the
     #: unscaled seed merge drops out (see ``PosteriorMergeTarget``).
     reference_bias_correction: bool = False
+    #: The per-reflection intensity the peer features are formed against:
+    #: ``"running"`` -- the running reference, reinstalled at every refresh;
+    #: ``"static"`` -- the unity merge of the input observations, installed
+    #: once and never moved, so training, evaluation and any later merge of
+    #: the same data see the same features.
+    feature_reference: str = "running"
     #: How the Wilson prior's Sigma is estimated from the running merge:
     #: ``"shells"`` (equal-count resolution shells) or ``"smooth"`` (a
     #: symmetry-adapted surface on a reciprocal-space basis, see
@@ -457,6 +463,11 @@ class AmortizedTrainer:
                     f"merge_target must be 'loo' or 'posterior', got {self.cfg.merge_target!r}"
                 )
             self.targets.append(t)
+        if self.cfg.feature_reference not in ("running", "static"):
+            raise ValueError(
+                f"feature_reference must be 'running' or 'static', got "
+                f"{self.cfg.feature_reference!r}"
+            )
         if self.cfg.loss == "evidence" and self.cfg.merge_target != "posterior":
             raise ValueError("loss='evidence' requires merge_target='posterior'")
         if self.cfg.merge_estimator not in ("posterior", "wls"):
@@ -1191,6 +1202,7 @@ class AmortizedTrainer:
                     "predict_shape": bool(getattr(self.scale.heads, "predict_shape", True)),
                     "anchor_log_k": bool(getattr(self.scale, "anchor_log_k", True)),
                     "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
+                    "peer_scale": getattr(self.scale.features, "peer_scale", "ratio"),
                 },
                 "splits": list(self.split_names or []),
                 # scatter family and miss component, so a merge rebuilds the
@@ -1223,6 +1235,7 @@ class AmortizedTrainer:
                 "reference_update": {
                     "estimator": self.cfg.reference_estimator,
                     "ema_decay": self.cfg.reference_ema_decay,
+                    "feature_reference": self.cfg.feature_reference,
                 },
                 # outer-grid geometry, so a later merge integrates on the SAME grid
                 "posterior_grid": {
@@ -1835,6 +1848,8 @@ class AmortizedTrainer:
 
     def _refresh_feature_reference(self) -> None:
         """Roll the obs_scale reference forward with the running merge."""
+        if self.cfg.feature_reference == "static":
+            return                      # the unity merge installed at construction
         # ONE reference for every condition (the first): ``obs_scale`` is an
         # input feature, and a per-condition reference would let the network
         # read the condition off it.

@@ -137,6 +137,21 @@ remains `wls` for comparison; both estimators use decay 0.99 by default.
 accumulated weight, so the unscaled starting merge drops out at a reflection's
 first update.
 
+### Peer features
+
+The context of an observation carries, for every peer, its observed scale.
+`--peer-scale ratio` (the default) gives it as the peer's intensity over its
+reflection's reference intensity. `--peer-scale rank` gives it as the normal
+score of the peer's rank among all observations of its reflection, computed
+once from the input observations with all states pooled; no reference
+intensity enters it. Readout inherits the choice.
+
+`--feature-reference running` (the default) forms the peer features against
+the running reference, reinstalled at every refresh. `--feature-reference
+static` forms them against the unity merge of the input observations,
+installed once. A separate merge also forms its features against the unity
+merge of the observations it is given.
+
 ### Intensity prior
 
 `torchsx-train ... --prior wilson` is the default. `--prior none` removes the

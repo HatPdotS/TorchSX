@@ -83,6 +83,13 @@ def _build_parser():
     p.add_argument("--reference-bias-correction", action="store_true",
                    help="normalise the running reference by its accumulated weight, so the "
                         "unscaled starting merge drops out at a reflection's first update")
+    p.add_argument("--feature-reference", choices=("running", "static"), default="running",
+                   help="per-reflection intensity the peer features are formed against: the "
+                        "running reference (default) or the unity merge of the inputs, fixed")
+    p.add_argument("--peer-scale", choices=("ratio", "rank"), default="ratio",
+                   help="a peer's observed scale in the context: its intensity over the reference "
+                        "(default) or its rank among the observations of its reflection; the "
+                        "merge inherits the checkpoint")
     p.add_argument("--d-model", type=int, default=None, help="encoder width (default 128)")
     p.add_argument("--n-layers", type=int, default=None, help="encoder blocks (default 5)")
     p.add_argument("--eval-every", type=int, default=100,
@@ -242,6 +249,7 @@ def main(argv=None):
         warmup_steps=(25 if args.warmup is None else args.warmup) * n_states,
         lr_schedule=args.lr_schedule, total_steps=args.steps,
         reference_bias_correction=args.reference_bias_correction,
+        feature_reference=args.feature_reference,
         grad_clip=20.0, log_every=25, merge_target="posterior", loss="evidence",
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
         posterior_max_halfwidth=settings["max_halfwidth"],
