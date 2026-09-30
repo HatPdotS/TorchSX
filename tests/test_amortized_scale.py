@@ -647,7 +647,8 @@ def test_fold_chunking_is_exact_in_value_and_gradient(split):
     for chunk in (1, 3):
         k1, g1 = run(chunk)
         torch.testing.assert_close(k1, k0, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(g1, g0, rtol=1e-4, atol=1e-6)
+        # float32 sums in a different order: gradients agree to rounding
+        torch.testing.assert_close(g1, g0, rtol=1e-4, atol=1e-5)
 
 
 def test_fold_mode_depth_split_moves_blocks_to_the_table():

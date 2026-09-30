@@ -393,8 +393,9 @@ def test_scatter_family_round_trips_through_the_checkpoint(tmp_path, monkeypatch
     assert S2["scatter_family"] == "mixture" and rebuilt.heads.n_components == 4 and isinstance(rebuilt.scatter, PredictedMixtureScatter)
     rebuilt.load_state_dict(ck["state_dict"])
     scale.eval(), rebuilt.eval()
+    rows = tr.index.rows(tr.index.nonempty)          # crystal-grouped, as the encoder needs
     with torch.no_grad():
-        a, b = scale.predict(prep_.obs_info), rebuilt.predict(p2.obs_info)
+        a, b = scale.predict(prep_.obs_info.gather(rows)), rebuilt.predict(p2.obs_info.gather(rows))
     torch.testing.assert_close(b.log_K, a.log_K)
     torch.testing.assert_close(b.mix, a.mix)
     # a checkpoint written before the family existed rebuilds the single family and loads strictly

@@ -58,7 +58,8 @@ def _inline_merge(tr, scale, obj, params, prep):
     tgt = tr.target
     crystals = torch.arange(tr.index.n_crystals)
     with torch.no_grad():
-        scan = tgt.scan_grid()
+        start = tgt.start_centre()
+        scan = tgt.scan_grid(start)
         acc_s = torch.zeros(n_hkl, scan.shape[1])
         for _, r in tr.index.batches(tr.cfg.max_obs_per_batch, crystals=crystals,
                                      shuffle=False):
@@ -67,7 +68,7 @@ def _inline_merge(tr, scale, obj, params, prep):
             acc_s = acc_s + tgt.accumulate(obj, scale.scatter, params, pr,
                                            tr.n_ph[r], prep.bg[r], m.hkl_idx, m, scan)
             scale.clear()
-        centre, sd = tgt.peak_from_scan(acc_s)
+        centre, sd = tgt.peak_from_scan(acc_s, start)
         tgt._loc = (centre, sd)
         v_nodes = centre[:, None] + sd[:, None] * tgt.u_coarse[None, :]
         acc = torch.zeros(n_hkl, v_nodes.shape[1])
@@ -78,7 +79,7 @@ def _inline_merge(tr, scale, obj, params, prep):
             acc = acc + tgt.accumulate(obj, scale.scatter, params, pr,
                                        tr.n_ph[r], prep.bg[r], m.hkl_idx, m, v_nodes)
             scale.clear()
-        _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc, v_nodes, None)
+        _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
         rootI = v.exp().clamp(min=0).sqrt()
         F = (w_post * rootI).sum(1)
         F_sd = ((w_post * (rootI - F[:, None]) ** 2).sum(1)).clamp(min=0).sqrt()
@@ -582,9 +583,10 @@ def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
     torch.testing.assert_close(rebuilt.gauge_phi, scale.gauge_phi)
     # every per-reflection input is formed from the data again: same predictions
     scale.eval(), rebuilt.eval()
+    rows = tr.index.rows(tr.index.nonempty)          # crystal-grouped, as the encoder needs
     with torch.no_grad():
-        torch.testing.assert_close(rebuilt.predict(p2.obs_info).log_K,
-                                   scale.predict(prep_.obs_info).log_K)
+        torch.testing.assert_close(rebuilt.predict(p2.obs_info.gather(rows)).log_K,
+                                   scale.predict(prep_.obs_info.gather(rows)).log_K)
 
 
 def test_defaults_are_the_wilson_prior_and_basis_anchor(tmp_path):

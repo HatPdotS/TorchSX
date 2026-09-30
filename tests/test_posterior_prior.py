@@ -22,7 +22,7 @@ def test_integrated_poisson_curve_matches_analytic_gamma(prior, centric):
     nodes = target.u_coarse[None, :]
     rate = torch.tensor(1.5, dtype=torch.float64, requires_grad=True)
     log_likelihood = 6 * nodes - rate * nodes.exp()
-    log_z, mean_i, sd_i, weights, v, edge = target.integrate(log_likelihood, nodes)
+    log_z, mean_i, sd_i, weights, v, edge = target.integrate(log_likelihood)
     shape, effective_rate, log_constant = 7., 1.5, 0.
     if prior == 'wilson':
         shape = 6.5 if centric else 7.
