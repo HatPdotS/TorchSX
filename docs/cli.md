@@ -30,14 +30,23 @@ selection reason and calibration diagnostics are recorded; checkpoint readout
 reuses the selected numeric gain. The legacy `stream` spelling remains a Python
 recipe alias for `trust_input`.
 
-Calibration uses background-binned off-Bragg variance. The systematically biased
-truncated-normal estimator is deprecated and is no longer an automatic fallback.
-If too few off-Bragg observations or background bins are available, calibration
-is unavailable: `auto` retains a valid declared gain, while `calibrate` fails.
-The Python method `calibrate_gain_truncnorm` remains available for historical
-reproduction with a `FutureWarning`. New `auto`/`calibrate` requests require
-prepared caches built with the current gain policy; checkpoint readout still
-reuses its recorded numeric gain.
+Calibration uses background-binned off-Bragg variance when the input predicts
+reflections far from the Ewald sphere. CrystFEL streams do not, so calibration
+then falls back to a truncated normal fitted to the negative integrated
+intensities, cut to the core of their distribution (above -3 robust standard
+deviations, the cut modelled in the fit) against over-subtracted outliers. That
+estimate is biased, so `auto` replaces a declared gain only past the 50%
+tolerance. If neither
+estimator is usable, `auto` retains a valid declared gain, while `calibrate`
+fails. New `auto`/`calibrate` requests require prepared caches built with the
+current gain policy; checkpoint readout still reuses its recorded numeric gain.
+
+`--detector-noise auto` refines a gain the calibration selected (by `auto` past
+the tolerance, or `calibrate`) in training by one global B, the counting variance
+B (lam + sig_b2), which is exactly a gain correction on the integrated sums; with
+the input gain kept, no detector term is fitted. `--detector-noise panel` fits
+A and/or B per detector panel (`--noise-terms`). The default, `off`, fits none.
+Merges inherit the checkpoint's terms.
 
 New training uses the annulus background-mean correction inferred from integration
 metadata and a four-component Gaussian mixture. Gain conversion, background-mean

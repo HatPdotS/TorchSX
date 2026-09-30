@@ -497,6 +497,18 @@ def prepare_observations(
         g, mu_bias, read_var_adu_sq = poisson_noise.calibrate_sigma2_of_bg(
             core_I, core_background, ewald_offset_core,
         )
+        if not (poisson_noise.gain_calibration_info.get("valid", True)
+                and g is not None and math.isfinite(g) and g > 0):
+            # No off-Bragg sample (CrystFEL streams predict only near the Ewald
+            # sphere): the truncated normal on the negative sums.  Biased (see its
+            # docstring), so it decides a wrong declaration only past the tolerance.
+            off_bragg = poisson_noise.gain_calibration_info
+            g, mu_bias = poisson_noise.calibrate_gain_truncnorm(core_I, core_background)
+            read_var_adu_sq = 0.0
+            poisson_noise.gain_calibration_info = {
+                **poisson_noise.gain_calibration_info,
+                "fallback_reason": off_bragg.get("reason", "invalid off-Bragg calibration"),
+                "off_bragg": off_bragg}
         calibrated = float(g) if g is not None and math.isfinite(g) and g > 0 else None
         info = poisson_noise.gain_calibration_info
         valid_calibration = calibrated is not None and info.get("valid", True)

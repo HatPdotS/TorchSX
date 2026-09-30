@@ -748,8 +748,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     scatter_shape = str(scat.get("component_shape") or ("shared" if ck else DEFAULTS["scatter_shape"]))
     beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
     kw = dict(
-        d_model=enc.get("d_model") or sc.get("d_model") or DEFAULTS["d_model"],
-        n_layers=enc.get("n_layers") or sc.get("n_layers") or DEFAULTS["n_layers"],
+        d_model=enc.get("d_model") or sc.get("d_model") or getattr(args, "d_model", None) or DEFAULTS["d_model"],
+        n_layers=enc.get("n_layers") or sc.get("n_layers") or getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
         include_hkl=bool(sc.get("include_hkl", DEFAULTS["include_hkl"])),
         predict_shape=bool(sc.get("predict_shape", DEFAULTS["predict_shape"])),
         beta_init=beta_init, w_init=w_init,
@@ -791,8 +791,13 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS):
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
                          "support SplitLogGrid checkpoints only")
-    miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
-            else (0.5 if scat.get("miss_logit") is not None else 0.0))
+    if ck:
+        # a checkpoint decides: its miss logit is restored below, None means off
+        miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
+                else (0.5 if scat.get("miss_logit") is not None else 0.0))
+    else:
+        miss = (getattr(args, "miss_frac", None) if getattr(args, "miss_frac", None) is not None
+                else DEFAULTS["miss"])
     if ck:
         outlier = 0.5 if scat.get("outlier_logit") is not None else 0.0
     else:
@@ -810,6 +815,38 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         with torch.no_grad():
             obj.outlier_logit.fill_(float(scat["outlier_logit"]))
         outlier = float(obj.outlier_logit.detach().sigmoid())
+    # Learned detector noise: a checkpoint restores what it fitted; a new run
+    # builds it from --detector-noise.  auto: one global B when preparation
+    # replaced the declared gain by its calibration, whose estimate is biased
+    # (a global B is exactly a gain correction on the integrated sums), else none;
+    # panel: A and/or B per panel (--noise-terms, panels from the stream's panel ids).
+    noise_rec = ck.get("detector_noise") if ck else None
+    noise_mode = None if ck else getattr(args, "detector_noise", None)
+    if noise_mode == "auto":
+        selection = (bundle.recipe.get("measurement") or {}).get("gain_selection") or {}
+        noise_mode = "global_B" if selection.get("selected") == "calibration" else "off"
+        if verbose:
+            print(f"detector noise auto: {noise_mode} (gain from "
+                  f"{'calibration' if noise_mode == 'global_B' else 'input'})", flush=True)
+    if noise_rec or noise_mode in ("global_B", "panel"):
+        from torchsx.merging.likelihood.detector_noise import DetectorNoise
+        if noise_rec:
+            dn = DetectorNoise.from_config(noise_rec["config"])
+            dn.load_state_dict({k: torch.tensor(v, dtype=torch.float32)
+                                for k, v in noise_rec["state"].items()})
+            noise_mode = "checkpoint"
+        elif noise_mode == "global_B":
+            dn = DetectorNoise(1, terms="B")
+        else:
+            pid = prep.obs_info.panel_id
+            n_groups = int(pid.max()) + 1 if pid is not None else 1
+            dn = DetectorNoise(n_groups, terms=str(getattr(args, "noise_terms", "AB") or "AB"))
+        obj.detector_noise = dn.to(dev)
+        if verbose:
+            print(f"detector noise: {noise_mode}, {dn.n_groups} panel(s), "
+                  f"V = A + B (lam + sig_b2), fitted terms {dn.terms}")
+    elif noise_mode not in (None, "off"):
+        raise ValueError(f"Unknown detector noise mode {noise_mode!r}; expected auto, off or panel")
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at
@@ -852,7 +889,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         prior=prior,
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
-        skew=bool(skew), miss=float(miss), outlier=float(outlier),
+        skew=bool(skew), miss=float(miss), outlier=float(outlier), detector_noise=noise_mode or "off",
         wilson_basis=wilson_basis, wilson_degree=wilson_degree, basis=basis,
         scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
     )

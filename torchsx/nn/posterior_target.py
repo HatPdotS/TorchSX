@@ -542,6 +542,9 @@ class PosteriorMergeTarget(nn.Module):
         :meth:`integrate` once.
         """
         base = pred.log_K - pred.log_e_s
+        # Learned detector noise: per-panel (A, B, C), gathered once per batch and
+        # grad mode by the objective (the node loop below reads the same terms).
+        noise = objective.noise_terms(meta) if hasattr(objective, "noise_terms") else None
 
         if _all_nodes_kernel(objective, scatter, n_ph, bg):
             from torchsx.merging.quadrature._posterior_nodes_triton import (
@@ -549,12 +552,13 @@ class PosteriorMergeTarget(nn.Module):
             )
             q, lik = objective.quadrature, objective.likelihood
             sig_b2 = q._sig_b2(lik, bg)
-            p = q.grid_params(n_ph, bg, sig_b2, q._bg_mean_offset(lik))
+            p = q.grid_params(n_ph, bg, sig_b2, q._bg_mean_offset(lik), noise)
             olog = getattr(objective, "outlier_logit", None)
             return posterior_node_sums(
                 base, scatter.mixture_obs(meta), objective.miss_logit, v_nodes, hkl_id,
                 n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=self.n_hkl, outlier_logit=olog,
                 log_out=objective.log_outlier(n_ph, bg) if olog is not None else None,
+                noise=noise,
             )
 
         # Fused path -- OFF by default; measured, not deprecated.  One launch
@@ -582,7 +586,7 @@ class PosteriorMergeTarget(nn.Module):
         # Falls back silently -- it is a GenGauss x Poisson x FixedLogGrid
         # specialisation with no d/d bg statistic, so a learned background must
         # use the eager loop.
-        if self.use_fused:
+        if self.use_fused and noise is None:
             from torchsx.merging.likelihood import Poisson
             from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
             from torchsx.merging.scatter.gengauss import GenGaussLogScatter

@@ -202,6 +202,12 @@ class TrainConfig:
     #: the initial state; the head reads the full embedding like the other
     #: heads, and at 10 it drove lower widths to alpha ~ 1e5 within 200 updates.
     mixture_lr_mult: float = 1.0
+    #: Learning-rate multiplier for the learned detector noise (per-panel log A,
+    #: log B).  They may have to move by several nats within the budget -- B by 2.3
+    #: for a gain off by 10x, A up from its near-zero start -- and
+    #: Adam moves a parameter by at most ~lr per update.  Each is projected into
+    #: its bounds after every step, so a persistent push cannot run away.
+    noise_lr_mult: float = 30.0
     #: Linear LR warmup.  Matters once the encoder is a deep stack of exchange
     #: blocks: the zero-initialised output projections make every block start
     #: as the identity, so all early gradient lands on the heads (measured
@@ -323,6 +329,12 @@ class TrainConfig:
     #: delay.  ``None`` pools all conditions and is only allowed when the
     #: data carries a single one.
     heldout_condition: int | None = 0
+    #: Explicit held-out crystals (indices into the prepared data), e.g. a fixed
+    #: external held-out stream shared by many runs so their held-out NLL is on
+    #: the same crystals.  They must belong to ``heldout_condition``; they are
+    #: scored, never trained on, and the export leaves them out
+    #: (``external_heldout``).  None: a random ``heldout_frac`` of that condition.
+    heldout_crystal_ids: object = None
     #: Crystals scored from the TRAINING set under the same conditions as the
     #: held-out set (eval_lam, no spread penalty).  Without this the logged
     #: train and heldout numbers differ in both the penalty and lambda, so
@@ -505,9 +517,19 @@ class AmortizedTrainer:
             in_ref = self.condition[pool] == hc
             ref_pool, other = pool[in_ref], pool[~in_ref]
         perm = ref_pool[torch.randperm(ref_pool.numel(), generator=self.gen)]
-        n_held = int(self.cfg.heldout_frac * perm.numel())
-        self.heldout_crystals = perm[:n_held]
-        ref_train = perm[n_held:]
+        self.external_heldout: Tensor | None = None
+        if self.cfg.heldout_crystal_ids is not None:
+            ids = torch.as_tensor(self.cfg.heldout_crystal_ids, dtype=torch.long).cpu()
+            if hc is not None and bool((self.condition[ids] != hc).any()):
+                raise ValueError(f"heldout_crystal_ids must all belong to condition {hc}")
+            held = torch.isin(perm, ids)
+            self.heldout_crystals = perm[held]
+            ref_train = perm[~held]
+            self.external_heldout = ids
+        else:
+            n_held = int(self.cfg.heldout_frac * perm.numel())
+            self.heldout_crystals = perm[:n_held]
+            ref_train = perm[n_held:]
         self.train_crystals = torch.cat([ref_train, other])
 
         decay, no_decay, mixture = [], [], []
@@ -519,10 +541,13 @@ class AmortizedTrainer:
                 continue
             (no_decay if prm.ndim <= 1 else decay).append(prm)
         # the objective may carry its own scalars (the miss fraction); they are
-        # fitted with the network, undecayed
+        # fitted with the network, undecayed.  The detector noise gets its own rate.
+        noise_ids = {id(p) for p in (self.objective.detector_noise.parameters()
+                                     if getattr(self.objective, "detector_noise", None) is not None else [])}
+        noise = []
         for prm in self.objective.parameters():
             if prm.requires_grad:
-                no_decay.append(prm)
+                (noise if id(prm) in noise_ids else no_decay).append(prm)
         # Merge-quality quartets, at MATCHED crystal count.  Merge statistics
         # depend strongly on multiplicity, so comparing a 66,822-crystal train
         # merge against a 3,516-crystal validation merge would measure the
@@ -572,6 +597,10 @@ class AmortizedTrainer:
             groups.append({"params": mixture, "weight_decay": 0.0,
                            "lr": self.cfg.lr * self.cfg.mixture_lr_mult,
                            "lr_mult": float(self.cfg.mixture_lr_mult)})
+        if noise:
+            groups.append({"params": noise, "weight_decay": 0.0,
+                           "lr": self.cfg.lr * self.cfg.noise_lr_mult,
+                           "lr_mult": float(self.cfg.noise_lr_mult)})
         self.opt = torch.optim.AdamW(groups, lr=self.cfg.lr)
         self.n_decayed = sum(p.numel() for p in decay)
         self.n_undecayed = sum(p.numel() for p in no_decay)
@@ -748,8 +777,14 @@ class AmortizedTrainer:
         # a refinement.
         bvf = float(getattr(getattr(self.objective, "likelihood", None),
                             "bg_var_factor", 0.0) or 0.0)
-        var = (sigma**2 + bvf * bg.clamp(min=0.0)
-               + var_scatter).clamp(min=1e-12)
+        var_count = sigma**2 + bvf * bg.clamp(min=0.0)
+        noise = (self.objective.noise_terms(meta)
+                 if hasattr(self.objective, "noise_terms") else None)
+        if noise is not None:
+            # the learned detector variance A + B (counting)
+            nA, nB = (t.detach() for t in noise)
+            var_count = nA + nB * var_count
+        var = (var_count + var_scatter).clamp(min=1e-12)
         # Same argument for the mean: under a bg_mean_offset the model claims
         # E[n] = K*I0 + bg + offset, so the residual this metric standardises
         # has to subtract the same background the loss used.  (~0.01 sigma at
@@ -831,6 +866,9 @@ class AmortizedTrainer:
                 self.scale.parameters(), self.cfg.grad_clip
             )
             self.opt.step()
+            dn = getattr(self.objective, "detector_noise", None)
+            if dn is not None:
+                dn.project()          # the noise terms stay inside their bounds
         gn["gradnorm_total"] = float(total_norm)          # pre-clip global norm
         gn["grad_was_clipped"] = bool(float(total_norm) > self.cfg.grad_clip)
         gn["step_skipped"] = skipped
@@ -1057,6 +1095,11 @@ class AmortizedTrainer:
             "var_z": _mean_of([r.get("var_z") for r in recs]),
             "frac_gt3": _mean_of([r.get("frac_gt3") for r in recs]),
         }
+        dn = getattr(self.objective, "detector_noise", None)
+        if dn is not None:
+            # the fitted variance terms per panel
+            for t, v in dn.values().items():
+                rec[f"noise_{t}"] = v
         if (
             self.cfg.keep_best and phase == "heldout"
             and rec["nll_per_obs"] == rec["nll_per_obs"]
@@ -1077,6 +1120,16 @@ class AmortizedTrainer:
         rec.update(self.wilson_fit_info())
         self.logger.log(rec)
         return rec
+
+    def _detector_noise_record(self) -> dict | None:
+        """Configuration and fitted (best-state) values of the detector noise."""
+        dn = getattr(self.objective, "detector_noise", None)
+        if dn is None:
+            return None
+        best = getattr(self, "_best_obj_state", None) or {}
+        state = {k: best.get(f"detector_noise.{k}", v).detach().cpu().tolist()
+                 for k, v in dn.state_dict().items()}
+        return {"config": dn.config(), "state": state}
 
     def save_best(self, path=None) -> "Path | None":
         """Persist the best held-out parameters so a finished run can be
@@ -1155,6 +1208,7 @@ class AmortizedTrainer:
                                       else float((getattr(self, "_best_obj_state", None) or {}).get(
                                           "outlier_logit", self.objective.outlier_logit.detach()))),
                 },
+                "detector_noise": self._detector_noise_record(),
                 "best_step": self.best_step,
                 "best_heldout": self.best_heldout,
                 "n_crystals": self.index.n_crystals,

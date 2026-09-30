@@ -130,3 +130,103 @@ def test_outlier_component_absorbs_a_gross_count_error():
         mean = lambda c: float((torch.softmax(c, 0) * v[0]).sum())
         shift[outlier] = abs(mean(b[0]) - mean(a[0]))
     assert shift[0.01] < 0.2 * shift[0.0], shift
+
+
+def fused_noise(obj, scatter, mu, n_ph, bg, meta, v, n_hkl):
+    from torchsx.merging.quadrature._posterior_nodes_triton import posterior_node_sums
+    q, lik = obj.quadrature, obj.likelihood
+    noise = obj.noise_terms(meta)
+    sig_b2 = q._sig_b2(lik, bg)
+    p = q.grid_params(n_ph, bg, sig_b2, q._bg_mean_offset(lik), noise)
+    return posterior_node_sums(mu, scatter.mixture_obs(meta), obj.miss_logit, v, meta.hkl_idx,
+                               n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=n_hkl, noise=noise)
+
+
+def with_noise(obj, meta, logs):
+    """One detector panel per observation, with the given ``(log A, log B)``."""
+    from torchsx.merging.likelihood.detector_noise import DetectorNoise
+    M = meta.hkl_idx.numel()
+    meta.panel_id = torch.arange(M, device="cuda")
+    obj.detector_noise = DetectorNoise(M).cuda()
+    with torch.no_grad():
+        for t, x in zip("AB", logs):
+            getattr(obj.detector_noise, f"log_{t}").copy_(x)
+    return obj
+
+
+def random_noise(M, seed=11):
+    g = torch.Generator().manual_seed(seed)
+    u = lambda lo, hi: (torch.rand(M, generator=g) * (math.log(hi) - math.log(lo)) + math.log(lo)).cuda()
+    return u(1e-2, 50.0), u(0.3, 5.0)
+
+
+@pytest.mark.parametrize("bvf,miss", [(1.16, 0.03), (0.0, 0.0), (1.16, 0.0), (0.0, 0.03)])
+def test_detector_noise_values_and_gradients_match_node_loop(bvf, miss):
+    n_ph, bg, mu0, mix0, hkl, v = problem()
+    n_hkl, M = v.shape[0], len(mu0)
+    logs = random_noise(M)
+    out = {}
+    for name in ("loop", "fused"):
+        meta = Meta(torch.arange(M, device="cuda"), hkl)
+        obj, scatter = build(bvf, miss)
+        obj = with_noise(obj, meta, logs)
+        mu = mu0.clone().requires_grad_()
+        mix = mix0.clone().requires_grad_()
+        scatter.set_prediction(meta.obs_id, mix)
+        S = (node_loop(obj, scatter, mu, n_ph, bg, meta, v, n_hkl) if name == "loop"
+             else fused_noise(obj, scatter, mu, n_ph, bg, meta, v, n_hkl))
+        W = torch.randn(S.shape, generator=torch.Generator().manual_seed(3)).cuda()
+        dn = obj.detector_noise
+        params = ([mu, mix, dn.log_A, dn.log_B]
+                  + ([obj.miss_logit] if obj.miss_logit is not None else []))
+        out[name] = (S.detach(), torch.autograd.grad((S * W).sum(), params))
+    S_ref, g_ref = out["loop"]
+    S_new, g_new = out["fused"]
+    torch.testing.assert_close(S_new, S_ref, rtol=1e-5, atol=2e-3)
+    # With noise the reference integrates each component on the eager GenGauss
+    # path, where the shape is free; the fixed-Gaussian mixture has no shape
+    # parameter, so the log-beta block (the last C columns) is not compared.
+    C = mix0.shape[1] // 5
+    g_new = (g_new[0], g_new[1][:, :4 * C], *g_new[2:])
+    g_ref = (g_ref[0], g_ref[1][:, :4 * C], *g_ref[2:])
+    for a, b in zip(g_new, g_ref):
+        torch.testing.assert_close(a, b, rtol=2e-4, atol=2e-4 * float(b.abs().max()))
+
+
+def test_detector_noise_at_poisson_is_the_plain_kernel():
+    n_ph, bg, mu, mix, hkl, v = problem(n=5000, n_hkl=200, K=9)
+    M = len(mu)
+    meta = Meta(torch.arange(M, device="cuda"), hkl)
+    obj, scatter = build(1.16, 0.03)
+    scatter.set_prediction(meta.obs_id, mix)
+    plain = fused(obj, scatter, mu, n_ph, bg, meta, v, 200)
+    tiny = torch.full((M,), math.log(1e-12), device="cuda")
+    obj = with_noise(obj, meta, (tiny, torch.zeros(M, device="cuda")))    # A ~ 0, B = 1
+    noisy = fused_noise(obj, scatter, mu, n_ph, bg, meta, v, 200)
+    torch.testing.assert_close(noisy, plain, rtol=1e-6, atol=1e-3)
+
+
+def test_detector_noise_terms_without_grad_are_not_reused_with_grad():
+    from torchsx.merging.likelihood.detector_noise import DetectorNoise
+    obj = MarginalNLL(SplitLogGrid(n_points=192), Poisson(), detector_noise=DetectorNoise(2))
+    meta = Meta(torch.arange(5), torch.zeros(5, dtype=torch.long))
+    meta.panel_id = torch.tensor([0, 1, 1, 0, 1])
+    with torch.no_grad():
+        a = obj.noise_terms(meta)
+    assert not a[0].requires_grad
+    b = obj.noise_terms(meta)                               # grad on: gathered again, with a graph
+    assert b[0].requires_grad and obj.noise_terms(meta) is b
+    with torch.no_grad():                                   # an optimizer-style update invalidates it too
+        obj.detector_noise.log_B.add_(1.0)
+    assert obj.noise_terms(meta) is not b
+
+
+def test_detector_noise_projection_bounds_the_terms():
+    from torchsx.merging.likelihood.detector_noise import BOUNDS, DetectorNoise
+    dn = DetectorNoise(3)
+    with torch.no_grad():
+        dn.log_A.fill_(20.0)
+        dn.log_B.fill_(-20.0)
+    dn.project()
+    assert torch.allclose(dn.log_A.exp(), torch.full((3,), BOUNDS["A"][1]))
+    assert torch.allclose(dn.log_B.exp(), torch.full((3,), BOUNDS["B"][0]))

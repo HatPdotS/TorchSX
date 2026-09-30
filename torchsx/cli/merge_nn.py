@@ -83,9 +83,19 @@ def main(argv: list[str] | None = None) -> None:
         tr.close()
 
 
+def _export_crystals(tr, k: int):
+    """Crystals of condition ``k`` that the export merges: all of them, less an
+    external held-out set (``--heldout-stream``), which is scored, never merged."""
+    in_cond = (tr.condition == k).nonzero(as_tuple=True)[0]
+    ext = getattr(tr, "external_heldout", None)
+    if ext is not None:
+        in_cond = in_cond[~torch.isin(in_cond, ext.cpu())]
+    return in_cond
+
+
 def _split_halves(tr, k: int, seed: int):
     """Disjoint crystal subsets for the shared-network internal CC1/2 statistic."""
-    in_cond = (tr.condition == k).nonzero(as_tuple=True)[0]
+    in_cond = _export_crystals(tr, k)
     g = torch.Generator().manual_seed(seed)
     perm = in_cond[torch.randperm(in_cond.numel(), generator=g)]
     return perm[: perm.numel() // 2], perm[perm.numel() // 2:]
@@ -120,7 +130,7 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
     summary = {}
     for k in wanted:
         cond = k if tr.n_conditions > 1 else None
-        sets = [(0, None)]
+        sets = [(0, _export_crystals(tr, k) if getattr(tr, "external_heldout", None) is not None else None)]
         h1, h2 = _split_halves(tr, k, args.seed + 1000000007)
         sets += [(1, h1), (2, h2)]
         merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior")
