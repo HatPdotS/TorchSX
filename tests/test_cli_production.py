@@ -158,7 +158,9 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
     assert ck['scatter']['family']=='mixture' and ck['scatter']['n_components']==4
     assert ck['likelihood']['bg_mean_offset']==0.1
     assert ck['data']['training']['config']['seed']==17
-    assert ck['reference_update']=={'estimator':'posterior','ema_decay':0.99}
+    assert ck['reference_update']=={'estimator':'posterior','ema_decay':0.99,
+                                   'feature_reference':'running'}
+    assert ck['scale']['peer_scale']=='ratio'
     assert ck['data']['training']['config']['reference_estimator']=='posterior'
     assert ck['posterior_grid']['prior']==prior
     assert ck['data']['training']['config']['posterior_prior']==prior
