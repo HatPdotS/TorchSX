@@ -35,7 +35,7 @@ def test_batch_centre_is_the_weighted_mean_and_floors_unseen_reflections():
     t.wilson_sigma.fill_(100.0)
     hkl = torch.tensor([0, 0, 1, 1])
     K = torch.tensor([0.5, 2.0, 1.0, 1.0])
-    I0 = torch.tensor([40.0, 40.0, 7.0, 7.0])
+    I0 = torch.tensor([40.0, 7.0])               # per reflection
     pred = SimpleNamespace(log_K=K.log(), log_w=torch.full((4,), -20.0))
     c = t.batch_centre(pred, K * I0[hkl], torch.ones(4), hkl)
     torch.testing.assert_close(c.exp(), torch.tensor([40.0, 7.0, 100.0 * math.exp(-4.0)]))
