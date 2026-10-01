@@ -29,11 +29,11 @@ Two tiers, and the split is load-bearing:
     evaluate it at ``j``.  Both halves of the pair must therefore be present —
     geometry alone says nothing, and raw intensity alone conflates "this
     reflection is intrinsically strong" (I0) with "this reflection was well
-    positioned" (partiality).  ``rank_score`` separates them: the peer's rank
-    among all observations of its own reflection, in which that reflection's
-    intrinsic brightness drops out.  Every context channel is a fixed function
-    of the observations, so no merge has to be kept, refreshed or stored to
-    form them.
+    positioned" (partiality).  ``obs_scale`` separates them: the peer's
+    intensity over the plain mean of its own reflection's observations, in
+    which that reflection's intrinsic brightness divides out.  Every context
+    channel is a fixed function of the observations, so no merge has to be
+    kept, refreshed or stored to form them.
 
 Both guards are enforced in ``__init__``, not left to convention.
 
@@ -52,7 +52,6 @@ representation).
 
 from __future__ import annotations
 
-import math
 import warnings
 
 import torch
@@ -94,15 +93,17 @@ CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
     "log_sigma",
     "i_over_sigma",    # the dimensionless one that actually carries weight
     "log_bg",
-    # The peer's *observed scale*: the normal score of its position among all
-    # observations of its reflection.  This is the channel that carries
-    # partiality -- raw intensity only tells the network how bright the crystal
-    # is.  Bounded, keeps the negative observations, and unchanged by any
-    # monotone rescaling of a reflection, so its intrinsic brightness drops out.
-    "rank_score",
-    # How bright the peer's reflection is: the log of the unity merge of the
-    # input observations, so the network can tell how informative a rank is.
-    "log_I_unity",
+    # The peer's *observed scale*: n' over the plain mean of its reflection's
+    # observations.  This is the channel that carries partiality -- raw
+    # intensity only tells the network how bright the crystal is.  Linear and
+    # clipped, not logged: negatives are real.
+    "obs_scale",
+    # The same ratio with the clips moved: bounded where the reflection's mean
+    # is small against the peer's sigma.
+    "obs_scale_over_sigma",
+    # How bright the peer's reflection is: the log of that plain mean, so the
+    # network can tell how informative a peer's ratio is.
+    "log_I_mean",
 )
 
 FORBIDDEN_IN_SELF: frozenset[str] = frozenset(CONTEXT_ONLY_FEATURES)
@@ -219,18 +220,9 @@ class ObsFeatureSpec(nn.Module):
         # computed once over every observation of the prepared set, all
         # conditions pooled: one table for every condition, so neither can tell
         # the network which condition a crystal belongs to.
-        from torchsx.nn.merge_target import unity_merge
-        self.register_buffer(
-            "_rank_score",
-            within_reflection_normal_score(I, oi.hkl_idx, prep.n_valid)
-            if "rank_score" in self.context_features else torch.zeros(0),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_log_I_unity",
-            unity_merge(I, sigma.clamp(min=1e-6), oi.hkl_idx, prep.n_valid).log(),
-            persistent=False,
-        )
+        from torchsx.nn.merge_target import plain_mean
+        self.register_buffer("_I_mean", plain_mean(I, oi.hkl_idx, prep.n_valid),
+                             persistent=False)
 
         # Normalisation stats over the FULL dataset (never per batch — that
         # would leak batch composition into the features).
@@ -334,11 +326,17 @@ class ObsFeatureSpec(nn.Module):
         out: dict[str, Tensor] = {}
         need = set(names)
 
-        I = sig = None
-        if {"signed_log_I", "i_over_sigma"} & need:
+        I = sig = I_ref = None
+        if {"signed_log_I", "i_over_sigma", "obs_scale", "obs_scale_over_sigma"} & need:
             I = self._I[oid.to(self._I.device)]
-        if {"log_sigma", "i_over_sigma"} & need:
+        if {"log_sigma", "i_over_sigma", "obs_scale_over_sigma"} & need:
             sig = self._sigma[oid.to(self._sigma.device)]
+        if {"obs_scale", "obs_scale_over_sigma", "log_I_mean"} & need:
+            # (n_hkl,) and module-resident; index on the meta's device, which
+            # stays the host for the cached statistics sample
+            I_ref = self._I_mean.to(meta.hkl_idx.device)[meta.hkl_idx]
+            I = I.to(I_ref.device) if I is not None else I
+            sig = sig.to(I_ref.device) if sig is not None else sig
 
         for k in need:
             if k == "s_sq":
@@ -373,12 +371,12 @@ class ObsFeatureSpec(nn.Module):
                 out[k] = (I / sig).clamp(-50.0, 50.0)
             elif k == "log_bg":
                 out[k] = torch.log1p(self._bg[oid].clamp(min=0.0))
-            elif k == "log_I_unity":
-                # (n_hkl,) and module-resident; index on the meta's device, which
-                # stays the host for the cached statistics sample
-                out[k] = self._log_I_unity.to(meta.hkl_idx.device)[meta.hkl_idx]
-            elif k == "rank_score":
-                out[k] = self._rank_score[oid.to(self._rank_score.device)].to(meta.s_sq.device)
+            elif k == "obs_scale":
+                out[k] = (I / I_ref).clamp(-20.0, 20.0)
+            elif k == "obs_scale_over_sigma":
+                out[k] = (I / sig).clamp(-50.0, 50.0) * (sig / I_ref).clamp(max=50.0)
+            elif k == "log_I_mean":
+                out[k] = I_ref.log()
             else:
                 raise KeyError(f"unknown feature {k!r}")
         return out
@@ -420,41 +418,6 @@ class ObsFeatureSpec(nn.Module):
             raise ValueError("ObsFeatureSpec.build needs ObsInfo.obs_id")
         x_ctx = self._matrix(meta, self.context_features)
         return self._matrix(meta, self.self_features), x_ctx, self.crystal_matrix()
-
-
-@torch.no_grad()
-def within_reflection_normal_score(I: Tensor, hkl_id: Tensor, n_hkl: int) -> Tensor:
-    """Normal score of each observation's rank among its reflection's observations.
-
-    With ``c`` observations of a reflection, the one at position ``p`` (0-based,
-    ascending intensity; ties take their mean position) has the rank
-    ``r = (p + 1/2) / c`` and the score ``Phi^-1(r)``.  One sort of a combined
-    ``(reflection, intensity)`` key: the float intensity is mapped to an
-    order-preserving unsigned 32-bit code below the reflection index.
-    """
-    n = int(I.numel())
-    if n == 0:
-        return torch.zeros(0)
-    I = I.detach().float().contiguous().cpu()
-    h = hkl_id.detach().to(torch.int64).cpu()
-    bits = I.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-    code = torch.where(bits >= 0x80000000, 0xFFFFFFFF - bits, bits + 0x80000000)
-    key, order = torch.sort(h * (1 << 32) + code)
-    del bits, code
-    new = torch.ones(n, dtype=torch.bool)
-    new[1:] = key[1:] != key[:-1]
-    run = new.cumsum(0) - 1
-    start = new.nonzero().squeeze(1)
-    length = torch.bincount(run)
-    mid = start[run].double() + 0.5 * (length[run] - 1).double()
-    del new, run, start, length
-    h_sorted = key >> 32
-    counts = torch.bincount(h, minlength=n_hkl)
-    first = counts.cumsum(0) - counts
-    r = (mid - first[h_sorted].double() + 0.5) / counts[h_sorted].double()
-    score = torch.empty(n, dtype=torch.float32)
-    score[order] = (math.sqrt(2.0) * torch.erfinv(2.0 * r - 1.0)).float()
-    return score
 
 
 def _or_zeros(t: Tensor | None, meta: ObsInfo) -> Tensor:

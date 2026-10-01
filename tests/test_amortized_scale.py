@@ -363,22 +363,22 @@ def test_calibration_metrics_skip_binning_on_length_mismatch():
     assert "var_z_by_shell" not in r
 
 
-def test_rank_is_context_only():
-    """The within-reflection rank is built from the observation's own intensity.
+def test_obs_scale_is_context_only():
+    """obs_scale = n'/I_mean contains the observation's own intensity.
 
     It is the channel that carries partiality — raw intensity only tells the
     network how bright the crystal is — but it must never reach the self
-    branch, where it would hand the scale head the observation's own intensity.
+    branch, where K_j = n'_j/I_j would fit exactly and mean nothing.
     """
     from torchsx.nn.obs_features import CONTEXT_ONLY_FEATURES, ObsFeatureSpec
 
-    assert "rank_score" in CONTEXT_ONLY_FEATURES
+    assert {"obs_scale", "log_I_mean"} <= set(CONTEXT_ONLY_FEATURES)
     prep = _toy_prep()
     with pytest.raises(ValueError, match="may not be self features"):
-        ObsFeatureSpec(prep, self_features=("s_sq", "rank_score"))
+        ObsFeatureSpec(prep, self_features=("s_sq", "obs_scale"))
 
 
-def test_peer_ranks_reach_the_prediction():
+def test_the_reference_reaches_the_prediction():
     prep = _toy_prep()
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_log_k=False)
     torch.manual_seed(4)
@@ -386,9 +386,9 @@ def test_peer_ranks_reach_the_prediction():
         if p.dim() > 1:
             torch.nn.init.normal_(p, std=0.3)
     base = scale.predict(prep.obs_info).log_K.detach().clone()
-    scale.features._rank_score.copy_(-scale.features._rank_score)
+    scale.features._I_mean.mul_(3.0)
     moved = scale.predict(prep.obs_info).log_K.detach()
-    assert not torch.allclose(base, moved), "the peers' ranks have no effect at all"
+    assert not torch.allclose(base, moved), "the reference has no effect at all"
 
 
 def test_constant_features_are_zeroed_not_standardised():

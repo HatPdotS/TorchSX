@@ -14,7 +14,7 @@ from torch import Tensor
 
 from torchsx.nn.pooling import group_sum
 
-__all__ = ["MergeTargetOut", "unity_merge"]
+__all__ = ["MergeTargetOut", "unity_merge", "plain_mean"]
 
 
 def unity_merge(
@@ -41,6 +41,19 @@ def unity_merge(
     return torch.where(den > 0, num / den.clamp(min=1e-12), torch.zeros_like(num)).clamp(
         min=floor
     )
+
+
+def plain_mean(I: Tensor, hkl_id: Tensor, n_hkl: int, *, floor: float = 1e-3) -> Tensor:
+    """Per-reflection mean of the background-subtracted counts, every observation
+    weighted equally, floored at ``floor``.
+
+    Unweighted, so it is not pulled toward the weakest observations of a
+    reflection the way an inverse-variance mean is when the counting variance
+    grows with the signal.
+    """
+    num = group_sum(I.float(), hkl_id, n_hkl)
+    cnt = group_sum(torch.ones_like(I, dtype=torch.float32), hkl_id, n_hkl)
+    return torch.where(cnt > 0, num / cnt.clamp(min=1.0), torch.zeros_like(num)).clamp(min=floor)
 
 
 @dataclass

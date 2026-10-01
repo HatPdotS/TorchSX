@@ -338,7 +338,7 @@ def test_evaluation_changes_no_state(tmp_path, prior):
                 for i, target in enumerate(tr.targets)
                 for name, value in [*target.named_buffers(), *target.named_parameters()]}
         refs.update({f"features.{name}": getattr(scale.features, name).clone()
-                     for name in ("_rank_score", "_log_I_unity", "_mean", "_std")})
+                     for name in ("_I_mean", "_mean", "_std")})
         return refs
 
     try:

@@ -129,9 +129,9 @@ floor and refines in three windows.
 ### Peer features
 
 The context of an observation carries, for every peer, its observed scale as
-the normal score of its rank among all observations of its reflection, and the
-log of its reflection's unity merge. Both are computed once from the input
-observations, all states pooled.
+its intensity over the plain (unweighted) mean of its reflection's
+observations, and the log of that mean. The mean is computed once from the
+input observations, all states pooled.
 
 ### Wilson surface
 
