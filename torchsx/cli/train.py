@@ -30,13 +30,6 @@ def _steps(value):
     return number
 
 
-def _decay(value):
-    number = float(value)
-    if not 0 <= number < 1:
-        raise argparse.ArgumentTypeError("Expected a finite decay in [0, 1)")
-    return number
-
-
 def _build_parser():
     p = argparse.ArgumentParser(prog="torchsx-train", description=__doc__)
     P.add_data_args(p)
@@ -76,13 +69,6 @@ def _build_parser():
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
-    p.add_argument("--reference-estimator", choices=("wls", "posterior"), default="wls",
-                   help="estimate averaged into the running reference (default wls)")
-    p.add_argument("--reference-ema-decay", type=_decay, default=0.99,
-                   help="exponential decay of the running reference (default 0.99)")
-    p.add_argument("--reference-bias-correction", action="store_true",
-                   help="normalise the running reference by its accumulated weight, so the "
-                        "unscaled starting merge drops out at a reflection's first update")
     p.add_argument("--d-model", type=int, default=None, help="encoder width (default 128)")
     p.add_argument("--n-layers", type=int, default=None, help="encoder blocks (default 5)")
     p.add_argument("--eval-every", type=int, default=100,
@@ -132,10 +118,10 @@ def _batch(tr):
 
 def _save_current(tr, path):
     """Save the final/current weights without changing the best-validation snapshot."""
-    keys = ("_best_state", "_best_obj_state", "_best_context", "best_step", "best_heldout")
+    keys = ("_best_state", "_best_obj_state", "_best_wilson", "best_step", "best_heldout")
     previous = {k: getattr(tr, k, None) for k in keys}
     try:
-        tr._best_state = tr._best_obj_state = tr._best_context = None
+        tr._best_state = tr._best_obj_state = tr._best_wilson = None
         tr.best_step, tr.best_heldout = tr.step_i, float("nan")
         tr.save_best(path)
     finally:
@@ -169,19 +155,16 @@ def attach_heldout_stream(bundle, name: str = "heldout"):
 
 
 def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
-    """Run a fixed update budget, with refresh/evaluation cadence per state;
+    """Run a fixed update budget, with the evaluation cadence per state;
     with ``patience`` > 0, stop after that many evaluations without a new
     held-out minimum."""
-    refresh_every, evaluate_every = 25 * tr.n_conditions, max(1, int(eval_every)) * tr.n_conditions
+    evaluate_every = max(1, int(eval_every)) * tr.n_conditions
     stale = 0
     updates = [0] * tr.n_conditions
     has_validation = bool(tr.heldout_crystals.numel())
     if has_validation:
         tr.evaluate(tr.heldout_crystals, phase="heldout_init")
     for _ in range(steps):
-        if tr.step_i % refresh_every == 0:
-            tr._refresh_feature_reference()
-            tr._refresh_wilson_sigma()
         k, rows = _batch(tr)
         rec = tr.step(rows.to(tr.device))
         if rec.get("step_skipped") or not rec.get("n_used"):
@@ -191,9 +174,6 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
             print(f"update {tr.step_i}/{steps}: per-state {updates}, "
                   f"nll/obs {rec['nll_per_obs']:.5f}", flush=True)
         if tr.step_i % evaluate_every == 0 or sum(updates) == steps:
-            # Checkpoint the exact context used at evaluation/readout.
-            tr._refresh_feature_reference()
-            tr._refresh_wilson_sigma()
             if has_validation:
                 result = tr.evaluate(tr.heldout_crystals)
                 print(f"  validation state 0: nll/obs {result['nll_per_obs']:.5f}", flush=True)
@@ -234,21 +214,17 @@ def main(argv=None):
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
         target_redundancy=args.redundancy, epochs=0, lr=1e-3,
-        lam0=10.0, lam_halflife_steps=400 * n_states,
         # 25 updates per state: on smded72k (two states, 400 updates) against 100,
         # held-out NLL -0.007 to -0.009 and dark per-state ln(N/S) -0.3 to -0.4 on two
         # seed pairs, difference maps unchanged (gym NOTES 2026-09-27).  No update was
         # ever clipped, so the long ramp only cost updates at the full rate.
         warmup_steps=(25 if args.warmup is None else args.warmup) * n_states,
         lr_schedule=args.lr_schedule, total_steps=args.steps,
-        reference_bias_correction=args.reference_bias_correction,
-        grad_clip=20.0, log_every=25, merge_target="posterior", loss="evidence",
+        grad_clip=20.0, log_every=25,
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
         posterior_max_halfwidth=settings["max_halfwidth"],
         locate_windows=(8.0, 1.0, 0.125), posterior_prior=settings["prior"],
-        reference_estimator=args.reference_estimator,
-        reference_ema_decay=args.reference_ema_decay,
-        wilson_basis=settings["wilson_basis"], wilson_degree=settings["wilson_degree"],
+        wilson_degree=settings["wilson_degree"],
         posterior_checkpoint_nodes=True, encoder_chunk_crystals=400,
         stream_batches=True, split_half_every=0, heldout_frac=0.05,
         device=settings["device"], outdir=str(args.out), seed=args.seed,
@@ -257,8 +233,7 @@ def main(argv=None):
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     try:
-        if settings.get("basis") is not None:
-            tr.set_reciprocal_basis(settings["basis"], smooth_prior=settings["wilson_basis"] == "smooth")
+        tr.set_reciprocal_basis(settings["basis"])
         tr.split_names = bundle.split_names
         config = asdict(cfg)
         if heldout_ids is not None:
@@ -266,7 +241,7 @@ def main(argv=None):
         recipe = dict(version=1, steps=args.steps, config=config,
                       checkpoint_selection="minimum validation NLL in state 0; last.pt retains endpoint",
                       validation="5% of condition-zero crystals; all observations retained for export",
-                      refresh_every=25 * n_states, evaluate_every=args.eval_every * n_states,
+                      evaluate_every=args.eval_every * n_states,
                       readout={k: v for k, v in settings.items() if k != "basis"})
         tr.data_recipe = dict(bundle.recipe, training=recipe)
         (args.out / "run.json").write_text(json.dumps(tr.data_recipe, indent=2) + "\n")

@@ -42,22 +42,16 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg = TrainConfig(
         max_obs_per_batch=P.READOUT_MAX_OBS, epochs=0,
-        merge_target="posterior", loss="evidence",
         posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
         posterior_n_sigma=S["n_sigma"], posterior_max_halfwidth=S["max_halfwidth"],
         stream_batches=True, encoder_chunk_crystals=400,
         locate_windows=(8.0, 1.0, 0.125),
-        posterior_prior=S["prior"],
-        reference_estimator=ckpt.get("reference_update", {}).get("estimator", "wls"),
-        reference_ema_decay=ckpt.get("reference_update", {}).get("ema_decay", 0.99),
-        wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
+        posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
         heldout_frac=0.05, device=S["device"], outdir=str(args.out.parent),
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
-    if S.get("basis") is not None:
-        tr.set_reciprocal_basis(S["basis"], smooth_prior=S["wilson_basis"] == "smooth")
-    else:
-        tr._refresh_wilson_sigma()
+    tr.set_reciprocal_basis(S["basis"])
+    restore_wilson_surface(tr, prep, ckpt, names=bundle.split_names)
     # Checkpoints written before the data buffers were made non-persistent
     # carry the training set's own _I/_bg/_sigma, whose length is that data
     # set's observation count; drop them rather than refuse to merge a
@@ -69,8 +63,9 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"checkpoint is missing {len(missing)} parameters, "
                          f"first {missing[:3]}")
     scale.load_state_dict(have)
-    # Keep references and merge targets initialized from the supplied data.
-    # Only network weights and fitted feature standardization are restored.
+    # The network weights, the fitted feature standardisation and the Wilson
+    # surface come from the checkpoint; everything per reflection is formed
+    # from the supplied data, as in training.
     scale.eval()
 
     names = bundle.split_names or [""]
@@ -81,6 +76,43 @@ def main(argv: list[str] | None = None) -> None:
                        spacegroup=bundle.spacegroup, merge_friedel=bundle.merge_friedel)
     finally:
         tr.close()
+
+
+def restore_wilson_surface(tr, prep, ckpt, names=None) -> None:
+    """Install the checkpoint's trained Wilson surfaces on these reflections.
+
+    A surface belongs to the network's scale convention, so a merge evaluates
+    the stored basis definition on the supplied reflections and applies the
+    trained coefficients, whatever reflection set they were trained on.  Each
+    input state takes the surface of the trained state of the same name
+    (``names`` against the checkpoint's ``splits``), or of the same position
+    when the checkpoint and the inputs carry the same unnamed states; any other
+    state takes the first trained state's surface.
+    """
+    if tr.cfg.posterior_prior != "wilson":
+        return
+    surface = ckpt.get("wilson_surface")
+    if surface is None:
+        raise SystemExit("the checkpoint carries no Wilson surface")
+    coefs, trained = list(surface["coef"]), list(ckpt.get("splits") or [])
+    names = list(names or [])
+    chosen = []
+    for k in range(len(tr.targets)):
+        name = names[k] if k < len(names) else None
+        if name is not None and name in trained:
+            chosen.append(coefs[trained.index(name)])
+        elif not names and not trained and len(coefs) == len(tr.targets):
+            chosen.append(coefs[k])
+        else:
+            chosen.append(coefs[0])
+    from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
+    phi = ReciprocalBasis.from_definition(surface["basis"]).evaluate(prep.hkl_valid)
+    for t, c in zip(tr.targets, chosen):
+        c = c.to(t.wilson_coef.device)
+        t.set_basis(phi.to(t.wilson_coef.device))
+        t.set_wilson_coef(c)
+        if t.wilson_coef_param is not None:
+            t.wilson_coef_param.data.copy_(c)
 
 
 def _export_crystals(tr, k: int):

@@ -190,6 +190,24 @@ class ReciprocalBasis:
                                    s2_max=self.s2_max)
         return ((raw - self.col_mean) / self.col_std).to(torch.float32)
 
+    def definition(self) -> dict:
+        """Everything :meth:`evaluate` needs, without the reflection set."""
+        return {"cell": self.cell.tolist(), "spacegroup": self.spacegroup, "degree": self.degree,
+                "s2_max": self.s2_max, "aniso_tensors": self.aniso_tensors.clone(),
+                "col_mean": self.col_mean.clone(), "col_std": self.col_std.clone()}
+
+    @classmethod
+    def from_definition(cls, d: dict) -> "ReciprocalBasis":
+        """A basis that evaluates like the one :meth:`definition` was taken from;
+        its own reflection set is empty."""
+        p = int(torch.as_tensor(d["col_mean"]).numel())
+        return cls(phi=torch.zeros(0, p), s2=torch.zeros(0),
+                   cell=torch.as_tensor(d["cell"], dtype=torch.float64), spacegroup=d["spacegroup"],
+                   degree=int(d["degree"]), s2_max=float(d["s2_max"]),
+                   aniso_tensors=torch.as_tensor(d["aniso_tensors"], dtype=torch.float64),
+                   col_mean=torch.as_tensor(d["col_mean"], dtype=torch.float64),
+                   col_std=torch.as_tensor(d["col_std"], dtype=torch.float64))
+
     def to(self, device) -> "ReciprocalBasis":
         return ReciprocalBasis(phi=self.phi.to(device), s2=self.s2.to(device), cell=self.cell,
                                spacegroup=self.spacegroup, degree=self.degree, s2_max=self.s2_max,

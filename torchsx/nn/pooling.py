@@ -72,7 +72,6 @@ __all__ = [
     "leave_one_out_mean",
     "fold_ids",
     "leave_fold_out_mean",
-    "loo_ratio",
     "loo_weighted_mean",
 ]
 
@@ -273,68 +272,6 @@ def leave_fold_out_mean(
         table = table / den
         table = torch.where(valid, table, torch.full_like(table, fill))
     return table.to(x.dtype), count, valid
-
-
-def loo_ratio(
-    a: Tensor,
-    b: Tensor,
-    gid: Tensor,
-    n_groups: int,
-    *,
-    fill: float | Tensor = 0.0,
-    min_den: float = 1e-12,
-    max_rel_error: float = 1e-3,
-    prior_a: Tensor | None = None,
-    prior_b: Tensor | None = None,
-) -> tuple[Tensor, Tensor]:
-    """Leave-one-out ratio of group sums: ``(Sum a - a_j) / (Sum b - b_j)``.
-
-    The general primitive.  Any least-squares estimator of a shared latent is
-    of this form, and expressing it directly lets the caller keep the
-    *numerically* good quantities in the accumulator.
-
-    For merging in **observation space** — never dividing data by the scale —
-    the least-squares solution of ``min_I0 Sum_j (n'_j - K_j I0)^2 / V_j`` is
-
-        a_j = K_j n'_j / V_j        b_j = K_j^2 / V_j
-
-    Both are well scaled even when ``K_j`` is tiny.  Writing the same estimator
-    as ``mean of y_j = n'_j/K_j weighted by K_j^2/V_j`` is algebraically
-    identical but numerically much worse: on this dataset 2.88 % of
-    observations sit at ``log K < -5``, so ``y`` is inflated ~150x while its
-    weight is shrunk ~22,000x, and the product is formed from two quantities
-    that have each travelled far from the data.
-    """
-    if not (a.ndim == b.ndim == gid.ndim == 1):
-        raise ValueError("a, b and gid must all be 1-D")
-    if not (a.shape[0] == b.shape[0] == gid.shape[0]):
-        raise ValueError(
-            f"length mismatch: a={a.shape[0]} b={b.shape[0]} gid={gid.shape[0]}"
-        )
-
-    acc_a = group_sum(a, gid, n_groups)
-    acc_b = group_sum(b, gid, n_groups)
-    if prior_a is not None:
-        acc_a = acc_a + prior_a.to(acc_a.dtype)
-    if prior_b is not None:
-        acc_b = acc_b + prior_b.to(acc_b.dtype)
-
-    sum_a = acc_a.index_select(0, gid)
-    num = sum_a - a
-    den = acc_b.index_select(0, gid) - b
-
-    valid = den > min_den
-    if max_rel_error < float("inf"):
-        eps = torch.finfo(a.dtype).eps
-        tiny = torch.finfo(a.dtype).tiny
-        valid = valid & (eps * sum_a.abs() / num.abs().clamp(min=tiny) < max_rel_error)
-
-    out = num / den.clamp(min=min_den)
-    fill_t = (
-        fill.to(out.dtype) if isinstance(fill, Tensor)
-        else torch.full_like(out, float(fill))
-    )
-    return torch.where(valid, out, fill_t), valid
 
 
 def loo_weighted_mean(

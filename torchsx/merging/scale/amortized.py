@@ -323,8 +323,9 @@ class AmortizedScale(ScaleModel):
         Used by the hkl-permutation monitor to isolate the degeneracy that
         actually matters: whether ``log_K[j]`` depends on ``j``'s own
         reflection identity.  A whole-meta permutation cannot answer that once
-        the context carries ``obs_scale = n'/I0``, because permuting hkl also
-        permutes the *peers'* I0 lookup — which is legitimate use, not leakage.
+        the context carries per-reflection channels (the peers' rank within
+        their reflection and its brightness), because permuting hkl also
+        permutes those lookups — which is legitimate use, not leakage.
         """
         x_self, _, _ = self.features.build(meta_self)
         _, x_ctx, x_crys = self.features.build(meta_ctx)

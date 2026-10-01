@@ -92,11 +92,11 @@ warmup/decay, resource policy and evaluation cadence. Research variants use the
 Python API rather than another public configuration language.
 
 Historical experiment scripts using removed flags or the retired correction need
-their original source revision. Separate merge initializes its intensity reference
-and merge targets from a unity merge of the supplied observations, retaining the
-checkpoint's network weights and fitted feature standardization. Any number of
-bins can be exported under their current labels. Exact checkpoint replay through
-the Python API still requires recorded inference context and matching data.
+their original source revision. A separate merge takes the checkpoint's network
+weights, fitted feature standardization and Wilson surface, and forms everything
+per reflection from the supplied observations exactly as training does, so a
+merge of the training data reproduces the training run's own readout. Any number
+of bins can be exported under their current labels.
 
 ### Scale encoder
 
@@ -118,24 +118,31 @@ The learning rate warms up over `--warmup` updates per state (default 25) and
 then stays constant. `--lr-schedule cosine` decays it to zero at the last
 update instead.
 
-### Running intensity reference
+### No per-reflection running state
 
-`torchsx-train --reference-estimator posterior --reference-ema-decay 0.99`
-reuses each training batch's integrated posterior mean for the running intensity
-reference. For reflections observed in the batch, the update is
-`reference = 0.99 * reference + 0.01 * posterior_mean`. Absent reflections retain
-their previous value. This is an exponential average with no fixed window; its
-e-folding horizon is about 100 updates **per observed reflection**. The initial
-unity merge supplies the starting value.
+Nothing is carried from one batch to the next except the network and its
+fitted parameters. Each batch places its own integration grid, around its
+weighted mean at the network's scale (floored 4 nats below the Wilson
+surface); a merge starts from the unity merge of its inputs with the same
+floor and refines in three windows.
 
-The reference is detached from autograd and is used for network context, Wilson
-prior fitting and integration-grid placement. Posterior densities are not reused
-as priors. Validation does not update any running reference. Checkpoints record
-the estimator and decay as well as the running state. The default estimator
-remains `wls` for comparison; both estimators use decay 0.99 by default.
-`--reference-bias-correction` normalises the running reference by its
-accumulated weight, so the unscaled starting merge drops out at a reflection's
-first update.
+### Peer features
+
+The context of an observation carries, for every peer, its observed scale as
+its intensity over the plain (unweighted) mean of its reflection's
+observations, and the log of that mean. The mean is computed once from the
+input observations, all states pooled.
+
+### Wilson surface
+
+With `--prior wilson` each state's prior mean `Σ(h)` is a smooth surface
+`log Σ(h) = φ(h)·c` on a reciprocal-space basis (Chebyshev polynomials in
+resolution plus the space group's anisotropy terms). The coefficients start at
+the Wilson fit to the unity merge and are trained with the network by the same
+marginal likelihood (type-II maximum likelihood), at ten times the base learning
+rate. The checkpoint stores the basis definition and each state's
+coefficients, so a separate merge evaluates the same surface on any reflection
+set.
 
 ### Intensity prior
 
@@ -161,20 +168,3 @@ The resulting integrated-likelihood score is not normalized Bayesian evidence;
 its scale and the weak-reflection moments can depend on the grid bounds. Inspect
 edge mass and range sensitivity before interpreting results. Wilson and `none`
 validation scores should not be compared as interchangeable model evidences.
-
-### Shared Wilson surface
-
-`--prior joined-wilson` fits one Wilson surface from all conditions and uses it
-for training and integration. Conditions retain separate intensity running means
-and integration widths. Each observed condition contributes equally to the fit,
-regardless of its reflection count; untouched running estimates are excluded.
-Before any updates the shared pooled initialization supplies the fit. Smooth and
-shell bases are supported; unsupported shells retain their previous prior.
-Use `--reference-estimator posterior` to fit from posterior running means
-(the reference estimator default remains `wls`).
-
-Separate checkpoint readout fits the Wilson surface from the current input's
-unity reference, including when overriding `wilson` or `joined-wilson`. All bins
-start from this common reference, and full/half readouts use the same fitted
-surface. Separate readout can therefore differ from training's immediate exports,
-which use the trained per-state running references.

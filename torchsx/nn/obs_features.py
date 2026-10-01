@@ -29,7 +29,11 @@ Two tiers, and the split is load-bearing:
     evaluate it at ``j``.  Both halves of the pair must therefore be present —
     geometry alone says nothing, and raw intensity alone conflates "this
     reflection is intrinsically strong" (I0) with "this reflection was well
-    positioned" (partiality).  ``obs_scale`` separates them.
+    positioned" (partiality).  ``obs_scale`` separates them: the peer's
+    intensity over the plain mean of its own reflection's observations, in
+    which that reflection's intrinsic brightness divides out.  Every context
+    channel is a fixed function of the observations, so no merge has to be
+    kept, refreshed or stored to form them.
 
 Both guards are enforced in ``__init__``, not left to convention.
 
@@ -89,14 +93,17 @@ CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
     "log_sigma",
     "i_over_sigma",    # the dimensionless one that actually carries weight
     "log_bg",
-    # n'/I0 — the peer's *observed scale*, K.S, with the reflection's intrinsic
-    # brightness divided out.  This is the channel that carries partiality:
-    # raw intensity only tells the network how bright the crystal is, which is
-    # why a raw-intensity context learns G and nothing else (between_frac 0.96,
-    # within_frac 0.04).  Linear, so the 32.4 % negative observations survive.
+    # The peer's *observed scale*: n' over the plain mean of its reflection's
+    # observations.  This is the channel that carries partiality -- raw
+    # intensity only tells the network how bright the crystal is.  Linear and
+    # clipped, not logged: negatives are real.
     "obs_scale",
+    # The same ratio with the clips moved: bounded where the reflection's mean
+    # is small against the peer's sigma.
     "obs_scale_over_sigma",
-    "log_I0_ref",      # how bright the peer's reflection should be
+    # How bright the peer's reflection is: the log of that plain mean, so the
+    # network can tell how informative a peer's ratio is.
+    "log_I_mean",
 )
 
 FORBIDDEN_IN_SELF: frozenset[str] = frozenset(CONTEXT_ONLY_FEATURES)
@@ -209,11 +216,13 @@ class ObsFeatureSpec(nn.Module):
         self.register_buffer("_sigma", sigma.clamp(min=1e-6), persistent=False)
         self.register_buffer("_hkl", prep.hkl_valid.float(), persistent=False)
         self.has_supplied_sigma = oi.sigma is not None
-        # Reference merged intensity per reflection, used to form obs_scale.
-        # Always detached: it is a lookup, never a gradient path.  Starts flat;
-        # the trainer installs the running merge (set_reference_I0) before the
-        # first forward.
-        self.register_buffer("_I0_ref", torch.ones(prep.n_valid), persistent=False)
+        # The per-reflection context channels are fixed by the data alone and
+        # computed once over every observation of the prepared set, all
+        # conditions pooled: one table for every condition, so neither can tell
+        # the network which condition a crystal belongs to.
+        from torchsx.nn.merge_target import plain_mean
+        self.register_buffer("_I_mean", plain_mean(I, oi.hkl_idx, prep.n_valid),
+                             persistent=False)
 
         # Normalisation stats over the FULL dataset (never per batch — that
         # would leak batch composition into the features).
@@ -268,14 +277,7 @@ class ObsFeatureSpec(nn.Module):
 
     @torch.no_grad()
     def _recompute_stats(self) -> None:
-        """Refresh normalisation over the full dataset.
-
-        Must be redone whenever the reference I0 moves: ``obs_scale`` and
-        ``log_I0_ref`` are both defined relative to it, so statistics computed
-        against a stale reference leave those channels badly off-scale.  That
-        is not a cosmetic issue — with the stats frozen at the initial
-        reference, the synthetic recovery test fell from rho = 0.96 to 0.11.
-        """
+        """Normalisation over the full dataset, computed once at construction."""
         # Subsample.  These are per-feature means and standard deviations, and
         # 2 M rows fix them to ~0.07 %; using all 133 M costs a 4 GB host-device
         # transfer every epoch once `prep` is host-resident, because the
@@ -317,21 +319,6 @@ class ObsFeatureSpec(nn.Module):
                 RuntimeWarning, stacklevel=2,
             )
 
-    @torch.no_grad()
-    def set_reference_I0(self, I0: Tensor) -> None:
-        """Update the per-reflection reference used by ``obs_scale``.
-
-        Call with the running merge (the target's EMA).  Detached by
-        construction — this is a feature lookup, not part of the objective.
-        """
-        if I0.shape != self._I0_ref.shape:
-            raise ValueError(
-                f"I0 must have shape {tuple(self._I0_ref.shape)}, "
-                f"got {tuple(I0.shape)}"
-            )
-        self._I0_ref.copy_(I0.detach().clamp(min=1e-3))
-        self._recompute_stats()
-
     # ── raw channels ───────────────────────────────────────────────────
 
     def _raw_columns(self, meta: ObsInfo, names) -> dict[str, Tensor]:
@@ -339,21 +326,17 @@ class ObsFeatureSpec(nn.Module):
         out: dict[str, Tensor] = {}
         need = set(names)
 
-        I = sig = None
-        if {"signed_log_I", "i_over_sigma", "obs_scale",
-            "obs_scale_over_sigma"} & need:
+        I = sig = I_ref = None
+        if {"signed_log_I", "i_over_sigma", "obs_scale", "obs_scale_over_sigma"} & need:
             I = self._I[oid.to(self._I.device)]
         if {"log_sigma", "i_over_sigma", "obs_scale_over_sigma"} & need:
             sig = self._sigma[oid.to(self._sigma.device)]
-        if {"obs_scale", "obs_scale_over_sigma", "log_I0_ref"} & need:
-            # `_I0_ref` is a buffer and follows the module's device, but the
-            # cached full-dataset meta used by `_recompute_stats` stays on the
-            # host once `prep` is host-resident (stream_batches).  Index on the
-            # meta's device: it is (n_hkl,), so moving it is free, whereas
-            # moving the meta would defeat the point of streaming.
-            I0 = self._I0_ref.to(meta.hkl_idx.device)[meta.hkl_idx]
-            I = I.to(I0.device) if I is not None else I
-            sig = sig.to(I0.device) if sig is not None else sig
+        if {"obs_scale", "obs_scale_over_sigma", "log_I_mean"} & need:
+            # (n_hkl,) and module-resident; index on the meta's device, which
+            # stays the host for the cached statistics sample
+            I_ref = self._I_mean.to(meta.hkl_idx.device)[meta.hkl_idx]
+            I = I.to(I_ref.device) if I is not None else I
+            sig = sig.to(I_ref.device) if sig is not None else sig
 
         for k in need:
             if k == "s_sq":
@@ -389,13 +372,11 @@ class ObsFeatureSpec(nn.Module):
             elif k == "log_bg":
                 out[k] = torch.log1p(self._bg[oid].clamp(min=0.0))
             elif k == "obs_scale":
-                # K.S for this peer.  Clipped, not logged: negatives are real.
-                out[k] = (I / I0).clamp(-20.0, 20.0)
+                out[k] = (I / I_ref).clamp(-20.0, 20.0)
             elif k == "obs_scale_over_sigma":
-                # How well determined that observed scale is.
-                out[k] = (I / sig).clamp(-50.0, 50.0) * (sig / I0).clamp(max=50.0)
-            elif k == "log_I0_ref":
-                out[k] = I0.log()
+                out[k] = (I / sig).clamp(-50.0, 50.0) * (sig / I_ref).clamp(max=50.0)
+            elif k == "log_I_mean":
+                out[k] = I_ref.log()
             else:
                 raise KeyError(f"unknown feature {k!r}")
         return out

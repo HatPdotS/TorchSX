@@ -36,9 +36,8 @@ def _stack(prep, params, tmp_path, *, skew=True, n_cond=1):
     scale = AmortizedScale.from_prep(prep, **kw)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
     cfg = TrainConfig(
-        max_obs_per_batch=6000, epochs=0, lr=1e-2, lam0=0.0,
-        lam_halflife_steps=0, log_every=10 ** 9, heldout_frac=0.0,
-        merge_target="posterior", loss="evidence", posterior_prior="wilson",
+        max_obs_per_batch=6000, epochs=0, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
+        posterior_prior="wilson",
         posterior_k_coarse=15, posterior_m_fine=65, posterior_n_sigma=8.0,
         device="cpu", outdir=str(tmp_path),
     )
@@ -59,7 +58,8 @@ def _inline_merge(tr, scale, obj, params, prep):
     tgt = tr.target
     crystals = torch.arange(tr.index.n_crystals)
     with torch.no_grad():
-        scan = tgt.scan_grid()
+        start = tgt.start_centre()
+        scan = tgt.scan_grid(start)
         acc_s = torch.zeros(n_hkl, scan.shape[1])
         for _, r in tr.index.batches(tr.cfg.max_obs_per_batch, crystals=crystals,
                                      shuffle=False):
@@ -68,7 +68,7 @@ def _inline_merge(tr, scale, obj, params, prep):
             acc_s = acc_s + tgt.accumulate(obj, scale.scatter, params, pr,
                                            tr.n_ph[r], prep.bg[r], m.hkl_idx, m, scan)
             scale.clear()
-        centre, sd = tgt.peak_from_scan(acc_s)
+        centre, sd = tgt.peak_from_scan(acc_s, start)
         tgt._loc = (centre, sd)
         v_nodes = centre[:, None] + sd[:, None] * tgt.u_coarse[None, :]
         acc = torch.zeros(n_hkl, v_nodes.shape[1])
@@ -79,7 +79,7 @@ def _inline_merge(tr, scale, obj, params, prep):
             acc = acc + tgt.accumulate(obj, scale.scatter, params, pr,
                                        tr.n_ph[r], prep.bg[r], m.hkl_idx, m, v_nodes)
             scale.clear()
-        _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc, v_nodes, None)
+        _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
         rootI = v.exp().clamp(min=0).sqrt()
         F = (w_post * rootI).sum(1)
         F_sd = ((w_post * (rootI - F[:, None]) ** 2).sum(1)).clamp(min=0).sqrt()
@@ -463,26 +463,6 @@ def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
 
 
 
-def test_lam_holds_when_the_halflife_is_zero(tmp_path):
-    """``lam_halflife_steps <= 0`` means no decay, as the help says.
-
-    It used to mean ``max(hl, 1)`` -- halve at EVERY step -- so lam0=10 was
-    below 1e-9 by step 30 and the in-batch target ran with no prior at all.
-    """
-    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
-    _scale, _obj, tr = _stack(prep, params, tmp_path)
-
-    tr.cfg.lam0, tr.cfg.lam_min = 10.0, 0.0
-    tr.cfg.lam_halflife_steps = 0
-    for tr.step_i in (0, 30, 5000):
-        assert tr._lam() == 10.0
-    tr.cfg.lam_halflife_steps = 400
-    tr.step_i = 0
-    assert tr._lam() == 10.0
-    tr.step_i = 400
-    assert abs(tr._lam() - 5.0) < 1e-9
-
-
 def test_merge_locating_survives_high_multiplicity():
     """The merge grid must still cover the peak at 1e5 counts per reflection.
 
@@ -503,11 +483,12 @@ def test_merge_locating_survives_high_multiplicity():
         t = PosteriorMergeTarget(torch.tensor([math.exp(v_true + 0.5)]),
                                  k_coarse=63, m_fine=257, n_sigma=24.0,
                                  max_halfwidth=12.0, prior="flat_log")
+        centre = torch.tensor([v_true + 0.5])
         for hw in windows:
             t.scan_halfwidth = hw
-            nodes = t.scan_grid().double()
-            v, sd = t.peak_from_scan((A * nodes - B * nodes.exp()).float())
-            t.ema_I0 = v.exp()
+            nodes = t.scan_grid(centre).double()
+            v, sd = t.peak_from_scan((A * nodes - B * nodes.exp()).float(), centre)
+            centre = v
         return abs(float(v) - v_true), float(sd)
 
     one_err, one_sd = locate((8.0,))
@@ -557,23 +538,20 @@ def test_merge_survives_a_non_finite_batch(tmp_path):
 
 def _trainer_from_stack(prep, params, scale, obj, S):
     cfg = TrainConfig(
-        epochs=0, merge_target="posterior", loss="evidence", posterior_prior=S["prior"],
-        wilson_basis=S["wilson_basis"], wilson_degree=S["wilson_degree"],
+        epochs=0, posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
         posterior_k_coarse=9, posterior_m_fine=33, device="cpu", heldout_frac=0.1,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
-    if S.get("basis") is not None:
-        tr.set_reciprocal_basis(S["basis"], smooth_prior=S["wilson_basis"] == "smooth")
+    tr.set_reciprocal_basis(S["basis"])
     return tr
 
 
-def test_smooth_basis_flags_round_trip_through_the_checkpoint(tmp_path):
-    """--wilson-basis smooth / --gauge-anchor basis are recorded in best.pt, rebuilt by
-    merge_nn without flags, and the fitted Sigma coefficients come back exactly."""
+def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
+    """best.pt records the Wilson surface and the basis anchor; merge_nn rebuilds the
+    stack without flags, evaluates the same surface and reproduces the predictions."""
     from torchsx.cli import _pipeline as P
-    from torchsx.cli.merge_nn import _build_parser as merge_parser
+    from torchsx.cli.merge_nn import _build_parser as merge_parser, restore_wilson_surface
     from torchsx.cli.train import _build_parser as train_parser
-    from torchsx.nn.checkpoint_context import load_checkpoint_context
 
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
@@ -581,71 +559,45 @@ def test_smooth_basis_flags_round_trip_through_the_checkpoint(tmp_path):
     targs = train_parser().parse_args(
         ["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
-    assert S["wilson_basis"] == "smooth" and S["basis"] is not None
-    assert scale.anchor_stat == "basis" and S["basis"].degree == 4
+    assert S["basis"] is not None and scale.anchor_stat == "basis" and S["basis"].degree == 4
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
     t = tr.targets[0]
-    assert t.has_basis and t.wilson_coef.abs().sum() > 0
+    assert t.has_basis and t.wilson_coef.abs().sum() > 0 and t.wilson_coef_param is not None
     tr.data_recipe = dict(recipe)
     ck = torch.load(tr.save_best(tmp_path / "smooth.pt"), weights_only=False)
-    assert ck["posterior_grid"]["wilson_basis"] == "smooth"
     assert ck["posterior_grid"]["wilson_degree"] == 4
     assert ck["scale"]["anchor_stat"] == "basis"
-    assert "wilson_coef" in ck["inference_context"]["targets"][0]
+    assert set(ck["wilson_surface"]) == {"basis", "coef"}
     assert "gauge_phi" not in ck["state_dict"], "the basis rows are rebuilt, not stored"
 
     # Merge side: no flags at all, everything comes from the checkpoint.
     margs = merge_parser().parse_args(
         ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
     p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
-    assert S2["wilson_basis"] == "smooth" and S2["wilson_degree"] == 4
-    assert rebuilt.anchor_stat == "basis" and S2["basis"] is not None
+    assert S2["wilson_degree"] == 4 and rebuilt.anchor_stat == "basis"
     rebuilt.load_state_dict(ck["state_dict"])
     tr2 = _trainer_from_stack(p2, q2, rebuilt, o2, S2)
-    load_checkpoint_context(tr2, ck, "exact")
-    assert torch.equal(tr2.targets[0].wilson_coef, t.wilson_coef)
+    restore_wilson_surface(tr2, p2, ck)
+    torch.testing.assert_close(tr2.targets[0].wilson_coef, t.wilson_coef)
     torch.testing.assert_close(tr2.targets[0].wilson_sigma, t.wilson_sigma)
     torch.testing.assert_close(rebuilt.gauge_phi, scale.gauge_phi)
-    # And the pinned predictions are reproduced (the context's probe check).
-    from torchsx.nn.checkpoint_context import verify_probes
-    verify_probes(tr2, ck["inference_context"])
+    # every per-reflection input is formed from the data again: same predictions
+    scale.eval(), rebuilt.eval()
+    rows = tr.index.rows(tr.index.nonempty)          # crystal-grouped, as the encoder needs
+    with torch.no_grad():
+        torch.testing.assert_close(rebuilt.predict(p2.obs_info.gather(rows)).log_K,
+                                   scale.predict(prep_.obs_info.gather(rows)).log_K)
 
 
-def test_shells_checkpoint_rebuilds_without_a_basis(tmp_path):
-    """A checkpoint written before the smooth basis existed rebuilds in shells / median mode,
-    whatever today's defaults are."""
-    from torchsx.cli import _pipeline as P
-    from torchsx.cli.merge_nn import _build_parser as merge_parser
-    from torchsx.cli.train import _build_parser as train_parser
-
-    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
-    recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
-    bundle = P.PrepBundle(prep, recipe, [], 0.1)
-    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
-    prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
-    tr = _trainer_from_stack(prep_, params_, scale, obj, S)
-    tr.data_recipe = dict(recipe)
-    ck = torch.load(tr.save_best(tmp_path / "shells.pt"), weights_only=False)
-    # A checkpoint written before the smooth basis existed: no wilson_basis key
-    # and no anchor_stat.  That is now the only way to select the shells prior.
-    del ck["posterior_grid"]["wilson_basis"], ck["posterior_grid"]["wilson_degree"]
-    del ck["scale"]["anchor_stat"]
-    margs = merge_parser().parse_args(
-        ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
-    _p, _q, rebuilt, _o, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
-    assert S2["basis"] is None and rebuilt.anchor_stat == "median"
-    rebuilt.load_state_dict(ck["state_dict"])
-
-
-def test_defaults_are_smooth_prior_and_basis_anchor(tmp_path):
+def test_defaults_are_the_wilson_prior_and_basis_anchor(tmp_path):
     from torchsx.cli import _pipeline as P
     from torchsx.cli.train import _build_parser as train_parser
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
     targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
     _p, _q, scale, _o, S = P.build_stack(bundle, targs, verbose=False)
-    assert S["wilson_basis"] == "smooth" and S["basis"] is not None and scale.anchor_stat == "basis"
-    assert TrainConfig().wilson_basis == "smooth"
+    assert S["prior"] == "wilson" and S["basis"] is not None and scale.anchor_stat == "basis"
+    assert TrainConfig().posterior_prior == "wilson"
 
 
 # ── detector noise under the gain policy ───────────────────────────────
