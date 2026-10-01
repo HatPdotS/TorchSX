@@ -37,6 +37,7 @@ Repository = "https://github.com/HatPdotS/torchsx"
 torchsx-train = "torchsx.cli.train:main"
 torchsx-merge-nn = "torchsx.cli.merge_nn:main"
 torchsx-stats = "torchsx.cli.stats:main"
+torchsx-merge-stats = "torchsx.cli.merge_stats:main"
 
 [project.optional-dependencies]
 stats = ["matplotlib>=3.7"]

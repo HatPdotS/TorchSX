@@ -217,6 +217,25 @@ These figures describe the observations that motivate scaling and likelihood
 modeling. They complement the independent precision and accuracy comparisons.
 [Plot interpretation, CLI controls and cache replay](docs/stats.md).
 
+## Merge statistics
+
+```bash
+torchsx-merge-stats A/merged_dark.mtz B/merged_dark.mtz --name dark \
+  --dataset light A/merged_light.mtz B/merged_light.mtz -o stats/
+```
+
+Scores merged MTZ, CrystFEL `.hkl` and mmCIF files. A dataset is one merge or two
+independent halves:
+
+- **One merge:** completeness, ⟨I/σ(I)⟩, multiplicity and the Wilson falloff.
+- **Two halves:** CC, R_split, RMS z and ln N/S after scaling B onto A.
+- **Differences:** every dataset is scored against the reference (default: the first
+  dataset), as per-shell CC and ln N/S of ΔF between the two arms, plus information in
+  bits over resolution × σ(ΔF) bins.
+
+Writes CSV and PNG by default (`--format csv json plots`).
+[Definitions, inputs and outputs](docs/merge_stats.md).
+
 ## Datasource API
 
 ```python
@@ -238,6 +257,7 @@ and measurement provenance.
 |---|---|
 | [docs/cli.md](docs/cli.md) | Measurement policy, gain selection, the full public option surface, caching and reproducibility |
 | [docs/stats.md](docs/stats.md) | `torchsx-stats` plot interpretation, CLI controls and cache replay |
+| [docs/merge_stats.md](docs/merge_stats.md) | `torchsx-merge-stats` inputs, statistic definitions and outputs |
 
 Design notes recording why the model looks the way it does:
 [scaling_merging](docs/scaling_merging.md),
