@@ -18,6 +18,18 @@ REAL_STREAMS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _float32_matmul_precision():
+    """Every test starts at the process's float32 matmul precision.
+
+    The train and merge CLIs switch float32 matmuls to TF32 for their process;
+    called in-process by a test, that would carry into every test after it.
+    """
+    precision = torch.get_float32_matmul_precision()
+    yield
+    torch.set_float32_matmul_precision(precision)
+
+
 @pytest.fixture(scope="session")
 def real_stream() -> Path:
     for p in REAL_STREAMS:
