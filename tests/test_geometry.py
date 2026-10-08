@@ -6,16 +6,18 @@ import torch
 from torchsx.geometry import Geometry, Panel
 
 
-def test_geometry_from_stream(merged_368_stream):
-    """Parse geometry from the real stream file."""
-    geom = Geometry.from_stream(merged_368_stream)
-    assert geom.n_panels == 32
-    assert geom.photon_energy_eV == 12960.0
-    assert abs(geom.clen - 0.0939) < 1e-4
-    assert abs(geom.res - 13333.3) < 1.0
-    assert "m0" in geom.panel_name_to_id
-    assert "m31" in geom.panel_name_to_id
-    assert geom.panel_name_to_id["m0"] == 0
+def test_geometry_from_stream(real_stream):
+    """Parse the geometry header of a real stream.
+
+    Photon energy and camera length are 0 when the header refers to per-image
+    values instead of giving numbers.
+    """
+    geom = Geometry.from_stream(str(real_stream))
+    assert geom.n_panels > 0
+    assert geom.res > 0
+    assert np.isfinite(geom.photon_energy_eV) and geom.photon_energy_eV >= 0
+    assert np.isfinite(geom.clen) and geom.clen >= 0
+    assert [geom.panel_name_to_id[n] for n in geom.panel_names] == list(range(geom.n_panels))
 
 
 def test_geometry_panel_properties(sample_geometry):

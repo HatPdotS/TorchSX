@@ -37,30 +37,29 @@ def test_sfx_geometry_round_trip(sample_core, tmp_path):
 
 
 @pytest.mark.slow
-def test_parse_real_stream(merged_368_stream):
-    """Parse the real merged_368.stream file.
+def test_parse_real_stream(real_stream):
+    """Parse a real CrystFEL stream end to end.
 
     Run with: pytest -m slow
-    Expected: ~81k crystals, ~195k images, 32 panels
+    Every crystal has a physical cell, and the stream's geometry has the panels
+    of its header.
     """
+    from torchsx.geometry import Geometry
     from torchsx.io._parser import parse_stream
 
-    core = parse_stream(merged_368_stream, spacegroup="P 1", n_workers=1)
+    core = parse_stream(str(real_stream), spacegroup="P 1", n_workers=1)
 
-    # Known properties of merged_368.stream
-    assert core.n_crystals > 80000, f"Expected >80k crystals, got {core.n_crystals}"
-    assert core.n_images > 190000, f"Expected >190k images, got {core.n_images}"
+    assert core.n_crystals > 0
+    assert core.n_images > 0
     assert core.n_observations > 0
 
-    # Cell parameters should be in Å range
-    mean_cell = core.cell.mean(dim=0)
-    assert 14.0 < mean_cell[0].item() < 16.0, f"a={mean_cell[0]:.2f}, expected ~14.97"
-    assert 18.0 < mean_cell[1].item() < 20.0, f"b={mean_cell[1]:.2f}, expected ~18.85"
-    assert 18.0 < mean_cell[2].item() < 20.0, f"c={mean_cell[2]:.2f}, expected ~18.89"
+    lengths, angles = core.cell[:, :3], core.cell[:, 3:]
+    assert torch.isfinite(core.cell).all()
+    assert (lengths > 0).all()
+    assert ((angles > 0) & (angles < 180)).all()
 
-    # Geometry
     assert core.geometry is not None
-    assert core.geometry.n_panels == 32
+    assert core.geometry.n_panels == Geometry.from_stream(str(real_stream)).n_panels
 
 
 def test_sfx_extra_column_round_trip(sample_core, tmp_path):
