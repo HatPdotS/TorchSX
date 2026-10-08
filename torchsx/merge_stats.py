@@ -205,15 +205,14 @@ def _average_duplicates(hkl, columns):
     return unique, out
 
 
-def _french_wilson(hkl, I, SIGI, cell, spacegroup):
-    """French-Wilson amplitudes; the rows it accepts."""
-    from torchref.base.french_wilson import FrenchWilson
-    from torchref.symmetry import Cell
-    cell_t = Cell(list(map(float, cell)))
-    fw = FrenchWilson(torch.from_numpy(hkl), cell_t.data, _spacegroup(spacegroup), verbose=0)
-    F, S = fw(torch.as_tensor(I, dtype=cell_t.data.dtype), torch.as_tensor(SIGI, dtype=cell_t.data.dtype))
-    keep = fw.valid_mask.cpu().numpy() & np.isfinite(F.cpu().numpy()) & (F.cpu().numpy() > 0)
-    return F.cpu().double().numpy(), S.cpu().double().numpy(), keep
+def _french_wilson(hkl, I, SIGI, d, spacegroup):
+    """French-Wilson amplitudes, the prior fitted to these intensities; the rows it accepts."""
+    from torchref.io.datasets import french_wilson_auto
+    as64 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float64)  # noqa: E731
+    F, S, valid = french_wilson_auto(as64(I), as64(SIGI), _tensor(hkl), as64(d), str(spacegroup))
+    F, S = F.cpu().double().numpy(), S.cpu().double().numpy()
+    keep = valid.cpu().numpy() & np.isfinite(F) & (F > 0)
+    return F, S, keep
 
 
 def merge_from_arrays(hkl, *, cell, spacegroup, F=None, SIGF=None, I=None, SIGI=None, counts=None,
@@ -267,7 +266,7 @@ def merge_from_arrays(hkl, *, cell, spacegroup, F=None, SIGF=None, I=None, SIGI=
         SIGF = SIGI / (2 * F)
         source = 'sqrt'
     else:
-        F, SIGF, ok = _french_wilson(hkl, I, SIGI, cell, spacegroup)
+        F, SIGF, ok = _french_wilson(hkl, I, SIGI, d, spacegroup)
         source = 'french-wilson'
     if source != 'file':
         F, SIGF = np.where(ok, F, np.nan), np.where(ok, SIGF, np.nan)

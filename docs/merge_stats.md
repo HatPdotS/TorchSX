@@ -42,7 +42,9 @@ inputs must share one Laue class, and `--dmin`/`--dmax` cut every input.
 Amplitudes stored in the file are used as given. For a file with intensities only,
 `--amplitudes` chooses how amplitudes are made:
 
-- `french-wilson` (the default) uses TorchRef's French-Wilson posterior.
+- `french-wilson` (the default) uses TorchRef's French-Wilson posterior. Its prior
+  is fitted to the file's intensities: a smooth curve over resolution, with the
+  crystal's anisotropy and each reflection's multiplicity ε.
 - `sqrt` uses F = √I and σ(F) = σ(I)/2F, for I > 0 only.
 
 A reflection without an amplitude (a French-Wilson rejection, or I ≤ 0 under `sqrt`)
