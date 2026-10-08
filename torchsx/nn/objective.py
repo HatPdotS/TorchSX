@@ -73,7 +73,7 @@ def wide_log_grid(n_points: int = 2001):
 def gengauss_grid_log_mass(
     log_mean: Tensor, log_alpha: Tensor, beta: Tensor, lo: float, hi: float
 ) -> Tensor:
-    """``log`` of the GenGauss mass lying inside ``[lo, hi]`` in ``log S``.
+    r"""``log`` of the GenGauss mass lying inside ``[lo, hi]`` in ``log S``.
 
     The quadrature integrates the scatter over a **finite** grid, so whatever
     mass falls off the ends is silently discarded and the "likelihood" stops

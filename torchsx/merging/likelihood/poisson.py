@@ -51,7 +51,7 @@ def poisson_logpeak(n: Tensor) -> Tensor:
 
 
 class Poisson(DetectionLikelihood):
-    """``n ~ Poisson(S + bg)``.
+    r"""``n ~ Poisson(S + bg)``.
 
     Per-grid-point log-PMF is computed without the factorial term — the
     constant ``−log Γ(n+1)`` cancels in the logsumexp over the signal

@@ -18,7 +18,7 @@ def _log_gg_norm(beta: Tensor) -> Tensor:
 
 
 def log_alpha_from_log_width(log_w: Tensor, beta: Tensor) -> Tensor:
-    """Width/shape reparameterisation: ``(w, β) → α``.
+    r"""Width/shape reparameterisation: ``(w, β) → α``.
 
     ``Var(GenGauss) = α²·Γ(3/β)/Γ(1/β)``, so α and β *both* set the width and
     compete during fitting.  Reparameterising on the actual SD ``w`` makes them
