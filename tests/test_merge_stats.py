@@ -166,7 +166,7 @@ def test_one_representative_per_unique_reflection(cell, sg):
     assert len(np.unique(canonical, axis=0)) == len(rep) and (d >= 3.0 * (1 - 1e-9)).all()
     assert not group.is_absent(torch.from_numpy(rep)).any()
     # every equivalent of every index within the limit maps onto a representative
-    eq = group.expand_reciprocal(torch.from_numpy(rep)).numpy().reshape(-1, 3)
+    eq = group.expand_reciprocal(torch.from_numpy(rep)).cpu().numpy().reshape(-1, 3)
     eq_canonical = group.canonicalize_hkl(torch.from_numpy(eq), sort=False)[0].numpy()
     assert len(np.unique(eq_canonical, axis=0)) == len(rep)
 
