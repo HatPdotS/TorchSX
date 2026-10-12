@@ -1,6 +1,6 @@
 # Merge statistics
 
-`torchsx-merge-stats` scores merged reflection files. Each **dataset** is either one
+`torchsx.merge-stats` scores merged reflection files. Each **dataset** is either one
 merge or two independent halves. A single merge gets its summary statistics, and two
 halves get A/B statistics. Every dataset other than the **reference** is also scored as
 a difference against it, provided both have two halves. The reference is the first
@@ -8,18 +8,18 @@ dataset unless `--reference` names another.
 
 ```bash
 # One merge: completeness, <I/sigma(I)>, multiplicity, Wilson falloff
-torchsx-merge-stats merged.mtz -o stats
+torchsx.merge-stats merged.mtz -o stats
 
 # Two independent halves of one dataset
-torchsx-merge-stats A/merged_dark.mtz B/merged_dark.mtz -o stats
+torchsx.merge-stats A/merged_dark.mtz B/merged_dark.mtz -o stats
 
 # Dark reference plus light datasets, each as two independent arms
-torchsx-merge-stats A/merged_dark.mtz B/merged_dark.mtz --name dark \
+torchsx.merge-stats A/merged_dark.mtz B/merged_dark.mtz --name dark \
   --dataset t1 A/merged_t1.mtz B/merged_t1.mtz \
   --dataset t2 A/merged_t2.mtz B/merged_t2.mtz -o stats
 
 # CrystFEL halves (no cell in the file) and mmCIF, all formats in one call
-torchsx-merge-stats dark.hkl1 dark.hkl2 --cell 61.5 90.8 150.9 90 90 90 \
+torchsx.merge-stats dark.hkl1 dark.hkl2 --cell 61.5 90.8 150.9 90 90 90 \
   --spacegroup 'C 2 2 21' --dataset light light.hkl1 light.hkl2 -o stats
 ```
 

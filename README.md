@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/torchsx-banner-dark.png">
-    <img src="assets/torchsx-banner-light.png" alt="TorchSX" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/HatPdotS/torchsx/master/assets/torchsx-banner-dark.png">
+    <img src="https://raw.githubusercontent.com/HatPdotS/torchsx/master/assets/torchsx-banner-light.png" alt="TorchSX" width="100%">
   </picture>
 </p>
 
@@ -11,7 +11,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.4+-ee4c2c.svg)](https://pytorch.org/)
-[![TorchRef](https://img.shields.io/badge/TorchRef-0.6.4+-f97316.svg)](https://github.com/HatPdotS/TorchRef)
+[![TorchRef](https://img.shields.io/badge/TorchRef-0.7-f97316.svg)](https://github.com/HatPdotS/TorchRef)
 [![CUDA](https://img.shields.io/badge/CUDA-supported-76b900.svg)](https://developer.nvidia.com/cuda-zone)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -78,14 +78,14 @@ it provides the refinement and difference-map tools that consume the merge.
 
 - **Built on PyTorch.** PyTorch throughout, so the model, likelihood and
   quadrature are ordinary differentiable modules that compose with the rest of a
-  PyTorch workflow, maybe at some point we differentiate the model against all the data? 
+  PyTorch workflow.
 
 ## Quickstart
 
 ```bash
-pip install -e .
+pip install torchsx
 
-torchsx-train indexed.stream --spacegroup 'P 63' --dmin 2.0 --steps 800 -o run/
+torchsx.train indexed.stream --spacegroup 'P 63' --dmin 2.0 -o run/
 ```
 
 That writes checkpoints and merged MTZs into `run/`. Everything below expands on
@@ -94,21 +94,22 @@ and the observation statistics that motivate the model.
 
 ## Install
 
-Python >=3.10 and TorchRef >=0.7.0 are required; TorchRef brings torch, triton
-and gemmi. Until the next TorchRef release, install it from the GitHub `dev`
-branch: torchsx needs `SpaceGroup.canonicalize_hkl(..., sort=False)` (TorchRef
-d6a6d29 or later). `.stream` files are read and written by `torchsx-native`, a small
-Rust package built from `native/` in this repository and released with
-torchsx; `pip install torchsx` installs the prebuilt wheel for your platform.
-Optional extras are `duckdb` (the existing Probixi reader), `stats` (Matplotlib
-for distribution plots) and `dev`.
+```bash
+pip install torchsx
+```
+
+Python >=3.10. torchsx depends on TorchRef 0.7, which brings torch, triton and
+gemmi. `.stream` files are read and written by `torchsx-native`, a small Rust
+package built from `native/` in this repository and released with torchsx;
+`pip install torchsx` installs the prebuilt wheel for your platform. Optional
+extras are `duckdb` (the existing Probixi reader) and `dev`.
 
 From a checkout, build the native package first (needs a Rust toolchain, see
-[native/README.md](native/README.md)), then install torchsx against it:
+[native/README.md](https://github.com/HatPdotS/torchsx/blob/master/native/README.md)), then install torchsx against it:
 
 ```bash
 pip install ./native
-pip install -e '.[stats]'
+pip install -e .
 ```
 
 If `torchsx_native` cannot be imported, torchsx reads and writes streams with
@@ -117,17 +118,17 @@ slower pure-Python code and warns once.
 ## Train and merge
 
 ```bash
-torchsx-train indexed.stream --spacegroup 'P 63' --dmin 2.0 --steps 800 -o run/
-torchsx-merge-nn run/best.pt indexed.stream -o merged.mtz
+torchsx.train indexed.stream --spacegroup 'P 63' --dmin 2.0 -o run/
+torchsx.merge run/best.pt indexed.stream -o merged.mtz
 ```
 
 Training writes `best.pt`, `last.pt`, `run.json`, `metrics.jsonl`,
 `training_summary.json` and full/half merged MTZs. `--no-merge` stops after saving
 checkpoints, for workflows that schedule readout separately.
 
-`--steps` is the total optimizer-update budget, independent of dataset size.
-Training alternates state-pure batches: 800 updates over two states gives 400 per
-state. An uneven budget differs by at most one update between states. Training
+`--steps` is the total optimizer-update budget, independent of dataset size
+(default 400). Training alternates state-pure batches: 400 updates over two
+states gives 200 per state. An uneven budget differs by at most one update between states. Training
 length remains empirical. `best.pt` selects minimum validation NLL in state zero;
 `last.pt` preserves the endpoint. Validation NLL is not established as an optimum
 for independent difference-map precision. Validation uses 5% of state-zero
@@ -141,7 +142,7 @@ Parser workers respect the available CPU allocation, capped at eight.
 
 Measurement policy, gain selection and the full public option surface —
 `--gain`, `--int-radius`, `--free-from`, `--cache`, `--seed` and the rest — are
-in the [command-line reference](docs/cli.md).
+in the [command-line reference](https://github.com/HatPdotS/torchsx/blob/master/docs/cli.md).
 
 ## Joint light/dark inputs
 
@@ -149,9 +150,9 @@ Train both states in one network; the merge targets remain separate. The label
 is not a network feature.
 
 ```bash
-torchsx-train --split dark=dark.stream --split light=light.stream \
-  --spacegroup 'P 63' --dmin 2.0 --steps 800 -o joint/
-torchsx-merge-nn joint/best.pt \
+torchsx.train --split dark=dark.stream --split light=light.stream \
+  --spacegroup 'P 63' --dmin 2.0 -o joint/
+torchsx.merge joint/best.pt \
   --split dark=dark.stream --split light=light.stream -o merged.mtz
 ```
 
@@ -159,8 +160,8 @@ A combined stream can instead use a CrystFEL custom-split file with
 `filename event dataset` columns:
 
 ```bash
-torchsx-train combined.stream --split-file states.split \
-  --spacegroup 'P 63' --dmin 2.0 --steps 800 -o joint/
+torchsx.train combined.stream --split-file states.split \
+  --spacegroup 'P 63' --dmin 2.0 -o joint/
 ```
 
 `--split-file` also accepts an integer label tensor (`.pt`), one label per
@@ -185,27 +186,26 @@ corresponding light files. The `.metrics.json` sidecar records internal CC1/2
 and R_split. These halves share the trained network; they are not independent
 network runs. There is no posterior-to-pooled correction or companion output.
 
-For difference maps, use each merge's own uncertainty and the native TorchRef CLI:
+For difference maps, use each merge's own uncertainty and TorchRef's CLIs:
 
 ```bash
-torchref.phased-difference-map -dm reference.pdb -lm reference.pdb \
-  -dsf merged_dark.mtz -lsf merged_light.mtz --fraction 0.5 --dmin 2.0 \
-  -o difference.mtz
-torchref.mtz2map -sf difference.mtz -csf WDF -cphi PHIC_dark -o difference.ccp4
+torchref.difference-map -dm dark.pdb \
+  -dsf merged_dark.mtz -lsf merged_light.mtz -o difference.mtz
+torchref.mtz2map -sf difference.mtz -csf dF -cw W_Q -cphi PHDELWT -o difference.ccp4
 ```
 
-With the same unchanged reference model, WDF contains the observed weighted
-light-minus-dark difference. The fraction controls additional extrapolated
-columns. Compare signed WDF and maps between two independent jointly trained
-light/dark runs, with disjoint pattern sets; do not impose an extra reserved-HKL
-subset. Use TorchSX amplitude/sigma MTZs and Partialator intensity/sigma MTZs,
-letting TorchRef perform its own intensity-to-amplitude conversion.
+`dF` is the observed light-minus-dark amplitude difference on the dark model's
+phases, and `W_Q` its per-reflection weight. A light model (`-lm`) with
+`--fraction` adds the extrapolated map. Compare signed differences and maps
+between two independent jointly trained light/dark runs, with disjoint pattern
+sets; do not impose an extra reserved-HKL subset. Use TorchSX amplitude/sigma
+MTZs and Partialator intensity/sigma MTZs, letting TorchRef perform its own
+intensity-to-amplitude conversion.
 
 ## Raw-distribution figures
 
 ```bash
-pip install -e '.[stats]'
-torchsx-stats indexed.stream --spacegroup 'P 63' -o figures/
+torchsx.observation-stats indexed.stream --spacegroup 'P 63' -o figures/
 ```
 
 Writes **PNG only**: raw intensities, reflection skewness, normalized mean–median
@@ -215,12 +215,12 @@ from the input. Named inputs and CrystFEL custom splits are supported.
 
 These figures describe the observations that motivate scaling and likelihood
 modeling. They complement the independent precision and accuracy comparisons.
-[Plot interpretation, CLI controls and cache replay](docs/stats.md).
+[Plot interpretation, CLI controls and cache replay](https://github.com/HatPdotS/torchsx/blob/master/docs/stats.md).
 
 ## Merge statistics
 
 ```bash
-torchsx-merge-stats A/merged_dark.mtz B/merged_dark.mtz --name dark \
+torchsx.merge-stats A/merged_dark.mtz B/merged_dark.mtz --name dark \
   --dataset light A/merged_light.mtz B/merged_light.mtz -o stats/
 ```
 
@@ -234,7 +234,7 @@ independent halves:
   bits over resolution × σ(ΔF) bins.
 
 Writes CSV and PNG by default (`--format csv json plots`).
-[Definitions, inputs and outputs](docs/merge_stats.md).
+[Definitions, inputs and outputs](https://github.com/HatPdotS/torchsx/blob/master/docs/merge_stats.md).
 
 ## Datasource API
 
@@ -255,19 +255,16 @@ and measurement provenance.
 
 | Document | Contents |
 |---|---|
-| [docs/cli.md](docs/cli.md) | Measurement policy, gain selection, the full public option surface, caching and reproducibility |
-| [docs/stats.md](docs/stats.md) | `torchsx-stats` plot interpretation, CLI controls and cache replay |
-| [docs/merge_stats.md](docs/merge_stats.md) | `torchsx-merge-stats` inputs, statistic definitions and outputs |
+| [docs/cli.md](https://github.com/HatPdotS/torchsx/blob/master/docs/cli.md) | Measurement policy, gain selection, the full public option surface, caching and reproducibility |
+| [docs/stats.md](https://github.com/HatPdotS/torchsx/blob/master/docs/stats.md) | `torchsx.observation-stats` plot interpretation, CLI controls and cache replay |
+| [docs/merge_stats.md](https://github.com/HatPdotS/torchsx/blob/master/docs/merge_stats.md) | `torchsx.merge-stats` inputs, statistic definitions and outputs |
 
 Design notes recording why the model looks the way it does:
-[scaling_merging](docs/scaling_merging.md),
-[optimize_integration](docs/optimize_integration.md),
-[sparse_poisson_loss](docs/sparse_poisson_loss.md),
-[fused_gaussian_mixture](docs/fused_gaussian_mixture.md) and
-[crystfel_ingestion_validation](docs/crystfel_ingestion_validation.md). The
-remaining files in `docs/` are working plans and drafts, kept as a record of the
-decisions rather than as current interface documentation.
+[scaling_merging](https://github.com/HatPdotS/torchsx/blob/master/docs/scaling_merging.md),
+[optimize_integration](https://github.com/HatPdotS/torchsx/blob/master/docs/optimize_integration.md),
+[sparse_poisson_loss](https://github.com/HatPdotS/torchsx/blob/master/docs/sparse_poisson_loss.md) and
+[fused_gaussian_mixture](https://github.com/HatPdotS/torchsx/blob/master/docs/fused_gaussian_mixture.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/HatPdotS/torchsx/blob/master/LICENSE).

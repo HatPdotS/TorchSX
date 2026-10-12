@@ -1,7 +1,7 @@
 # Command-line reference
 
 Measurement policy, gain selection, the public option surface and the
-reproducibility rules for `torchsx-train` and `torchsx-merge-nn`. The README
+reproducibility rules for `torchsx.train` and `torchsx.merge`. The README
 covers the common path; this document is the lookup reference.
 
 ## Measurement and gain
@@ -9,8 +9,9 @@ covers the common path; this document is the lookup reference.
 CrystFEL loading retains raw intensities, backgrounds, sigmas and integration
 metadata. Ring radii resolve from an explicit `--int-radius`, then the checkpoint,
 then the input's recorded integration command. Omitted CrystFEL options inherit
-its defaults: ring integration without centering, saturation or gradient options,
-and radii `4,5,7` if not declared. Defaults are recorded in measurement provenance;
+its defaults ([indexamajig manual](https://www.desy.de/~twhite/crystfel/manual-indexamajig.html)):
+ring integration without centering, saturation or gradient options, and radii
+`4,5,7` if not declared. Defaults are recorded in measurement provenance;
 explicit declarations are preserved. Unsupported integration semantics are
 rejected. Nominal aperture counts do not account for masked or clipped pixels.
 
@@ -57,8 +58,13 @@ retain their recorded scatter family and background convention.
 
 The shared options are `--out`, `--split`, `--split-file`, `--spacegroup`,
 `--dmin`, `--dmax`, `--gain`, `--int-radius`, `--merge-friedel`/`--no-merge-friedel`, `--free-from`,
-`--device`, `--cache` and `--seed`. Training adds `--steps`, `--redundancy` and
-`--no-merge`. Friedel mates are merged by default; checkpoint readout inherits
+`--device`, `--cache`, `--seed` and `--prior`. Training adds `--steps` (default
+400), `--redundancy`, `--no-merge`, `--miss-frac`, `--outlier-frac`,
+`--detector-noise`, `--noise-terms`, `--peer-attention`, `--warmup` and
+`--lr-schedule`. The defaults are the production configuration. A few research
+options (encoder geometry, evaluation cadence, early stopping, an external
+held-out set) are accepted but not listed by `--help`; see
+`torchsx/cli/train.py`. Friedel mates are merged by default; checkpoint readout inherits
 the recorded choice unless overridden. `--no-merge-friedel` keeps acentric mates
 separate and writes (+)/(−) columns. Bijvoet mates share refinement free flags.
 
@@ -91,8 +97,7 @@ locating windows 8/1/0.125. The resolved recipe records learning rates, per-stat
 warmup/decay, resource policy and evaluation cadence. Research variants use the
 Python API rather than another public configuration language.
 
-Historical experiment scripts using removed flags or the retired correction need
-their original source revision. A separate merge takes the checkpoint's network
+A separate merge takes the checkpoint's network
 weights, fitted feature standardization and Wilson surface, and forms everything
 per reflection from the supplied observations exactly as training does, so a
 merge of the training data reproduces the training run's own readout. Any number
@@ -103,14 +108,14 @@ of bins can be exported under their current labels.
 Each observation's scale is predicted from its own features and those of the
 other observations of its crystal. `--peer-attention N` sets the number of
 cross-attention layers onto these peers (default 2; `0` pools by mean only).
-`--peer-dim` sets the width inside each layer, by default the encoder width; a
-comma-separated list gives one width per layer, for example `128,128,32,32`.
-`--context-folds K` splits each crystal into K folds and takes an observation's
-context from the other K−1 (default 2); `0` takes it from all other reflections
-of the crystal. Checkpoint readout inherits all three.
+Each crystal is split into two folds, and an observation takes its context from
+the other fold. Checkpoint readout inherits both.
 
-`--outlier-frac F` adds a learnable detector-outlier component to the
-likelihood, starting at fraction F (default 0, off). Readout inherits it.
+`--miss-frac F` adds a learnable miss component, a predicted reflection that
+recorded no signal, starting at fraction F (default 0.03; `0` turns it off).
+`--outlier-frac F` adds a learnable detector-outlier component, starting at
+fraction F (default 0, off). Both fractions lie in [0, 1); readout inherits
+them.
 
 ### Training schedule
 
@@ -146,7 +151,7 @@ set.
 
 ### Intensity prior
 
-`torchsx-train ... --prior wilson` is the default. `--prior none` removes the
+`torchsx.train ... --prior wilson` is the default. `--prior none` removes the
 Wilson intensity density and integrates the observation likelihood with respect
 to positive intensity (`dI`, including the Jacobian on the log-intensity grid).
 It does not select a maximum-likelihood point estimate or a flat-log prior.
@@ -155,7 +160,7 @@ use the selected measure. I, F, their uncertainties and integration-edge
 statistics come from those same weights. The scale anchor remains enabled.
 
 The choice is saved in `posterior_grid.prior` and the resolved training recipe.
-`torchsx-merge-nn best.pt ...` inherits it; an explicit `--prior none` or
+`torchsx.merge best.pt ...` inherits it; an explicit `--prior none` or
 `--prior wilson` overrides it for a readout experiment without retraining.
 The resolved prior is printed and saved for each state in `.metrics.json`.
 Historical `flat_I0` checkpoints are read as `none`; historical `flat_log`

@@ -1,25 +1,25 @@
 # Raw-distribution figures
 
-`torchsx-stats` describes integrated observations before scaling or merging. It
+`torchsx.observation-stats` describes integrated observations before scaling or merging. It
 writes PNG figures only, retaining negative and zero intensities and the complete
 finite tails. There is no gain calibration, posterior correction or training in
-this command. Install plotting support with `pip install -e '.[stats]'`.
+this command.
 
 ```bash
 # Quick look: random complete images totaling at least 50K crystals, or all available.
-torchsx-stats indexed.stream --spacegroup 'P 63' -o figures
+torchsx.observation-stats indexed.stream --spacegroup 'P 63' -o figures
 
 # Final figures with explicit input selection and full observation counts.
-torchsx-stats combined.stream --spacegroup 'P 63' \
+torchsx.observation-stats combined.stream --spacegroup 'P 63' \
   --split-file custom.split --select dark light3 \
   --sample-crystals all -o figures_full
 
 # Separate inputs are plotted separately, with shared raw-intensity bins and resolution axes.
-torchsx-stats --split dark=dark.stream --split light=light.stream \
+torchsx.observation-stats --split dark=dark.stream --split light=light.stream \
   --spacegroup 'P 63' --sample-crystals all -o light_dark
 
 # Replot without reparsing or requiring the original sources.
-torchsx-stats --from-cache figures_full-cache --plots reflection-skew skew-examples \
+torchsx.observation-stats --from-cache figures_full-cache --plots reflection-skew skew-examples \
   --target-skew 0 1 2 4 --min-observations 50 --min-frames 30 -o figures_selected
 ```
 
