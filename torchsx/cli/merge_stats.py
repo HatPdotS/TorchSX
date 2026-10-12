@@ -1,7 +1,6 @@
 """Statistics of merged reflection files: single merges, independent halves, and differences against a reference."""
 import argparse
 import csv
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -23,7 +22,7 @@ def _labels(items):
 
 
 def _build_parser():
-    p = argparse.ArgumentParser(prog='torchsx-merge-stats', description=__doc__,
+    p = argparse.ArgumentParser(prog='torchsx.merge-stats', description=__doc__,
         epilog='A dataset is one merge (summary statistics) or two independent halves (A/B statistics). '
                'Every dataset other than the reference is also scored as a difference against it, '
                'when both have two halves. Inputs: MTZ, CrystFEL .hkl/.hkl1/.hkl2, mmCIF structure factors. '
@@ -178,8 +177,6 @@ def main(argv=None):
         p.error(f'--reference {reference!r} is not a dataset name: {[n for n, _ in datasets]}')
     if args.out.exists():
         p.error(f'{args.out} already exists; choose a new --out directory')
-    if 'plots' in args.formats and importlib.util.find_spec('matplotlib') is None:
-        p.error('Plotting requires matplotlib; install torchsx[stats] or drop plots from --format')
     merges = _load(p, args, datasets, labels)
 
     results = {'settings': {'reference': reference, 'amplitudes': args.amplitudes, 'shells': args.shells,
@@ -195,7 +192,7 @@ def main(argv=None):
         if name == reference:
             continue
         if len(files) != 2 or len(ref_files) != 2:
-            print(f'torchsx-merge-stats: skipping difference {name} - {reference}: '
+            print(f'{p.prog}: skipping difference {name} - {reference}: '
                   'both datasets need two independent halves', file=sys.stderr)
             continue
         res = difference_stats(tuple(merges[f] for f in ref_files), tuple(merges[f] for f in files),

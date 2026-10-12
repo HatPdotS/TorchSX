@@ -27,6 +27,25 @@ def test_public_options_and_split_inputs(module, count):
     assert a.split_file == Path('custom.split')
 
 
+def test_research_options_parse_but_stay_out_of_help():
+    parser = train._build_parser()
+    hidden = {'--noise-lr-mult': '10', '--peer-dim': '64', '--context-folds': '0', '--d-model': '64',
+              '--n-layers': '3', '--eval-every': '50', '--patience': '2', '--heldout-stream': 'h.stream'}
+    text = parser.format_help()
+    assert not [o for o in hidden if o in text]
+    a = parser.parse_args(['x.stream', '-o', 'run', *(t for o, v in hidden.items() for t in (o, v))])
+    assert (a.noise_lr_mult, a.peer_dim, a.context_folds, a.d_model, a.n_layers, a.eval_every, a.patience,
+            a.heldout_stream) == (10.0, '64', 0, 64, 3, 50, 2, Path('h.stream'))
+    assert parser.parse_args(['x.stream', '-o', 'run']).steps == 400
+
+
+@pytest.mark.parametrize('option,value', [('--miss-frac', '1'), ('--outlier-frac', '-0.1'), ('--noise-terms', 'C')])
+def test_out_of_range_training_options_fail_at_parsing(option, value, capsys):
+    with pytest.raises(SystemExit):
+        train._build_parser().parse_args(['x.stream', '-o', 'run', option, value])
+    assert value in capsys.readouterr().err
+
+
 @pytest.mark.parametrize('module', [train,merge_nn])
 @pytest.mark.parametrize('option,value', [('--gain','garbage'),('--prior','flat'),('--scatter-family','mixture'),('--calib-degree','9,9')])
 def test_invalid_or_removed_options_fail_before_loading(module,option,value,capsys):

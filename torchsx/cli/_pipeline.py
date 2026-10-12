@@ -41,11 +41,10 @@ class PrepBundle:
         return bool(self.recipe.get("merge_friedel", True))
 
 
-def add_data_args(p: argparse.ArgumentParser, *, require_recipe: bool = True) -> None:
+def add_data_args(p: argparse.ArgumentParser) -> None:
     """Stream inputs and the detector recipe.
 
-    ``require_recipe=False`` for commands that read the recipe off a
-    checkpoint; the flags then act as overrides.
+    A merge reads the recipe off its checkpoint; the flags then act as overrides.
     """
     p.add_argument("stream", type=Path, nargs="*",
                    help=".stream or .sfx input.  Omit when every input is "
@@ -188,7 +187,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                 "Rebuild it from the source using a new --cache path; "
                 "Cache validation cannot be bypassed."
             )
-    def _stamp(path, *, precise=False):
+    def _stamp(path):
         if path is None:
             return None
         digest = hashlib.sha256()
@@ -226,7 +225,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         signature.update(radii=list(radii), gain=gain,
                          measurement={"source": measurement.to_dict() if measurement else None,
                                       "resolved": resolved.to_dict()},
-                         source_files=[_stamp(path, precise=True) for _, path in splits])
+                         source_files=[_stamp(path) for _, path in splits])
         if verbose:
             origins = dict(resolved.provenance)
             print(f"  measurement: radii={radii} [{origins['radii']}], "
@@ -638,18 +637,10 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 # ── model stack ────────────────────────────────────────────────────────
 
 
-#: The configuration the shipped numbers were measured with.  Two-width scatter
-#: is ON: it took SwissFEL R_free 0.121 -> 0.119 (lowest shell 0.115 -> 0.103)
-#: and rhodopsin 0.289 -> 0.276 with the low-resolution shell 0.344 -> 0.304.
-#: The outer shells are still behind a shape-free pooled estimator; that trade
-#: is deliberate.  ``lam_spread`` is absent on purpose -- the -0.25 carried by
-#: every scored run was a silent no-op (``_lam_spread`` returns 0 for <= 0), so
-#: shipping it as if it did something would be a lie in the config.
+#: The production configuration of a new run.  ``skew``: two-width scatter.
 #: ``peer_attention=2``: two full-width cross-attention layers from each
-#: observation onto the other observations of its crystal (gym NOTES
-#: 2026-09-24, smded72k: light - dark F CC 0.362 vs 0.337 without, dark per-state
-#: ln(N/S) -6.62 vs -6.05, held-out NLL -0.03; +0.5 s per update, ~+1 GiB).
-#: Deeper, narrower and tapered stacks were not better.
+#: observation onto the other observations of its crystal.  A checkpoint's own
+#: record overrides these in a merge.
 DEFAULTS = dict(
     d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
@@ -670,9 +661,8 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
 
 
 # Checkpoint ``kind`` markers for the corrected detection stack.  The first of
-# each pair is what this package writes; the second is the out-of-tree
-# experiment wrapper (``annulus_mean_only_v1``, jobs 205123/205124) whose
-# trained models predate the parameter and are still worth merging.
+# each pair is what this package writes; the second is an earlier wrapper
+# (``annulus_mean_only_v1``) whose checkpoints predate the parameter.
 _BG_MEAN_QUAD_KINDS = ("SplitLogGrid+bgmean", "AnnulusMeanOnlySplitLogGridV1")
 _BG_MEAN_LIK_KINDS = ("Poisson+bgmean", "AnnulusMeanOnlyPoissonV1")
 

@@ -16,12 +16,14 @@ from torchsx.cli import _pipeline as P
 
 
 def _build_parser():
-    p = argparse.ArgumentParser(prog="torchsx-merge-nn", description="Export raw posterior full/half MTZs for every supplied state.")
-    p.add_argument("ckpt", type=Path, help="checkpoint from torchsx-train")
-    P.add_data_args(p, require_recipe=False)
+    p = argparse.ArgumentParser(prog="torchsx.merge", description="Export raw posterior full/half MTZs for every supplied state.")
+    p.add_argument("ckpt", type=Path, help="checkpoint from torchsx.train")
+    P.add_data_args(p)
     P.add_model_args(p)
     P.add_free_args(p)
-    p.add_argument("-o", "--out", type=Path, required=True)
+    p.add_argument("-o", "--out", type=Path, required=True,
+                   help="output MTZ, e.g. merged.mtz; with several states one file per state, "
+                        "merged_STATE.mtz, each with its _half1/_half2 companions")
     return p
 
 

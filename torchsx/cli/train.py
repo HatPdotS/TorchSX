@@ -30,19 +30,26 @@ def _steps(value):
     return number
 
 
+def _fraction(value):
+    number = float(value)
+    if not 0 <= number < 1:
+        raise argparse.ArgumentTypeError(f"Expected a fraction in [0, 1), got {value!r}")
+    return number
+
+
 def _build_parser():
-    p = argparse.ArgumentParser(prog="torchsx-train", description=__doc__)
+    p = argparse.ArgumentParser(prog="torchsx.train", description=__doc__)
     P.add_data_args(p)
     P.add_model_args(p)
     P.add_free_args(p)
     p.add_argument("-o", "--out", type=Path, required=True, help="run directory")
-    p.add_argument("--steps", type=_steps, default=800,
-                   help="total optimizer updates, balanced across states (default 800)")
-    p.add_argument("--miss-frac", type=float, default=None,
+    p.add_argument("--steps", type=_steps, default=400,
+                   help="total optimizer updates, balanced across states (default 400)")
+    p.add_argument("--miss-frac", type=_fraction, default=None,
                    help="initial fraction of the learnable miss component (a predicted reflection "
                         "that recorded no signal); 0 = off (default 0.03; the merge inherits the "
                         "checkpoint)")
-    p.add_argument("--outlier-frac", type=float, default=None,
+    p.add_argument("--outlier-frac", type=_fraction, default=None,
                    help="initial fraction of the learnable detector-outlier component "
                         "(default 0 = off; the merge inherits the checkpoint)")
     p.add_argument("--detector-noise", choices=("off", "auto", "panel"), default="off",
@@ -51,33 +58,34 @@ def _build_parser():
                         "sums) when preparation replaced the declared gain by its calibration, none "
                         "otherwise; panel: per detector panel, terms from --noise-terms. The merge "
                         "inherits the checkpoint")
-    p.add_argument("--noise-terms", default="AB",
+    p.add_argument("--noise-terms", default="AB", choices=("AB", "A", "B"),
                    help="--detector-noise panel: which of the terms A, B are fitted (default AB; "
                         "B alone is a per-panel gain correction)")
-    p.add_argument("--noise-lr-mult", type=float, default=30.0,
-                   help="learning-rate multiplier of the detector-noise parameters (default 30)")
+    # Research controls: they work, but --help does not list them.
+    p.add_argument("--noise-lr-mult", type=float, default=30.0, help=argparse.SUPPRESS)
     p.add_argument("--peer-attention", type=int, default=None,
                    help="cross-attention layers from each observation onto the other observations "
                         "of its crystal (default 2; 0 = mean pool only); the merge inherits the checkpoint")
-    p.add_argument("--peer-dim", default=None,
-                   help="width inside each peer-attention layer (default: the encoder width), or a "
-                        "comma-separated width per layer for a tapered stack, e.g. 128,128,32,32")
-    p.add_argument("--context-folds", type=int, default=None,
-                   help="crystal context pooling: K >= 2 folds (context from the other K-1 folds of "
-                        "the crystal, default 2), or 0 = leave-one-out (all other reflections, "
-                        "every context block per observation); the merge inherits the checkpoint")
+    # Width inside each peer-attention layer (default: the encoder width), or a
+    # comma-separated width per layer for a tapered stack, e.g. 128,128,32,32.
+    p.add_argument("--peer-dim", default=None, help=argparse.SUPPRESS)
+    # Crystal context pooling: K >= 2 folds (context from the other K-1 folds of the
+    # crystal, default 2), or 0 = leave-one-out; the merge inherits the checkpoint.
+    p.add_argument("--context-folds", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
-    p.add_argument("--d-model", type=int, default=None, help="encoder width (default 128)")
-    p.add_argument("--n-layers", type=int, default=None, help="encoder blocks (default 5)")
-    p.add_argument("--eval-every", type=int, default=100,
-                   help="held-out evaluation and checkpoint every this many updates per state (default 100)")
-    p.add_argument("--patience", type=int, default=0,
-                   help="stop after this many evaluations without a new held-out minimum (default 0 = never)")
-    p.add_argument("--heldout-stream", type=Path, default=None,
-                   help="patterns of the first split scored as the held-out set -- never trained on, never "
-                        "merged into the outputs; one file across runs puts their held-out NLL on the same crystals")
+    # Encoder width (default 128) and number of blocks (default 5).
+    p.add_argument("--d-model", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--n-layers", type=int, default=None, help=argparse.SUPPRESS)
+    # Held-out evaluation and checkpoint every this many updates per state.
+    p.add_argument("--eval-every", type=int, default=100, help=argparse.SUPPRESS)
+    # Stop after this many evaluations without a new held-out minimum (0 = never).
+    p.add_argument("--patience", type=int, default=0, help=argparse.SUPPRESS)
+    # Patterns of the first split scored as the held-out set: never trained on, never
+    # merged into the outputs; one file across runs puts their held-out NLL on the
+    # same crystals.
+    p.add_argument("--heldout-stream", type=Path, default=None, help=argparse.SUPPRESS)
     p.add_argument("--warmup", type=int, default=None,
                    help="learning-rate warm-up in updates per state (default 25)")
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
@@ -214,10 +222,6 @@ def main(argv=None):
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
         target_redundancy=args.redundancy, epochs=0, lr=1e-3,
-        # 25 updates per state: on smded72k (two states, 400 updates) against 100,
-        # held-out NLL -0.007 to -0.009 and dark per-state ln(N/S) -0.3 to -0.4 on two
-        # seed pairs, difference maps unchanged (gym NOTES 2026-09-27).  No update was
-        # ever clipped, so the long ramp only cost updates at the full rate.
         warmup_steps=(25 if args.warmup is None else args.warmup) * n_states,
         lr_schedule=args.lr_schedule, total_steps=args.steps,
         grad_clip=20.0, log_every=25,

@@ -256,7 +256,7 @@ def test_merge_friedel_flag_and_recipe_resolution():
     from torchsx.cli import _pipeline as P
 
     p = argparse.ArgumentParser()
-    P.add_data_args(p, require_recipe=False)
+    P.add_data_args(p)
     assert p.parse_args(["x.sfx"]).merge_friedel is None
     assert p.parse_args(["x.sfx", "--merge-friedel"]).merge_friedel is True
     assert p.parse_args(["x.sfx", "--no-merge-friedel"]).merge_friedel is False

@@ -1,6 +1,5 @@
 """Plot raw observation distributions to motivate scaling and likelihood modeling."""
 import argparse
-import importlib.util
 import json
 from pathlib import Path
 
@@ -23,7 +22,7 @@ def _sample_size(value):
 
 
 def _build_parser():
-    p = argparse.ArgumentParser(prog='torchsx-stats', description=__doc__,
+    p = argparse.ArgumentParser(prog='torchsx.observation-stats', description=__doc__,
         epilog='CPU only. Signed input ADU, before scaling or merging. '
                'Sampling keeps complete images and precedes custom-split selection.')
     p.add_argument('stream', nargs='*', type=Path, help='.stream or .sfx inputs')
@@ -52,8 +51,6 @@ def _build_parser():
 def main(argv=None):
     p = _build_parser()
     args = p.parse_args(argv)
-    if importlib.util.find_spec('matplotlib') is None:
-        p.error('Plotting requires matplotlib; install torchsx[stats]')
     if args.min_observations < 3 or args.min_frames < 1 or not np.isfinite(args.target_skew).all():
         p.error('Require minimum observations >= 3, frames >= 1 and finite skew targets')
     cache = args.out.with_name(args.out.name + '-cache')
