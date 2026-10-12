@@ -1,225 +1,192 @@
 # Command-line reference
 
-Measurement policy, gain selection, the public option surface and the
-reproducibility rules for `torchsx.train` and `torchsx.merge`. The README
-covers the common path; this document is the lookup reference.
+`torchsx.train` trains the scaling network on one or more streams and merges
+them with it. `torchsx.merge` merges streams with an already trained network.
+Both take the same input and measurement options.
 
-## Measurement and gain
+## torchsx.train
 
-CrystFEL loading retains raw intensities, backgrounds, sigmas and integration
-metadata. Ring radii resolve from an explicit `--int-radius`, then the checkpoint,
-then the input's recorded integration command. Omitted CrystFEL options inherit
-its defaults ([indexamajig manual](https://www.desy.de/~twhite/crystfel/manual-indexamajig.html)):
-ring integration without centering, saturation or gradient options, and radii
-`4,5,7` if not declared. Defaults are recorded in measurement provenance;
-explicit declarations are preserved. Unsupported integration semantics are
-rejected. Nominal aperture counts do not account for masked or clipped pixels.
+```bash
+torchsx.train STREAM --spacegroup SG -o RUN [options]
+torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [options]
+```
 
-`--gain` accepts:
+### Inputs
 
-| Value | Behavior |
-|---|---|
-| `auto` (default) | Compare input and calibrated gains; replace input when the relative discrepancy exceeds 50%. |
-| `trust_input` | Use the datasource declaration without calibration. |
-| `calibrate` | Always use a valid calibrated estimate; fail if unavailable. |
-| Positive finite number | Explicit ADU/photon gain. |
+| Option | Default | |
+|---|---|---|
+| `STREAM` | | CrystFEL `.stream` (or a prepared `.sfx`) input. |
+| `--split NAME=PATH` | | A named state, one stream each; repeatable. Each state is merged on its own. |
+| `--split-file FILE` | | States for a single stream (see [States](#states)). |
+| `--spacegroup SG` | | Space group, e.g. `'P 63'`. Required for `.stream` input. |
+| `--dmin`, `--dmax` | all | High- and low-resolution cut in Å. |
+| `--merge-friedel` / `--no-merge-friedel` | merge | Keep Friedel mates apart with `--no-merge-friedel`; the MTZs then carry (+) and (−) columns. |
 
-Auto retains a valid input gain when calibration is unavailable and uses valid
-calibration when input gain is missing. It fails when neither is usable. Invalid
-arguments report the received value and accepted choices. The resolved gain,
-selection reason and calibration diagnostics are recorded; checkpoint readout
-reuses the selected numeric gain. The legacy `stream` spelling remains a Python
-recipe alias for `trust_input`.
+### Measurement
 
-Calibration uses background-binned off-Bragg variance when the input predicts
-reflections far from the Ewald sphere. CrystFEL streams do not, so calibration
-then falls back to a truncated normal fitted to the negative integrated
-intensities, cut to the core of their distribution (above -3 robust standard
-deviations, the cut modelled in the fit) against over-subtracted outliers. That
-estimate is biased, so `auto` replaces a declared gain only past the 50%
-tolerance. If neither
-estimator is usable, `auto` retains a valid declared gain, while `calibrate`
-fails. New `auto`/`calibrate` requests require prepared caches built with the
-current gain policy; checkpoint readout still reuses its recorded numeric gain.
+| Option | Default | |
+|---|---|---|
+| `--int-radius R_PEAK,R_GAP,R_BG` | from the stream | The integration radii in pixels, as given to indexamajig. |
+| `--gain` | `auto` | Detector gain in ADU per photon (see [Gain](#gain)). |
+| `--detector-noise` | `off` | Learned detector variance A + B (λ + σ<sub>b</sub>²): `auto` fits one global B when the gain was calibrated, `panel` fits it per detector panel. |
+| `--noise-terms` | `AB` | With `--detector-noise panel`: which of A and B are fitted. B alone is a per-panel gain correction. |
 
-`--detector-noise auto` refines a gain the calibration selected (by `auto` past
-the tolerance, or `calibrate`) in training by one global B, the counting variance
-B (lam + sig_b2), which is exactly a gain correction on the integrated sums; with
-the input gain kept, no detector term is fitted. `--detector-noise panel` fits
-A and/or B per detector panel (`--noise-terms`). The default, `off`, fits none.
-Merges inherit the checkpoint's terms.
+### Training
 
-New training uses the annulus background-mean correction inferred from integration
-metadata and a four-component Gaussian mixture. Gain conversion, background-mean
-correction and posterior uncertainty are distinct operations. Existing checkpoints
-retain their recorded scatter family and background convention.
+| Option | Default | |
+|---|---|---|
+| `--steps N` | 400 | Optimizer updates in total, divided evenly over the states. |
+| `--redundancy N` | 100 | Target observations per reflection in a batch. |
+| `--warmup N` | 25 | Learning-rate warm-up, in updates per state. |
+| `--lr-schedule` | `constant` | Learning rate after the warm-up: `constant`, or `cosine` decay to zero at the last update. |
+| `--peer-attention N` | 2 | Cross-attention layers from each observation onto the other observations of its crystal; 0 pools by mean only. |
+| `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
+| `--outlier-frac F` | 0 | Initial weight of a detector-outlier component; 0 turns it off. |
+| `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
+| `--seed N` | 0 | Network initialization and batch sampling. |
+| `--device` | `cuda` if available | `cuda` or `cpu`. |
 
-## Training length and checkpoints
+### Output
 
-`--steps` is the total optimizer-update budget, independent of dataset size
-(default 400). Training alternates state-pure batches: 400 updates over two
-states gives 200 per state; an uneven budget differs by at most one update
-between states. `best.pt` is the network at minimum validation NLL in state
-zero, and the merges written by `torchsx.train` use it; `last.pt` preserves the
-endpoint. Validation uses 5% of state-zero crystals; all supplied observations
-remain eligible for the final merge. Training length remains an empirical
-setting: validation NLL is not established as an optimum for independent
-difference-map precision. `--no-merge` stops after saving checkpoints, for
-workflows that merge separately with `torchsx.merge`.
+| Option | Default | |
+|---|---|---|
+| `-o`, `--out RUN` | | Run directory. |
+| `--no-merge` | | Stop after saving the checkpoints, for a separate `torchsx.merge`. |
+| `--free-from FILE` | 5 % new | Copy the free set from an `.mtz` (`R-free-flags` or `FreeR_flag`). |
+| `--cache FILE` | `RUN/prepared.pt` | Where the parsed observations are cached. |
 
-Data stay on the host; encoder chunking and quadrature recomputation bound GPU
-memory without reducing the requested statistical batch support. Parser workers
-respect the available CPU allocation, capped at eight.
+`torchsx.train --help` lists the same options.
+
+### How a run proceeds
+
+1. The streams are parsed, converted to photons with the selected gain and
+   cached in `prepared.pt`.
+2. 5 % of the crystals of the first state are held out for validation.
+3. The network is trained for `--steps` updates. Each batch holds crystals of
+   one state, and the states take turns: 400 updates over two states give 200
+   per state.
+4. `best.pt` keeps the network at the lowest validation loss, `last.pt` the
+   network after the last update.
+5. With `best.pt`, all crystals of each state are merged into `merged.mtz`, and
+   each half of the crystals into `merged_half1.mtz` and `merged_half2.mtz`.
+   `merged.metrics.json` records CC<sub>1/2</sub> and R<sub>split</sub> between
+   the halves.
+
+The halves share the network. For independent merges, train two runs on
+disjoint sets of patterns.
+
+## torchsx.merge
+
+```bash
+torchsx.merge RUN/best.pt STREAM -o merged.mtz
+torchsx.merge RUN/best.pt --split dark=dark.stream --split light=light.stream -o merged.mtz
+```
+
+Merges the given streams with a trained network. The checkpoint supplies the
+network, the Wilson surface, the measurement settings (radii, gain, detector
+noise) and the seed for the halves; `--int-radius`, `--gain`, `--prior` and
+`--merge-friedel` override them. The streams can be the training data, more
+data from the same experiment, or other states. Merging the training data
+reproduces the merge written by `torchsx.train`.
+
+With one state the output is `merged.mtz` with its two halves and
+`merged.metrics.json`. With several states each gets its own set:
+`merged_dark.mtz`, `merged_dark_half1.mtz`, and so on.
 
 ## States
 
-Light and dark (or any set of labelled states) are trained in one network; the
-merge targets remain separate, and the label is not a network feature.
+States are subsets of the data that share the network but are merged
+separately, typically light and dark. The state label is not an input to the
+network.
 
 ```bash
 torchsx.train --split dark=dark.stream --split light=light.stream \
   --spacegroup 'P 63' --dmin 2.0 -o joint/
-torchsx.merge joint/best.pt \
-  --split dark=dark.stream --split light=light.stream -o merged.mtz
 ```
 
-A combined stream can instead use a CrystFEL custom-split file with
-`filename event dataset` columns:
+A single stream can be divided with `--split-file`, either a CrystFEL
+custom-split file (the one partialator takes as `--custom-split`) or a `.pt`
+tensor with one integer label per crystal after the resolution cut:
 
 ```bash
 torchsx.train combined.stream --split-file states.split \
   --spacegroup 'P 63' --dmin 2.0 -o joint/
 ```
 
-`--split-file` also accepts an integer label tensor (`.pt`), one label per
-crystal after the resolution filter. Every crystal must be labelled. State names
-in text custom-split files are sorted; repeated `--split NAME=PATH` inputs retain
-argument order. In text split files, repeat a `filename event` pair with
-different dataset names to include the frame (and all its crystals) in multiple
-bins; repeated identical rows count only once per bin.
+A custom-split file has three columns, `filename event dataset`. Every crystal
+must be labelled. A frame listed under several dataset names goes into each of
+those states; a repeated identical row counts once. States from a split file
+are ordered by name, states from `--split` in the order given. The first state
+supplies the validation crystals.
 
-Separate checkpoint readout accepts any number of bins and uses their supplied
-names. References and merge targets are initialized from the current input
-data; network weights and feature standardization are restored from the
-checkpoint. All supplied states are exported automatically. For changed inputs
-or split assignments, supply a new `--cache` path.
+## Gain
 
-## Public controls and reproducibility
+TorchSX models the data in photons, so the gain matters: a wrong gain
+misstates the counting noise. `--gain` takes:
 
-The shared options are `--out`, `--split`, `--split-file`, `--spacegroup`,
-`--dmin`, `--dmax`, `--gain`, `--int-radius`, `--merge-friedel`/`--no-merge-friedel`, `--free-from`,
-`--device`, `--cache`, `--seed` and `--prior`. Training adds `--steps` (default
-400), `--redundancy`, `--no-merge`, `--miss-frac`, `--outlier-frac`,
-`--detector-noise`, `--noise-terms`, `--peer-attention`, `--warmup` and
-`--lr-schedule`. The defaults are the production configuration. A few research
-options (encoder geometry, evaluation cadence, early stopping, an external
-held-out set) are accepted but not listed by `--help`; see
-`torchsx/cli/train.py`. Friedel mates are merged by default; checkpoint readout inherits
-the recorded choice unless overridden. `--no-merge-friedel` keeps acentric mates
-separate and writes (+)/(−) columns. Bijvoet mates share refinement free flags.
+| Value | |
+|---|---|
+| `auto` | Estimate the gain from the data and compare it with the gain in the stream. Keep the stream's gain unless the two differ by more than 50 %. |
+| `trust_input` | Use the stream's gain. |
+| `calibrate` | Use the estimate; fail if there is none. |
+| a number | Use this gain in ADU per photon. |
 
-`--redundancy` sets the target observations per reflection in a training batch
-(default 100).
-If a state's available training data is smaller than the requested batch,
-training warns once for that state and uses all its training crystals in one
-batch. Validation crystals remain held out.
+The estimate fits a truncated normal to the core of the negative integrated
+intensities, whose spread is set by the counting noise. It is biased, hence
+the 50 % tolerance. `auto` uses the stream's gain when no estimate is possible and the
+estimate when the stream has no gain. The selected gain and the reason for it
+are printed and recorded in `run.json`.
 
-Use `--free-from existing.mtz` to preserve a refinement free set. Otherwise the
-existing default 5% free-flag export policy applies. Refinement free flags are
-export annotations, distinct from validation crystals and the diagnostic halves;
-no reflections are removed from the difference calculation by these flags.
+Integration radii come from `--int-radius`, else the checkpoint, else the
+indexamajig command recorded in the stream. Omitted indexamajig options take
+their CrystFEL defaults ([indexamajig manual](https://www.desy.de/~twhite/crystfel/manual-indexamajig.html)),
+including radii `4,5,7`. Ring integration without centring is supported; other
+integration modes are rejected.
 
-`--seed` controls initialization and batch sampling, with a derived diagnostic
-half seed. Merge reuses the saved run seed unless overridden. Refinement free-flag
-assignment retains its separate fixed seed, so changing the training seed does
-not deliberately change the refinement comparison.
+## Free set
 
-`--cache` names a prepared cache (default `RUN/prepared.pt`; merge uses the
-checkpoint directory). Input contents, labels, measurement policy and preparation
-settings are validated. Identical files may move without invalidating the cache;
-source hashes cost one sequential input read. Inputs must remain available for
-validation. Changed data/settings and older cache schemas require a new cache
-path. There is no bypass flag. Original input paths remain recorded as provenance.
+Each MTZ carries `R-free-flags` (0 = free, 1 = work). By default 5 % of the
+reflections are drawn with a fixed seed, independent of `--seed`. To compare
+refinements of different merges, give them the same free set with
+`--free-from earlier.mtz`. Friedel mates always share a flag.
 
-Model, likelihood and quadrature settings are internal and recorded in each run.
-Training uses the 31/129/6 outer grid; readout uses 63/257/24, with inner 192 and
-locating windows 8/1/0.125. The resolved recipe records learning rates, per-state
-warmup/decay, resource policy and evaluation cadence. Research variants use the
-Python API rather than another public configuration language.
+## Intensity prior
 
-A separate merge takes the checkpoint's network
-weights, fitted feature standardization and Wilson surface, and forms everything
-per reflection from the supplied observations exactly as training does, so a
-merge of the training data reproduces the training run's own readout. Any number
-of bins can be exported under their current labels.
+With `--prior wilson` each state has a Wilson prior whose mean intensity is a
+smooth surface over reciprocal space: Chebyshev polynomials in resolution plus
+the anisotropy terms of the space group. Its coefficients start from a Wilson
+fit to the data and are trained with the network on the same marginal
+likelihood.
 
-### Scale encoder
+`--prior none` integrates the likelihood over positive intensity without a
+prior density. The result then depends on the bounds of the integration grid
+for weak reflections, and its validation loss is not comparable with that of
+a Wilson run.
 
-Each observation's scale is predicted from its own features and those of the
-other observations of its crystal. `--peer-attention N` sets the number of
-cross-attention layers onto these peers (default 2; `0` pools by mean only).
-Each crystal is split into two folds, and an observation takes its context from
-the other fold. Checkpoint readout inherits both.
+`torchsx.merge` uses the prior of the checkpoint unless `--prior` is given.
 
-`--miss-frac F` adds a learnable miss component, a predicted reflection that
-recorded no signal, starting at fraction F (default 0.03; `0` turns it off).
-`--outlier-frac F` adds a learnable detector-outlier component, starting at
-fraction F (default 0, off). Both fractions lie in [0, 1); readout inherits
-them.
+## Model
 
-### Training schedule
+Each observation's scale and scatter distribution are predicted from its own
+geometry and from the other observations of its crystal. The crystal's
+observations are split into two folds, and each observation attends to the
+other fold (`--peer-attention` layers). For every peer the network sees its
+intensity relative to the mean of its reflection over the whole input, and the
+log of that mean. The scatter distribution is a mixture of four Gaussians in
+log scale, plus the miss component (`--miss-frac`). The detector term is
+Poisson counting on the spot and the background estimate.
 
-The learning rate warms up over `--warmup` updates per state (default 25) and
-then stays constant. `--lr-schedule cosine` decays it to zero at the last
-update instead.
+## Cache and reproducibility
 
-### No per-reflection running state
+The parsed observations are cached in `--cache` (default `RUN/prepared.pt`;
+`torchsx.merge` uses the checkpoint's directory). A later run with the same
+inputs and preparation settings reuses it: the cache records the input
+contents and settings, and a mismatch is an error rather than a silent reparse.
+Moved but identical files are accepted. For changed inputs or split
+assignments, give a new `--cache` path.
 
-Nothing is carried from one batch to the next except the network and its
-fitted parameters. Each batch places its own integration grid, around its
-weighted mean at the network's scale (floored 4 nats below the Wilson
-surface); a merge starts from the unity merge of its inputs with the same
-floor and refines in three windows.
-
-### Peer features
-
-The context of an observation carries, for every peer, its observed scale as
-its intensity over the plain (unweighted) mean of its reflection's
-observations, and the log of that mean. The mean is computed once from the
-input observations, all states pooled.
-
-### Wilson surface
-
-With `--prior wilson` each state's prior mean `Σ(h)` is a smooth surface
-`log Σ(h) = φ(h)·c` on a reciprocal-space basis (Chebyshev polynomials in
-resolution plus the space group's anisotropy terms). The coefficients start at
-the Wilson fit to the unity merge and are trained with the network by the same
-marginal likelihood (type-II maximum likelihood), at ten times the base learning
-rate. The checkpoint stores the basis definition and each state's
-coefficients, so a separate merge evaluates the same surface on any reflection
-set.
-
-### Intensity prior
-
-`torchsx.train ... --prior wilson` is the default. `--prior none` removes the
-Wilson intensity density and integrates the observation likelihood with respect
-to positive intensity (`dI`, including the Jacobian on the log-intensity grid).
-It does not select a maximum-likelihood point estimate or a flat-log prior.
-Training's integrated likelihood, validation, and full/half posterior readouts all
-use the selected measure. I, F, their uncertainties and integration-edge
-statistics come from those same weights. The scale anchor remains enabled.
-
-The choice is saved in `posterior_grid.prior` and the resolved training recipe.
-`torchsx.merge best.pt ...` inherits it; an explicit `--prior none` or
-`--prior wilson` overrides it for a readout experiment without retraining.
-The resolved prior is printed and saved for each state in `.metrics.json`.
-Historical `flat_I0` checkpoints are read as `none`; historical `flat_log`
-checkpoints retain their original measure. Neither legacy spelling is a CLI option.
-
-`none` uses the finite numerical integration range. In particular, the existing
-missed-spot likelihood has an intensity-independent component, so a uniform prior
-over an unbounded positive intensity axis would not yield a proper posterior.
-The resulting integrated-likelihood score is not normalized Bayesian evidence;
-its scale and the weak-reflection moments can depend on the grid bounds. Inspect
-edge mass and range sensitivity before interpreting results. Wilson and `none`
-validation scores should not be compared as interchangeable model evidences.
+`run.json` records the resolved settings: inputs, measurement, gain and its
+reason, model, learning rates and schedule. `--seed` fixes network
+initialization and batch sampling; `torchsx.merge` reuses the run's seed for
+the halves unless `--seed` is given. Parsing uses up to eight CPU workers
+within the allocation.

@@ -36,7 +36,7 @@ hidden by occupancy rather than by ILP within an iteration, so *small* tiles
 win: in a tile sweep BLOCK_M = 16 with 4 warps beats the per-column path while
 BLOCK_M = 32 with 4 warps is already slower than what it replaces, and large
 tiles collapse.  Do not change the default without re-running an equivalent
-tile sweep -- the measurement traps are in ``docs/optimize_integration.md``.
+tile sweep.
 """
 from __future__ import annotations
 

@@ -1,104 +1,70 @@
 # Raw-distribution figures
 
-`torchsx.observation-stats` describes integrated observations before scaling or merging. It
-writes PNG figures only, retaining negative and zero intensities and the complete
-finite tails. There is no gain calibration, posterior correction or training in
-this command.
+`torchsx.observation-stats` plots integrated observations before any scaling
+or merging: how the intensities of each reflection are distributed across
+crystals. It keeps negative and zero intensities and the full tails, and
+writes PNG figures.
 
 ```bash
-# Quick look: random complete images totaling at least 50K crystals, or all available.
+# Quick look: random complete images totalling at least 50,000 crystals.
 torchsx.observation-stats indexed.stream --spacegroup 'P 63' -o figures
 
-# Final figures with explicit input selection and full observation counts.
+# Every crystal, for selected states of a custom-split file.
 torchsx.observation-stats combined.stream --spacegroup 'P 63' \
   --split-file custom.split --select dark light3 \
   --sample-crystals all -o figures_full
 
-# Separate inputs are plotted separately, with shared raw-intensity bins and resolution axes.
+# Separate inputs, plotted separately on shared bins and axes.
 torchsx.observation-stats --split dark=dark.stream --split light=light.stream \
   --spacegroup 'P 63' --sample-crystals all -o light_dark
 
-# Replot without reparsing or requiring the original sources.
+# Replot from the cache, without the original inputs.
 torchsx.observation-stats --from-cache figures_full-cache --plots reflection-skew skew-examples \
   --target-skew 0 1 2 4 --min-observations 50 --min-frames 30 -o figures_selected
 ```
 
-`python -m torchsx.cli.stats` runs the same command from a source checkout.
+## Plots
 
-## What the plots show
-
-| Plot | Interpretation |
+| Plot | Shows |
 | --- | --- |
-| `raw-intensity` | Signed unscaled ADU across all finite observations. The asinh intensity axis preserves negatives and the region near zero; counts have a log axis. Unequal ADU bin widths mean this is counts per transformed bin, not a probability density. |
-| `reflection-skew` | Adjusted sample skewness of repeated observations of each symmetry-unique HKL versus resolution, colored by observation count. Positive values indicate a longer positive tail. |
-| `mean-median-gap` | `(mean − median) / (Q75 − Q25)` per HKL. This shows separation of two location summaries relative to the middle-50% width. The orange curve is the median in each resolution bin with at least 20 eligible HKLs. |
-| `skew-examples` | Histograms for distinct HKLs nearest the requested skewnesses, with their means, medians, achieved skewness, image counts and resolution. Writes an overview and an individual PNG for each selected HKL. |
+| `raw-intensity` | Histogram of all finite observations in ADU, on an asinh axis that keeps negative values and the region near zero; counts on a log axis. The bins are uneven in ADU, so this is counts per bin, not a density. |
+| `reflection-skew` | Skewness of the repeated observations of each unique reflection against resolution, coloured by the number of observations. Positive values mean a longer tail towards high intensities. |
+| `mean-median-gap` | `(mean − median) / (Q75 − Q25)` per reflection against resolution, with the median per resolution bin (bins with at least 20 reflections) in orange. |
+| `skew-examples` | Histograms of individual reflections whose skewness is closest to each `--target-skew`, with mean, median, skewness, number of images and resolution. One overview PNG and one PNG per reflection. |
 
-For a motivation figure, the per-HKL examples make asymmetry concrete, and the
-skewness/gap panels show its prevalence across reflections and resolution. The
-aggregate intensity histogram provides dynamic-range and negative-observation
-context: mixing weak and strong reflections alone produces a broad distribution.
-Per-HKL raw distributions also combine counting noise, crystal scales,
-partiality and other heterogeneity. They do not isolate a likelihood residual or
-establish that TorchSX improves accuracy. Use the independent merge and difference
-comparisons for that claim. The mean–median gap is a descriptive statistic, not an
-estimate of estimator bias.
+The per-reflection distributions combine counting noise, crystal scale,
+partiality and every other source of variation; they describe the data, they
+do not separate these sources. The examples are chosen by their skewness, not
+at random. The shape plots leave out systematic absences and reflections below
+`--min-observations` or `--min-frames`; the gap plot also leaves out reflections
+with a zero interquartile range. The raw-intensity histogram includes every
+finite observation.
 
-Examples are selected for proximity to the requested skewnesses, with observation
-count and HKL ordering breaking ties. They are explicitly labeled as selected
-examples, not a random or representative sample. Displayed skewness may differ
-from its target. Shape panels exclude systematic absences, undefined skewness,
-invalid resolution and insufficiently observed HKLs. Gap panels also require a
-nonzero interquartile range. Their captions record the eligibility thresholds.
-The raw-intensity histogram includes all finite observations, including systematic
-absences. No outlier clipping is applied.
+## Options
 
-## CLI review
+| Option | Default | |
+| --- | --- | --- |
+| `-o`, `--out DIR` | | New directory for the PNGs, one subdirectory per input or state. The cache goes to `DIR-cache`. |
+| `STREAM`, `--split NAME=PATH` | | Inputs. A bare input is labelled by its file name. |
+| `--split-file FILE`, `--select LABEL ...` | all labels | CrystFEL custom-split file (`filename event label`), and the labels to plot. |
+| `--spacegroup SG` | | Required for `.stream` input. |
+| `--cell A B C ALPHA BETA GAMMA` | median cell of the input | Cell used for resolution. |
+| `--sample-crystals N\|all` | 50000 | Whole images are drawn at random until N crystals are reached; `all` uses every crystal. |
+| `--seed N` | 42 | Sampling seed. |
+| `--merge-friedel` / `--no-merge-friedel` | merge | Keep acentric Friedel mates apart with `--no-merge-friedel`. |
+| `--from-cache DIR` | | Replot from a cache; input options are not accepted with it. |
+| `--plots` | all four | Which plots to draw. |
+| `--target-skew` | `-1 0 1 2 4 6` | Skewness targets for the examples. |
+| `--min-observations`, `--min-frames` | 30, 20 | Minimum observations and distinct images per reflection for the shape plots. Several crystals on one image count as one image. |
 
-The recovered command has **14 optional controls**, reduced from the original 20.
+Images are sampled before a custom split is applied, so 50,000 crystals from a
+combined stream are 50,000 in total, not per state. The command prints the
+sampled counts and the observations and eligible reflections per label.
 
-| Controls | Default and purpose |
-| --- | --- |
-| `-o` / `--out` | Required new PNG directory; one subdirectory per input/split label. |
-| `--split NAME=PATH` | Repeat for named inputs. Bare positional inputs use their filename stems. Labels must be unique and safe directory names. |
-| `--split-file`, `--select` | CrystFEL `filename event label` assignments; optionally select labels. Every sampled image must have an assignment. Conflicting duplicate assignments fail. |
-| `--spacegroup` | Required for `.stream`; inherited from `.sfx` metadata unless overridden. |
-| `--cell A B C ALPHA BETA GAMMA` | Optional resolution reference, in angstrom/degrees; otherwise the median valid cell of the sampled input. The resolved cell is recorded. |
-| `--sample-crystals N\|all` | Default 50000 per input, seed 42. Random complete images are retained until the crystal target is reached, so the final image may exceed it. `all` uses the full input. |
-| `--seed` | Sampling seed. |
-| `--merge-friedel` / `--no-merge-friedel` | Merge by default; otherwise separate acentric mates using the production loader. Centric mates remain one HKL. Legacy caches lacking observed indices cannot recover already-merged mates. |
-| `--from-cache` | Regenerate PNGs from a statistics cache. Accepts plot and eligibility controls, rejects input overrides. |
-| `--plots` | All four plot families by default. |
-| `--target-skew` | Example targets: `-1 0 1 2 4 6`. |
-| `--min-observations`, `--min-frames` | Shape eligibility: at least 30 observations and 20 distinct images per HKL. Multiple crystals from one image count as one image. |
+## Cache
 
-The former `--full` is `--sample-crystals all`. `--output` becomes `--out`, and
-`--no-friedel` becomes `--no-merge-friedel`, matching the production CLI.
-Parser workers follow the CPU allocation, capped at eight. The cache automatically
-lives beside the output in `OUT-cache`. Reference-structure cell extraction,
-custom cache placement, titles and intensity-unit relabeling no longer add public
-flags; explicit cells and the Python rendering API cover those needs. Existing
-cache unit labels are respected when replayed.
-
-Sampling happens before custom-split selection: 50K crystals from a combined
-stream does not mean 50K in each selected label. Actual sampled crystal/image
-counts are printed and recorded; finite observation counts and eligible HKLs are
-reported per label. `.stream` sampling uses the existing parser; `.sfx` loads the
-cached tensors before sampling complete images, so its peak read memory is still
-that of the full cache. Run substantial datasets on an allocated CPU node.
-
-## Reproducibility and output
-
-`OUT` contains PNGs only, never PDF files. `OUT-cache` contains compressed grouped
-observations and a manifest recording source paths, sizes, timestamps, SFX sidecar
-checksum, split-file checksum, resolved cells/groups, sample counts, settings and
-stats/CLI source hashes. Cached arrays have checksums verified on replay. This
-cache preserves the observations used to render; source files are not reread on
-replay. Source size/timestamp records are not full source-content hashes.
-
-Each rendering records its plot choices, target skewnesses and eligibility
-thresholds beside the cached arrays. Existing output/cache directories are not
-overwritten. Shared plotting bins/axes apply within one command invocation.
-
-This CLI was restored for dataset characterization and paper motivation figures;
-its usefulness is independent of whether a training job invokes it.
+`DIR-cache` holds the grouped observations behind the figures and a manifest
+of the inputs (paths, sizes, timestamps, split-file checksum), the cell,
+sample counts and settings. `--from-cache` replots from it without reading the
+inputs again, with checksums verified. Existing output and cache directories
+are never overwritten.
