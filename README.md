@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/HatPdotS/torchsx/master/assets/torchsx-banner-dark.png">
-    <img src="https://raw.githubusercontent.com/HatPdotS/torchsx/master/assets/torchsx-banner-light.png" alt="TorchSX" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/HatPdotS/TorchSX/master/assets/torchsx-banner-dark.png">
+    <img src="https://raw.githubusercontent.com/HatPdotS/TorchSX/master/assets/torchsx-banner-light.png" alt="TorchSX" width="100%">
   </picture>
 </p>
 
@@ -115,7 +115,7 @@ pip install torchsx
 ```
 
 From a checkout, build the native package first (needs a Rust toolchain, see
-[native/README.md](https://github.com/HatPdotS/torchsx/blob/master/native/README.md)), then install torchsx against it:
+[native/README.md](https://github.com/HatPdotS/TorchSX/blob/master/native/README.md)), then install torchsx against it:
 
 ```bash
 pip install ./native
@@ -152,7 +152,7 @@ Parser workers respect the available CPU allocation, capped at eight.
 
 Measurement policy, gain selection and the full public option surface —
 `--gain`, `--int-radius`, `--free-from`, `--cache`, `--seed` and the rest — are
-in the [command-line reference](https://github.com/HatPdotS/torchsx/blob/master/docs/cli.md).
+in the [command-line reference](https://github.com/HatPdotS/TorchSX/blob/master/docs/cli.md).
 
 ## Joint light/dark inputs
 
@@ -225,7 +225,7 @@ from the input. Named inputs and CrystFEL custom splits are supported.
 
 These figures describe the observations that motivate scaling and likelihood
 modeling. They complement the independent precision and accuracy comparisons.
-[Plot interpretation, CLI controls and cache replay](https://github.com/HatPdotS/torchsx/blob/master/docs/stats.md).
+[Plot interpretation, CLI controls and cache replay](https://github.com/HatPdotS/TorchSX/blob/master/docs/stats.md).
 
 ## Merge statistics
 
@@ -244,7 +244,7 @@ independent halves:
   bits over resolution × σ(ΔF) bins.
 
 Writes CSV and PNG by default (`--format csv json plots`).
-[Definitions, inputs and outputs](https://github.com/HatPdotS/torchsx/blob/master/docs/merge_stats.md).
+[Definitions, inputs and outputs](https://github.com/HatPdotS/TorchSX/blob/master/docs/merge_stats.md).
 
 ## Datasource API
 
@@ -265,16 +265,16 @@ and measurement provenance.
 
 | Document | Contents |
 |---|---|
-| [docs/cli.md](https://github.com/HatPdotS/torchsx/blob/master/docs/cli.md) | Measurement policy, gain selection, the full public option surface, caching and reproducibility |
-| [docs/stats.md](https://github.com/HatPdotS/torchsx/blob/master/docs/stats.md) | `torchsx.observation-stats` plot interpretation, CLI controls and cache replay |
-| [docs/merge_stats.md](https://github.com/HatPdotS/torchsx/blob/master/docs/merge_stats.md) | `torchsx.merge-stats` inputs, statistic definitions and outputs |
+| [docs/cli.md](https://github.com/HatPdotS/TorchSX/blob/master/docs/cli.md) | Measurement policy, gain selection, the full public option surface, caching and reproducibility |
+| [docs/stats.md](https://github.com/HatPdotS/TorchSX/blob/master/docs/stats.md) | `torchsx.observation-stats` plot interpretation, CLI controls and cache replay |
+| [docs/merge_stats.md](https://github.com/HatPdotS/TorchSX/blob/master/docs/merge_stats.md) | `torchsx.merge-stats` inputs, statistic definitions and outputs |
 
 Design notes recording why the model looks the way it does:
-[scaling_merging](https://github.com/HatPdotS/torchsx/blob/master/docs/scaling_merging.md),
-[optimize_integration](https://github.com/HatPdotS/torchsx/blob/master/docs/optimize_integration.md),
-[sparse_poisson_loss](https://github.com/HatPdotS/torchsx/blob/master/docs/sparse_poisson_loss.md) and
-[fused_gaussian_mixture](https://github.com/HatPdotS/torchsx/blob/master/docs/fused_gaussian_mixture.md).
+[scaling_merging](https://github.com/HatPdotS/TorchSX/blob/master/docs/scaling_merging.md),
+[optimize_integration](https://github.com/HatPdotS/TorchSX/blob/master/docs/optimize_integration.md),
+[sparse_poisson_loss](https://github.com/HatPdotS/TorchSX/blob/master/docs/sparse_poisson_loss.md) and
+[fused_gaussian_mixture](https://github.com/HatPdotS/TorchSX/blob/master/docs/fused_gaussian_mixture.md).
 
 ## License
 
-MIT. See [LICENSE](https://github.com/HatPdotS/torchsx/blob/master/LICENSE).
+MIT. See [LICENSE](https://github.com/HatPdotS/TorchSX/blob/master/LICENSE).

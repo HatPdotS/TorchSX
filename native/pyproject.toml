@@ -20,7 +20,7 @@ classifiers = [
 dependencies = ["numpy>=2"]
 
 [project.urls]
-Repository = "https://github.com/HatPdotS/torchsx"
+Repository = "https://github.com/HatPdotS/TorchSX"
 
 [tool.maturin]
 module-name = "torchsx_native"
