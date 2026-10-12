@@ -53,8 +53,6 @@ jobs:
     name: Test suite
     needs: check
     uses: ./.github/workflows/tests.yml
-    with:
-      torchref-from-pypi: true
 
   native-linux:
     name: torchsx-native wheel (linux ${{ matrix.target }})

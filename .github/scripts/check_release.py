@@ -2,15 +2,15 @@
 
 usage: python .github/scripts/check_release.py [TAG]
 
-- TAG (a GitHub release tag) must be ``v<torchsx version>``.
+- TAG (a GitHub release tag) must be ``v<torchsx version>``, and
+  ``torchsx.__version__`` must be that version.
 - torchsx's ``torchsx-native`` requirement must accept native/Cargo.toml's version.
 - ``PROTOCOL`` in native/src/lib.rs and torchsx/io/_native.py must agree.
 - torchsx-native is uploaded with skip-existing, so a release that changes the
   native build without bumping its version would silently keep the old wheels
   on PyPI; that is refused against the previous tag.
-- Every other torchsx dependency must have a release on PyPI that satisfies it
-  (e.g. ``torchref>=0.7.0`` before TorchRef 0.7 is out), or users could not
-  install the release.
+- Every other torchsx dependency must have a release on PyPI that satisfies it,
+  or users could not install the release.
 """
 from __future__ import annotations
 
@@ -63,6 +63,9 @@ def main() -> None:
 
     if tag is not None and tag != f"v{torchsx_version}":
         errors.append(f"tag {tag} does not match torchsx version v{torchsx_version}")
+    module = re.search(r'^__version__ = "([^"]+)"$', (ROOT / "torchsx/__init__.py").read_text(), re.M)
+    if not module or Version(module.group(1)) != torchsx_version:
+        errors.append(f"torchsx/__init__.py __version__ does not match pyproject.toml's {torchsx_version}")
     if len(pins) != 1:
         errors.append("torchsx must depend on torchsx-native exactly once")
     elif native_version not in pins[0].specifier:

@@ -9,17 +9,6 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
-    inputs:
-      torchref-from-pypi:
-        description: "Test against the released TorchRef on PyPI (the release gate)"
-        type: boolean
-        default: false
-
-env:
-  # torchsx needs TorchRef >= 0.7.0, which is not on PyPI yet, so pushes and PRs
-  # test against TorchRef's dev branch. The release gate uses PyPI's TorchRef,
-  # which is what users get. Drop this once TorchRef 0.7 is released.
-  TORCHREF_GIT: git+https://github.com/HatPdotS/TorchRef@dev
 
 jobs:
   rust:
@@ -66,11 +55,11 @@ jobs:
       # CPU torch within TorchRef's bound, so the next install keeps it rather
       # than pulling a CUDA build. torchsx-native is built from this commit
       # first, so the torchsx pin resolves to it instead of a published wheel.
+      # TorchRef comes from PyPI, as for users.
       - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install "torch>=2.4,<2.14" --index-url https://download.pytorch.org/whl/cpu
-          if [ "${{ inputs.torchref-from-pypi }}" != "true" ]; then pip install "torchref @ $TORCHREF_GIT"; fi
           pip install ./native
           pip install -e ".[dev]"
 
@@ -94,7 +83,6 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          if [ "${{ inputs.torchref-from-pypi }}" != "true" ]; then pip install "torchref @ $TORCHREF_GIT"; fi
           pip install ./native
           pip install -e ".[dev]"
 
