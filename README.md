@@ -104,6 +104,16 @@ package built from `native/` in this repository and released with torchsx;
 `pip install torchsx` installs the prebuilt wheel for your platform. Optional
 extras are `duckdb` (the existing Probixi reader) and `dev`.
 
+PyPI's default torch build needs a recent NVIDIA driver. If
+`torch.cuda.is_available()` is false on a GPU machine, install the torch build
+for your driver first (see [pytorch.org](https://pytorch.org/get-started/locally/)),
+within TorchRef's bound, for example for a CUDA 12 driver:
+
+```bash
+pip install "torch<2.14" --index-url https://download.pytorch.org/whl/cu128
+pip install torchsx
+```
+
 From a checkout, build the native package first (needs a Rust toolchain, see
 [native/README.md](https://github.com/HatPdotS/torchsx/blob/master/native/README.md)), then install torchsx against it:
 
