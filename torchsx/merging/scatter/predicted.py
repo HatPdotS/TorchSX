@@ -8,12 +8,10 @@ downstream routes through that hook, so this class is accepted unchanged by:
   ``isinstance(scatter, GenGaussLogScatter)``, and this is a subclass, so the
   fast path is kept — the kernel already takes per-observation
   ``log_alpha_obs`` / ``log_beta_obs`` and returns analytic gradients for both),
-* :func:`~torchsx.merging.posterior.compute_posterior_moments`,
-* and therefore :class:`~torchsx.merging.merger.Merger` itself.
+* and therefore the posterior merge itself.
 
 Predictions are addressed by ``ObsInfo.obs_id``, not by position, so an
-arbitrary crystal-batched gather resolves correctly — and so does a contiguous
-chunk taken by ``DataNLLTarget``.
+arbitrary crystal-batched gather resolves correctly, as does a contiguous chunk.
 """
 
 from __future__ import annotations

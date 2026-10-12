@@ -140,9 +140,8 @@ class BaseStream:
         # Always store provenance paths absolute (idempotent; "" passes through).
         self.source_path = abspath_str(source_path)
         # Whether ``hkl`` has already been Friedel-merged (canonicalized to the
-        # P-1 ASU, mates collapsed).  Drives anomalous-aware MTZ writing in
-        # :meth:`torchsx.merging.posterior.Posterior.integrate`.  Default True
-        # for backwards compatibility (the historical behaviour).
+        # P-1 ASU, mates collapsed).  Drives anomalous-aware MTZ writing.
+        # Default True.
         self.friedel_merged = bool(friedel_merged)
         # Optional detector good-pixel mask ``(P, ss, fs)`` bool (True=good) built by
         # the masking pass. Carried here so it can be embedded in the .sfx; not threaded

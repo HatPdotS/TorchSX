@@ -1,8 +1,7 @@
 """L-BFGS fit of a GenGauss + Gauss mixture to ``log(I/⟨I⟩)`` per shell.
 
 Used by ``prepare_observations`` to seed per-HKL GenGauss β from shell-pooled
-data.  Extracted from the legacy ``torchsx.merge._distribution._fit_shell_lbfgs``
-(renamed here to ``fit_shell_gengauss_gauss`` for clarity).
+data.
 """
 
 from __future__ import annotations
