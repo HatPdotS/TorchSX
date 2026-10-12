@@ -11,8 +11,13 @@
 # One-time setup:
 #   - On PyPI and on TestPyPI, add a trusted publisher for BOTH projects
 #     (a "pending publisher" until the first upload): owner HatPdotS,
-#     repository TorchSX, workflow publish.yml, environment pypi / testpypi.
-#   - Create the GitHub environments "pypi" and "testpypi".
+#     repository TorchSX, workflow publish.yml, and environment
+#       torchsx-native  pypi-native / testpypi-native
+#       torchsx         pypi / testpypi
+#     The environments differ because PyPI registers a pending publisher
+#     configuration for one project only.
+#   - Create the GitHub environments "pypi", "testpypi", "pypi-native" and
+#     "testpypi-native".
 name: Publish to PyPI
 
 on:
@@ -202,7 +207,7 @@ jobs:
     needs: [tests, native-smoke, native-sdist, torchsx-dist]
     runs-on: ubuntu-latest
     environment:
-      name: ${{ github.event_name == 'release' && 'pypi' || inputs.target }}
+      name: ${{ github.event_name == 'release' && 'pypi-native' || format('{0}-native', inputs.target) }}
       url: ${{ (github.event_name == 'release' || inputs.target == 'pypi') && 'https://pypi.org/p/torchsx-native' || 'https://test.pypi.org/p/torchsx-native' }}
     permissions:
       id-token: write
