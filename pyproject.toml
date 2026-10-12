@@ -18,9 +18,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "torchref>=0.7.0",   # brings torch, triton and gemmi; SpaceGroup.canonicalize_hkl/expand_reciprocal
+    # Brings torch, triton and gemmi. TorchRef's minor releases change its API,
+    # so the bound follows the minor version torchsx is tested against.
+    "torchref>=0.7.0,<0.8",
     "numpy>=2",          # the Python writer's float32 arithmetic (NEP 50)
     "safetensors>=0.4",  # the .sfx working format
+    "matplotlib>=3.7",   # the figures of torchsx.observation-stats and torchsx.merge-stats
     # The .stream reader/writer (Rust), built from native/ in this repository and
     # released with torchsx. The pin follows native/Cargo.toml's minor version;
     # bump both (and PROTOCOL) when the Rust↔Python interface changes.
@@ -31,16 +34,12 @@ dependencies = [
 Repository = "https://github.com/HatPdotS/torchsx"
 
 [project.scripts]
-# The venvs put torchsx on PYTHONPATH rather than pip-installing it, so
-# `python -m torchsx.cli.<name>` is the invocation that actually gets used;
-# these exist for an installed copy and are the same entry points.
-torchsx-train = "torchsx.cli.train:main"
-torchsx-merge-nn = "torchsx.cli.merge_nn:main"
-torchsx-stats = "torchsx.cli.stats:main"
-torchsx-merge-stats = "torchsx.cli.merge_stats:main"
+"torchsx.train" = "torchsx.cli.train:main"
+"torchsx.merge" = "torchsx.cli.merge_nn:main"
+"torchsx.observation-stats" = "torchsx.cli.stats:main"
+"torchsx.merge-stats" = "torchsx.cli.merge_stats:main"
 
 [project.optional-dependencies]
-stats = ["matplotlib>=3.7"]
 # Read probixi's DuckDB runs (SFXStream.from_duckdb).
 duckdb = ["duckdb>=1.0"]
 
@@ -48,3 +47,7 @@ dev = ["pytest>=6.0", "black>=21.5", "isort>=5.9"]
 
 [tool.setuptools.packages.find]
 include = ["torchsx*"]
+
+[tool.setuptools.package-data]
+# The Triton kernel's per-GPU launch configurations.
+"torchsx.merging.quadrature" = ["_fixed_log_grid_tuning.json"]
