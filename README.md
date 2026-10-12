@@ -42,17 +42,7 @@ pip install torchsx
 ```
 
 Python ≥ 3.10. This brings TorchRef 0.7, torch, triton, gemmi and
-`torchsx-native`, the compiled `.stream` reader for your platform.
-
-PyPI's default torch build needs a recent NVIDIA driver. If
-`torch.cuda.is_available()` is false on a GPU machine, install the torch build
-for your driver first ([pytorch.org](https://pytorch.org/get-started/locally/)),
-for example for a CUDA 12 driver:
-
-```bash
-pip install "torch<2.14" --index-url https://download.pytorch.org/whl/cu128
-pip install torchsx
-```
+`torchsx-native`, the compiled `.stream` reader for your platform. TorchSX is intended to be run on a GPU, while performance and memory requirements should be quite low, it relies on triton kernels for core algorithms. We have not investigated CPU runtime or even functionality. 
 
 From a checkout, build the native package first (needs Rust, see
 [native/README.md](https://github.com/HatPdotS/TorchSX/blob/master/native/README.md)):
