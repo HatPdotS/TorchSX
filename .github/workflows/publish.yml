@@ -11,7 +11,7 @@
 # One-time setup:
 #   - On PyPI and on TestPyPI, add a trusted publisher for BOTH projects
 #     (a "pending publisher" until the first upload): owner HatPdotS,
-#     repository torchsx, workflow publish.yml, environment pypi / testpypi.
+#     repository TorchSX, workflow publish.yml, environment pypi / testpypi.
 #   - Create the GitHub environments "pypi" and "testpypi".
 name: Publish to PyPI
 
