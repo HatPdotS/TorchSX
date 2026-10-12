@@ -24,10 +24,13 @@ neural network per dataset that predicts, for every observation, a scale factor
 and a scatter distribution from that observation's crystal- and image-level
 context. Merging is a posterior integral rather than an average: each merged
 amplitude and its uncertainty are moments of the posterior of the reflection's
-intensity. The network is trained on the marginal likelihood of the data
-alone, never against a reference structure.
+intensity. The network is trained on the marginal likelihood of the data.
 
 TorchSX starts from integrated CrystFEL `.stream` files and writes merged MTZs.
+We are working on integration with dials and deep integration of Probixi. 
+
+TorchSX is under active development, if you find something behaving unexpectedly please create an issue on GitHub. 
+
 Refinement and difference maps are done with
 [TorchRef](https://github.com/HatPdotS/TorchRef), or any other program that
 reads amplitudes.
@@ -108,19 +111,6 @@ One network is trained on both states, and each state is merged on its own:
 `merged_dark.mtz` and `merged_light.mtz`, each with its two halves. A single
 stream with a CrystFEL custom-split file works too (`--split-file`).
 
-### Difference maps
-
-With TorchRef:
-
-```bash
-torchref.difference-map -dm dark.pdb \
-  -dsf run/merged_dark.mtz -lsf run/merged_light.mtz -o difference.mtz
-torchref.mtz2map -sf difference.mtz -csf dF -cw W_Q -cphi PHDELWT -o difference.ccp4
-```
-
-`dF` is the light-minus-dark amplitude difference on the dark model's phases and
-`W_Q` its weight.
-
 ## Compared with Partialator
 
 On the bacteriorhodopsin (bR) data of Weinert et al.<sup>[1](#references)</sup>:
@@ -161,23 +151,6 @@ the [command-line reference](https://github.com/HatPdotS/TorchSX/blob/master/doc
 
 In Python, `torchsx.SFXStream.read('indexed.stream', spacegroup='P 63')` reads a
 stream with its geometry and measurement settings.
-
-Design notes:
-[scaling_merging](https://github.com/HatPdotS/TorchSX/blob/master/docs/scaling_merging.md),
-[optimize_integration](https://github.com/HatPdotS/TorchSX/blob/master/docs/optimize_integration.md),
-[sparse_poisson_loss](https://github.com/HatPdotS/TorchSX/blob/master/docs/sparse_poisson_loss.md) and
-[fused_gaussian_mixture](https://github.com/HatPdotS/TorchSX/blob/master/docs/fused_gaussian_mixture.md).
-
-## Refinement
-
-We recommend [TorchRef](https://github.com/HatPdotS/TorchRef)<sup>[2](#references)</sup>
-for refinement against TorchSX merges. It is installed with TorchSX, reads
-`F-obs`, `SIGF-obs` and `R-free-flags` as written, and is the refinement behind
-the comparison above:
-
-```bash
-torchref.refine -m model.pdb -sf run/merged.mtz -o refined/
-```
 
 ## References
 
