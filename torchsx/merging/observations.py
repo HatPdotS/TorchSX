@@ -453,8 +453,9 @@ def prepare_observations(
     core_I = core.I
     core_background = core.background
 
-    # Phase timing, off unless TORCHSX_PREP_TIMING is set: this function is the
-    # 50-minute front end of every merge and the cost is not where one guesses.
+    # Phase timing, off unless TORCHSX_PREP_TIMING is set: on a large data set
+    # this function is the slow front end of every merge and the cost is not
+    # where one guesses.
     import os as _os
     import time as _time
     _t_prev = _time.perf_counter()

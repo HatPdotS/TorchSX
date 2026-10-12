@@ -85,14 +85,13 @@ def calibration_metrics(
 
     ``var_z`` is the primary number and its target is exactly 1.0.  It pins the
     *level* of the scatter as a constraint rather than a fitted parameter,
-    which is what both known failures were missing — abismal's ``Sdfac``
-    running to 4.75 and torchsx's own ``g1 ~ 14`` are the same defect: one
-    global number forced to describe every observation when scale determinacy
-    varies >20x across crystals.
+    which is what a free global noise coefficient lacks: one global number
+    forced to describe every observation when scale determinacy varies by more
+    than an order of magnitude across crystals.
 
-    ``frac_gt3`` against the Gaussian 0.27 % is the heavy-tail monitor.  A tail
-    is what collapsed abismal until ``-t 32``: 0.19 % of reflections held
-    46.9 % of the chi-squared.  Watch it from step 0, not after divergence.
+    ``frac_gt3`` against the Gaussian 0.27 % is the heavy-tail monitor.  A
+    fraction of a percent of reflections in a tail can hold half of the
+    chi-squared and collapse a fit.  Watch it from step 0, not after divergence.
 
     ``kurtosis`` decides whether the predicted ``beta`` is earning its keep: a
     Gaussian is 0, a Laplace +3.  With ``beta`` predicted this is a direct
@@ -193,7 +192,7 @@ def scale_metrics(
     if features:
         # Where does the scale come from?  Also the interpretability check:
         # the predicted width should track ewald_offset, which is the
-        # partiality signal --fix-profile-radius erased from the geometry.
+        # partiality signal a fixed profile radius erases from the geometry.
         out["spearman_log_K"] = {k: spearman(log_K, v) for k, v in features.items()}
     return out
 
@@ -206,15 +205,15 @@ def hkl_permutation_sensitivity(scale, meta, *, seed: int = 0) -> float:
     """Fraction of ``log K`` variance that moves when hkl labels are permuted.
 
     A scale that depends on hkl is degenerate with ``I0`` and is the **one
-    channel that can manufacture a difference peak**.  It was 0.3 % in abismal.
+    channel that can manufacture a difference peak**.
     Run this every epoch, not once: if it grows as the model strengthens, drop
     hkl from the features before any light/dark work.
 
     Only the **self** branch is permuted.  Once the context carries
     per-reflection channels (the peers' rank within their reflection and its
     brightness), permuting the whole meta also permutes those lookups, and the
-    monitor then reports legitimate use of them as if it were leakage
-    (measured: 0.33 on a model with no hkl feature at all).  The degeneracy that matters is whether ``log_K[j]`` responds to
+    monitor then reports legitimate use of them as if it were leakage, even on
+    a model with no hkl feature at all.  The degeneracy that matters is whether ``log_K[j]`` responds to
     ``j``'s *own* reflection identity, which is a self-branch property.
     """
     import dataclasses
@@ -350,9 +349,8 @@ def grad_norms(module: torch.nn.Module, groups: tuple[str, ...] = ("encoder", "h
 class MetricLogger:
     """JSONL sink, one line per logged step, plus a printed table.
 
-    Matches the repo's existing convention (JSONL/CSV + PNG + a table into the
-    SLURM ``.out``); there is no tensorboard or wandb anywhere in torchsx and
-    the compute nodes have no outbound network.
+    Plain files only: no tensorboard or wandb, so it works on compute nodes
+    without outbound network.
     """
 
     def __init__(self, outdir: str | Path, *, filename: str = "metrics.jsonl") -> None:
@@ -363,7 +361,7 @@ class MetricLogger:
         # Append mode keeps history across reruns, which is wanted — but
         # without a marker the records silently interleave, and an analysis
         # that does not filter will mix a buggy run with its replacement.
-        # That has happened twice.  Stamp every record with a run id.
+        # Stamp every record with a run id.
         self.run_id = os.environ.get("SLURM_JOB_ID") or f"pid{os.getpid()}"
         self._fh.write(json.dumps({
             "phase": "run_start", "run_id": self.run_id,

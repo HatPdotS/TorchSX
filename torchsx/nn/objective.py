@@ -11,8 +11,8 @@ evaluated by the existing quadrature.  On CUDA this dispatches to the Triton
 kernel, which takes **per-observation** ``log_alpha_obs`` / ``log_beta_obs``,
 never materialises the ``(M, K)`` integrand (it saves four aux statistics,
 ~5 floats per observation) and returns analytic gradients for both.  So the
-marginal is the *cheap* option here — the quadrature costs ~30 MB at 1.46 M
-observations against several GB of network activations — and it is what makes
+marginal is the *cheap* option here — the quadrature costs tens of MB per
+million observations against several GB of network activations — and it is what makes
 ``beta`` identifiable, which a Gaussian closed form cannot be.
 
 :class:`AgreementNLL` — reference.  Moment-matched Gaussian overlap between the
@@ -25,7 +25,7 @@ observations of a reflection, in closed form, no grid::
 Grid-free and exactly differentiable, so it is a fast dev loop and a
 cross-check: at ``beta = 2`` and high counts the two must agree.  Its third
 term is worth understanding even though the primary objective does not use it —
-there is one nuisance parameter per reflection (~19,030, growing with the ASU),
+there is one nuisance parameter per reflection (thousands, growing with the ASU),
 so this is the Neyman-Scott incidental-parameter problem, and profiling I0 out
 by maximisation biases exactly the quantity we intend to judge the model by,
 the scatter width.  In :class:`MarginalNLL` leave-one-out plays that role:
@@ -62,8 +62,7 @@ def wide_log_grid(n_points: int = 2001):
     marginal is no longer a density.
 
     At ``n_points=2001`` the node spacing is 0.034.  Cost is close to flat in
-    the node count (K 501 -> 10001 is 26 % wall clock), so the default is set
-    by resolution rather than by budget.
+    the node count, so the default is set by resolution rather than by budget.
     """
     from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
     import math as _m
@@ -77,7 +76,7 @@ def gengauss_grid_log_mass(
 
     The quadrature integrates the scatter over a **finite** grid, so whatever
     mass falls off the ends is silently discarded and the "likelihood" stops
-    being a density.  Measured on the fixed grid (``log S`` in [-6.9, 13.8]):
+    being a density.  On the default fixed grid (``log S`` in [-6.9, 13.8]):
     ``Sum_n p(n)`` is 1.000 at ``w = 0.2`` but 0.941 at ``w = 1.65``, 0.586 at
     ``w = 6.75`` and 0.390 at ``w = 12``.  At ``w = 6.75, beta = 3.5`` the
     density is near-uniform across ``2*alpha = 22.8``, wider than the whole
@@ -88,9 +87,8 @@ def gengauss_grid_log_mass(
     conditioning event *moves with the parameters*, so it is not a valid
     likelihood across them.  Worse, it is unbounded in the wrong direction:
     ``log p - log mass`` goes to ``+inf`` as the mass goes to zero, so the
-    width head is *rewarded* for growing the scatter past the grid.  Tried on
-    the real dark, it drove the loss to 0 and NaN-ed the network within one
-    epoch.
+    width head is *rewarded* for growing the scatter past the grid: in
+    training it drives the loss to 0 and NaNs the network within an epoch.
 
     The honest reading of a mass below 1 is "the model is putting probability
     where we are not integrating", and the fix is a wider grid (see
@@ -151,9 +149,8 @@ class MarginalNLL(nn.Module):
         Recompute each chunk's ``(M, K)`` integrand in the backward pass rather
         than storing it.  **Chunking alone saves nothing**: concatenating the
         chunk outputs keeps every chunk's graph alive until backward, so peak
-        memory is the same as one call.  That OOM'd a 40 GB A100 at 1.5 M
-        observations with a per-observation grid.  Mirrors the strategy of
-        ``merging.targets.data._ChunkedDataNLL``.
+        memory is the same as one call, which exceeds a 40 GB card at ~1e6
+        observations with a per-observation grid.
     """
 
     def __init__(
@@ -174,8 +171,7 @@ class MarginalNLL(nn.Module):
         #: all -- masked pixels, a mis-prediction, a spot that never formed --
         #: is not a partial observation, but the scatter has to stretch its
         #: lower tail to cover it, and on strong predictions that costs the
-        #: width its calibration (measured: 7 % of rhodopsin's >200-photon
-        #: predictions had n <= bg).  With ``miss_frac > 0`` the likelihood is
+        #: width its calibration.  With ``miss_frac > 0`` the likelihood is
         #: the mixture ``(1 - pi) p(n | S, scatter) + pi p(n | S = 0)``, with
         #: ``pi`` a learnable global scalar started at ``miss_frac``.  The
         #: second term does not depend on the reflection intensity, so on the
@@ -189,10 +185,10 @@ class MarginalNLL(nn.Module):
         #: Detector-outlier component.  A small fraction of observations carry
         #: count errors no intensity can explain -- a zinger or a neighbouring
         #: spot in the peak, a contaminated annulus, a broken pedestal: at zero
-        #: predicted signal 0.04-0.2 % of the small-molecule observations lie
-        #: beyond 5 robust SDs of the detector law, ~10^3 x a Gaussian rate.
+        #: predicted signal they lie beyond 5 robust SDs of the detector law at
+        #: orders of magnitude above a Gaussian rate.
         #: Without this term only the scatter can absorb them, and it does, with
-        #: a heavy upper tail that carried half of E[S].  With
+        #: a heavy upper tail that can carry much of E[S].  With
         #: ``outlier_frac > 0`` the likelihood is
         #: ``(1 - rho) p_miss(n | S) + rho p_out(n)``, ``p_out`` a Cauchy about
         #: the background mean with ``outlier_scale`` times the detector SD at

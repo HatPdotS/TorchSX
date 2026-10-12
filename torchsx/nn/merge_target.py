@@ -25,14 +25,11 @@ def unity_merge(
 
     Deliberately **linear and over all observations**, including the negatives.
     ``PreparedObs.mu_init`` is a log-space MLE fitted to *positive* observations
-    only; with 32.4 % of this dataset negative, exponentiating it gives a target
-    biased high, and every observation then sits systematically low against it.
-    That is not a subtle effect — seeding from ``exp(mu_init)`` put the initial
-    normalised residual at ``var_z = 31`` on the real dark, against a target
-    of 1.
-
-    At ``K == 1`` this is the unity merge; ``partialator --model=unity``
-    reaches CC1/2 0.985 on this data.
+    only; with a large share of observations negative, exponentiating it gives
+    a target biased high, and every observation then sits systematically low
+    against it.  That is not a subtle effect — seeding from ``exp(mu_init)``
+    puts the initial normalised residual an order of magnitude above its
+    target of 1.
     """
     # The K == 1 case of the same observation-space regression.
     w = 1.0 / sigma.clamp(min=1e-6) ** 2

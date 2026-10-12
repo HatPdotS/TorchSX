@@ -19,8 +19,8 @@ class StreamMetadata(dict):
     Examples
     --------
     >>> meta = StreamMetadata()
-    >>> meta["crystal"] = {"cell": [[14.9, 18.8, 18.9, 89.4, 85.0, 67.8]], "scale": [1.0]}
-    >>> meta["image"] = {"filename": ["a.h5", "b.h5"], "energy": [12960.0, 12960.0]}
+    >>> meta["crystal"] = {"cell": [[40.0, 50.0, 60.0, 90.0, 90.0, 90.0]], "scale": [1.0]}
+    >>> meta["image"] = {"filename": ["a.h5", "b.h5"], "energy": [12000.0, 12000.0]}
     >>> tensors, schema = meta.to_tensors()
     >>> meta2 = StreamMetadata.from_tensors(tensors, schema)
     >>> assert meta == meta2

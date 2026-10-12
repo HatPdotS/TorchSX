@@ -33,11 +33,10 @@ non-power-of-two value.
 
 ``BLOCK_M`` matters more than it looks.  The serial ``k`` loop means latency is
 hidden by occupancy rather than by ILP within an iteration, so *small* tiles
-win: measured at M = 1.05e6, K = 2001, C = 21, BLOCK_M = 16 with 4 warps runs
-1.22x the per-column path while BLOCK_M = 32 with 4 warps runs 0.91x -- slower
-than what it replaces.  BLOCK_M = 256 collapses to 0.06x.  Do not change the
-default without re-running an equivalent tile sweep -- the numbers above and
-the measurement traps behind them are in ``docs/optimize_integration.md``.
+win: in a tile sweep BLOCK_M = 16 with 4 warps beats the per-column path while
+BLOCK_M = 32 with 4 warps is already slower than what it replaces, and large
+tiles collapse.  Do not change the default without re-running an equivalent
+tile sweep -- the measurement traps are in ``docs/optimize_integration.md``.
 """
 from __future__ import annotations
 
@@ -112,8 +111,8 @@ if HAVE_TRITON:
             # `n log(lam) - lam - log n!` minus a separately computed maximum:
             # at n = 2e6 and lam = e^34.5 those terms are 6.9e7 and 9.6e14, and
             # float32 carries ~4 nats of absolute error in the first alone.
-            # Measured before the fix: 35 % of entries wrong by more than a nat
-            # and over-estimates up to 243 nats, which the per-column kernel
+            # The direct form leaves many entries wrong by more than a nat and
+            # over-estimates by hundreds, which the per-column kernel
             # avoids only because its running max is built from the very same
             # expression so the error cancels.  log n! drops out exactly here.
             d = (n_ph * 0.6931471805599453 * tl.math.log2(lam / lam_hat)
@@ -139,10 +138,10 @@ if HAVE_TRITON:
         # underflowing means the true log_p is at least ~80 nats below shift --
         # possibly hundreds.  Reporting `shift + log(1e-38)` = shift - 87.5
         # therefore over-estimates such a node by however much further down it
-        # really was: measured up to 233 nats against a float64 reference, and
+        # really was -- hundreds of nats against a float64 reference -- and
         # a node that should carry no posterior weight at all then carries a
-        # lot.  That was invisible in log_Z and in I0_mean and showed up only
-        # in the gradient direction (1-cos 5e-6 -> 3e-3).  Sending it to
+        # lot.  That is invisible in log_Z and in I0_mean and shows up only
+        # in the gradient direction.  Sending it to
         # -1e4 makes the node's weight exactly zero, which is the right limit.
         under = T0 <= 1e-38
         T0s = tl.where(under, 1.0, T0)

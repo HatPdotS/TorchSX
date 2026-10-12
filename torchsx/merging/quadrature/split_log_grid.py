@@ -36,9 +36,9 @@ smooth function of the parameters and the analytic per-node gradients of the
 Triton kernel remain exact.  The window is sized from the Poisson factor but
 does not cut the scatter tail: the tail is integrated in closed form.
 
-The window is 7-15 nats for the real dark stream against the fixed grid's 69,
-so the same 0.1-nat resolution the narrowest predicted scatter (``w = 0.38``)
-needs costs ~9x fewer integrand evaluations.
+The window is typically 7-15 nats against the fixed grid's 69, so the same
+0.1-nat resolution the narrowest predicted scatter needs costs several times
+fewer integrand evaluations.
 
 Grid parameters are cached on the identity of ``(n_ph, bg)`` because
 ``PosteriorMergeTarget.accumulate`` calls this 40 times per step on the same
@@ -104,7 +104,7 @@ class SplitLogGrid(Quadrature):
     ----------
     n_points
         Trapezoid nodes per observation in the window (``K``).  192 gives a
-        coarse spacing of at most ~0.1 nat on the real dark stream, three
+        coarse spacing of at most ~0.1 nat for windows up to ~15 nats, a few
         nodes per alpha for the narrowest predicted scatter.
     tau
         Flatness tolerance for the analytic tail: ``x_lo`` is where

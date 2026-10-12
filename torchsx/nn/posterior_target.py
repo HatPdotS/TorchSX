@@ -18,30 +18,28 @@ the geometric form of the ``-log alpha`` normaliser.
 Why this is affordable
 ----------------------
 The naive cost is one inner quadrature per outer grid point per observation.
-Two measured facts collapse it:
+Two facts collapse it:
 
 1. **Individual observation curves are broad; only their product is narrow.**
    ``f_j(mu) = log p(n'_j | mu)`` has the width of one observation's
    uncertainty, while the posterior is ~sqrt(n) narrower.  So evaluate ``f_j``
-   on a **coarse** grid and linearly interpolate to a fine one.  Measured
-   requirement: ~25-33 coarse points (rel. error 5.6e-3 at 25, 8.2e-4 at 33),
-   which is why the writeout pipeline in :mod:`torchsx.merging.posterior` uses
-   ``K_coarse = 31``.
+   on a **coarse** grid and linearly interpolate to a fine one.  ~25-33 coarse
+   points suffice, hence the default ``k_coarse = 31``.
 2. **Linear interpolation commutes with the sum over observations.**
    ``sum_j interp(f_j) = interp(sum_j f_j)``, so accumulate on the *coarse*
    grid first — ``(n_hkl, K_coarse)``, tiny — and interpolate that.  The
    ``(n_obs, M_fine)`` tensor never exists.
 
 With the Triton inner kernel the remaining cost is small: it never materialises
-the ``(M, K_inner)`` integrand (it saves six tensors of size M), so a pass is
-~60 MB of traffic rather than ~1.8 GB eager, and 31 passes come to roughly one
+the ``(M, K_inner)`` integrand (it saves six tensors of size M), so a pass
+moves a few percent of the eager traffic, and 31 passes come to roughly one
 eager pass — a few percent of a training step.  Use a **wide** FixedLogGrid so
 the Triton path applies without truncating the scatter; the inner node count is
-nearly free (K 501 -> 2001 costs +4 %).
+nearly free.
 
 Grid geometry (centre, width) is **detached**: it only places quadrature nodes,
 exactly like choosing integration limits, and the answer is insensitive to it
-provided the mass is covered.  ``edge_mass`` reports whether it is — measured
+provided the mass is covered.  ``edge_mass`` reports whether it is — taken
 as weight in the outer 10 % of the *range*, which is node-count independent
 (the outermost single node's weight shrinks with n_grid and would measure
 resolution, not truncation).
@@ -125,21 +123,19 @@ class PosteriorMergeTarget(nn.Module):
     m_fine
         Interpolated integration points.  Nearly free — raise before ``k_coarse``.
     n_sigma
-        Grid half-width in Laplace sigmas.  Measured: 5 suffices for the median
-        but the 90th-percentile error is *width*-limited (flat in node count),
-        so 8 is the safer default now that width is free.
+        Grid half-width in Laplace sigmas.  5 suffices for the median but the
+        90th-percentile error is *width*-limited (flat in node count), so 8 is
+        the safer default since width is free.
     prior
         ``"none"`` integrates ``dI0`` (weight ``exp(v)``), with no Wilson
         density; ``"flat_I0"`` is its legacy alias. ``"flat_log"``
         integrates ``d log I0``; ``"wilson"`` uses ``p(I) = exp(-I/Sigma)/Sigma``
         with ``Sigma(h)`` the smooth Wilson surface.  **Use wilson.**  Where the
-        likelihood is uninformative — and 84 % of observations here are
+        likelihood is uninformative — and most serial observations are
         noise-limited — the posterior is whatever the prior says, and a
         flat-in-I0 prior on a log grid drags those reflections toward the *top
-        of the grid*.  Measured consequence: per-shell CC1/2 improved at low
-        resolution (0.776 -> 0.821) while collapsing at high resolution
-        (0.359 -> 0.246, 0.159 -> 0.094), because exactly the weak reflections
-        were being inflated.
+        of the grid*: per-shell CC1/2 rises at low resolution and collapses at
+        high resolution, because exactly the weak reflections are inflated.
     """
 
     def __init__(
@@ -177,17 +173,16 @@ class PosteriorMergeTarget(nn.Module):
         # A weak reflection's curve is flat below and a cliff above, the
         # parabola reads a width of several nats, and 24 x 4 nats puts the 31
         # coarse nodes 6.4 nats apart -- the cliff is then linearly interpolated
-        # over 6 nats and the posterior mean lands nats too high.  Measured on
-        # the SACLA dark merge: 27 % of reflections sat on such a grid; R_free
-        # 0.351 against partialator's 0.322.  The Wilson prior removes all mass
-        # more than ~12 nats from the centre, so nothing beyond needs nodes.
+        # over 6 nats and the posterior mean lands nats too high.  The Wilson
+        # prior removes all mass more than ~12 nats from the centre, so nothing
+        # beyond needs nodes.
         self.max_halfwidth = float(max_halfwidth)
         # Recompute each outer node in backward instead of holding all C graphs.
         # OFF by default: it roughly doubles the accumulate's compute, which is
         # not worth paying on a data set that already fits.  Turn it on when the
-        # batch is memory-bound -- on a 114 k-reflection cell the in-batch
-        # redundancy that fits on a 40 GB card is ~4x below what a 14 k-reflection
-        # cell gets at the same batch size, and that is what it buys back.
+        # batch is memory-bound -- a large cell gets several times less in-batch
+        # redundancy than a small one at the same batch size, and that is what
+        # it buys back.
         self.checkpoint_nodes = False
         self.use_fused = bool(use_fused)
         #: Lower bound of a grid centre, in nats below the Wilson surface.
@@ -251,13 +246,11 @@ class PosteriorMergeTarget(nn.Module):
         """Find the peak and width of the log-likelihood curve by MEASURING it,
         scanning around ``centre`` (log intensity per reflection).
 
-        Three formulas for the grid width have now failed in three different
-        directions -- too narrow (edge_mass 0.93), oscillating (a
-        follow-the-measurement loop swinging 0.29 / 0.03 / 0.52), and too wide
-        (sigma pinned at its bound, half-width 30 in log I0, so the merge
-        returned the grid centre and the data contributed nothing).  Every one
-        was a *formula* for the posterior width derived from the Gaussian
-        variance model, and the posterior is not that shape.
+        A *formula* for the grid width derived from the Gaussian variance model
+        fails in every direction -- too narrow (mass at the grid edge),
+        oscillating (a follow-the-measurement loop), or too wide (sigma pinned
+        at its bound, so the merge returns the grid centre and the data
+        contribute nothing) -- because the posterior is not that shape.
 
         So: sweep a deliberately generous grid once, then read the peak and
         curvature off the curve itself.  A parabola through the maximum and its
@@ -316,12 +309,10 @@ class PosteriorMergeTarget(nn.Module):
         """Peak location and width read off an accumulated scan curve.
 
         Separate from :meth:`locate` so a caller that spans several batches can
-        accumulate ``S`` itself first — the merge does, and previously called
-        ``nodes()`` instead, which still used the old closed-form width.  That
-        placed the merge grid by the very formula this replaces, and the merge
-        collapsed back onto the grid centre: per-shell CC1/2 read exactly
-        1.0000 in five shells, because both halves returned the same shared
-        centre rather than anything from the data.
+        accumulate ``S`` itself first, as the merge does.  A merge grid placed by
+        a closed-form width instead collapses onto the grid centre: both halves
+        return the same shared centre rather than anything from the data, and
+        per-shell CC1/2 reads a spurious 1.
         """
         u = torch.linspace(
             -self.scan_halfwidth, self.scan_halfwidth, self.scan_points,
@@ -347,8 +338,7 @@ class PosteriorMergeTarget(nn.Module):
         # flat, argmax is essentially random over the whole +-scan_halfwidth,
         # and taking it displaces the grid centre by a large random amount --
         # independently in each half, which is exactly what destroys their
-        # correlation.  Measured: the two weakest shells fell 0.82 -> 0.73 and
-        # 0.69 -> 0.50 while shells 2-8 improved.
+        # correlation in the weakest shells.
         #
         # The curve locates the peak to +-sd_meas, so compare that against the
         # scan width: w = 1 when the peak is sharp, 0 when the curve says
@@ -365,10 +355,9 @@ class PosteriorMergeTarget(nn.Module):
         # bound and a cliff above it: no peak, so the parabola width is
         # meaningless (several nats) and ``n_sigma`` times that is a grid of
         # +-96 nats whose 31 coarse nodes straddle the cliff 6.4 nats apart.
-        # Linear interpolation across the cliff then cut the posterior off
-        # nats below the true bound -- 27 % of the SACLA dark reflections came
-        # out collapsed to ~0 and R_free was 0.351 against 0.322 for
-        # partialator.  Anchor these on the plateau EDGE instead: the last scan
+        # Linear interpolation across the cliff then cuts the posterior off
+        # nats below the true bound and collapses the reflection to ~0.
+        # Anchor these on the plateau EDGE instead: the last scan
         # node within 2 nats of the maximum is the knee, and the Wilson prior
         # (density ~ e^v below its mode) leaves no mass more than ~10 nats
         # below it, so the support is [knee - 0.75 H, knee + 0.25 H] with
@@ -482,27 +471,25 @@ class PosteriorMergeTarget(nn.Module):
                 noise=noise,
             )
 
-        # Fused path -- OFF by default; measured, not deprecated.  One launch
+        # Fused path -- OFF by default, not deprecated.  One launch
         # for all C nodes instead of C, hoisting the Poisson factor out of the
         # node loop and replacing the online-logsumexp maximum with a
         # closed-form bound.  Against the float64 oracle it gives *better*
-        # values than the per-column path (I0_mean 3.1e-4 vs 6.0e-4 relative,
-        # I0_sd 6.9e-4 vs 1.1e-3) and is 2.08x faster at C = 32, but its
-        # gradient DIRECTION is 46-880x worse (1-cos on d/d log_alpha 3.3e-3 vs
-        # 5.0e-6, about 5 degrees).
+        # values than the per-column path and is ~2x faster at C = 32, but its
+        # gradient DIRECTION is orders of magnitude worse (about 5 degrees on
+        # d/d log_alpha).
         #
         # Cause: dropping the per-(m, c) running max costs dynamic range.  When
         # one observation's accumulator underflows at a node, that node is
         # floored, S[h, c] is annihilated, and with it the gradient
         # contribution of every OTHER observation at that node.  The values
         # survive because the node carried little weight; the direction does
-        # not.  Flooring higher instead over-estimates such nodes by up to 233
-        # nats (measured), which is worse.  A periodic rescale would fix it and
+        # not.  Flooring higher instead over-estimates such nodes by hundreds
+        # of nats, which is worse.  A periodic rescale would fix it and
         # would give back part of the speed the running max was costing.
         #
-        # Speed also depends sharply on C: 2.08x at 32 and 2.10x at 64, but
-        # 1.03x at 21 and 0.61x at 33, because the tile is next_pow2(C).  So it
-        # only pays at a power-of-two k_coarse.
+        # Speed also depends sharply on C, because the tile is next_pow2(C):
+        # it only pays at a power-of-two k_coarse.
         #
         # Falls back silently -- it is a GenGauss x Poisson x FixedLogGrid
         # specialisation with no d/d bg statistic, so a learned background must
@@ -613,8 +600,7 @@ class PosteriorMergeTarget(nn.Module):
         # Moments in LOG space.  With n_sigma = 24 and the flat-curve fallback
         # width (scan_halfwidth / 2 = 4) the top node sits ~96 nats above the
         # centre, where ``v.exp()`` overflows float32 to inf; its posterior
-        # weight is exactly 0 there, and 0 * inf = NaN.  Measured on the SACLA
-        # light merge: 28 k of 67 k reflections NaN, and one NaN is enough to
+        # weight is exactly 0 there, and 0 * inf = NaN; one NaN is enough to
         # take CC1/2 with it.  E[I] = exp(logsumexp(logits + v) - log Z) never
         # forms the overflowing value.
         I0_mean = (torch.logsumexp(logits + v, dim=1) - log_Z).exp()
@@ -646,8 +632,8 @@ class PosteriorMergeTarget(nn.Module):
     ) -> PosteriorOut:
         """Infer this batch on a grid placed by the batch itself."""
         # Measure the curve around the batch's own weighted mean, then place
-        # the grid on it.  One extra sweep of scan_points, against three failed
-        # attempts at a closed-form width.
+        # the grid on it.  One extra sweep of scan_points instead of a
+        # closed-form width.
         start = self.batch_centre(pred, n_ph - bg, sigma, hkl_id)
         centre, sig_h = self.locate(
             objective, scatter, params, pred, n_ph, bg, hkl_id, meta, start

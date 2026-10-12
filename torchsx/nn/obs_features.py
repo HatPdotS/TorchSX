@@ -20,9 +20,9 @@ Two tiers, and the split is load-bearing:
     at SASE jitters shot to shot.  The other reflections *measure the crystal's
     state*: which of them came out strong or weak, given where they nominally
     sat, constrains the orientation error and the spectral content, and those
-    are what actually set ``j``'s partiality.  (This dataset also has
-    ``--fix-profile-radius=4e7``, so the one geometric partiality parameter is
-    constant across every crystal.)
+    are what actually set ``j``'s partiality.  (When integration fixes the
+    profile radius, the one geometric partiality parameter is also constant
+    across every crystal.)
 
     That makes the context a **regression problem**: fit the crystal's scale
     function from ``(geometry, observed scale)`` pairs over the peers, then
@@ -89,7 +89,7 @@ SELF_FEATURES: tuple[str, ...] = (
 
 #: Measurement channels, legitimate ONLY in the leave-one-out pooled branch.
 CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
-    "signed_log_I",    # sign(I)·log1p(|I|) — keeps the 32.5 % negatives
+    "signed_log_I",    # sign(I)·log1p(|I|) — keeps the negatives
     "log_sigma",
     "i_over_sigma",    # the dimensionless one that actually carries weight
     "log_bg",
@@ -204,9 +204,9 @@ class ObsFeatureSpec(nn.Module):
         )
         # persistent=False on every buffer that is a COPY OF THE DATA.  They
         # are rebuilt from the prep at construction, so saving them puts the
-        # data set in the checkpoint: three per-observation arrays, 429 MB on a
-        # 35 M-observation probe and ~10 GB on the full 794 M-observation set,
-        # rewritten at every epoch's save_best.  Worse, a strict load would then
+        # data set in the checkpoint: three per-observation arrays, gigabytes
+        # on a large set, rewritten at every epoch's save_best.  Worse, a strict
+        # load would then
         # demand that a *different* data set have the same number of rows.  The
         # standardisation statistics below stay persistent: those are fitted,
         # and a merge that recomputed them would be standardising on its own
@@ -272,15 +272,15 @@ class ObsFeatureSpec(nn.Module):
     CONST_REL_TOL: float = 1e-6
 
     #: Rows used to estimate the per-feature mean and std.  Full-dataset stats
-    #: over 133 M observations buy nothing a 2 M sample does not already give.
+    #: over ~1e8 observations buy nothing a 2 M sample does not already give.
     STAT_SAMPLE: int = 2_000_000
 
     @torch.no_grad()
     def _recompute_stats(self) -> None:
         """Normalisation over the full dataset, computed once at construction."""
         # Subsample.  These are per-feature means and standard deviations, and
-        # 2 M rows fix them to ~0.07 %; using all 133 M costs a 4 GB host-device
-        # transfer every epoch once `prep` is host-resident, because the
+        # 2 M rows fix them to ~0.1 %; using all of ~1e8 costs a GB-scale
+        # host-device transfer every epoch once `prep` is host-resident, because the
         # module's own `_I`/`_sigma` buffers live on the compute device while
         # the cached stat meta does not.  Deterministic, so the normalisation
         # does not jitter between calls.
@@ -298,11 +298,11 @@ class ObsFeatureSpec(nn.Module):
         raw_std = torch.stack([full[k].std() for k in self._stat_names])
 
         # Near-constant columns must be zeroed, not standardised.  Dividing by
-        # a std of ~0 amplifies float noise without limit: ``beam_energy`` is
-        # ~12960 eV with essentially no spread, and normalising it produced
-        # feature values of order 1e6 and a training loss of 5.7e6 on the first
-        # epoch.  ``profile_rad`` is exactly constant on this dataset
-        # (--fix-profile-radius), so this is not a corner case.
+        # a std of ~0 amplifies float noise without limit: a ``beam_energy``
+        # with essentially no spread, normalised, gives feature values of
+        # order 1e6 and a loss to match.  ``profile_rad`` is exactly constant
+        # whenever integration fixes the profile radius, so this is not a
+        # corner case.
         scale = raw_std.abs() + mean.abs() + 1.0
         const = raw_std <= self.CONST_REL_TOL * scale
         self._mean.copy_(mean)

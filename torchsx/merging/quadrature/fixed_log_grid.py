@@ -82,7 +82,7 @@ class FixedLogGrid(Quadrature):
     ----------
     S_min, S_max
         Linear-S range of the integration window (default ``1e-3`` to
-        ``1e6`` — 9 decades, ample for BR-scale data).
+        ``1e6`` — 9 decades, ample for typical protein SFX data).
     n_points
         Number of nodes (default 10001 → ``Δlog_S ≈ 2.07e-3``).
     """

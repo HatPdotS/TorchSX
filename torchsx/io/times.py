@@ -176,7 +176,7 @@ def load_split_labels(
 
     Format: each line ``<filename> <event> <label>`` (whitespace separated).
     ``label`` is the partialator dataset name (e.g. ``"dark"``,
-    ``"45ps_5uJ"``).
+    ``"100ps"``).
 
     Returns a dict mapping ``(filename, event) → label`` for all rows.
     Duplicate keys keep the last value with a warning.

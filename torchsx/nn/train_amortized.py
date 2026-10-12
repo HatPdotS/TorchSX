@@ -4,10 +4,10 @@ Batches are drawn over **crystals**, not observations, because the
 leave-one-out context pool needs a crystal's reflections to be complete: a
 truncated crystal gives a biased context.  The merge target is the opposite —
 it is an average, so a subsample of each reflection's observations is unbiased,
-and at 8192 crystals a batch holds ~77 observations per reflection.
+and a batch of a few thousand crystals holds tens of observations per reflection.
 
 That is why the batch is sized in *observations* rather than crystals: crystals
-carry a variable number (median 178, long tail), so a fixed crystal count makes
+carry a variable number (long tail), so a fixed crystal count makes
 memory jump around while a fixed observation budget keeps it flat.
 
 Each step is two passes:
@@ -105,9 +105,9 @@ class CrystalIndex:
     def rows(self, crystals: Tensor) -> Tensor:
         """All observation rows of the given crystals, as a flat index.
 
-        Vectorised rather than a per-crystal Python loop: a batch holds ~8600
-        crystals, and building one tensor each cost 38.8 ms against 15.1 ms
-        for the arithmetic form.
+        Vectorised rather than a per-crystal Python loop: a batch holds
+        thousands of crystals, and building one tensor each costs more than
+        twice the arithmetic form.
         """
         if crystals.numel() == 0:
             return torch.empty(0, dtype=torch.long)
@@ -180,25 +180,24 @@ def lr_factor(step: int, *, warmup: int, total: int, schedule: str = "constant",
 class TrainConfig:
     #: Warn when the hkl-permutation sensitivity exceeds this.  A scale that
     #: depends on hkl is degenerate with I0 and can manufacture a difference
-    #: peak; measured 0.003 in abismal and 0.586 in a collapsed run here.
+    #: peak.
     hkl_permutation_warn: float = 0.02
     max_obs_per_batch: int = 1_500_000
     #: Size the batch by the in-batch REDUNDANCY it buys, not by an observation
     #: count.  The in-batch merge target for a reflection is built from roughly
     #: ``max_obs_per_batch / n_hkl`` observations, and that -- not the number of
     #: crystals or observations -- is what decides whether the target is any
-    #: good.  The same 1.5 M observations give 106 obs/reflection on a 15 x 19 x
-    #: 19 A cell with 14 k unique reflections and 13 on a 61 x 91 x 150 A cell
-    #: with 114 k, so a batch size carried across data sets silently changes the
+    #: good.  The same 1.5 M observations give ~100 obs/reflection on a small
+    #: cell with ~10 k unique reflections and ~10 on a protein cell with
+    #: ~100 k, so a batch size carried across data sets silently changes the
     #: objective.  When set, ``max_obs_per_batch`` is derived as
     #: ``target_redundancy * n_hkl`` and the configured value is ignored.
     target_redundancy: float | None = None
     epochs: int = 10
     lr: float = 1e-3
-    #: Learning-rate multiplier for the mixture head's parameters.  10 suited
-    #: the old three-input conditioner, whose outputs had small gradients near
-    #: the initial state; the head reads the full embedding like the other
-    #: heads, and at 10 it drove lower widths to alpha ~ 1e5 within 200 updates.
+    #: Learning-rate multiplier for the mixture head's parameters.  The head
+    #: reads the full embedding like the other heads; a large multiplier drives
+    #: the lower widths to extreme alpha within a few hundred updates.
     mixture_lr_mult: float = 1.0
     #: Learning-rate multiplier for the learned detector noise (per-panel log A,
     #: log B).  They may have to move by several nats within the budget -- B by 2.3
@@ -208,8 +207,8 @@ class TrainConfig:
     noise_lr_mult: float = 30.0
     #: Linear LR warmup.  Matters once the encoder is a deep stack of exchange
     #: blocks: the zero-initialised output projections make every block start
-    #: as the identity, so all early gradient lands on the heads (measured
-    #: 4161 at step 0 against ~1 later) and a constant LR spends the first
+    #: as the identity, so all early gradient lands on the heads (orders of
+    #: magnitude above its later size) and a constant LR spends the first
     #: steps taking large, badly-scaled steps.  0 disables.
     warmup_steps: int = 0
     #: Learning rate after the warm-up: ``"constant"``, or ``"cosine"`` decay
@@ -228,12 +227,11 @@ class TrainConfig:
     weight_decay: float = 0.0
     grad_clip: float = 1.0
     #: Penalty on the predicted scatter width, ``lam_spread * mean(log w)``.
-    #: The design doc argued no explicit penalty on w is needed because the
-    #: GenGauss normaliser already contains -log(alpha).  That is true *at the
-    #: likelihood optimum*; it says nothing about which optimum you reach.
-    #: Empirically the model settles into a wide-scatter minimum where the
-    #: width absorbs all per-observation variation (var_frac_scatter 0.99,
-    #: within_frac 0.02) and there is then almost no gradient pressure left to
+    #: The GenGauss normaliser already contains -log(alpha), so no explicit
+    #: penalty on w is needed *at the likelihood optimum*; that says nothing
+    #: about which optimum you reach.  The model can settle into a wide-scatter
+    #: minimum where the width absorbs nearly all per-observation variation,
+    #: and there is then almost no gradient pressure left to
     #: refine K per observation.  This penalty is a tool for escaping that
     #: basin, not a claim about the statistics -- so it is annealed away and
     #: the final w is judged on calibration (var_z), not on this term.
@@ -244,16 +242,13 @@ class TrainConfig:
     #: Recompute each outer quadrature node in backward instead of keeping all
     #: ``k_coarse`` node graphs alive at once.  Trades ~2x compute in
     #: ``accumulate`` for a large drop in retained activations.  Only worth it
-    #: when the batch is memory-bound: on a 67 k-reflection cell the in-batch
-    #: redundancy that fits on a 40 GB card is several times below what a
-    #: 14 k-reflection cell gets at the same batch size, and redundancy is what
-    #: decides whether the in-batch merge target is any good.
+    #: when the batch is memory-bound: a large cell gets several times less
+    #: in-batch redundancy than a small one at the same batch size, and
+    #: redundancy is what decides whether the in-batch merge target is any good.
     #: Keep ``prep`` on the host and copy only the current batch's rows to the
-    #: device.  Measured on 133 M observations: ``prep`` is 13.85 GB resident
-    #: (10.65 GB of it ``obs_info``) and does not shrink with the batch, which
-    #: is 40 % of a 34.85 GB step and pure overhead -- the encoder activations
-    #: that actually scale with the batch are another 40 %.  The transfer is
-    #: ~320 MB per batch at redundancy 100, i.e. ~13 ms against a multi-second
+    #: device.  On a large data set ``prep`` (mostly ``obs_info``) is a large
+    #: share of device memory and does not shrink with the batch, so it is pure
+    #: overhead; the transfer is milliseconds against a multi-second
     #: step.  Off by default: it is a loss on a data set that already fits.
     #: Crystals per encoder chunk (0 = the whole batch at once).  The encoder
     #: is separable across crystals -- only ``leave_one_out_mean`` couples rows,
@@ -305,18 +300,18 @@ class TrainConfig:
     #: rather than generalisation — and that gap is precisely the diagnostic
     #: for whether capacity binds.
     train_eval_crystals: int = 3500
-    #: Keep the parameters that scored best on held-out.  The 300-epoch run
-    #: peaked at ~epoch 230 (held-out 5.044) and then degraded to 5.15+ as the
-    #: spread penalty annealed and the model over-committed to within-crystal
-    #: structure -- the endpoint was not the model we wanted.
+    #: Keep the parameters that scored best on held-out.  A long run can peak
+    #: before its end and then degrade as the spread penalty anneals and the
+    #: model over-commits to within-crystal structure -- the endpoint need not
+    #: be the model we want.
     keep_best: bool = True
     #: Run the split-half merge every N epochs (0 disables).  Costs one
     #: no-grad pass over the whole dataset.
     split_half_every: int = 20
     #: Scan half-widths for the merge's locating passes, one full data pass
-    #: each.  A single wide round mis-centres the grid by ~0.59 nats whatever
-    #: the multiplicity (see ``merge``); shrinking the window squares that
-    #: away.  Set to a single value to recover the old one-pass behaviour.
+    #: each.  A single wide round mis-centres the grid by about half a nat
+    #: whatever the multiplicity (see ``merge``); shrinking the window squares
+    #: that away.  Set to a single value for a one-pass locate.
     locate_windows: tuple[float, ...] = (8.0, 1.0, 0.125)
     seed: int = 0
     outdir: str = "."
@@ -470,8 +465,8 @@ class AmortizedTrainer:
             if prm.requires_grad:
                 (noise if id(prm) in noise_ids else no_decay).append(prm)
         # Merge-quality quartets, at MATCHED crystal count.  Merge statistics
-        # depend strongly on multiplicity, so comparing a 66,822-crystal train
-        # merge against a 3,516-crystal validation merge would measure the
+        # depend strongly on multiplicity, so comparing a full train merge
+        # against a validation merge a twentieth its size would measure the
         # count, not the model.  Both sets are subsampled to the same size and
         # each is split in half, giving CC1/2 within seen crystals and within
         # unseen crystals on equal footing.
@@ -491,11 +486,11 @@ class AmortizedTrainer:
         }
         self.n_merge_crystals = n_match
 
-        # FULL-dataset split-half, for an absolute CC1/2 comparable to the
-        # published figures (partialator unity 0.9850, EM Poisson 0.9872).
+        # FULL-dataset split-half, for an absolute CC1/2 comparable to other
+        # programs' full-data split-half figures.
         # The matched train/val sets above answer a different question and are
-        # much shallower: 3,516 crystals per set is ~21 observations per
-        # reflection per half, against ~375 when everything is merged, and
+        # much shallower: each half carries an order of magnitude fewer
+        # observations per reflection than the full merge, and
         # merge statistics depend strongly on multiplicity -- so those numbers
         # are NOT comparable to the literature and only their train-vs-val
         # difference is meaningful.
@@ -582,10 +577,9 @@ class AmortizedTrainer:
         if hl <= 0:
             # No ramp: hold the penalty constant.  A decaying penalty makes the
             # optimised loss non-comparable across a run for a reason that has
-            # nothing to do with the model -- and at lam_spread = 0.5 it did
-            # real damage, driving the per-shell CC1/2 non-monotone in
-            # resolution (shells 3-5 scored above shell 1, which is not
-            # physically possible).  A weak constant penalty is a prior, not a
+            # nothing to do with the model -- and a strong decaying penalty can
+            # drive the per-shell CC1/2 non-monotone in resolution, which is
+            # not physically possible.  A weak constant penalty is a prior, not a
             # schedule, and is what the shrinkage is meant to be.
             return self.cfg.lam_spread
         return self.cfg.lam_spread * (0.5 ** (self.step_i / hl))
@@ -624,10 +618,10 @@ class AmortizedTrainer:
         with ctx:
             # ONE forward.  The target needs a *detached* prediction, and this
             # prediction detached is exactly that -- same weights, same inputs,
-            # same numbers.  Running a separate no_grad pass first (as this did)
-            # bought nothing and cost a full forward: with gradient
-            # checkpointing the grad pass is ~3 forward-equivalents, so the
-            # redundant pass was ~25 % of the step.
+            # same numbers.  A separate no_grad pass first would buy nothing
+            # and cost a full forward: with gradient checkpointing the grad
+            # pass is ~3 forward-equivalents, so that pass would be ~25 % of
+            # the step.
             pred = self.scale.prime(meta)
             tgt, log_Z = self._posterior_step(pred, n_ph, bg, sigma, meta)
             # The marginal likelihood per reflection.  I0 appears nowhere.
@@ -651,9 +645,9 @@ class AmortizedTrainer:
         # the background ESTIMATE's variance the model claims
         # lam + sigma_b^2 + scatter, and omitting that term makes `var_z` rise
         # purely because the width head shrank -- so the metric would report a
-        # calibration change when nothing about the residuals moved.  At this
-        # data's median bg the term is 135 against sigma^2 = 136, so it is not
-        # a refinement.
+        # calibration change when nothing about the residuals moved.  At a
+        # typical background the term is as large as sigma^2 itself, so it is
+        # not a refinement.
         bvf = float(getattr(getattr(self.objective, "likelihood", None),
                             "bg_var_factor", 0.0) or 0.0)
         var_count = sigma**2 + bvf * bg.clamp(min=0.0)
@@ -666,8 +660,8 @@ class AmortizedTrainer:
         var = (var_count + var_scatter).clamp(min=1e-12)
         # Same argument for the mean: under a bg_mean_offset the model claims
         # E[n] = K*I0 + bg + offset, so the residual this metric standardises
-        # has to subtract the same background the loss used.  (~0.01 sigma at
-        # this data's medians -- it keeps the metric honest, it is not a fix.)
+        # has to subtract the same background the loss used.  (Small at a
+        # typical background -- it keeps the metric honest, it is not a fix.)
         resid = (n_ph - bg - _bg_mean_offset(self.objective)) - K * I0
         tgt = MergeTargetOut(
             log_I0=I0.clamp(min=1e-12).log(), I0=I0, resid=resid, var=var,
@@ -760,12 +754,10 @@ class AmortizedTrainer:
             # What the optimiser actually minimised (penalty included).
             "loss_total": float(loss.item()),
             # ``nll_per_obs`` is the DATA term in both train and held-out
-            # records.  It previously aliased ``loss_total`` here while
-            # ``evaluate()`` wrote the penalty-free objective under the same
-            # key -- two different quantities under one name.  That made the
-            # spread penalty (negative, since log w < 0) look like training
-            # progress: loss_total fell 5.37 -> 4.67 while the model's actual
-            # data term ROSE 5.12 -> 5.37.
+            # records, the penalty-free objective ``evaluate()`` writes under
+            # the same key.  ``loss_total`` includes the spread penalty
+            # (negative, since log w < 0), which can fall while the data term
+            # rises and would otherwise look like training progress.
             "nll_per_obs": nll_data,
             "nll_data": nll_data,
             # Under ``loss="evidence"`` the numerator is a sum over
@@ -774,8 +766,8 @@ class AmortizedTrainer:
             # two are not in a fixed ratio.  log Z_h carries one O(1) term per
             # reflection that does NOT grow with multiplicity, so the per-obs
             # number picks up an offset ~ n_hkl_used / n_obs.  Train batches
-            # here hold 1.5 M observations and the held-out set 0.63 M over
-            # nearly the same reflections, so that offset differs by ~2.4x
+            # and the held-out set differ in observation count over nearly the
+            # same reflections, so that offset differs
             # between them: a train-vs-heldout GAP under this loss is partly an
             # artefact of the normaliser, not generalisation.  Read each curve's
             # trend, and use ``evidence_per_hkl`` when comparing sets.
@@ -812,7 +804,7 @@ class AmortizedTrainer:
         out: dict = {
             # A. loss decomposition — never log only the total.  nll falling
             # while median_w rises is the network buying fit with uncertainty,
-            # which is invisible in the total and is exactly how Sdfac -> 4.75.
+            # which is invisible in the total.
             "median_w": float(pred.log_w.exp().median().item()),
             "mean_log_w": float(pred.log_w.mean().item()),
             "median_beta": float(pred.beta.median().item()),
@@ -855,7 +847,7 @@ class AmortizedTrainer:
             n_shells=self.cfg.shell_bins, i_over_sigma=ios,
         ))
         # Is the width head actually using its per-observation freedom?  var_z
-        # runs 0.01 -> 1.21 across I/sigma deciles, which a per-observation
+        # varies strongly across I/sigma deciles, which a per-observation
         # width should be able to flatten.  If median w is flat across the same
         # deciles the head is predicting a constant in all but name.
         from torchsx.nn.metrics import _rank
@@ -927,8 +919,7 @@ class AmortizedTrainer:
         """Score crystals the network never trained on.
 
         In-batch loss falling while this does not is co-adaptation through the
-        merge rather than learning — the diagnostic that was missing throughout
-        the abismal investigation.
+        merge rather than learning.
         """
         self.scale.eval()
         tot, n_tot, n_hkl, recs = 0.0, 0, 0, []
@@ -993,11 +984,8 @@ class AmortizedTrainer:
 
     def save_best(self, path=None) -> "Path | None":
         """Persist the best held-out parameters so a finished run can be
-        re-analysed without retraining it.
-
-        Nothing was written to disk before this, so every post-hoc question
-        (merge statistics, a different split, per-shell breakdowns) meant a
-        full re-run.
+        re-analysed (merge statistics, a different split, per-shell
+        breakdowns) without retraining it.
         """
         # With no held-out set (a two-parameter global fit, say) nothing is ever
         # scored and there is no "best" -- write the current state rather than
@@ -1031,7 +1019,7 @@ class AmortizedTrainer:
                 },
                 # everything a merge must not have to guess: the likelihood it
                 # was fitted under, the data recipe, and the scale geometry.  A
-                # silent mismatch here has already cost 0.022 in R_free once.
+                # silent mismatch here changes the merge without any error.
                 "likelihood": {
                     "kind": type(getattr(self.objective, "likelihood", None)).__name__
                             + ("+bgmean" if _bg_mean_offset(self.objective) else ""),
@@ -1124,8 +1112,8 @@ class AmortizedTrainer:
         """Merge a crystal set and return everything an MTZ needs.
 
         The single merge implementation the CLIs use.  ``_merge_set`` keeps its
-        own shorter path: it feeds CC1/2 and R_split, and those numbers stay on
-        the code they were measured with.
+        own shorter path: it feeds the training-time CC1/2 and R_split, which
+        stay on one fixed code path.
 
         ``estimator``:
 
@@ -1270,22 +1258,20 @@ class AmortizedTrainer:
         # Locating rounds, each a full pass: anchor on the previous
         # estimate and shrink the scan window.
         #
-        # One round is not enough at this data's multiplicity.  The scan is
+        # One round is not enough at high multiplicity.  The scan is
         # 9 nodes over +-scan_halfwidth (2-nat spacing by default) and the
         # peak is read off a parabola through three of them, but the
         # accumulated log-likelihood is ``A v - B e^v`` -- exponential above
         # the peak, linear below -- so the fitted vertex carries a bias of
-        # ~0.59 nats that does NOT shrink with multiplicity (both the
+        # about half a nat that does NOT shrink with multiplicity (both the
         # y-differences and the curvature scale with A, so the vertex does
         # not move).  Meanwhile the grid built around it is n_sigma * sd
         # wide with sd ~ 1/sqrt(A).  The two cross between 1e3 and 1e4
         # counts per reflection: below that the grid still covers the peak,
         # above it every reflection puts all its mass on the grid edge.
-        # Measured on the full SwissFEL set, one round per split: edge_mass
-        # median 3e-13 at 41 k crystals, 0.30 at 195 k, and all-NaN F at
-        # 422 k.  The vertex bias is O(h^2), so each round of a shrinking
-        # window squares it away: 0.374 -> 0.004 -> 0.0002 nats, covered at
-        # every multiplicity from 1e2 to 5e5 counts.
+        # The vertex bias is O(h^2), so each round of a shrinking
+        # window squares it away, and the grid covers the peak at every
+        # multiplicity.
         hw0 = tgt.scan_halfwidth
         centre = tgt.start_centre()
         loc_sd = None
@@ -1313,13 +1299,11 @@ class AmortizedTrainer:
                     # one-sided / sd_max logic is scaled to the wide scan:
                     # at a 0.125-nat window the returned sd is a local
                     # curvature, which for a weak one-sided reflection is
-                    # tiny and yields a grid far too narrow.  Measured on
-                    # the scored 50 k-crystal baseline, refining the width
-                    # too put 3 % of reflections on the grid edge and moved
-                    # their F by up to 80 %.  The wide round's width is
-                    # already good (it tracks 1/sqrt(A) to ~25 %); only the
-                    # CENTRE carries the parabola bias, so only the centre
-                    # is refined.
+                    # tiny and yields a grid far too narrow: refining the
+                    # width too puts such reflections on the grid edge.
+                    # The wide round's width already tracks 1/sqrt(A); only
+                    # the CENTRE carries the parabola bias, so only the
+                    # centre is refined.
                     loc_sd = sd_r
         finally:
             tgt.scan_halfwidth = hw0
@@ -1330,11 +1314,9 @@ class AmortizedTrainer:
         # summed in.  ``accumulate`` is additive over observations, so a NaN
         # from one batch otherwise propagates to every reflection that batch
         # touched -- and since ``seen`` is ``acc.abs().sum(1) > 0`` and
-        # ``NaN > 0`` is False, the whole split comes back empty.  Two splits
-        # of the full SwissFEL set died that way, one of them the largest
-        # (422 k crystals), at the same ~0.2 % rate of non-finite batches
-        # training already drops.  Losing those reflections' share of one
-        # batch is worth far less than the split.
+        # ``NaN > 0`` is False, the whole split comes back empty.  Losing
+        # those reflections' share of one batch is worth far less than the
+        # split.
         acc = torch.zeros(n_hkl, v_nodes.shape[1], device=dev)
         n_bad_acc = 0
         for _, rows in batches():
@@ -1418,9 +1400,9 @@ class AmortizedTrainer:
                 )
             self._cond = int(cb[0])
         tgt = self.target
-        # Locate the peak on THIS crystal subset first.  Using a closed-form
-        # width here instead collapsed the merge onto the shared grid centre
-        # (per-shell CC1/2 read exactly 1.0000).
+        # Locate the peak on THIS crystal subset first.  A closed-form width
+        # here would collapse the merge onto the shared grid centre (per-shell
+        # CC1/2 a spurious 1).
         start = tgt.start_centre()
         scan = tgt.scan_grid(start)
         acc_s = torch.zeros(n_hkl, scan.shape[1], device=self.device)
@@ -1466,12 +1448,8 @@ class AmortizedTrainer:
         generalisation of the *scale model* — a per-crystal G has no such gap
         by construction, because it is refit for every crystal.
 
-        Computed on **intensities**, not amplitudes.  Note this makes the
-        numbers NOT directly comparable to the figures in
-        ``experiments/benchmark_refactored_genpoiss/RESULTS.md`` (EM Poisson
-        0.9872, partialator unity 0.9850) — and those were measured on three
-        negative-delay streams from the ``sfx_scan`` dataset, not on this one,
-        so they were never a valid baseline here regardless.  The baseline that
+        Computed on **intensities**, not amplitudes, so the numbers are not
+        directly comparable to an amplitude CC1/2.  The baseline that
         counts is the same-data, same-protocol unity merge.
         """
         from torchsx.merging.hkl.stats import (
@@ -1481,13 +1459,11 @@ class AmortizedTrainer:
         was_training = self.scale.training
         self.scale.eval()
         merged = {k: self._merge_set(v) for k, v in self.merge_sets.items()}
-        # CC1/2 on INTENSITIES, not amplitudes.  ``to_F = I.clamp(min=0).sqrt()``
-        # is the repo's benchmark convention, but clamping sends every
-        # negative merged intensity to exactly 0, and identical values in both
-        # halves read to Pearson as perfect agreement.  Measured here the
-        # both-negative fraction is under 1 % so it changes little (0.9918 vs
-        # 0.9928 overall), but intensities are the honest choice: negatives are
-        # real measurements and must be allowed to disagree.
+        # CC1/2 on INTENSITIES, not amplitudes.  ``I.clamp(min=0).sqrt()``
+        # sends every negative merged intensity to exactly 0, and identical
+        # values in both halves read to Pearson as perfect agreement.
+        # Intensities are the honest choice: negatives are real measurements
+        # and must be allowed to disagree.
 
         def _pair(a: str, b: str) -> tuple[MatchedHalves, Tensor]:
             (na, da), (nb, db) = merged[a], merged[b]

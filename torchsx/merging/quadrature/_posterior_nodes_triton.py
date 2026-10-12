@@ -274,10 +274,9 @@ if HAVE_TRITON:
 
 
 #: ``(observations per program, outer nodes per inner-grid pass, warps)`` by the
-#: node count.  Measured on A100 at 1.41 M observations: two warps win
-#: throughout; 16 nodes per pass for the 31-node training grid (forward +
-#: backward 371 ms, against 599 at (4, 8, 4)), 8 for the 9-node locate scan
-#: (41 ms against 64), where 16 wastes most of the pass.
+#: node count.  Tuned on A100: two warps win throughout; 16 nodes per pass for
+#: the 31-node training grid (~1.6x faster than (4, 8, 4)), 8 for the 9-node
+#: locate scan, where 16 wastes most of the pass.
 _CONFIG_MANY, _CONFIG_FEW = (2, 16, 2), (2, 8, 2)
 #: benchmarking override, ``(BM, KO, warps)`` or None
 _OVERRIDE = None

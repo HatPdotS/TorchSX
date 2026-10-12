@@ -31,8 +31,8 @@ def compute_hkl_index(hkl: torch.Tensor) -> HKLIndex:
     lexicographically (h, then k, then l).
     """
     # torch.unique(dim=0) sorts (N_obs, 3) rows lexicographically and is by far
-    # the most expensive step in prepare_observations -- 84 % of it at 794 M
-    # observations, where the .long() cast alone materialises 19 GB.  Miller
+    # the most expensive step in prepare_observations -- the bulk of it at
+    # ~1e9 observations, where the .long() cast alone materialises tens of GB.  Miller
     # indices span a few hundred values at most, so pack them into ONE int64
     # key.  The encoding is positional with h most significant, so ordering by
     # key is exactly ordering lexicographically by (h, k, l): the returned

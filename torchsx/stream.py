@@ -24,7 +24,7 @@ class SFXStream:
     --------
     >>> stream = SFXStream.from_stream("indexed.stream", spacegroup="P 21 21 21")
     >>> stream.n_crystals
-    81121
+    50000
     >>> filtered = stream.filter_resolution(d_min=2.0)
     >>> filtered.save("filtered.sfx")
     """
@@ -395,8 +395,8 @@ class SFXStream:
         Example
         -------
         >>> local = s.remap_filenames(
-        ...     "/sf/alvra/data/p21957/raw/",
-        ...     "/das/work/.../h5files/",
+        ...     "/original/raw/",
+        ...     "/local/copy/",
         ... )
         """
         import dataclasses

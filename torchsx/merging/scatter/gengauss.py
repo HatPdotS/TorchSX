@@ -52,8 +52,8 @@ def log_e_s_gengauss(
     This is the mean/median correction, and getting it wrong closes a runaway
     loop.  ``GenGaussLogScatter`` centres the density on ``log_mean``, so
     ``median(S) = exp(log_mean)`` but ``E[S] = exp(log_mean) E[exp(eps)]``.  A
-    **linear** merge estimator — which is what you must use when 32 % of
-    observations are negative — estimates the *mean*.  So unless ``log_mean``
+    **linear** merge estimator — which is what you must use when a large share
+    of observations is negative — estimates the *mean*.  So unless ``log_mean``
     is shifted by this term, the target is biased high by ``E[exp(eps)]``,
     which at ``w = 1.65, beta = 2`` is a factor of 3.9 and **grows with the
     width**: bigger w -> more bias -> worse fit -> bigger w.
@@ -219,8 +219,8 @@ def _log_cdf_value(t: Tensor, log_alpha: Tensor, log_beta: Tensor, x_switch: flo
 class _GenGaussLogCDF(torch.autograd.Function):
     """``log F`` with closed-form gradients and three saved ``(M,)`` tensors.
 
-    Plain autograd through the incomplete gamma kept ~10 intermediates per
-    call; at 31 outer nodes x 13 M observations that was 16 GB and forced
+    Plain autograd through the incomplete gamma keeps ~10 intermediates per
+    call; at 31 outer nodes x ~1e7 observations that is over 10 GB and forces
     node checkpointing.  Here
 
         d log F / d t         = f(t) / F(t)

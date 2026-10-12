@@ -82,8 +82,8 @@ def shape_prior_kl(mix: Tensor, log_e_s: Tensor, *, n_sample: int = 2048,
     # Every density as bin masses: the grid cells plus one overflow bin for the
     # mass beyond the grid, so the KL is a proper discrete one -- non-negative,
     # zero when an observation has the population shape -- and a component
-    # moved far off the grid (seen: alpha_lo ~ 1e3 carrying a quarter of the
-    # weight once the grid alone was normalised) is visible to it.
+    # moved far off the grid, which a normalisation over the grid alone would
+    # hide, is visible to it.
     log_cell = mixture_log_density(mix, grid[None, :] + log_e_s[:, None]) + math.log(du)    # (m, G)
     on_grid = torch.logsumexp(log_cell, dim=1).exp()
     log_out = torch.log((1.0 - on_grid).clamp(min=1e-12))

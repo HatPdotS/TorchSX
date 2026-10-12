@@ -18,11 +18,10 @@ genuinely different signal.  α is derived for the kernel by
 No explicit penalty on ``w`` is needed or wanted.  The GenGauss normaliser
 already contains ``−log α``, so widening by a factor ``c`` costs exactly
 ``log c`` per observation — automatic, correctly scaled, no hyperparameter.
-That is what makes this safe where a *free global* noise coefficient was not:
-``Sdfac`` running to 4.75 in abismal, and torchsx's own
-``GaussianPolynomialLikelihood`` converging to a non-physical ``g1 ≈ 14``, are
-both one global number being forced to describe every observation when scale
-determinacy varies >20× across crystals.  Here every quantity is predicted
+That is what makes this safe where a *free global* noise coefficient is not:
+one global number is forced to describe every observation when scale
+determinacy varies by more than an order of magnitude across crystals, and it
+runs to non-physical values.  Here every quantity is predicted
 per observation from features by a shared network, which is regularisation by
 construction.
 """
@@ -101,9 +100,9 @@ class MixtureHead(nn.Module):
     heavy-tailed component that is wide on the upper side is not finite, and
     the mixture is centred on that mean.  Gaussian components (``"gaussian"``)
     have a finite mean at any width, so there the upper delta takes either
-    sign: bounding every component's upper width by the base's made the base
-    component itself carry the widest upper side any component needed (seen:
-    alpha_hi ~ 4 nats at 1-2 % weight, half of E[S]).  The weights are zero-initialised, so
+    sign: bounding every component's upper width by the base's makes the base
+    component itself carry the widest upper side any component needs.  The
+    weights are zero-initialised, so
     the first forward returns the biases for every observation: component 0
     carries most of the weight and the others start at a small but
     non-negligible weight with distinct offsets and widths, large enough that
@@ -194,11 +193,10 @@ class ScaleHeads(nn.Module):
     Parameters
     ----------
     w_init
-        Initial scatter SD.  Default 1.65 — the measured median α on this data
-        under the **Poisson, all-observations** fit.  Deliberately *not* 1.25,
-        which is the log-space positives-only number: 32.5 % of observations
-        here are negative, and any fit that takes logs discards them and
-        underestimates the spread.
+        Initial scatter SD.  Default 1.65 — a typical width under the
+        **Poisson, all-observations** fit.  Deliberately *not* a log-space
+        positives-only value: a large share of observations is negative, and
+        any fit that takes logs discards them and underestimates the spread.
     beta_init
         Initial shape.  Default 2.0 = Gaussian in log space, i.e. a log-normal
         scale — the right neutral starting point.
@@ -207,8 +205,8 @@ class ScaleHeads(nn.Module):
     predict_width, predict_shape
         Turn a head off to replace the per-observation prediction with **one
         learnable global scalar**, initialised at ``w_init`` / ``beta_init``.
-        This does *not* freeze the value: over a 300-epoch run a "beta_init=1"
-        global beta drifted to 2.16.  To actually pin it, set
+        This does *not* freeze the value: the scalar is trained and can move
+        far from its start.  To actually pin it, set
         ``requires_grad_(False)`` on ``global_log_w`` / ``global_beta_raw``.
         Ablation switches — with both off this is a pure scale model.
     """

@@ -21,24 +21,23 @@ see an observation's own intensity — that would let the network fit ``K_j =
 I_j / I0`` exactly and mean nothing.  The context branch may see every
 intensity, because the pool removes observation ``j`` from the context it is
 scored against.  So a crystal's mosaic state and partiality get inferred from
-the pattern of its *other* reflections, which for this dataset is the only
-place that information exists: integration used ``--fix-profile-radius=4e7``,
-so ``profile_radius`` is constant across all crystals and the geometry carries
-none of it.
+the pattern of its *other* reflections, which is the only place that
+information exists when integration fixed the profile radius: ``profile_radius``
+is then constant across all crystals and the geometry carries none of it.
 
 Two pooling modes
 -----------------
 ``context_folds = 0`` — **leave-one-out** (the original abismal port).  Every
 observation's context is "crystal mean minus me".  Two observations of one
-crystal differ in context by a single term in ~180, but they differ, so the
+crystal differ in context by a single term of a few hundred, but they differ, so the
 context is an ``(n, D)`` tensor and *every* block runs per observation.
 
 ``context_folds = K >= 2`` — **leave-one-fold-out**.  Observations are dealt
 round-robin into ``K`` folds within their crystal; the context for fold ``f``
 is the mean over the crystal's *other* folds.  The context is now a
 ``(crystals * K, D)`` table, computed once and read back by gather, and the
-blocks that act on the context alone run on that table -- ~14 k rows instead of
-~13 M.  The exclusion is *stronger* than leave-one-out (``j`` never enters the
+blocks that act on the context alone run on that table -- thousands of rows
+instead of millions.  The exclusion is *stronger* than leave-one-out (``j`` never enters the
 sum it is scored against, so value and gradient are independent of ``x_ctx[j]``
 bit-exactly) at the price of ``(K-1)/K`` of the peers instead of ``n-1``.
 
@@ -136,9 +135,8 @@ class ResidualFF(nn.Module):
     Pre-norm, and the second projection is **zero-initialised** so the block
     starts as the identity.  A stack of these is therefore exactly a linear map
     at step 0, which is what makes the zero-init heads give ``K == 1`` on the
-    first batch — i.e. the first merge is a unity merge, and
-    ``partialator --model=unity`` already reaches CC1/2 0.985 on this data, so
-    training starts from a serviceable point with no special-casing.
+    first batch — i.e. the first merge is a unity merge, already a
+    serviceable starting point, with no special-casing.
     """
 
     def __init__(
@@ -280,10 +278,8 @@ class DeepSetsEncoder(nn.Module):
         Width of ``x_ctx`` — what goes into the pooled branch.  May include
         intensity and σ, because the pool removes ``j`` from its own context.
     d_model
-        Embedding width.  Default 128.  (abismal's class default is 32 and its
-        CLI default 256 — a factor of 8 apart, with the CLI value coming from a
-        benchmark config that was subsequently reverted.  Scale up only if
-        held-out likelihood says capacity binds.)
+        Embedding width.  Default 128.  Scale up only if held-out likelihood
+        says capacity binds.
     n_layers
         Residual blocks per stack; ``2 * n_layers`` total.
     n_crystal_features
@@ -321,9 +317,9 @@ class DeepSetsEncoder(nn.Module):
     checkpoint
         Recompute each **per-observation** residual block in the backward pass
         instead of storing its activations.  On by default: activations are the
-        entire memory cost here (parameters are ~2.7 M weights, i.e. noise),
-        and checkpointing turns ~10.9 MB per crystal into ~1.8 MB at
-        D=256/L=5, which is what makes an 8192-crystal batch fit.  The
+        entire memory cost here (a few million parameters are noise), and
+        checkpointing cuts the activation memory per crystal several-fold,
+        which is what makes a batch of thousands of crystals fit.  The
         crystal-level blocks are never checkpointed; they are too small to
         matter.
     """
@@ -366,13 +362,9 @@ class DeepSetsEncoder(nn.Module):
                 f"context_folds must be 0 (leave-one-out) or >= 2, got {context_folds}"
             )
         self.context_folds = folds
-        # Fold-mode default 2+2, measured on SwissFEL dark against the
-        # leave-one-out baseline (R_free 0.1269 / 0.1252 nll / ml):
-        #   1+1  R_free 0.1252 / 0.1229 but weak-quartile slope 0.87 / 0.74
-        #   2+2  R_free 0.1242 / 0.1221 and slope 0.98 / 0.99, CC1/2 0.9979
-        # One per-observation block on each side is short of capacity for the
-        # weak end; two match or beat the ten-block original at 2.4x less
-        # encoder time.
+        # Fold-mode default 2+2.  One per-observation block on each side is
+        # short of capacity for the weak end; two match the ten-block
+        # leave-one-out original at less than half the encoder time.
         if obs_context_layers is None:
             obs_context_layers = self.n_layers if folds == 0 else min(2, self.n_layers)
         if obs_self_layers is None:
@@ -428,9 +420,8 @@ class DeepSetsEncoder(nn.Module):
         )
         # The architecture travels WITH the weights.  Both pooling modes and
         # every depth split share the same parameter names, so a state dict
-        # loads silently into the wrong forward -- which is exactly what
-        # happened when to_mtz built a default encoder for a fold-trained
-        # checkpoint: CC1/2 fine in training, R_free 0.127 -> 0.149 at merge.
+        # loads silently into the wrong forward: a fold-trained checkpoint
+        # read by a default encoder scores fine in training and merges worse.
         self.register_buffer(
             "_arch",
             torch.tensor([self.context_folds, self.obs_context_layers,
@@ -527,7 +518,7 @@ class DeepSetsEncoder(nn.Module):
             K = self.context_folds
             fold = fold_ids(group_id, n_groups, K)
             # Compact to the crystals present in this batch: ``n_groups`` is the
-            # dataset count (~150 k), and under chunked prediction the table
+            # dataset count (often 1e5 or more), and under chunked prediction the table
             # would otherwise be rebuilt at full size for every chunk.
             present = torch.bincount(group_id, minlength=n_groups) > 0
             local = torch.cumsum(present.long(), 0) - 1

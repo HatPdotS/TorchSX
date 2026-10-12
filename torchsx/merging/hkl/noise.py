@@ -69,8 +69,8 @@ class PoissonNoiseModel:
     r_peak, r_gap, r_bg :
         Integration ring radii in pixels (default 7/9/11 as CrystFEL).
         These **must match the indexamajig run** that produced the upstream
-        stream — Rhodopsin (Alvra/JF06T08V01) uses 2/4/6, tubulin uses
-        2/3/6, BR (CSPAD) uses 3/4/7.  Mismatch silently corrupts both
+        stream (its ``--int-radius``, which differs between setups).
+        Mismatch silently corrupts both
         the gain auto-fit AND every per-observation bg-in-peak value.
     gain :
         ADU-to-photon conversion factor; calibrate via ``calibrate_sigma2_of_bg``
@@ -81,7 +81,7 @@ class PoissonNoiseModel:
         ([integration.c:404-445](https://gitlab.desy.de/thomas.white/crystfel/-/blob/master/libcrystfel/src/integration.c#L404)).
         If ``False``, the legacy continuous-disk approximation
         ``π·r²`` / ``π·(r_bg²−r_gap²)`` is used — only useful for
-        reproducing pre-2026-05 results.
+        reproducing results computed with that approximation.
     """
 
     r_peak: float = 7.0
@@ -304,8 +304,8 @@ class PoissonNoiseModel:
             stream's beam energy.
         ewald_min :
             |Ewald offset| threshold for the off-Bragg sample.  Default
-            0.25 Å⁻¹, empirically validated on Rhodopsin/optimization4
-            (μ_z drops below 0.1σ at this scale).  Datasets with broader
+            0.25 Å⁻¹, a scale at which the residual-signal bias μ_z
+            typically drops below 0.1σ.  Datasets with broader
             mosaicity may need lower thresholds.
         mu_z_max :
             Per-bin bias QC: bins where ``|μ_z| > mu_z_max`` are dropped

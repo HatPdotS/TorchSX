@@ -65,19 +65,18 @@ class Poisson(DetectionLikelihood):
     bg_var_factor
         ``n_peak / n_bg``; ``0`` (default) reproduces the plain Poisson
         exactly.  Non-zero accounts for the fact that ``bg`` is not measured
-        but ESTIMATED, from the 9–11 px annulus, so it carries
-        ``σ_b² = (n_peak/n_bg)·bg`` — 11.6 counts at this data's median bg of
-        116, against a median signal of 7.3.
+        but ESTIMATED, from the background annulus, so it carries
+        ``σ_b² = (n_peak/n_bg)·bg`` — comparable to a weak reflection's own
+        signal.
 
         Treating it as exact does not merely lose precision: the error
         *rectifies*, because an upward fluctuation makes the apparent signal
         negative and ``S = K·I₀·e^ε > 0`` cannot represent that, so it is
-        absorbed by raising ``I₀``.  Measured on ground truth, that inflates
-        weak reflections by 2.4–3.4×, and it does not average down with
-        multiplicity.  The mechanism shows up directly as a width error: on a
-        real batch the plain Poisson's marginal is **0.70×** as wide as the
-        exact marginal over the annulus's Gamma posterior, and only 0.32× as
-        wide in the weakest quartile.
+        absorbed by raising ``I₀``.  That inflates weak reflections
+        severalfold, and it does not average down with multiplicity.  The
+        mechanism shows up directly as a width error: the plain Poisson's
+        marginal is narrower than the exact marginal over the annulus's Gamma
+        posterior, most of all for the weakest reflections.
 
     Note ``d log p/d bg`` is no longer the plain ``S2`` statistic when
     ``bg_var_factor > 0``, so a learned background (``bg_mix``) must not be
@@ -86,7 +85,7 @@ class Poisson(DetectionLikelihood):
 
     bg_mean_offset
         Added to the background the detection mean uses: ``λ = S + bg + offset``.
-        ``0`` (default) reproduces every earlier result exactly.
+        ``0`` (default) is the plain detection mean.
 
         ``bg_var_factor`` above models the *variance* of the annulus estimate
         but leaves its *mean* as if the estimate were exact, and it is not.
@@ -101,15 +100,9 @@ class Poisson(DetectionLikelihood):
         error does not average down: ``S = K·I₀·e^ε > 0`` cannot represent a
         negative excursion, so it rectifies into inflated weak intensities —
         the same mechanism the ``bg_var_factor`` docstring describes for the
-        variance.  The bias therefore scales with ``c``, which is what the data
-        show: ``c`` is 1.1641 for the small-molecule geometry (149/128), 0.2788
-        for BR and 0.1477 for TD1, and the measured damage is ordered the same
-        way.
-
-        Measured at ``offset = c``: independent-annulus recovery RMS falls from
-        4.54 to 1.37 SIGF over three seeds, and a matched ten-epoch retrain
-        moves small-molecule raw posterior R_free from 11.8676 % to 8.7519 %
-        with native intensity R_split holding (1.5567 % → 1.5468 %).
+        variance.  The bias therefore scales with ``c``: it matters most where
+        the peak region is large against the annulus, and ``offset = c``
+        removes most of it.
 
         It is an approximation, not the exact predictive, and it is not
         universally unbiased: synthetic recovery keeps a residual *negative*
@@ -117,9 +110,8 @@ class Poisson(DetectionLikelihood):
         real integrated backgrounds are non-integer and pixel-masked, so the
         pure Poisson-annulus law is itself a model.  Note also that the
         variance stays ``c·bg`` rather than the self-consistent predictive
-        ``Var[B | A] = c·(bg + c)`` — a ``c²`` ≈ 1.36-count difference against a
-        median λ of ~116, kept so this reproduces the qualified experiment
-        exactly.  See ``experiments/posterior_accuracy_20260910/REPORT_20260911.md``.
+        ``Var[B | A] = c·(bg + c)`` — a ``c²`` difference that is small
+        against a typical λ.
 
         Detection-only: the raw ``bg`` still feeds the encoder features, the
         pooled ``(n − bg)/K`` estimator (unbiased at fixed true background

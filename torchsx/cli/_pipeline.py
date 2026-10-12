@@ -264,7 +264,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         # --spacegroup reaches the .sfx loader too, and is applied before
         # canonicalization: an .sfx cache carries whatever group it was parsed
         # with, and reducing a P 2 21 21 data set as P 1 marks every reflection
-        # acentric and gives the wrong Wilson prior for 9 % of them.
+        # acentric and gives the wrong Wilson prior for every centric one.
         s = SFXStream.read(
             path, spacegroup=spacegroup,
             n_workers=_workers(), merge_friedel=merge_friedel,
@@ -595,7 +595,7 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
     if not int(seen.sum()):
         # Nothing survived the merge.  Say so and return: quantile() on an
         # empty tensor raises, and a split whose grid missed every reflection
-        # once took a whole run's remaining merges down with it.
+        # would take the run's remaining merges down with it.
         print(f"  estimator {res['estimator']}: NO reflections merged "
               f"({res['n_crystals']:,} crystals) -- the outer grid found no "
               f"support; check edge_mass and the locating rounds", flush=True)
@@ -686,7 +686,7 @@ def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
     stored = (ck.get("likelihood") or {}).get("bg_mean_offset")
     if stored is not None:
         return float(stored)
-    # The experiment wrapper recorded no offset; it always used c itself.
+    # The earlier wrapper recorded no offset; it always used c itself.
     return float(bvf) if any(corrected) else 0.0
 
 
@@ -840,11 +840,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         raise ValueError(f"Unknown detector noise mode {noise_mode!r}; expected auto, off or panel")
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
-    # training run may integrate on a cheaper grid than a merge should: at
-    # n_sigma 6 a quarter of the reflections put >1 % of their posterior against
-    # the grid edge in a full merge, a defect invisible during training because
-    # edge_mass is computed per batch and reads ~2e-3 there.  Every comparison
-    # that has been scored was merged at 24 / 63 / 257, so that is the default
+    # training run may integrate on a cheaper grid than a merge should: at a
+    # small n_sigma many reflections put posterior mass against the grid edge
+    # in a full merge, a defect invisible during training because edge_mass is
+    # computed per batch, where fewer observations leave the posterior wider.
+    # The merge uses the DEFAULTS grid (n_sigma 24, k_coarse 63, m_fine 257),
     # and the checkpoint's training grid is reported, not applied.
     grid = dict(ck.get("posterior_grid") or {})
     prior = getattr(args, "prior", None)

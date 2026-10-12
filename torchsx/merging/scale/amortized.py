@@ -58,10 +58,9 @@ class AmortizedScale(ScaleModel):
     anchor_stat
         ``"median"`` (default) or ``"mean"``.  The gauge is arbitrary, so any
         location statistic is valid — but the mean is **not robust**, and that
-        matters here.  Measured on the real dark: ~1.5 % of observations ran
-        away to ``log K ≈ +68`` while the bulk sat in ``[-5.5, +0.2]``.  Under a
-        mean anchor those outliers contribute ≈ +1.0 to the mean and drag the
-        other 98.5 % down by ≈ 1.0 — the bulk median came out at −2.4.  A small
+        matters here: a few percent of observations can run away to very large
+        ``log K`` while the bulk stays put, and under a mean anchor they shift
+        the mean and drag every other observation with it.  A small
         runaway subset thereby corrupts the scale of every other observation.
         The median cannot be hijacked that way.  ``"basis"`` subtracts the
         least-squares projection of ``log K`` onto a smooth reciprocal-space
@@ -112,18 +111,16 @@ class AmortizedScale(ScaleModel):
 
     # ── construction ───────────────────────────────────────────────────
 
-    #: hkl defaults OFF.  The design doc said "hkl goes in for now -- but see
-    #: the monitor"; the monitor has since spoken.  On the real dark stream with
-    #: hkl enabled, ``hkl_permutation_sensitivity`` reached **0.586** (abismal:
-    #: 0.003) -- 59 % of the predicted scale's variance moved when hkl labels
-    #: were permuted, ``sd(log K)`` blew up to 14.5, and 80 % of that variance
-    #: sat *within* crystal, i.e. per reflection.  That is the scale absorbing
+    #: hkl defaults OFF.  With hkl enabled, ``hkl_permutation_sensitivity``
+    #: can show most of the predicted scale's variance moving when hkl labels
+    #: are permuted, ``sd(log K)`` blowing up, and most of that variance
+    #: *within* crystal, i.e. per reflection.  That is the scale absorbing
     #: I0, which is degenerate by construction and is the one channel that can
     #: manufacture a difference peak.
     #:
-    #: The failure has a signature worth remembering: training converged
-    #: normally (var_z -> 1.02, held-out NLL 5.10 at epoch 18) and only *then*
-    #: collapsed (held-out 6.33, var_z 12.5 by epoch 28).  The network learns
+    #: The failure has a signature worth remembering: training converges
+    #: normally (var_z near 1, held-out NLL falling) and only *then*
+    #: collapses (held-out NLL and var_z jump).  The network learns
     #: the legitimate scale first and discovers the shortcut second, so a short
     #: run looks healthy.
     #:
@@ -250,9 +247,9 @@ class AmortizedScale(ScaleModel):
 
         With ``chunk_crystals > 0`` the encoder runs in crystal-aligned chunks,
         each wrapped in a SINGLE checkpoint.  That moves the checkpoint boundary
-        from the block to the chunk: measured at 1.67 M observations the encoder
-        held 14.0 GB, which is 16 retained ``(M, d_model)`` tensors at 512 B per
-        observation each, and every one of them is interior -- only ``log_K``,
+        from the block to the chunk: the encoder otherwise retains 16
+        ``(M, d_model)`` tensors at 512 B per observation each (``d_model =
+        128``), and every one of them is interior -- only ``log_K``,
         ``log_w`` and ``beta`` leave.  Storing the chunk's inputs and outputs
         instead is ~52 B per observation, and the 16 are rematerialised one
         chunk at a time in backward.
@@ -262,8 +259,9 @@ class AmortizedScale(ScaleModel):
             # Chunk in EVERY mode, not only when building a graph.  The
             # no-grad paths -- the locate sweep, evaluation, the merge -- store
             # nothing, but a single SiLU on a whole batch is still one
-            # allocation: at R=200 that is 13.3 M rows and 12.7 GB, which OOMs
-            # a 40 GB card before any checkpointing question arises.  The
+            # allocation: at a high target redundancy on a large cell that is
+            # tens of millions of rows and many GB, enough to exhaust a 40 GB
+            # card before any checkpointing question arises.  The
             # checkpoint is what is conditional on grad, not the chunking.
             return self._predict_chunked(meta, n_chunk)
         x_self, x_ctx, x_crys = self.features.build(meta)
@@ -360,8 +358,8 @@ class AmortizedScale(ScaleModel):
         reflections come from the well-diffracting ones -- so the mean of a
         legitimate per-crystal scale over the observations of ``h`` is itself
         a smooth function of ``h``.  Removing it would push crystal scale into
-        the merged intensities (measured on BR: the c*/ab intensity ratio went
-        from 0.49 to 0.79).  The crystal term absorbs exactly that, and what
+        the merged intensities and distort their anisotropy.  The crystal term
+        absorbs exactly that, and what
         is left in ``span(phi)`` is the common mode no crystal owns.  The
         projection is linear and stays in the graph, so the network receives no
         gradient along the removed direction.

@@ -52,8 +52,8 @@ that matters:
   rounding noise, far below any real feature variation, and carries no gradient.
 
 **2. Cancellation is the one real float32 hazard, and it is detected, not
-avoided.**  The summands ``w·y`` span several decades (99.4 % of this dataset's
-variance sits in I/σ > 20 observations).  On realistic groups float32 holds a
+avoided.**  The summands ``w·y`` span several decades (most of the variance
+sits in the few strongest observations).  On realistic groups float32 holds a
 median relative error of ~1e-7 against float64, so it is simply fine.  It fails
 only when one observation carries essentially the whole group weight — and
 there :func:`loo_weighted_mean` marks the observation **invalid** rather than
@@ -220,8 +220,8 @@ def leave_fold_out_mean(
     never enters the sum it is scored against, so both the forward value and
     the gradient are independent of ``x[j]`` bit-exactly -- there is no
     sum-minus-self cancellation to round.  What is given up is peers:
-    ``(n_folds - 1) / n_folds`` of the group instead of ``n - 1``.  At ~180
-    observations per crystal (SwissFEL) or ~2000 (SACLA) that is immaterial.
+    ``(n_folds - 1) / n_folds`` of the group instead of ``n - 1``.  At hundreds
+    to thousands of observations per crystal that is immaterial.
 
     Returns
     -------
@@ -294,11 +294,10 @@ def loo_weighted_mean(
     This is the leave-one-out merged intensity: every observation is scored
     against a target its peers set, not one it helped set.  ``w`` is ``1/τ²`` —
     a *linear* inverse-variance regression, deliberately not a log-space mean:
-    32.5 % of observations here are negative, and any merge that takes logs
-    discards them and underestimates the spread (measured: α 1.25 log-space
-    positives-only vs 1.65 Poisson all-observations).
+    a large share of observations is negative, and any merge that takes logs
+    discards them and underestimates the spread.
 
-    Runs in float32.  On realistic data (77 observations per reflection,
+    Runs in float32.  On realistic data (tens of observations per reflection,
     heavy-tailed ``w``) that costs a median relative error of ~1e-7 against a
     float64 reference.  It only breaks when a *single* observation carries
     essentially the whole group weight, and ``max_rel_error`` detects exactly

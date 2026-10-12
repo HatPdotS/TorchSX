@@ -10,9 +10,8 @@ sums over the K grid). Backward then applies analytic gradient formulas
 without recomputing the (M, K) integrand.
 
 Each statistic is gated by a ``constexpr`` derived from whether the matching
-input actually requires grad, because they are not cheap: an ablation probe
-with four of the five accumulators removed ran 25.1 ms -> 13.5 ms at
-M = 1.05e6, K = 2001, so together they are ~47 % of the kernel.  ``S2``
+input actually requires grad, because they are not cheap: together they are
+roughly half of the kernel's runtime.  ``S2``
 (``d log p/d bg``) is the clearest case — ``bg`` is data except under the
 learned-background ``bg_mix`` mode — and the ``locate`` sweep in
 :mod:`torchsx.nn.posterior_target` runs under ``no_grad`` and needs none of
@@ -21,9 +20,8 @@ them.  The gates read ``requires_grad``, so no caller has to opt in.
 Tuning is read from ``_fixed_log_grid_tuning.json`` (in-package),
 keyed by GPU name and K bucket. On unknown GPUs we fall back to the
 A100 winners with a one-time warning. To extend the cache for a new
-GPU, run a tuning sweep externally and add the entry; the measured
-state and the traps to avoid are in ``docs/optimize_integration.md``
-(the sweep scripts themselves are no longer in the repo).
+GPU, run a tuning sweep externally and add the entry; the traps to
+avoid are in ``docs/optimize_integration.md``.
 """
 from __future__ import annotations
 
@@ -151,7 +149,7 @@ if HAVE_TRITON:
         # Reciprocal of n is per-OBSERVATION, so hoist it: as a division
         # inside the k loop it is an SFU op evaluated M*K times and cost 29 %
         # of the kernel; as a multiply against a hoisted reciprocal it is free.
-        # Floor at 1e-12, not 1: counts are gain-scaled and 0.07 % of them fall
+        # Floor at 1e-12, not 1: counts are gain-scaled and some of them fall
         # between 0 and 1, where flooring at 1 would silently use the wrong
         # ratio.  At n = 0 the term vanishes anyway (0 * log(lam*1e12) = 0) and
         # lam*1e12 stays inside float32 for any lam on this grid.
@@ -185,11 +183,10 @@ if HAVE_TRITON:
 
             # Poisson factor about its own peak, NOT as
             # `n log(lam) - lam - log n!`.  Those three terms are each ~3e6 at
-            # the real batch's brightest observation (n = 2.7e5) and cancel to
-            # -6.4, so float32 -- which resolves 3e6 to +-0.2 -- leaves ~0.2-0.4
+            # a bright observation (n ~ 1e5) and cancel to O(1), so float32 --
+            # which resolves 3e6 to +-0.2 -- leaves ~0.2-0.4
             # nats of absolute error right at the peak, where the integrand
-            # carries all its mass.  Measured against a float64 reference: 0.457
-            # nats median error at n = 2e6 before this change.  Writing it as
+            # carries all its mass.  Writing it as
             # `n log(lam/n) - (lam - n) + logpeak(n)` cancels the large terms on
             # paper; `logpeak = n log n - n - log n!` is formed once per
             # observation in float64 on the host, where the cancellation is
@@ -200,27 +197,26 @@ if HAVE_TRITON:
                           - (lam - n_ph[:, None]))
             if BG_VAR:
                 if BG_DEVIANCE:
-                    # bg is ESTIMATED from the 9-11 px annulus and carries
+                    # bg is ESTIMATED from the background annulus and carries
                     # sigma_b^2 = (n_peak/n_bg)*bg, so the count's variance is
                     # lam + sigma_b^2, not lam.  Scaling the Poisson deviance by
                     # the dispersion phi = 1 + sigma_b^2/lam is the saddlepoint
                     # density of that overdispersed law: it keeps the mode at
                     # lam = n, matches the variance, collapses to the exact
                     # Poisson at sigma_b^2 = 0, and is bounded -- so it needs no
-                    # clamp.  Measured against the exact marginal over the
-                    # annulus's Gamma posterior on a real batch, median error
-                    # 0.13 nats against the second-order form's 0.89.
+                    # clamp.  It tracks the exact marginal over the annulus's
+                    # Gamma posterior far more closely than the second-order form.
                     inv_lps2 = 1.0 / (lam + sig_b2[:, None])
                     inv_phi = lam * inv_lps2
                     neg_half_D = (neg_half_D * inv_phi
                                   + 0.5 * 0.6931471805599453
                                   * tl.math.log2(inv_phi))
                 else:
-                    # Legacy second-order expansion, kept only to reproduce the
-                    # earlier measurements: +0.5 sigma_b^2 [(n/lam-1)^2 - n/lam^2].
+                    # Legacy second-order expansion, kept only for comparison:
+                    # +0.5 sigma_b^2 [(n/lam-1)^2 - n/lam^2].
                     # It is unbounded as lam leaves n, so it needs the +-10 clamp
-                    # -- which fires on 16 % of the grid points that carry mass
-                    # and inflates the weak quartile's posterior mean 5.4x.
+                    # -- which fires on many of the grid points that carry mass
+                    # and inflates weak reflections' posterior means severalfold.
                     inv_lam = 1.0 / lam
                     rr = n_ph[:, None] * inv_lam
                     corr = 0.5 * sig_b2[:, None] * ((rr - 1.0) * (rr - 1.0)
@@ -252,9 +248,8 @@ if HAVE_TRITON:
             T0 += tl.sum(e_shift, axis=1)
 
             # Each aux statistic costs a full BLOCK_K cross-lane reduction, and
-            # together they are ~47 % of this kernel's runtime (measured by an
-            # ablation probe: 25.1 ms -> 13.5 ms at M=1.05e6, K=2001 with four
-            # of the five accumulators removed).  Every one of them is dead
+            # together they are roughly half of this kernel's runtime.  Every
+            # one of them is dead
             # weight unless the matching input actually requires grad -- and
             # the posterior accumulator's `locate` sweep runs under no_grad,
             # while `bg` is data in every path except the learned-background
