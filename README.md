@@ -149,20 +149,19 @@ On the bacteriorhodopsin (bR) data of Weinert et al.<sup>[1](#references)</sup>:
   <img src="https://raw.githubusercontent.com/HatPdotS/TorchSX/master/assets/readme-br-rfree.png" alt="bR R-free against dark patterns per merge, TorchSX and Partialator" width="65%">
 </p>
 
-R<sub>free</sub> of models refined from one starting model against dark merges
-of increasing size. Each size was split into two halves of the patterns and
-each half was trained and merged separately, light and dark of a half together:
-points show the mean of the two halves, bars their range. R<sub>free</sub> is computed on the same
-reflections for both programs at each size; refinement used TorchRef with one
-protocol for all merges.
+R<sub>free</sub> of models refined from one starting model against each dark
+merge, on the reflections common to both programs at each size, as a function
+of the number of dark patterns per merge. Points, mean of two independent
+merges; bars, their range. Initial models were refined against a larger merge
+with the respective method. Refinement used TorchRef with one protocol for all
+merges.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/HatPdotS/TorchSX/master/assets/readme-br-maps.png" alt="bR light-minus-dark difference maps from two independent halves, TorchSX and Partialator" width="100%">
 </p>
 
-Light-minus-dark difference maps from two halves of the patterns (7,800 per
-state and half), each half trained and merged separately with its light and
-dark data together, and phased with the dark model. Shown: the end of helix E, the EF loop and helix F of the dark model
+Light-minus-dark difference maps from two independent merges of disjoint
+patterns (7,800 per state each), phased with the dark model. Shown: the end of helix E, the EF loop and helix F of the dark model
 (grey) and of the open state 6RPH<sup>[1](#references)</sup> (orange). The
 number under each program is the correlation of its two maps over helix F.
 
