@@ -54,6 +54,56 @@ metadata and a four-component Gaussian mixture. Gain conversion, background-mean
 correction and posterior uncertainty are distinct operations. Existing checkpoints
 retain their recorded scatter family and background convention.
 
+## Training length and checkpoints
+
+`--steps` is the total optimizer-update budget, independent of dataset size
+(default 400). Training alternates state-pure batches: 400 updates over two
+states gives 200 per state; an uneven budget differs by at most one update
+between states. `best.pt` is the network at minimum validation NLL in state
+zero, and the merges written by `torchsx.train` use it; `last.pt` preserves the
+endpoint. Validation uses 5% of state-zero crystals; all supplied observations
+remain eligible for the final merge. Training length remains an empirical
+setting: validation NLL is not established as an optimum for independent
+difference-map precision. `--no-merge` stops after saving checkpoints, for
+workflows that merge separately with `torchsx.merge`.
+
+Data stay on the host; encoder chunking and quadrature recomputation bound GPU
+memory without reducing the requested statistical batch support. Parser workers
+respect the available CPU allocation, capped at eight.
+
+## States
+
+Light and dark (or any set of labelled states) are trained in one network; the
+merge targets remain separate, and the label is not a network feature.
+
+```bash
+torchsx.train --split dark=dark.stream --split light=light.stream \
+  --spacegroup 'P 63' --dmin 2.0 -o joint/
+torchsx.merge joint/best.pt \
+  --split dark=dark.stream --split light=light.stream -o merged.mtz
+```
+
+A combined stream can instead use a CrystFEL custom-split file with
+`filename event dataset` columns:
+
+```bash
+torchsx.train combined.stream --split-file states.split \
+  --spacegroup 'P 63' --dmin 2.0 -o joint/
+```
+
+`--split-file` also accepts an integer label tensor (`.pt`), one label per
+crystal after the resolution filter. Every crystal must be labelled. State names
+in text custom-split files are sorted; repeated `--split NAME=PATH` inputs retain
+argument order. In text split files, repeat a `filename event` pair with
+different dataset names to include the frame (and all its crystals) in multiple
+bins; repeated identical rows count only once per bin.
+
+Separate checkpoint readout accepts any number of bins and uses their supplied
+names. References and merge targets are initialized from the current input
+data; network weights and feature standardization are restored from the
+checkpoint. All supplied states are exported automatically. For changed inputs
+or split assignments, supply a new `--cache` path.
+
 ## Public controls and reproducibility
 
 The shared options are `--out`, `--split`, `--split-file`, `--spacegroup`,
