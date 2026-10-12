@@ -44,7 +44,7 @@ We are working on integration with dials and integration of Probixi.
 TorchSX is under active development, if you find something behaving unexpectedly please create an issue on GitHub. 
 
 Refinement and difference maps in this repo were done with
-[TorchRef](https://github.com/HatPdotS/TorchRef). TorchSX should be compatible with any classical refinement or map calculation program. 
+[TorchRef](https://github.com/HatPdotS/TorchRef). TorchSX output should be compatible with any classical refinement or map calculation program. 
 
 ## Install
 
@@ -53,7 +53,7 @@ pip install torchsx
 ```
 
 Python ≥ 3.10. This brings TorchRef 0.7, torch, triton, gemmi and
-`torchsx-native`, the compiled `.stream` reader for your platform. TorchSX is intended to be run on a GPU; its core algorithms are Triton kernels, and we have not investigated CPU runtime or even functionality. GPU memory should not exceed 10 GB. It scales with the redundancy requested for training and the number of unique HKLs, not with the amount of data. Host RAM does scale with the amount of data, at roughly half the size of the CrystFEL stream; streaming from disk is being worked on but is not implemented yet.
+`torchsx-native`, the compiled `.stream` reader for your platform. TorchSX is intended to be run on a GPU; its core algorithms are Triton kernels, and we have not investigated CPU runtime or even functionality. GPU memory should not exceed 10 GB. It scales with the redundancy requested for training (default 100) and the number of unique HKLs, not with the amount of data. Host RAM does scale with the amount of data, at roughly half the size of the CrystFEL stream; streaming from disk is being worked on but is not implemented yet.
 
 From a checkout, build the native package first (needs Rust, see
 [native/README.md](https://github.com/HatPdotS/TorchSX/blob/master/native/README.md)):
