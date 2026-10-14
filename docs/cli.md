@@ -53,14 +53,15 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `-o`, `--out RUN` | | Run directory. |
 | `--no-merge` | | Stop after saving the checkpoints, for a separate `torchsx.merge`. |
 | `--free-from FILE` | 5 % new | Copy the free set from an `.mtz` (`R-free-flags` or `FreeR_flag`). |
-| `--cache FILE` | `RUN/prepared.pt` | Where the parsed observations are cached. |
+| `--cache DIR` | `RUN/prepared` | Where the prepared observations are stored. |
 
 `torchsx.train --help` lists the same options.
 
 ### How a run proceeds
 
-1. The streams are parsed, converted to photons with the selected gain and
-   cached in `prepared.pt`.
+1. The streams are parsed block by block, converted to photons with the
+   selected gain and written to the store `prepared/`, one crystal's
+   observations after the other.
 2. 5 % of the crystals of the first state are held out for validation.
 3. The network is trained for `--steps` updates. Each batch holds crystals of
    one state, and the states take turns: 400 updates over two states give 200
@@ -180,12 +181,25 @@ Poisson counting on the spot and the background estimate.
 
 ## Cache and reproducibility
 
-The parsed observations are cached in `--cache` (default `RUN/prepared.pt`;
+The prepared observations are stored in `--cache` (default `RUN/prepared`;
 `torchsx.merge` uses the checkpoint's directory). A later run with the same
-inputs and preparation settings reuses it: the cache records the input
+inputs and preparation settings reuses it: the store records the input
 contents and settings, and a mismatch is an error rather than a silent reparse.
 Moved but identical files are accepted. For changed inputs or split
-assignments, give a new `--cache` path.
+assignments, give a new `--cache` path. A run prepared before the store
+existed keeps its `prepared.pt`, and `torchsx.merge` reads it.
+
+The store holds the observations on disk; host memory holds the crystal and
+reflection tables and a few batches. Preparation reads the streams in blocks
+into a temporary file next to the store, and training and merging read one
+batch of crystals at a time, the next while the current one is computed. The
+store needs about 52 bytes per observation of disk space, and the temporary
+file about 38 more while it is written.
+
+While it is built, the store stages in `CACHE.raw` and `CACHE.partial` next to
+it. A directory of either name that an interrupted build left behind is
+replaced; any other directory of that name stops the run before parsing, and
+its contents are left as they are.
 
 `run.json` records the resolved settings: inputs, measurement, gain and its
 reason, model, learning rates and schedule. `--seed` fixes network

@@ -44,10 +44,16 @@ def parse_stream(
     indices shares their tensor until canonicalization replaces ``hkl``.
     """
     from torchsx.io._crystfel import read_measurement
-    from torchsx.measurement import MEASUREMENT_KEY
 
     spec = read_measurement(path)
     core = _parse_stream(path, spacegroup, n_workers, max_crystals, seed, sequential)
+    return _attach_source(core, path, spec)
+
+
+def _attach_source(core: _SFXStreamCore, path, spec) -> _SFXStreamCore:
+    """Source columns every parsed core carries."""
+    from torchsx.measurement import MEASUREMENT_KEY
+
     # The core is still private to this reader: add columns in place, avoiding
     # repeated whole-tensor validation passes on very large observation tables.
     core.levels["obs"]["observed_hkl"] = core.hkl
@@ -56,6 +62,96 @@ def parse_stream(
     core.metadata.setdefault("image", {})["source_file"] = [str(Path(path).resolve())] * core.n_images
     core.friedel_merged = False
     return core
+
+
+def parse_stream_blocks(
+    path: str | Path,
+    spacegroup: str = "P 1",
+    n_workers: int = 1,
+    block_obs: int = 4_000_000,
+    transform=None,
+):
+    """:func:`parse_stream` of a whole file, yielded as consecutive cores of
+    whole chunks with about ``block_obs`` observations each.
+
+    Concatenating the blocks gives the core :func:`parse_stream` returns, so a
+    file of any size is read with memory for a few blocks.  The next block is
+    parsed -- and passed through ``transform(core)``, if given, whose result is
+    yielded -- on a background thread while the caller works on the current
+    one.  Exclusions and a constant sigma are reported once, for the whole file.
+    """
+    import queue
+    import threading
+
+    from torchsx.io import _native
+    from torchsx.io._crystfel import read_measurement
+
+    path = str(path)
+    spec = read_measurement(path)
+    geometry = Geometry.from_stream(path)
+    native_mod = _native.load()
+    chunks = _index_chunks_native_or_python(path, n_workers=n_workers)
+    cum = np.cumsum(chunks[:, 3])
+    edges = [0]
+    while edges[-1] < len(chunks):
+        base = cum[edges[-1] - 1] if edges[-1] else 0
+        edges.append(max(edges[-1] + 1, int(np.searchsorted(cum, base + block_obs, side="right"))))
+    groups = [chunks[a:b] for a, b in zip(edges[:-1], edges[1:])]
+
+    def parse(group):
+        if native_mod is not None:
+            cols, filenames, events, report = native_mod.parse_chunks(
+                path, np.ascontiguousarray(group, dtype=np.int64),
+                geometry.panel_names, max(1, int(n_workers)),
+            )
+            tensors = {k: torch.from_numpy(a) for k, a in cols.items()}
+            report = {k: list(v) for k, v in report.items()}
+        else:
+            tensors, filenames, events, report = _parse_chunks_python(
+                path, group, geometry.panel_name_to_id)
+        sigma = tensors["sigma"].double()
+        moments = (sigma.numel(), float(sigma.sum()), float((sigma * sigma).sum()))
+        core = _attach_source(
+            _build_core(tensors, filenames, events, {}, geometry, spacegroup, path, warn=False),
+            path, spec)
+        return (core if transform is None else transform(core)), report, moments
+
+    q: queue.Queue = queue.Queue(maxsize=1)
+
+    def produce():
+        try:
+            for group in groups:
+                q.put(("ok", parse(group)))
+        except BaseException as exc:  # handed to the consumer
+            q.put(("err", exc))
+            return
+        q.put(("end", None))
+
+    threading.Thread(target=produce, daemon=True, name="torchsx-parse").start()
+    total: dict[str, list[int]] = {}
+    sig_n, sig_s, sig_s2 = 0, 0.0, 0.0
+    while True:
+        kind, item = q.get()
+        if kind == "err":
+            raise item
+        if kind == "end":
+            break
+        block, report, (n, s1, s2) = item
+        for reason, (count, first) in report.items():
+            got = total.setdefault(reason, [0, first])
+            got[0] += count
+            got[1] = min(got[1], first)
+        sig_n, sig_s, sig_s2 = sig_n + n, sig_s + s1, sig_s2 + s2
+        yield block
+    _warn_report(total, path)
+    if sig_n > 1:
+        var = max(sig_s2 - sig_s * sig_s / sig_n, 0.0) / (sig_n - 1)
+        if var ** 0.5 < 1e-6:
+            warnings.warn(
+                f"All sigma values are constant ({sig_s / sig_n:.2f}), "
+                "likely set to photon energy. Consider replacing with proper estimates.",
+                stacklevel=2,
+            )
 
 
 def _parse_stream(
@@ -212,11 +308,13 @@ def _build_core(
     geometry: Geometry,
     spacegroup: str,
     path: str,
+    warn: bool = True,
 ) -> _SFXStreamCore:
     """Wrap parsed columns as a ``_SFXStreamCore``."""
-    _warn_report(report, path)
+    if warn:
+        _warn_report(report, path)
     sigma = tensors["sigma"]
-    if sigma.numel() > 0 and sigma.std() < 1e-6:
+    if warn and sigma.numel() > 0 and sigma.std() < 1e-6:
         warnings.warn(
             f"All sigma values are constant ({sigma[0].item():.2f}), "
             "likely set to photon energy. Consider replacing with proper estimates.",

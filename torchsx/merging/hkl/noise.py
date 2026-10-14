@@ -13,6 +13,25 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
+#: Default selections of the two gain calibrations: off-Bragg observations
+#: above this background and Ewald offset (Å⁻¹), and negative sums above this
+#: background.
+OFF_BRAGG_BG_MIN = 1.0
+OFF_BRAGG_EWALD_MIN = 0.25
+NEGATIVE_BG_MIN = 0.1
+
+
+def calibration_candidates(I_obs: Tensor, background: Tensor, ewald_offset: Tensor) -> Tensor:
+    """Observations either default gain calibration can select.
+
+    Both calibrations select their own sample from the arrays they are given,
+    so passing them this subset (in the original order) gives the same gain as
+    passing every observation.
+    """
+    off_bragg = ((background > OFF_BRAGG_BG_MIN) & (ewald_offset.abs() > OFF_BRAGG_EWALD_MIN)
+                 & torch.isfinite(ewald_offset))
+    return off_bragg | ((I_obs < 0) & (background > NEGATIVE_BG_MIN))
+
 
 def compute_sigma2_LN(alpha: Tensor, beta: Tensor) -> Tensor:
     """Log-space variance of GenGauss noise (first-order approximation):
@@ -192,7 +211,7 @@ class PoissonNoiseModel:
         I_obs: Tensor,
         background: Tensor,
         *,
-        bg_min: float = 0.1,
+        bg_min: float = NEGATIVE_BG_MIN,
         tail_cut: float = 3.0,
         max_pool: int = 1_000_000,
         max_iter: int = 200,
@@ -272,9 +291,9 @@ class PoissonNoiseModel:
         background: Tensor,
         ewald_offset: Tensor,
         *,
-        bg_min: float = 1.0,
+        bg_min: float = OFF_BRAGG_BG_MIN,
         z_max: float = 25.0,
-        ewald_min: float = 0.25,
+        ewald_min: float = OFF_BRAGG_EWALD_MIN,
         n_bins: int = 12,
         min_per_bin: int = 2000,
         mu_z_max: float = 0.5,
