@@ -234,8 +234,9 @@ def test_auto_metadata_matches_explicit_prep_and_posterior(stream_file, python_p
     explicit_args.int_radius, explicit_args.gain = "3,4,7", 1.0
     explicit = P.load_prep(explicit_args, verbose=False)
     assert auto.recipe["measurement"]["gain_adu_per_photon"] == 1.0
-    for field in fields(auto.prep):
-        left, right = getattr(auto.prep, field.name), getattr(explicit.prep, field.name)
+    auto_mem, explicit_mem = auto.prep.materialize(), explicit.prep.materialize()
+    for field in fields(auto_mem):
+        left, right = getattr(auto_mem, field.name), getattr(explicit_mem, field.name)
         if isinstance(left, torch.Tensor):
             assert torch.equal(left, right), field.name
     results = []
@@ -279,18 +280,20 @@ def test_requested_gain_calibration_still_runs(stream_file, python_parser, monke
     explicit = P.load_prep(args, verbose=False)
     assert calls == [mode]
     assert calibrated.recipe["measurement"]["gain_adu_per_photon"] == 3.0
-    assert torch.equal(calibrated.prep.I_obs, explicit.prep.I_obs)
-    assert torch.equal(calibrated.prep.bg, explicit.prep.bg)
-    assert torch.equal(calibrated.prep.obs_info.sigma, explicit.prep.obs_info.sigma)
+    calibrated, explicit = calibrated.prep.materialize(), explicit.prep.materialize()
+    assert torch.equal(calibrated.I_obs, explicit.I_obs)
+    assert torch.equal(calibrated.bg, explicit.bg)
+    assert torch.equal(calibrated.obs_info.sigma, explicit.obs_info.sigma)
 
 
 def test_prepared_cache_recipe_and_legacy_compatibility(stream_file, python_parser, tmp_path, monkeypatch):
-    cache, sfx = tmp_path / "prep.pt", tmp_path / "parsed.sfx"
+    cache, sfx = tmp_path / "prepared", tmp_path / "parsed.sfx"
     args = _args(stream_file, cache_prep=cache, sfx_cache=sfx)
     built = P.load_prep(args, verbose=False)
     def no_parse(*a, **k):
         raise AssertionError("prepared-cache hit must not parse tensors")
-    monkeypatch.setattr(SFXStream, "read", no_parse)
+    from torchsx.merging.prepare_store import StoreBuilder
+    monkeypatch.setattr(StoreBuilder, "add", no_parse)
     again = P.load_prep(args, verbose=False)
     assert again.recipe == built.recipe
     # merge_nn can reuse training's cache with the checkpoint's numeric gain.
@@ -325,15 +328,15 @@ def test_legacy_sfx_requires_recipe_and_refuses_to_invent_hkl_state(sample_core,
 @pytest.mark.parametrize("trust", [False, True])
 @pytest.mark.parametrize("version", [None, -1])
 def test_prepared_cache_requires_current_observation_filter(stream_file, python_parser, tmp_path, trust, version):
-    cache = tmp_path / "prep.pt"
+    cache = tmp_path / "prepared"
     args = _args(stream_file, cache_prep=cache)
     P.load_prep(args, verbose=False)
-    blob = torch.load(cache, weights_only=False)
+    meta = json.loads((cache / "meta.json").read_text())
     if version is None:
-        blob["signature"].pop("observation_filter_version")
+        meta["signature"].pop("observation_filter_version")
     else:
-        blob["signature"]["observation_filter_version"] = version
-    torch.save(blob, cache)
+        meta["signature"]["observation_filter_version"] = version
+    (cache / "meta.json").write_text(json.dumps(meta))
     args.trust_cache_prep = trust
     with pytest.raises(SystemExit, match="Rebuild it from the source"):
         P.load_prep(args, verbose=False)
@@ -356,10 +359,11 @@ def test_auto_gain_threshold_and_units(stream_file, python_parser, monkeypatch,
     assert decision["selected_gain"] == selected
     assert decision["selected"] == ("input" if selected == 1.0 else "calibration")
     args.gain = selected
-    explicit = P.load_prep(args, verbose=False)
-    for a, b in ((result.prep.I_obs, explicit.prep.I_obs),
-                 (result.prep.bg, explicit.prep.bg),
-                 (result.prep.obs_info.sigma, explicit.prep.obs_info.sigma)):
+    explicit = P.load_prep(args, verbose=False).prep.materialize()
+    result = result.prep.materialize()
+    for a, b in ((result.I_obs, explicit.I_obs),
+                 (result.bg, explicit.bg),
+                 (result.obs_info.sigma, explicit.obs_info.sigma)):
         assert torch.equal(a, b)
 
 
@@ -408,20 +412,20 @@ def test_auto_gain_cache_policy_is_checked(stream_file, python_parser, tmp_path,
         pytest.skip("calibrate does not use a discrepancy tolerance")
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg",
                         lambda self, *args: (2.0, 0.0, 0.0))
-    cache = tmp_path / "prep.pt"
+    cache = tmp_path / "prepared"
     args = _args(stream_file, cache_prep=cache)
     args.gain = mode
     P.load_prep(args, verbose=False)
     if change == "tolerance":
         monkeypatch.setattr(P, "DEFAULT_GAIN_TOLERANCE", 0.2)
     else:
-        blob = torch.load(cache, weights_only=False)
+        meta = json.loads((cache / "meta.json").read_text())
         if change == "previous_policy":
             from torchsx.measurement import GAIN_POLICY_VERSION
-            blob["signature"]["gain_policy_version"] = GAIN_POLICY_VERSION - 1
+            meta["signature"]["gain_policy_version"] = GAIN_POLICY_VERSION - 1
         else:
-            blob["signature"].pop("gain_policy_version")
-        torch.save(blob, cache)
+            meta["signature"].pop("gain_policy_version")
+        (cache / "meta.json").write_text(json.dumps(meta))
     with pytest.raises(SystemExit, match="different settings"):
         P.load_prep(args, verbose=False)
 
@@ -620,14 +624,14 @@ def test_gain_selection_provenance_follows_checkpoint_or_override(
 @pytest.mark.parametrize("flag,expected", [(None, False), (True, True)])
 def test_friedel_recipe_reaches_loader_and_cache(
         stream_file, python_parser, tmp_path, monkeypatch, flag, expected):
-    from torchsx.stream import SFXStream
-    read = SFXStream.read
+    from torchsx.merging.prepare_store import StoreBuilder
+    init = StoreBuilder.__init__
     observed = []
-    def capture(*args, **kwargs):
+    def capture(self, *args, **kwargs):
         observed.append(kwargs["merge_friedel"])
-        return read(*args, **kwargs)
-    monkeypatch.setattr(SFXStream, "read", capture)
-    args = _args(stream_file, merge_friedel=flag, cache_prep=tmp_path / "prepared.pt")
+        return init(self, *args, **kwargs)
+    monkeypatch.setattr(StoreBuilder, "__init__", capture)
+    args = _args(stream_file, merge_friedel=flag, cache_prep=tmp_path / "prepared")
     built = P.load_prep(args, recipe_defaults={"merge_friedel": False}, verbose=False)
     assert built.merge_friedel is expected
     loaded = P.load_prep(args, recipe_defaults=built.recipe, verbose=False)

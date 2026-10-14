@@ -372,6 +372,11 @@ def test_build_stack_rebuilds_a_checkpoint_geometry(tmp_path):
 # ── custom splits ──────────────────────────────────────────────────────
 
 
+def _in_memory(prep):
+    """A prepared store's observations as an in-memory ``PreparedObs``."""
+    return prep.materialize() if hasattr(prep, "materialize") else prep
+
+
 class _DataArgs:
     """The data half of the CLI namespace, with everything defaulted."""
 
@@ -435,15 +440,16 @@ def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
     assert expanded.split_names == ["alpha", "beta", "gamma"]
     expanded_labels = expanded.prep.obs_info.delay_bin_idx
     assert torch.bincount(expanded_labels).tolist() == [4, 2, 2]
-    obs_labels = expanded_labels[expanded.prep.obs_info.crystal_id]
-    original_labels = labels[b.prep.obs_info.crystal_id]
+    exp_prep, b_prep = _in_memory(expanded.prep), _in_memory(b.prep)
+    obs_labels = expanded_labels[exp_prep.obs_info.crystal_id]
+    original_labels = labels[b_prep.obs_info.crystal_id]
     for k in range(3):
-        expected = b.prep.I_obs if k == 0 else b.prep.I_obs[original_labels == 1]
-        torch.testing.assert_close(expanded.prep.I_obs[obs_labels == k].sort().values,
+        expected = b_prep.I_obs if k == 0 else b_prep.I_obs[original_labels == 1]
+        torch.testing.assert_close(exp_prep.I_obs[obs_labels == k].sort().values,
                                    expected.sort().values)
     cached = P.load_prep(overlap_args, verbose=False)
     assert torch.equal(cached.prep.obs_info.delay_bin_idx, expanded_labels)
-    torch.testing.assert_close(cached.prep.I_obs, expanded.prep.I_obs)
+    torch.testing.assert_close(_in_memory(cached.prep).I_obs, exp_prep.I_obs)
 
     # a frame the split file does not mention is refused, not silently pooled
     partial = tmp_path / "partial.split"

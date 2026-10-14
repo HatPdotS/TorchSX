@@ -53,7 +53,7 @@ pip install torchsx
 ```
 
 Python ≥ 3.10. This brings TorchRef 0.7, torch, triton, gemmi and
-`torchsx-native`, the compiled `.stream` reader for your platform. TorchSX is intended to be run on a GPU; its core algorithms are Triton kernels, and we have not investigated CPU runtime or even functionality. GPU memory should not exceed 10 GB. It scales with the redundancy requested for training (default 100) and the number of unique HKLs, not with the amount of data. Host RAM does scale with the amount of data, at roughly half the size of the CrystFEL stream; streaming from disk is being worked on but is not implemented yet.
+`torchsx-native`, the compiled `.stream` reader for your platform. TorchSX is intended to be run on a GPU; its core algorithms are Triton kernels, and we have not investigated CPU runtime or even functionality. GPU memory should not exceed 10 GB. It scales with the redundancy requested for training (default 100) and the number of unique HKLs, not with the amount of data. Host RAM does not scale with the amount of data either: the streams are prepared block by block into an on-disk store of 52 bytes per observation, and training and merging read it one batch at a time, with the next batch read while the current one is computed.
 
 From a checkout, build the native package first (needs Rust, see
 [native/README.md](https://github.com/HatPdotS/TorchSX/blob/master/native/README.md)):
@@ -76,7 +76,7 @@ run/
 ├── merged.metrics.json     in-run precision: CC1/2 and R_split between the two halves
 ├── best.pt                 the network at the lowest validation loss; it made the merges
 ├── last.pt                 the network after the last update
-├── prepared.pt             the parsed observations, reused by later runs on the same input
+├── prepared/               the prepared observations on disk, reused by later runs on the same input
 ├── run.json                the resolved settings
 ├── training_summary.json   updates, best step and run time
 └── metrics.jsonl           training log: one line per update and per validation

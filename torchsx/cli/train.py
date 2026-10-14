@@ -94,13 +94,18 @@ def _build_parser():
     return p
 
 
-def _batch(tr):
-    """Sample complete crystals from one state, alternating states per update."""
-    k = tr.step_i % tr.n_conditions
+def _batch(tr, step=None):
+    """Sample complete crystals from one state, alternating states per update.
+
+    ``step`` (default: the trainer's next update) fixes the draw, so a coming
+    batch can be named, and read ahead, before its update runs.
+    """
+    step = tr.step_i if step is None else int(step)
+    k = step % tr.n_conditions
     pool = tr.train_crystals[tr.condition[tr.train_crystals] == k]
     if not pool.numel():
         raise ValueError(f"State {k} has no training crystals after observation filtering")
-    g = torch.Generator().manual_seed(tr.cfg.seed + 1000003 * (tr.step_i // tr.n_conditions))
+    g = torch.Generator().manual_seed(tr.cfg.seed + 1000003 * (step // tr.n_conditions))
     perm = pool[torch.randperm(len(pool), generator=g)]
     counts = tr.index.counts[perm].cumsum(0)
     requested = tr.cfg.max_obs_per_batch
@@ -170,10 +175,23 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
     stale = 0
     updates = [0] * tr.n_conditions
     has_validation = bool(tr.heldout_crystals.numel())
+    upcoming = _batch(tr) if steps else None
+    if upcoming is not None:
+        tr.prefetch(upcoming[1])
     if has_validation:
         tr.evaluate(tr.heldout_crystals, phase="heldout_init")
-    for _ in range(steps):
-        k, rows = _batch(tr)
+    for i in range(steps):
+        k, rows = upcoming
+        if i + 1 < steps:
+            # read the next update's observations while this one computes
+            upcoming = _batch(tr, tr.step_i + 1)
+            tr.prefetch(upcoming[1])
+        if has_validation and ((tr.step_i + 1) % evaluate_every == 0 or i + 1 == steps):
+            # and the validation set's first batch, when a validation follows
+            first = next(tr.index.batches(tr.cfg.max_obs_per_batch, crystals=tr.heldout_crystals,
+                                          shuffle=False), None)
+            if first is not None:
+                tr.prefetch(first[1])
         rec = tr.step(rows.to(tr.device))
         if rec.get("step_skipped") or not rec.get("n_used"):
             raise FloatingPointError(f"Update {tr.step_i} for state {k} was unusable; see metrics.jsonl")

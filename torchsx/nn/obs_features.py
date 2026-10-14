@@ -191,17 +191,24 @@ class ObsFeatureSpec(nn.Module):
         self.context_features = tuple(context_features)
         self.crystal_features = tuple(crystal_features)
 
+        from torchsx.merging.store import PreparedStore
+
         oi = prep.obs_info
-        if oi.obs_id is None:
+        #: Observations on disk: every batch carries its own I, bg and sigma,
+        #: and the whole-set tables come from the store.
+        self._store = prep if isinstance(prep, PreparedStore) else None
+        if self._store is None and oi.obs_id is None:
             raise ValueError("ObsInfo.obs_id is required (prepare_observations sets it)")
 
-        n = prep.n_obs_total
-        I = prep.I_obs.float()
-        bg = prep.bg.float()
-        sigma = (
-            oi.sigma.float() if oi.sigma is not None
-            else (I.abs() + bg.clamp(min=0) + 1.0).sqrt()   # Poisson fallback
-        )
+        if self._store is not None:
+            I = bg = sigma = torch.zeros(0)
+        else:
+            I = prep.I_obs.float()
+            bg = prep.bg.float()
+            sigma = (
+                oi.sigma.float() if oi.sigma is not None
+                else (I.abs() + bg.clamp(min=0) + 1.0).sqrt()   # Poisson fallback
+            )
         # persistent=False on every buffer that is a COPY OF THE DATA.  They
         # are rebuilt from the prep at construction, so saving them puts the
         # data set in the checkpoint: three per-observation arrays, gigabytes
@@ -215,13 +222,15 @@ class ObsFeatureSpec(nn.Module):
         self.register_buffer("_bg", bg, persistent=False)
         self.register_buffer("_sigma", sigma.clamp(min=1e-6), persistent=False)
         self.register_buffer("_hkl", prep.hkl_valid.float(), persistent=False)
-        self.has_supplied_sigma = oi.sigma is not None
+        self.has_supplied_sigma = (oi.has_sigma if self._store is not None
+                                   else oi.sigma is not None)
         # The per-reflection context channels are fixed by the data alone and
         # computed once over every observation of the prepared set, all
         # conditions pooled: one table for every condition, so neither can tell
         # the network which condition a crystal belongs to.
         from torchsx.nn.merge_target import plain_mean
-        self.register_buffer("_I_mean", plain_mean(I, oi.hkl_idx, prep.n_valid),
+        self.register_buffer("_I_mean", prep.plain_mean() if self._store is not None
+                             else plain_mean(I, oi.hkl_idx, prep.n_valid),
                              persistent=False)
 
         # Normalisation stats over the FULL dataset (never per batch — that
@@ -255,7 +264,8 @@ class ObsFeatureSpec(nn.Module):
         self.register_buffer("_crys_const", torch.zeros(n_cf, dtype=torch.bool))
         if n_cf:
             # Only crystals that actually have observations define the stats.
-            present = torch.bincount(oi.crystal_id, minlength=oi.n_crystals) > 0
+            present = (prep.crystal_counts() if self._store is not None else
+                       torch.bincount(oi.crystal_id, minlength=oi.n_crystals)) > 0
             rows = raw[present.to(raw.device)]
             mean = rows.mean(dim=0)
             std = rows.std(dim=0) if rows.shape[0] > 1 else torch.zeros(n_cf)
@@ -284,14 +294,19 @@ class ObsFeatureSpec(nn.Module):
         # module's own `_I`/`_sigma` buffers live on the compute device while
         # the cached stat meta does not.  Deterministic, so the normalisation
         # does not jitter between calls.
-        meta_s = self._stat_obs_info
-        n = int(meta_s.hkl_idx.numel())
-        if n > self.STAT_SAMPLE:
-            # With replacement: a full randperm(n) to take 2 M rows costs
-            # seconds at 1e8 observations and buys nothing for a mean and std.
-            g = torch.Generator(device="cpu").manual_seed(0)
-            idx = torch.randint(n, (self.STAT_SAMPLE,), generator=g)
-            meta_s = meta_s.gather(idx.to(meta_s.hkl_idx.device))
+        if self._store is not None:
+            n = self._store.n_obs_total
+            meta_s = (self._store.random_rows(self.STAT_SAMPLE, 0) if n > self.STAT_SAMPLE
+                      else self._store.gather(torch.arange(n)))
+        else:
+            meta_s = self._stat_obs_info
+            n = int(meta_s.hkl_idx.numel())
+            if n > self.STAT_SAMPLE:
+                # With replacement: a full randperm(n) to take 2 M rows costs
+                # seconds at 1e8 observations and buys nothing for a mean and std.
+                g = torch.Generator(device="cpu").manual_seed(0)
+                idx = torch.randint(n, (self.STAT_SAMPLE,), generator=g)
+                meta_s = meta_s.gather(idx.to(meta_s.hkl_idx.device))
         meta_s = meta_s.to(self._I.device)
         full = self._raw_columns(meta_s, self._stat_names)
         mean = torch.stack([full[k].mean() for k in self._stat_names])
@@ -327,10 +342,19 @@ class ObsFeatureSpec(nn.Module):
         need = set(names)
 
         I = sig = I_ref = None
+        if self._store is not None and meta.I_obs is None:
+            raise ValueError("ObsFeatureSpec over a PreparedStore needs batches from "
+                             "PreparedStore.batch, which carry I_obs and bg")
         if {"signed_log_I", "i_over_sigma", "obs_scale", "obs_scale_over_sigma"} & need:
-            I = self._I[oid.to(self._I.device)]
+            I = (meta.I_obs.float() if meta.I_obs is not None
+                 else self._I[oid.to(self._I.device)])
         if {"log_sigma", "i_over_sigma", "obs_scale_over_sigma"} & need:
-            sig = self._sigma[oid.to(self._sigma.device)]
+            if meta.I_obs is None:
+                sig = self._sigma[oid.to(self._sigma.device)]
+            elif meta.sigma is not None:
+                sig = meta.sigma.float().clamp(min=1e-6)
+            else:
+                sig = (meta.I_obs.float().abs() + meta.bg.float().clamp(min=0) + 1.0).sqrt().clamp(min=1e-6)
         if {"obs_scale", "obs_scale_over_sigma", "log_I_mean"} & need:
             # (n_hkl,) and module-resident; index on the meta's device, which
             # stays the host for the cached statistics sample
@@ -370,7 +394,8 @@ class ObsFeatureSpec(nn.Module):
             elif k == "i_over_sigma":
                 out[k] = (I / sig).clamp(-50.0, 50.0)
             elif k == "log_bg":
-                out[k] = torch.log1p(self._bg[oid].clamp(min=0.0))
+                bg = meta.bg.float() if meta.I_obs is not None else self._bg[oid]
+                out[k] = torch.log1p(bg.clamp(min=0.0))
             elif k == "obs_scale":
                 out[k] = (I / I_ref).clamp(-20.0, 20.0)
             elif k == "obs_scale_over_sigma":
