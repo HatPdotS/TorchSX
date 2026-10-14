@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import torch
 
 
 READOUT_MAX_OBS = 1_500_000
@@ -161,6 +160,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     from torchsx.stream import SFXStream
     from torchsx.io.sources import inspect_source
     from torchsx.measurement import combine_measurements, resolve_measurement, validate_measurement
+    import torch
 
     d = dict(recipe_defaults or {})
     d_min = args.dmin if args.dmin is not None else d.get("d_min")
@@ -436,6 +436,8 @@ def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | No
     them into the test set would score the model on data no other merge held
     out.
     """
+    import torch
+
     if args.no_free:
         return None
     n = len(hkl)
@@ -489,6 +491,7 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
     pivots the mates onto one ASU row carrying ``F-obs(+)``/``F-obs(-)``.
     """
     import gemmi
+    import torch
     from torchref import ReflectionData
     from torchref.symmetry import Cell, SpaceGroup
 
@@ -590,6 +593,8 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
     """The diagnostics that have actually caught bugs in this pipeline."""
     if not verbose:
         return
+    import torch
+
     q = lambda t, p: float(t.quantile(torch.tensor(p, dtype=t.dtype, device=t.device)))
     seen = res["seen"]
     if not int(seen.sum()):
@@ -713,6 +718,7 @@ def _peer_layers(args) -> int:
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                 verbose: bool = True):
     """Build the production model, preserving recorded checkpoint geometry."""
+    import torch
     from torchsx.merging.likelihood import Poisson
     from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
     from torchsx.merging.scale import AmortizedScale

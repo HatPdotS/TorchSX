@@ -1,16 +1,20 @@
 # Merge statistics
 
-`torchsx.merge-stats` scores merged reflection files. Each **dataset** is either one
-merge or two independent halves. A single merge gets its summary statistics, and two
-halves get A/B statistics. Every dataset other than the **reference** is also scored as
-a difference against it, provided both have two halves. The reference is the first
+`torchsx.merge-stats` scores merged reflection files. Each **dataset** is one merge,
+two independent halves, or both. A merge gets its summary statistics, and two halves
+get CC1/2 and R_split. Every dataset other than the **reference** is also scored as a
+difference against it, provided both have two halves. The reference is the first
 dataset unless `--reference` names another.
 
 ```bash
+# The merges of a torchsx.train or torchsx.merge run, found in its directory
+torchsx.merge-stats run/                  # writes run/merge_stats/
+cd run/ && torchsx.merge-stats            # the same
+
 # One merge: completeness, <I/sigma(I)>, multiplicity, Wilson falloff
 torchsx.merge-stats merged.mtz -o stats
 
-# Two independent halves of one dataset
+# Two independent halves of one dataset: CC1/2 and R_split per resolution shell
 torchsx.merge-stats A/merged_dark.mtz B/merged_dark.mtz -o stats
 
 # Dark reference plus light datasets, each as two independent arms
@@ -23,9 +27,28 @@ torchsx.merge-stats dark.hkl1 dark.hkl2 --cell 61.5 90.8 150.9 90 90 90 \
   --spacegroup 'C 2 2 21' --dataset light light.hkl1 light.hkl2 -o stats
 ```
 
-The positional files come first; each `--dataset NAME FILE [FILE]` adds one more
-dataset. `python -m torchsx.cli.merge_stats` runs the same command from a source
-checkout. CPU only.
+The positional files, or the states of a run directory, come first; each
+`--dataset NAME FILE [FILE]` adds one more dataset. `python -m torchsx.cli.merge_stats`
+runs the same command from a source checkout. CPU only.
+
+## A torchsx run directory
+
+Given a directory, or with no inputs inside one, the command reads the merges that
+`torchsx.train` or `torchsx.merge` wrote there. Each export leaves `STEM.metrics.json`,
+keyed by the states it merged, next to `STEM.mtz` and its halves `STEM_half1.mtz` and
+`STEM_half2.mtz` (`STEM_STATE.mtz` and so on when the run has several states). Every
+state becomes one dataset with its merge and its two halves, named after the state
+(after `STEM` when the run has no `--split`). The first state is the reference.
+
+A run with one state has no difference: only its summary and its CC1/2 and R_split
+are written. With several states, every other state is scored against the first, for
+example light against dark. The output goes to `DIR/merge_stats` unless `-o` names
+another directory.
+
+The two halves of one run are merged with the same network, so their CC1/2 and R_split
+and the differences between their states measure the precision within the run. For
+independent halves, train two runs on disjoint sets of patterns and give their merges
+as files.
 
 ## Inputs
 
@@ -48,8 +71,8 @@ Amplitudes stored in the file are used as given. For a file with intensities onl
 - `sqrt` uses F = √I and σ(F) = σ(I)/2F, for I > 0 only.
 
 A reflection without an amplitude (a French-Wilson rejection, or I ≤ 0 under `sqrt`)
-still counts for the summary of a single merge. It is left out of the A/B and
-difference comparisons, which need amplitudes.
+still counts for the summary of a single merge. It is left out of the comparisons of
+halves and of the differences, which need amplitudes.
 
 Intensity statistics use the measured intensities when every merge in the comparison
 carries them, and F² otherwise. The `intensities` field records which was used.
@@ -72,18 +95,11 @@ model is one log scale plus six anisotropic terms on hkl/max|hkl|. It is fitted 
 
 | Column | Definition |
 | --- | --- |
-| `cc_I`, `cc_F` | Pearson CC of I and of F |
-| `rsplit_I` | √2 Σ\|I_A − I_B\| / Σ(I_A + I_B) |
-| `r_F` | Σ\|F_A − F_B\| / ½Σ(F_A + F_B) |
-| `rms_z`, `frac_z_gt3` | RMS and tail fraction of (F_A − F_B)/√(σ_A² + σ_B²); 1 and 0.3 % for honest σ |
-| `S_I`, `N_I`, `lnsr_I`, `lnsr_F` | S = Cov(x_A, x_B), the variance of the common signal; N = Var(x_A − x_B)/2, the error variance of one half; ln N/S |
+| `cc_half` | CC<sub>1/2</sub>: Pearson CC of I_A and I_B |
+| `r_split` | R<sub>split</sub> = √2 Σ\|I_A − I_B\| / Σ\|I_A + I_B\|; the magnitude of each pair, so negative measured intensities do not cancel positive ones |
 
-CC = 1/(1 + N/S) saturates once N ≪ S, while `lnsr` keeps resolving the error: a
-change of −0.1 means 10 % less error variance. The scale coefficients and the
-isotropic ΔB of B against A are reported alongside. `lowres_drift` is the unscaled
-median ln(I_B/I_A) of the lowest-resolution 2 % of reflections minus that of the
-middle 40 %. It is the smooth falloff difference that the anisotropic model cannot
-absorb.
+The headline adds both for the highest-resolution shell (`cc_half_outer`,
+`r_split_outer`); `stats.json` also records the scale coefficients.
 
 **Difference of dataset X against the reference R.** Both datasets come as two
 independent arms A and B. The difference is computed on the reflections common to the
@@ -116,13 +132,14 @@ on the binning, so compare datasets at a fixed `--shells` and `--sigma-bins`.
 
 ## Outputs
 
-`--format` chooses what is written to the new `-o` directory; the default is `csv plots`.
+`--format` chooses what is written to the new output directory (`-o`, by default `DIR/merge_stats`
+for a run directory); the default is `tsv plots`.
 A short table always goes to stdout.
 
 | File | Contents |
 | --- | --- |
-| `summary.csv` | One headline row per dataset (`kind` summary or halves) and per difference (`kind` difference, with its `reference`). |
-| `shells_summary.csv`, `shells_halves.csv`, `shells_difference.csv` | One row per dataset and shell; written for the kinds present. |
-| `bins_difference.csv` | One row per difference, shell and σ bin: ranges, n, cc_dF and bits. |
+| `summary.tsv` | One headline row per merge (`kind` summary), per pair of halves (`kind` halves) and per difference (`kind` difference, with its `reference`). |
+| `shells_summary.tsv`, `shells_halves.tsv`, `shells_difference.tsv` | One row per dataset and shell; written for the kinds present. |
+| `bins_difference.tsv` | One row per difference, shell and σ bin: ranges, n, cc_dF and bits. |
 | `stats.json` | Everything above plus scale coefficients and settings (`--format json`). |
 | `summary.png`, `halves.png`, `difference.png` | Per-shell curves with one line per dataset, written for the kinds present (`--format plots`). |
