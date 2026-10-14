@@ -96,11 +96,28 @@ def test_split_half_cc_and_rsplit_after_scaling():
     IA, IB = FA**2, FB**2
     assert res['intensities'] == 'F^2' and len(res['shells']) == 20
     assert res['overall']['cc_half'] == pytest.approx(np.corrcoef(IA, IB)[0, 1], abs=3e-3)
-    assert res['overall']['r_split'] == pytest.approx(np.sqrt(2) * np.abs(IA - IB).sum() / (IA + IB).sum(), rel=0.02)
+    assert res['overall']['r_split'] == pytest.approx(np.sqrt(2) * np.abs(IA - IB).sum() / np.abs(IA + IB).sum(),
+                                                      rel=0.02)
     full = halves_stats(merge(hkl, FA, sig), merge(hkl, FB * g, sig * g))
     assert [(s['cc_half'], s['r_split']) for s in res['shells']] == [(s['cc_I'], s['rsplit_I']) for s in full['shells']]
     h = res['headline']
     assert (h['cc_half_outer'], h['r_split_outer']) == (res['shells'][-1]['cc_half'], res['shells'][-1]['r_split'])
+
+
+def test_r_split_of_weak_measured_intensities():
+    """Negative measured intensities: each pair counts by magnitude in the denominator."""
+    rng = np.random.default_rng(4)
+    hkl = asu()
+    n = len(hkl)
+    true = 0.5 * np.abs(rng.standard_normal(n))
+    IA, IB = true + 5 * rng.standard_normal(n), true + 5 * rng.standard_normal(n)
+    assert (IA + IB).sum() < 0.3 * np.abs(IA + IB).sum()
+    one, sig = np.ones(n), np.full(n, 5.0)
+    res = split_half_stats(merge(hkl, one, one, I=IA, SIGI=sig), merge(hkl, one, one, I=IB, SIGI=sig))
+    assert res['intensities'] == 'measured' and res['n_common'] == n
+    expected = np.sqrt(2) * np.abs(IA - IB).sum() / np.abs(IA + IB).sum()
+    assert res['overall']['r_split'] == pytest.approx(expected, rel=1e-6)
+    assert all(0 < s['r_split'] < 3 for s in res['shells'])
 
 
 def arms(rng, hkl, tau, sigma=3.0):

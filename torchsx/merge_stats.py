@@ -383,8 +383,13 @@ def scale_onto(target: Merge, source: Merge):
 
 
 def r_split(IA, IB) -> float:
-    """``sqrt(2) sum|I_A - I_B| / sum(I_A + I_B)``."""
-    return float(np.sqrt(2) * np.abs(IA - IB).sum() / (IA + IB).sum())
+    """``sqrt(2) sum|I_A - I_B| / sum|I_A + I_B|``.
+
+    The denominator sums the magnitude of each pair, so the negative measured
+    intensities of weak reflections cannot cancel the positive ones.
+    """
+    den = np.abs(IA + IB).sum()
+    return float(np.sqrt(2) * np.abs(IA - IB).sum() / den) if den > 0 else float('nan')
 
 
 def pair_stats(FA, SA, FB, SB, IA, IB) -> dict:
@@ -430,7 +435,7 @@ def split_half_stats(a: Merge, b: Merge, n_shells=20) -> dict:
 
     Half B is scaled onto half A on their common reflections. CC1/2 is the
     Pearson correlation of the intensities, R_split = sqrt(2) sum|I_A - I_B| /
-    sum(I_A + I_B); intensities are the measured ones when both halves carry
+    sum|I_A + I_B|; intensities are the measured ones when both halves carry
     them, else F^2.
     """
     a, b, A, B, g, c = _common_scaled(a, b)

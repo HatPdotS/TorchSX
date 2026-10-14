@@ -96,7 +96,7 @@ model is one log scale plus six anisotropic terms on hkl/max|hkl|. It is fitted 
 | Column | Definition |
 | --- | --- |
 | `cc_half` | CC<sub>1/2</sub>: Pearson CC of I_A and I_B |
-| `r_split` | R<sub>split</sub> = √2 Σ\|I_A − I_B\| / Σ(I_A + I_B) |
+| `r_split` | R<sub>split</sub> = √2 Σ\|I_A − I_B\| / Σ\|I_A + I_B\|; the magnitude of each pair, so negative measured intensities do not cancel positive ones |
 
 The headline adds both for the highest-resolution shell (`cc_half_outer`,
 `r_split_outer`); `stats.json` also records the scale coefficients.
