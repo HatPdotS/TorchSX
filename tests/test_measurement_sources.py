@@ -80,7 +80,7 @@ def test_missing_zero_and_unknown_semantics(stream_file):
     assert resolve_measurement(zero, gain=1).gain == 1
     for change in ({"integration_method": "prof2d"}, {"background_definition": "summed_background"},
                    {"uncertainty_definition": "variance"}, {"upstream_corrections": ("lp",)}):
-        with pytest.raises(ValueError, match="Unsupported measurement semantics"):
+        with pytest.raises(ValueError, match="Unsupported measurement semantics.*" + next(iter(change))):
             resolve_measurement(replace(spec, **change), radii="3,4,7", gain=1)
     unknown = replace(spec, unresolved=("integration_modifiers",))
     with pytest.raises(ValueError, match="confirm"):
@@ -127,15 +127,18 @@ def test_recipe_precedence(stream_file):
         assert explicit.overrides
 
 
-def test_panel_gains_and_gradient_background(stream_file):
+def test_panel_gains_and_gradient_background(stream_file, monkeypatch):
     text = stream_file.read_text()
     stream_file.write_text(text.replace("adu_per_photon = 1.0", "m0/adu_per_photon = 2.0\nm1/adu_per_photon = 2.0"))
     spec = read_measurement(stream_file)
     assert gain_from_measurement(spec, 12000) == 2.0
     assert {d[0] for d in spec.gain_declarations} == {"m0", "m1"}
     stream_file.write_text(text.replace("rings-cen", "rings-grad"))
-    with pytest.raises(ValueError, match="background_definition"):
+    monkeypatch.setattr("torchsx.measurement._PLANE_WARNED", set())
+    with pytest.warns(UserWarning, match="Gradient background.*--integration=rings-grad.*nograd") as record:
+        assert resolve_measurement(read_measurement(stream_file), radii="3,4,7", gain=1).radii == (3, 4, 7)
         resolve_measurement(read_measurement(stream_file), radii="3,4,7", gain=1)
+    assert sum("Gradient background" in str(w.message) for w in record) == 1
 
 
 def test_named_dispatch_and_future_seams(stream_file, python_parser):

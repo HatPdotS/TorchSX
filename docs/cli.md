@@ -141,7 +141,9 @@ Integration radii come from `--int-radius`, else the checkpoint, else the
 indexamajig command recorded in the stream. Omitted indexamajig options take
 their CrystFEL defaults ([indexamajig manual](https://www.desy.de/~twhite/crystfel/manual-indexamajig.html)),
 including radii `4,5,7`. Ring integration without centring is supported; other
-integration modes are rejected.
+integration modes are rejected. With `grad`, CrystFEL subtracts a background
+plane fitted to the background ring instead of the ring's mean; TorchSX then
+prints a warning and uses the mean-background noise model as an approximation.
 
 ## Free set
 

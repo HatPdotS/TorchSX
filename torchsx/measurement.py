@@ -15,6 +15,7 @@ MEASUREMENT_KEY = "_torchsx_measurement"
 # calibration replaced can be refined in training by one global B (--detector-noise auto).
 GAIN_POLICY_VERSION = 3
 DEFAULT_GAIN_TOLERANCE = 0.5
+_PLANE_WARNED: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -116,16 +117,33 @@ def validate_measurement(spec: MeasurementSpec | None, *, explicit_rings: bool) 
         "background_definition": "local_mean_per_pixel",
         "uncertainty_definition": "supplied_sigma_of_intensity",
     }
-    bad = [key for key, val in expected.items() if getattr(spec, key) != val]
+    plane = spec.background_definition == "local_plane_at_peak"
+    bad = [f"{key} is {getattr(spec, key)!r}, expected {val!r}" for key, val in expected.items()
+           if getattr(spec, key) != val and not (key == "background_definition" and plane)]
     if (spec.intensity_unit, spec.background_unit) not in (("adu", "adu/pixel"),
                                                          ("photon", "photon/pixel")):
-        bad.append("units")
+        bad.append(f"units are {spec.intensity_unit!r} and {spec.background_unit!r}, "
+                   "expected 'adu' and 'adu/pixel' or 'photon' and 'photon/pixel'")
     if spec.upstream_corrections:
-        bad.append("upstream_corrections")
+        bad.append(f"upstream_corrections {list(spec.upstream_corrections)} were applied, expected none")
     if spec.integration_method not in (None, "rings"):
-        bad.append("integration_method")
+        bad.append(f"integration_method is {spec.integration_method!r}, expected 'rings'")
     if bad:
-        raise ValueError("Unsupported measurement semantics: " + ", ".join(bad))
+        sources = ", ".join(spec.source_files) or "the input"
+        raise ValueError(f"Unsupported measurement semantics in {sources}: " + "; ".join(bad)
+                         + ". The noise model needs background-subtracted ring sums with "
+                         "their supplied sigma, as written by CrystFEL ring integration.")
+    recipe = "-".join((spec.integration_method or "rings", *spec.integration_modifiers))
+    if plane and recipe not in _PLANE_WARNED:
+        # Validation runs at several stages of one run; warn once per recipe.
+        import warnings
+        _PLANE_WARNED.add(recipe)
+        warnings.warn(
+            f"Gradient background: the stream was integrated with --integration={recipe}, "
+            "so CrystFEL subtracted a background plane fitted to the background ring, not "
+            "the ring's mean. The noise model assumes the mean background and is used here "
+            "as an approximation. For an exact match, integrate with nograd (the "
+            "indexamajig default).", stacklevel=1)
     if (spec.integration_method is None or "integration_modifiers" in spec.unresolved) and not explicit_rings:
         raise ValueError("Integration recipe is unresolved; confirm the ring recipe with --int-radius.")
 
