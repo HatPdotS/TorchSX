@@ -7,10 +7,13 @@ common to the merges involved, after scaling, in equal-count resolution shells:
 * ``summary_stats``: one merge on its own -- completeness, mean intensity and
   I/sigma(I), mean multiplicity where the file carries counts, and the Wilson
   falloff of <I/epsilon>.
-* ``halves_stats``: two independent halves of one dataset. Half B is scaled
-  onto half A (one log scale plus six anisotropic terms on normalised hkl,
-  sigma-weighted robust least squares on amplitudes), then CC, R_split, the
-  sigma-normalised difference and the noise-to-signal ratio ``ln N/S``.
+* ``split_half_stats``: two independent halves of one dataset. Half B is
+  scaled onto half A (one log scale plus six anisotropic terms on normalised
+  hkl, sigma-weighted robust least squares on amplitudes), then CC1/2 and
+  R_split of the intensities.
+* ``halves_stats``: the same halves, scaled the same way, with CC and R on
+  intensities and amplitudes, the sigma-normalised difference and the
+  noise-to-signal ratio ``ln N/S``.
 * ``difference_stats``: dataset X against a reference R, both as two
   independent arms A and B. In each arm X is scaled onto R, arm B onto arm A by
   the reference merges; the arms' Delta F = F_X - F_R are compared per shell
@@ -25,10 +28,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import torch
 
 AMPLITUDES = ('french-wilson', 'sqrt')
-FORMATS = ('csv', 'json', 'plots')
+FORMATS = ('tsv', 'json', 'plots')
 COUNT_LABELS = ('N', 'NOBS', 'N_OBS', 'NMEAS', 'MULT', 'MULTIPLICITY', 'REDUNDANCY')
 LABEL_KEYS = ('F', 'SIGF', 'I', 'SIGI')
 WILSON_D_MAX = 4.0
@@ -79,6 +81,7 @@ def _spacegroup(name):
 
 
 def _tensor(a):
+    import torch
     return torch.from_numpy(np.ascontiguousarray(a))
 
 
@@ -88,12 +91,14 @@ def laue_key(spacegroup):
     Merges with equal keys share one reciprocal asymmetric unit, so their
     canonical indices can be matched.
     """
+    import torch
     m = _spacegroup(spacegroup).matrices.round().to(torch.int64)
     return frozenset(tuple(r.flatten().tolist()) for r in torch.cat([m, -m]))
 
 
 def d_spacing(hkl, cell):
     """Resolution of each Miller index, in angstrom."""
+    import torch
     from torchref.base.reciprocal.hkl import get_d_spacing
     return get_d_spacing(torch.as_tensor(np.asarray(hkl), dtype=torch.float64),
                          torch.as_tensor(np.asarray(cell, dtype=np.float64))).cpu().numpy()
@@ -207,6 +212,7 @@ def _average_duplicates(hkl, columns):
 
 def _french_wilson(hkl, I, SIGI, d, spacegroup):
     """French-Wilson amplitudes, the prior fitted to these intensities; the rows it accepts."""
+    import torch
     from torchref.io.datasets import french_wilson_auto
     as64 = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float64)  # noqa: E731
     F, S, valid = french_wilson_auto(as64(I), as64(SIGI), _tensor(hkl), as64(d), str(spacegroup))
@@ -366,11 +372,19 @@ def fit_scale(X, FA, SA, FB, SB):
     return least_squares(resid, c0, loss='soft_l1', f_scale=3.0).x
 
 
+SCALE_MODEL = 'F_B *= exp(c . [1, h2, k2, l2, 2hk, 2hl, 2kl]) on hkl / max|hkl|'
+
+
 def scale_onto(target: Merge, source: Merge):
     """Per-row correction factor of ``source`` onto ``target`` (rows aligned) and its coefficients."""
     X = design(target.hkl)
     c = fit_scale(X, target.F, target.SIGF, source.F, source.SIGF)
     return np.exp(X @ c), c
+
+
+def r_split(IA, IB) -> float:
+    """``sqrt(2) sum|I_A - I_B| / sum(I_A + I_B)``."""
+    return float(np.sqrt(2) * np.abs(IA - IB).sum() / (IA + IB).sum())
 
 
 def pair_stats(FA, SA, FB, SB, IA, IB) -> dict:
@@ -380,7 +394,7 @@ def pair_stats(FA, SA, FB, SB, IA, IB) -> dict:
         'n': int(FA.size),
         'cc_I': pearson(IA, IB),
         'cc_F': pearson(FA, FB),
-        'rsplit_I': float(np.sqrt(2) * np.abs(IA - IB).sum() / (IA + IB).sum()),
+        'rsplit_I': r_split(IA, IB),
         'r_F': float(np.abs(FA - FB).sum() / (0.5 * (FA + FB).sum())),
         'rms_z': float(np.sqrt(np.mean(z**2))),
         'frac_z_gt3': float(np.mean(np.abs(z) > 3)),
@@ -394,6 +408,49 @@ def _finite_mean(values):
     return float(np.mean(v)) if v else float('nan')
 
 
+def _common_scaled(a: Merge, b: Merge):
+    """Both halves with amplitudes, both on their common reflections, and the
+    per-row correction of B onto A with its coefficients."""
+    a, b = a.with_amplitudes(), b.with_amplitudes()
+    ia, ib = common_indices(a, b)
+    A, B = a.take(ia), b.take(ib)
+    g, c = scale_onto(A, B)
+    return a, b, A, B, g, c
+
+
+def _intensities(A: Merge, B: Merge, g):
+    """``(I_A, I_B scaled onto A, kind)``: measured when both halves carry them, else F^2."""
+    if A.I is not None and B.I is not None:
+        return A.I, B.I * g**2, 'measured'
+    return A.F**2, (B.F * g) ** 2, 'F^2'
+
+
+def split_half_stats(a: Merge, b: Merge, n_shells=20) -> dict:
+    """CC1/2 and R_split of two halves of one dataset, per resolution shell and overall.
+
+    Half B is scaled onto half A on their common reflections. CC1/2 is the
+    Pearson correlation of the intensities, R_split = sqrt(2) sum|I_A - I_B| /
+    sum(I_A + I_B); intensities are the measured ones when both halves carry
+    them, else F^2.
+    """
+    a, b, A, B, g, c = _common_scaled(a, b)
+    IA, IB, intensities = _intensities(A, B, g)
+
+    def stats(ix):
+        return {'n': len(ix), 'cc_half': pearson(IA[ix], IB[ix]), 'r_split': r_split(IA[ix], IB[ix])}
+    shells = [{**_shell(j, A.d, ix), **stats(ix)} for j, ix in enumerate(resolution_shells(A.d, n_shells))]
+    overall = stats(np.arange(len(A)))
+    return {
+        'n_A': len(a), 'n_B': len(b), 'n_common': len(A), 'intensities': intensities,
+        'amplitudes': [a.amplitudes, b.amplitudes],
+        'scale': {'model': SCALE_MODEL, 'c': [float(v) for v in c], 'g_range': [float(g.min()), float(g.max())]},
+        'overall': overall,
+        'shells': shells,
+        'headline': {'n_common': len(A), 'cc_half': overall['cc_half'], 'r_split': overall['r_split'],
+                     'cc_half_outer': shells[-1]['cc_half'], 'r_split_outer': shells[-1]['r_split']},
+    }
+
+
 def halves_stats(a: Merge, b: Merge, n_shells=20) -> dict:
     """Two independent halves of one dataset, half B scaled onto half A.
 
@@ -402,21 +459,17 @@ def halves_stats(a: Merge, b: Merge, n_shells=20) -> dict:
     lowest-resolution 2 % of the common reflections minus that of the middle
     40 %: the smooth falloff difference the anisotropic model cannot absorb.
     """
-    a, b = a.with_amplitudes(), b.with_amplitudes()
-    ia, ib = common_indices(a, b)
-    A, B = a.take(ia), b.take(ib)
+    a, b, A, B, g, c = _common_scaled(a, b)
     d = A.d
-    g, c = scale_onto(A, B)
     ci = fit_scale(np.stack([np.ones_like(d), 1.0 / d**2], 1), A.F, A.SIGF, B.F, B.SIGF)
     FB, SB = B.F * g, B.SIGF * g
-    measured = A.I is not None and B.I is not None
-    IA, IB = (A.I, B.I * g**2) if measured else (A.F**2, FB**2)
+    IA, IB, intensities = _intensities(A, B, g)
     out = {
         'n_A': len(a), 'n_B': len(b), 'n_common': len(A),
-        'intensities': 'measured' if measured else 'F^2',
+        'intensities': intensities,
         'amplitudes': [a.amplitudes, b.amplitudes],
         'scale': {
-            'model': 'F_B *= exp(c . [1, h2, k2, l2, 2hk, 2hl, 2kl]) on hkl / max|hkl|',
+            'model': SCALE_MODEL,
             'c': [float(v) for v in c],
             'iso_log_k': float(ci[0]),
             # F ~ exp(-B s^2 / 4) with s = 1/d: positive = B falls off faster than A
@@ -662,8 +715,8 @@ def render(results, folder):
         _wilson_panel(summaries, folder)
         written.append('summary.png')
     if halves:
-        _panels(halves, (('cc_I', 'CC(I), A vs B'), ('rms_z', 'RMS z of F_A − F_B'), ('lnsr_I', 'ln N/S of I')),
-                'halves.png', folder, 'independent halves (B scaled onto A)', refs={'rms_z': 1.0})
+        _panels(halves, (('cc_half', 'CC1/2'), ('r_split', 'R_split')),
+                'halves.png', folder, 'independent halves (B scaled onto A)')
         written.append('halves.png')
     if diffs:
         _panels(diffs, (('cc_dF', 'CC(ΔF), arm A vs arm B'), ('lnsr_dF', 'ln N/S of ΔF'), ('bits', 'information (bits)')),

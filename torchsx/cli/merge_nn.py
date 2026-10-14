@@ -10,7 +10,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from torchsx.cli import _pipeline as P
 
@@ -29,6 +28,8 @@ def _build_parser():
 
 def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
+    import torch
+
     # TF32 for the encoder's float32 matmuls; the likelihood and posterior
     # integrals are elementwise and Triton code, which this does not touch.
     torch.set_float32_matmul_precision("high")
@@ -120,6 +121,8 @@ def restore_wilson_surface(tr, prep, ckpt, names=None) -> None:
 def _export_crystals(tr, k: int):
     """Crystals of condition ``k`` that the export merges: all of them, less an
     external held-out set (``--heldout-stream``), which is scored, never merged."""
+    import torch
+
     in_cond = (tr.condition == k).nonzero(as_tuple=True)[0]
     ext = getattr(tr, "external_heldout", None)
     if ext is not None:
@@ -129,6 +132,8 @@ def _export_crystals(tr, k: int):
 
 def _split_halves(tr, k: int, seed: int):
     """Disjoint crystal subsets for the shared-network internal CC1/2 statistic."""
+    import torch
+
     in_cond = _export_crystals(tr, k)
     g = torch.Generator().manual_seed(seed)
     perm = in_cond[torch.randperm(in_cond.numel(), generator=g)]
@@ -137,6 +142,8 @@ def _split_halves(tr, k: int, seed: int):
 
 def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0") -> dict | None:
     """CC1/2 and R_split of two half merges on ``key``."""
+    import torch
+
     both = (a["seen"] & b["seen"]).cpu()
     I1 = a[key].detach().cpu().double(); I2 = b[key].detach().cpu().double()
     I1, I2 = I1[both], I2[both]

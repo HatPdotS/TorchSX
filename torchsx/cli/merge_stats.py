@@ -3,12 +3,13 @@ import argparse
 import csv
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from torchsx.merge_stats import (AMPLITUDES, FORMATS, LABEL_KEYS, difference_stats, file_format, halves_stats,
-                                 load_merge, render, summary_stats)
+from torchsx.merge_stats import (AMPLITUDES, FORMATS, LABEL_KEYS, difference_stats, file_format, load_merge, render,
+                                 split_half_stats, summary_stats)
 
 
 def _labels(items):
@@ -21,15 +22,65 @@ def _labels(items):
     return labels
 
 
+@dataclass
+class Dataset:
+    """One merge, two independent halves, or both (a state of a torchsx export)."""
+    name: str
+    merge: Path | None = None
+    halves: tuple[Path, Path] | None = None
+
+    @property
+    def files(self):
+        return [f for f in (self.merge, *(self.halves or ())) if f is not None]
+
+
+def _from_files(name, files):
+    return Dataset(name, merge=files[0]) if len(files) == 1 else Dataset(name, halves=tuple(files))
+
+
+def discover(folder):
+    """The states exported to ``folder`` by torchsx.train or torchsx.merge, in state order.
+
+    An export writes ``STEM.metrics.json``, keyed by the states it wrote, next to
+    ``STEM.mtz`` (``STEM_STATE.mtz`` when the run has several states) and its
+    ``_half1``/``_half2`` companions. Each state is one dataset with its merge and
+    its two halves, named by the state (by ``STEM`` when unnamed), or by the
+    merge's file stem when the folder holds several exports.
+    """
+    folder = Path(folder)
+    exports = sorted(folder.glob('*.metrics.json'))
+    datasets = []
+    for metrics in exports:
+        stem = metrics.name[:-len('.metrics.json')]
+        try:
+            states = list(json.loads(metrics.read_text()))
+        except (OSError, ValueError):
+            continue
+        for state in states:
+            bases = [folder / f'{stem}_{state}', folder / stem] if state else [folder / stem]
+            for base in bases:
+                merge, half1, half2 = (base.with_name(base.name + s + '.mtz') for s in ('', '_half1', '_half2'))
+                halves = (half1, half2) if half1.is_file() and half2.is_file() else None
+                if merge.is_file() or halves:
+                    name = base.name if len(exports) > 1 else (state or stem)
+                    datasets.append(Dataset(name, merge if merge.is_file() else None, halves))
+                    break
+    return datasets
+
+
 def _build_parser():
     p = argparse.ArgumentParser(prog='torchsx.merge-stats', description=__doc__,
-        epilog='A dataset is one merge (summary statistics) or two independent halves (A/B statistics). '
-               'Every dataset other than the reference is also scored as a difference against it, '
-               'when both have two halves. Inputs: MTZ, CrystFEL .hkl/.hkl1/.hkl2, mmCIF structure factors. '
-               'CPU only.')
-    p.add_argument('files', nargs='*', type=Path, metavar='FILE',
-                   help='the first dataset: one merge, or two independent halves')
-    p.add_argument('--name', help='name of the first dataset (default: stem of its first file)')
+        epilog='A dataset is one merge (summary statistics), two independent halves (CC1/2 and R_split), '
+               'or, for each state of a torchsx output directory, both. Every dataset other than the '
+               'reference is also scored as a difference against it, when both have two halves; a run '
+               'with one state has no differences. Inputs: MTZ, CrystFEL .hkl/.hkl1/.hkl2, mmCIF '
+               'structure factors. CPU only.')
+    p.add_argument('files', nargs='*', type=Path, metavar='PATH',
+                   help='the first dataset: one merge or two independent halves; or a torchsx.train / '
+                        'torchsx.merge output directory, one dataset per state. Default: the current '
+                        'directory, when it holds a torchsx export')
+    p.add_argument('--name', help='name of the first dataset (default: stem of its first file, '
+                                    'without _half1)')
     p.add_argument('--dataset', action='append', nargs='+', default=[], metavar=('NAME', 'FILE'),
                    help='an additional dataset: a name and one merge or two halves; repeatable')
     p.add_argument('--reference', metavar='NAME', help='dataset the differences are taken against (default: the first)')
@@ -45,34 +96,54 @@ def _build_parser():
                    help='quantile bins of sigma(dF) per shell for information in bits (default 5)')
     p.add_argument('--dmin', type=float, help='high-resolution cut (angstrom)')
     p.add_argument('--dmax', type=float, help='low-resolution cut (angstrom)')
-    p.add_argument('--format', nargs='+', choices=FORMATS, default=['csv', 'plots'], dest='formats',
-                   help='outputs to write (default: csv plots)')
-    p.add_argument('-o', '--out', type=Path, required=True, help='new output directory')
+    p.add_argument('--format', nargs='+', choices=FORMATS, default=['tsv', 'plots'], dest='formats',
+                   help='outputs to write (default: tsv plots)')
+    p.add_argument('-o', '--out', type=Path,
+                   help='new output directory (default for a torchsx output directory: DIR/merge_stats)')
     return p
 
 
 def _datasets(p, args):
+    """The datasets in order, and the directory they were discovered in (None when given as files)."""
+    folder = None
+    if any(f.is_dir() for f in args.files):
+        if len(args.files) != 1:
+            p.error('give one torchsx output directory, or one or two merge files')
+        folder = args.files[0]
+    elif not (args.files or args.dataset or args.name):
+        folder = Path('.')
     datasets = []
-    if args.files:
-        datasets.append((args.name or args.files[0].name.split('.')[0], list(args.files)))
+    if folder is not None:
+        if args.name:
+            p.error('--name names a dataset given as files; a torchsx output directory names its states')
+        datasets = discover(folder)
+        if not datasets:
+            p.error(f'{folder.resolve()}: no torchsx export (STEM.metrics.json beside its merged MTZs); '
+                    'supply FILE [FILE] or --dataset NAME FILE [FILE]')
+        print(f'{p.prog}: {folder.resolve()}: ' + ', '.join(
+            f"{d.name} ({' + '.join(['merge'] * bool(d.merge) + ['halves'] * bool(d.halves))})" for d in datasets))
+    elif args.files:
+        if len(args.files) > 2:
+            p.error(f'the first dataset takes one merge or two halves, got {len(args.files)} files')
+        stem = args.files[0].name.split('.')[0]
+        if len(args.files) == 2:
+            stem = stem.removesuffix('_half1')
+        datasets.append(_from_files(args.name or stem, list(args.files)))
     elif args.name:
         p.error('--name names the positional dataset; give its files')
     for entry in args.dataset:
-        datasets.append((entry[0], [Path(f) for f in entry[1:]]))
-    if not datasets:
-        p.error('Supply a dataset: FILE [FILE] and/or --dataset NAME FILE [FILE]')
-    for name, files in datasets:
-        if len(files) not in (1, 2):
-            p.error(f'dataset {name!r} takes one merge or two halves, got {len(files)} files')
-    names = [n for n, _ in datasets]
+        if len(entry) not in (2, 3):
+            p.error(f'dataset {entry[0]!r} takes one merge or two halves, got {len(entry) - 1} files')
+        datasets.append(_from_files(entry[0], [Path(f) for f in entry[1:]]))
+    names = [d.name for d in datasets]
     if len(set(names)) != len(names):
         p.error(f'dataset names must be unique: {names}')
-    return datasets
+    return datasets, folder
 
 
 def _load(p, args, datasets, labels):
     """Every distinct file once; CrystFEL lists take the given symmetry, else the first other input's."""
-    paths = list(dict.fromkeys(f for _, files in datasets for f in files))
+    paths = list(dict.fromkeys(f for d in datasets for f in d.files))
     for f in paths:
         if not f.exists():
             p.error(f'{f}: no such file')
@@ -104,17 +175,17 @@ def _num(v):
     return v
 
 
-def _write_csv(path, rows):
+def _write_tsv(path, rows):
     fields = list(dict.fromkeys(k for r in rows for k in r))
     with path.open('w', newline='') as fh:
-        w = csv.DictWriter(fh, fieldnames=fields, restval='')
+        w = csv.DictWriter(fh, fieldnames=fields, restval='', delimiter='\t', lineterminator='\n')
         w.writeheader()
         for r in rows:
             w.writerow({k: _num(v) for k, v in r.items()})
 
 
-def write_csv(results, out):
-    """``summary.csv`` (one headline row per dataset and difference) and the long per-shell tables."""
+def write_tsv(results, out):
+    """``summary.tsv`` (one headline row per merge, pair of halves and difference) and the long per-shell tables."""
     summary, shells = [], {'summary': [], 'halves': [], 'difference': []}
     bins = []
     for r in results['datasets']:
@@ -126,15 +197,15 @@ def write_csv(results, out):
                         'files': ';'.join(r['files']), **r['headline']})
         shells['difference'] += [{'name': r['name'], 'reference': r['reference'], **s} for s in r['shells']]
         bins += [{'name': r['name'], 'reference': r['reference'], **b} for b in r['bins']]
-    written = ['summary.csv']
-    _write_csv(out / 'summary.csv', summary)
+    written = ['summary.tsv']
+    _write_tsv(out / 'summary.tsv', summary)
     for kind, rows in shells.items():
         if rows:
-            _write_csv(out / f'shells_{kind}.csv', rows)
-            written.append(f'shells_{kind}.csv')
+            _write_tsv(out / f'shells_{kind}.tsv', rows)
+            written.append(f'shells_{kind}.tsv')
     if bins:
-        _write_csv(out / 'bins_difference.csv', bins)
-        written.append('bins_difference.csv')
+        _write_tsv(out / 'bins_difference.tsv', bins)
+        written.append('bins_difference.tsv')
     return written
 
 
@@ -151,10 +222,9 @@ def table(results):
                         f"completeness {_f(h['completeness'], '.3f')}  I/sig {_f(h['mean_I_over_sigma'], '.2f')}  "
                         f"multiplicity {_f(h['multiplicity'], '.1f')}  Wilson B {_f(h['wilson_B'], '.1f')}")
         else:
-            rows.append(f"halves      {r['name']:<16} n {h['n_common']:>8d}  cc_I {_f(h['cc_I'], '.4f')}  "
-                        f"outer {_f(h['cc_I_outer'], '.4f')}  rsplit_I {_f(h['rsplit_I'], '.4f')}  "
-                        f"rms_z {_f(h['rms_z'], '.3f')}  lnsr_I {_f(h['lnsr_I'], '.3f')}  "
-                        f"lowres_drift {_f(h['lowres_drift'], '+.3f')}")
+            rows.append(f"halves      {r['name']:<16} n {h['n_common']:>8d}  CC1/2 {_f(h['cc_half'], '.4f')}  "
+                        f"outer {_f(h['cc_half_outer'], '.4f')}  R_split {_f(h['r_split'], '.4f')}  "
+                        f"outer {_f(h['r_split_outer'], '.4f')}")
     for r in results['differences']:
         h = r['headline']
         rows.append(f"difference  {r['name'] + ' - ' + r['reference']:<16} n {h['n_common']:>8d}  "
@@ -171,10 +241,15 @@ def main(argv=None):
         p.error(str(e))
     if args.shells < 1 or args.sigma_bins < 1:
         p.error('--shells and --sigma-bins must be >= 1')
-    datasets = _datasets(p, args)
-    reference = args.reference or datasets[0][0]
-    if reference not in dict(datasets):
-        p.error(f'--reference {reference!r} is not a dataset name: {[n for n, _ in datasets]}')
+    datasets, folder = _datasets(p, args)
+    by_name = {d.name: d for d in datasets}
+    reference = args.reference or datasets[0].name
+    if reference not in by_name:
+        p.error(f'--reference {reference!r} is not a dataset name: {list(by_name)}')
+    if args.out is None:
+        if folder is None:
+            p.error('the following arguments are required: -o/--out')
+        args.out = folder / 'merge_stats'
     if args.out.exists():
         p.error(f'{args.out} already exists; choose a new --out directory')
     merges = _load(p, args, datasets, labels)
@@ -182,28 +257,30 @@ def main(argv=None):
     results = {'settings': {'reference': reference, 'amplitudes': args.amplitudes, 'shells': args.shells,
                             'sigma_bins': args.sigma_bins, 'dmin': args.dmin, 'dmax': args.dmax, 'labels': labels},
                'datasets': [], 'differences': []}
-    for name, files in datasets:
-        ms = [merges[f] for f in files]
-        res = summary_stats(ms[0], args.shells, args.dmax) if len(ms) == 1 else halves_stats(*ms, n_shells=args.shells)
-        results['datasets'].append({'name': name, 'kind': 'summary' if len(ms) == 1 else 'halves',
-                                    'files': [str(f) for f in files], **res})
-    ref_files = dict(datasets)[reference]
-    for name, files in datasets:
-        if name == reference:
+    for d in datasets:
+        if d.merge is not None:
+            results['datasets'].append({'name': d.name, 'kind': 'summary', 'files': [str(d.merge)],
+                                        **summary_stats(merges[d.merge], args.shells, args.dmax)})
+        if d.halves is not None:
+            results['datasets'].append({'name': d.name, 'kind': 'halves', 'files': [str(f) for f in d.halves],
+                                        **split_half_stats(*(merges[f] for f in d.halves), n_shells=args.shells)})
+    ref = by_name[reference]
+    for d in datasets:
+        if d is ref:
             continue
-        if len(files) != 2 or len(ref_files) != 2:
-            print(f'{p.prog}: skipping difference {name} - {reference}: '
+        if d.halves is None or ref.halves is None:
+            print(f'{p.prog}: skipping difference {d.name} - {reference}: '
                   'both datasets need two independent halves', file=sys.stderr)
             continue
-        res = difference_stats(tuple(merges[f] for f in ref_files), tuple(merges[f] for f in files),
+        res = difference_stats(tuple(merges[f] for f in ref.halves), tuple(merges[f] for f in d.halves),
                                n_shells=args.shells, n_sigma=args.sigma_bins)
-        results['differences'].append({'name': name, 'reference': reference,
-                                       'files': [str(f) for f in ref_files + files], **res})
+        results['differences'].append({'name': d.name, 'reference': reference,
+                                       'files': [str(f) for f in ref.halves + d.halves], **res})
 
     args.out.mkdir(parents=True)
     written = []
-    if 'csv' in args.formats:
-        written += write_csv(results, args.out)
+    if 'tsv' in args.formats:
+        written += write_tsv(results, args.out)
     if 'json' in args.formats:
         (args.out / 'stats.json').write_text(json.dumps(results, indent=2) + '\n')
         written.append('stats.json')
