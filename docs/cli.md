@@ -194,6 +194,11 @@ batch of crystals at a time, the next while the current one is computed. The
 store needs about 52 bytes per observation of disk space, and the temporary
 file about 38 more while it is written.
 
+While it is built, the store stages in `CACHE.raw` and `CACHE.partial` next to
+it. A directory of either name that an interrupted build left behind is
+replaced; any other directory of that name stops the run before parsing, and
+its contents are left as they are.
+
 `run.json` records the resolved settings: inputs, measurement, gain and its
 reason, model, learning rates and schedule. `--seed` fixes network
 initialization and batch sampling; `torchsx.merge` reuses the run's seed for

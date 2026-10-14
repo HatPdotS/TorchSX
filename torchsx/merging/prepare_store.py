@@ -61,6 +61,40 @@ _IMAGE = ("beam_energy", "det_shift_x", "det_shift_y", "n_peaks")
 _COUNTS = ("all", "kept", "positive", "I", "background", "sigma")
 
 
+#: Marks a directory this module created for staging; only such a directory
+#: (or an empty one) is ever deleted to make room for a new build.
+STAGING_MARKER = ".torchsx-staging"
+
+
+def staging_paths(out: str | Path) -> tuple[Path, Path]:
+    """The staging directories of a store built at ``out``: the parsed inputs
+    (``OUT.raw``) and the store being written (``OUT.partial``)."""
+    out = Path(out)
+    return out.with_name(out.name + ".raw"), out.with_name(out.name + ".partial")
+
+
+def check_staging(path: str | Path) -> None:
+    """Raise ``FileExistsError`` unless ``path`` is absent, an empty directory,
+    or a staging directory left by an earlier build."""
+    path = Path(path)
+    if not path.exists() or (path / STAGING_MARKER).is_file():
+        return
+    if path.is_dir() and not any(path.iterdir()):
+        return
+    raise FileExistsError(f"{path} exists and was not created by TorchSX; move it away "
+                          "or prepare into another directory")
+
+
+def _fresh_staging(path: Path) -> Path:
+    """``path`` as a new, marked staging directory, replacing only an earlier one."""
+    check_staging(path)
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    (path / STAGING_MARKER).touch()
+    return path
+
+
 def hkl_key(hkl: Tensor) -> Tensor:
     """One int64 per Miller index, ordered as ``(h, k, l)`` lexicographically."""
     h = hkl.to(torch.int64) + 32768
@@ -199,10 +233,7 @@ class StoreBuilder:
 
     def __init__(self, workdir: str | Path, *, spacegroup: str | None, merge_friedel: bool = True,
                  n_workers: int = 1, block_obs: int | None = None, verbose: bool = True):
-        self.workdir = Path(workdir)
-        if self.workdir.exists():
-            shutil.rmtree(self.workdir)
-        self.workdir.mkdir(parents=True)
+        self.workdir = _fresh_staging(Path(workdir))
         self.spacegroup = spacegroup
         self.merge_friedel = bool(merge_friedel)
         self.n_workers = max(1, int(n_workers))
@@ -603,8 +634,7 @@ class StoreBuilder:
             inp.to_valid = torch.where(found, remap[at], torch.full_like(at, -1))
 
         # ── prepared records ──
-        tmp = out.with_name(out.name + ".partial")
-        shutil.rmtree(tmp, ignore_errors=True)
+        tmp = _fresh_staging(staging_paths(out)[1])
         writer = StoreWriter(tmp)
         n_obs_total = int(kept_count[valid].sum())
         if n_obs_total > ObsFeatureSpec.STAT_SAMPLE:
@@ -677,6 +707,7 @@ class StoreBuilder:
         self.clock.report("prepare")
         self.close()
         # renamed only once complete, so an interrupted build is never read as a store
+        (tmp / STAGING_MARKER).unlink()
         tmp.rename(out)
         return PreparedStore(out)
 

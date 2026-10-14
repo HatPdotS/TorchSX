@@ -286,3 +286,50 @@ def test_load_prep_reads_a_prepared_blob_of_an_earlier_run(streams, tmp_path, pa
     old = P.load_prep(args, recipe_defaults=meta["recipe"], verbose=False)
     assert not isinstance(old.prep, PreparedStore)
     assert torch.equal(old.prep.I_obs, built.prep.materialize().I_obs)
+
+
+def test_build_replaces_only_its_own_staging(streams, tmp_path):
+    """A directory beside the store is replaced only when it is empty or an earlier
+    build staged it; anything else stops the build and stays untouched."""
+    kw = dict(spacegroup="P 2 2 2", merge_friedel=True, d_min=2.2, gain=2.5)
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    (mine / "keep.txt").write_text("user data")
+    with pytest.raises(FileExistsError, match="not created by TorchSX"):
+        PS.StoreBuilder(mine, spacegroup="P 2 2 2")
+    assert (mine / "keep.txt").read_text() == "user data"
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    b = PS.StoreBuilder(empty, spacegroup="P 2 2 2")
+    assert (empty / PS.STAGING_MARKER).is_file()
+    b.close()
+    assert not empty.exists()
+
+    out = tmp_path / "prepared"
+    partial = PS.staging_paths(out)[1]
+    partial.mkdir()
+    (partial / "keep.txt").write_text("user data")
+    with pytest.raises(FileExistsError, match="not created by TorchSX"):
+        _build(streams, out, **kw)
+    assert (partial / "keep.txt").read_text() == "user data" and not out.exists()
+    # the same directory left by an interrupted build is replaced
+    (partial / PS.STAGING_MARKER).touch()
+    store, _ = _build(streams, out, **kw)
+    assert isinstance(store, PreparedStore) and not partial.exists()
+    assert not (out / PS.STAGING_MARKER).exists()
+
+
+def test_load_prep_refuses_foreign_staging_before_parsing(streams, tmp_path, monkeypatch):
+    from tests.test_cli_pipeline import _DataArgs
+    cache = tmp_path / "prepared"
+    raw = PS.staging_paths(cache)[0]
+    raw.mkdir()
+    (raw / "keep.txt").write_text("user data")
+
+    def no_parse(*a, **k):
+        raise AssertionError("the staging check comes before parsing")
+    monkeypatch.setattr(PS.StoreBuilder, "add", no_parse)
+    args = _DataArgs(stream=[streams[0]], int_radius=None, gain=None, cache_prep=cache)
+    with pytest.raises(SystemExit, match="not created by TorchSX"):
+        P.load_prep(args, verbose=False)
+    assert (raw / "keep.txt").read_text() == "user data"

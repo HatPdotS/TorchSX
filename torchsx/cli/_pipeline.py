@@ -277,7 +277,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                   f"{len(bundle.split_names)} splits)", flush=True)
         return bundle
 
-    from torchsx.merging.prepare_store import StoreBuilder
+    from torchsx.merging.prepare_store import StoreBuilder, check_staging, staging_paths
 
     if cache is None:
         import atexit
@@ -286,7 +286,14 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         scratch = Path(tempfile.mkdtemp(prefix="torchsx-prepared-"))
         atexit.register(shutil.rmtree, scratch, ignore_errors=True)
         cache = scratch / "prepared"
-    builder = StoreBuilder(cache.with_name(cache.name + ".raw"), spacegroup=spacegroup,
+    try:
+        # before any parsing: the build stages beside the store and replaces only
+        # directories it created itself
+        for staging in staging_paths(cache):
+            check_staging(staging)
+    except FileExistsError as exc:
+        raise SystemExit(f"--cache {cache}: {exc}") from None
+    builder = StoreBuilder(staging_paths(cache)[0], spacegroup=spacegroup,
                            merge_friedel=merge_friedel, n_workers=_workers())
     try:
         # --spacegroup reaches the .sfx loader too, and is applied before
