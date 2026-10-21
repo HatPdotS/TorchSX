@@ -100,6 +100,8 @@ model is one log scale plus six anisotropic terms on hkl/max|hkl|. It is fitted 
 
 The headline adds both for the highest-resolution shell (`cc_half_outer`,
 `r_split_outer`); `stats.json` also records the scale coefficients.
+R_split has this one definition throughout torchsx: the training log, the
+`STEM.metrics.json` of an export and this command.
 
 **Difference of dataset X against the reference R.** Both datasets come as two
 independent arms A and B. The difference is computed on the reflections common to the

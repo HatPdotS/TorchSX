@@ -383,13 +383,14 @@ def scale_onto(target: Merge, source: Merge):
 
 
 def r_split(IA, IB) -> float:
-    """``sqrt(2) sum|I_A - I_B| / sum|I_A + I_B|``.
+    """``sqrt(2) sum|I_A - I_B| / sum|I_A + I_B|``, NaN when the denominator is zero.
 
     The denominator sums the magnitude of each pair, so the negative measured
-    intensities of weak reflections cannot cancel the positive ones.
+    intensities of weak reflections cannot cancel the positive ones. The one
+    definition of R_split in torchsx; takes numpy arrays or torch tensors.
     """
-    den = np.abs(IA + IB).sum()
-    return float(np.sqrt(2) * np.abs(IA - IB).sum() / den) if den > 0 else float('nan')
+    den = float(abs(IA + IB).sum())
+    return math.sqrt(2) * float(abs(IA - IB).sum()) / den if den > 0 else float('nan')
 
 
 def pair_stats(FA, SA, FB, SB, IA, IB) -> dict:

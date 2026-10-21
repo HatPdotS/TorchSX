@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from torchsx.cli import _pipeline as P
+from torchsx.merge_stats import r_split
 
 
 def _build_parser():
@@ -152,9 +153,7 @@ def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0") -> dict | None:
         return None
     I1, I2 = I1[ok], I2[ok]
     cc = float(torch.corrcoef(torch.stack([I1, I2]))[0, 1])
-    # CrystFEL's definition: the 1/sqrt(2) puts R_split on the scale of a
-    # full-dataset R, not of the difference between two halves.
-    rs = float((2 ** -0.5) * (I1 - I2).abs().sum() / (0.5 * (I1 + I2)).abs().sum())
+    rs = r_split(I1, I2)
     dd = torch.as_tensor(d)[both][ok]
     outer = dd <= float(dd.quantile(0.10))
     cc_o = float(torch.corrcoef(torch.stack([I1[outer], I2[outer]]))[0, 1])
