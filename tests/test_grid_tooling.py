@@ -92,4 +92,4 @@ def test_width_flags_reach_the_encoder():
     from torchsx.cli import train
     a = train._build_parser().parse_args(["x.stream", "-o", "run", "--d-model", "64", "--n-layers", "3",
                                           "--eval-every", "50", "--patience", "3", "--heldout-stream", "h.stream"])
-    assert (a.d_model, a.n_layers, a.eval_every, a.patience, str(a.heldout_stream)) == (64, 3, 50, 3, "h.stream")
+    assert (a.d_model, a.n_layers, a.eval_every, a.patience, a.heldout_stream.name) == (64, 3, 50, 3, "h.stream")

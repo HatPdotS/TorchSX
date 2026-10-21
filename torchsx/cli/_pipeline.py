@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from torchsx.cli import path_arg
+
 
 READOUT_MAX_OBS = 1_500_000
 
@@ -47,7 +49,7 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
 
     A merge reads the recipe off its checkpoint; the flags then act as overrides.
     """
-    p.add_argument("stream", type=Path, nargs="*",
+    p.add_argument("stream", type=path_arg, nargs="*",
                    help=".stream or .sfx input.  Omit when every input is "
                         "given as --split NAME=PATH.")
     p.add_argument("--split", action="append", default=[], metavar="NAME=PATH",
@@ -55,7 +57,7 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
                         "Splits are merged separately and never pooled in an "
                         "in-batch merge target.  No physical meaning is "
                         "assumed -- the name is just a label.")
-    p.add_argument("--split-file", type=Path, default=None,
+    p.add_argument("--split-file", type=path_arg, default=None,
                    help="crystal splits for a single stream, either a "
                         "CrystFEL custom-split file (three whitespace columns, "
                         "'filename event dataset', the same file partialator "
@@ -76,7 +78,7 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
                         "calibration differs by more than 50%%.")
     p.add_argument("--dmin", type=float, default=None, help="high-resolution cut (A)")
     p.add_argument("--dmax", type=float, default=None, help="low-resolution cut (A)")
-    p.add_argument("--cache", dest="cache_prep", type=Path, default=None,
+    p.add_argument("--cache", dest="cache_prep", type=path_arg, default=None,
                    help="prepared-data directory, written on first use and read in "
                         "batches; default RUN/prepared. Input content and "
                         "preparation settings are validated.")
@@ -449,7 +451,7 @@ def _split_labels(args, builder, *, verbose: bool = True):
 def add_free_args(p: argparse.ArgumentParser) -> None:
     p.set_defaults(free_frac=0.05, free_seed=20260902, no_free=False)
     p.add_argument("--seed", type=int, default=None, help="random seed (default 0; merge reuses the run seed)")
-    p.add_argument("--free-from", type=Path, default=None,
+    p.add_argument("--free-from", type=path_arg, default=None,
                    help="take the free set from an existing .mtz (FreeR_flag / "
                         "R-free-flags) or a .pkl of {(h,k,l): flag} on the "
                         "Friedel-canonical index.  Sharing the free set is the "

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from torchsx.cli import path_arg
 from torchsx.stats import PLOTS, digest, load_cache, read_inputs, render, save_cache
 
 
@@ -25,9 +26,9 @@ def _build_parser():
     p = argparse.ArgumentParser(prog='torchsx.observation-stats', description=__doc__,
         epilog='CPU only. Signed input ADU, before scaling or merging. '
                'Sampling keeps complete images and precedes custom-split selection.')
-    p.add_argument('stream', nargs='*', type=Path, help='.stream or .sfx inputs')
+    p.add_argument('stream', nargs='*', type=path_arg, help='.stream or .sfx inputs')
     p.add_argument('--split', action='append', default=[], metavar='NAME=PATH', help='named input; repeatable')
-    p.add_argument('--split-file', type=Path, help='CrystFEL filename/event/label custom splits')
+    p.add_argument('--split-file', type=path_arg, help='CrystFEL filename/event/label custom splits')
     p.add_argument('--select', nargs='+', help='custom-split labels to plot; default all labels')
     p.add_argument('--spacegroup', help='required for .stream; defaults to metadata for .sfx')
     p.add_argument('--cell', type=float, nargs=6, metavar=('A', 'B', 'C', 'ALPHA', 'BETA', 'GAMMA'),
@@ -38,8 +39,8 @@ def _build_parser():
     p.add_argument('--seed', type=int, default=None, help='sampling seed (default 42)')
     p.add_argument('--merge-friedel', action=argparse.BooleanOptionalAction, default=None,
                    help='group Friedel mates (default); --no-merge-friedel keeps acentric mates apart')
-    p.add_argument('-o', '--out', type=Path, required=True, help='new figure directory; cache saved beside it as OUT-cache')
-    p.add_argument('--from-cache', type=Path, help='replot a stats cache without original inputs')
+    p.add_argument('-o', '--out', type=path_arg, required=True, help='new figure directory; cache saved beside it as OUT-cache')
+    p.add_argument('--from-cache', type=path_arg, help='replot a stats cache without original inputs')
     p.add_argument('--plots', nargs='+', choices=PLOTS, default=list(PLOTS), help='plot families; default all four')
     p.add_argument('--target-skew', type=float, nargs='+', default=[-1, 0, 1, 2, 4, 6],
                    help='choose distinct example HKLs nearest these skewnesses; default -1 0 1 2 4 6')

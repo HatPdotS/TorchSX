@@ -13,7 +13,7 @@ import warnings
 import numpy as np
 import torch
 
-from torchsx.cli import _pipeline as P
+from torchsx.cli import _pipeline as P, path_arg
 
 
 def _positive(value):
@@ -42,7 +42,7 @@ def _build_parser():
     P.add_data_args(p)
     P.add_model_args(p)
     P.add_free_args(p)
-    p.add_argument("-o", "--out", type=Path, required=True, help="run directory")
+    p.add_argument("-o", "--out", type=path_arg, required=True, help="run directory")
     p.add_argument("--steps", type=_steps, default=400,
                    help="total optimizer updates, balanced across states (default 400)")
     p.add_argument("--miss-frac", type=_fraction, default=None,
@@ -85,7 +85,7 @@ def _build_parser():
     # Patterns of the first split scored as the held-out set: never trained on, never
     # merged into the outputs; one file across runs puts their held-out NLL on the
     # same crystals.
-    p.add_argument("--heldout-stream", type=Path, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--heldout-stream", type=path_arg, default=None, help=argparse.SUPPRESS)
     p.add_argument("--warmup", type=int, default=None,
                    help="learning-rate warm-up in updates per state (default 25)")
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",

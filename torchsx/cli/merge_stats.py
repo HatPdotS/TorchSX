@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from torchsx.cli import path_arg
 from torchsx.merge_stats import (AMPLITUDES, FORMATS, LABEL_KEYS, difference_stats, file_format, halves_stats,
                                  load_merge, render, summary_stats)
 
@@ -27,7 +28,7 @@ def _build_parser():
                'Every dataset other than the reference is also scored as a difference against it, '
                'when both have two halves. Inputs: MTZ, CrystFEL .hkl/.hkl1/.hkl2, mmCIF structure factors. '
                'CPU only.')
-    p.add_argument('files', nargs='*', type=Path, metavar='FILE',
+    p.add_argument('files', nargs='*', type=path_arg, metavar='FILE',
                    help='the first dataset: one merge, or two independent halves')
     p.add_argument('--name', help='name of the first dataset (default: stem of its first file)')
     p.add_argument('--dataset', action='append', nargs='+', default=[], metavar=('NAME', 'FILE'),
@@ -47,7 +48,7 @@ def _build_parser():
     p.add_argument('--dmax', type=float, help='low-resolution cut (angstrom)')
     p.add_argument('--format', nargs='+', choices=FORMATS, default=['csv', 'plots'], dest='formats',
                    help='outputs to write (default: csv plots)')
-    p.add_argument('-o', '--out', type=Path, required=True, help='new output directory')
+    p.add_argument('-o', '--out', type=path_arg, required=True, help='new output directory')
     return p
 
 

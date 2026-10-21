@@ -90,6 +90,10 @@ noise) and the seed for the halves; `--int-radius`, `--gain`, `--prior` and
 data from the same experiment, or other states. Merging the training data
 reproduces the merge written by `torchsx.train`.
 
+`-o` takes an `.mtz` file name or a directory: any other name, such as
+`-o merge2/` or `-o merge2`, is a directory and the output goes to
+`merge2/merged.mtz`.
+
 With one state the output is `merged.mtz` with its two halves and
 `merged.metrics.json`. With several states each gets its own set:
 `merged_dark.mtz`, `merged_dark_half1.mtz`, and so on.

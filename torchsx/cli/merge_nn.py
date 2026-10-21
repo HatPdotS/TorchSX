@@ -7,23 +7,32 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+import os
 
 import numpy as np
 import torch
 
-from torchsx.cli import _pipeline as P
+from torchsx.cli import _pipeline as P, path_arg
+
+
+def _mtz_out(value: str):
+    """``-o``: an ``.mtz`` file, or else a directory that then holds ``merged.mtz``."""
+    path = path_arg(value)
+    if path.suffix.lower() != ".mtz" or path.is_dir() or value.endswith(("/", os.sep)):
+        return path / "merged.mtz"
+    return path
 
 
 def _build_parser():
     p = argparse.ArgumentParser(prog="torchsx.merge", description="Export raw posterior full/half MTZs for every supplied state.")
-    p.add_argument("ckpt", type=Path, help="checkpoint from torchsx.train")
+    p.add_argument("ckpt", type=path_arg, help="checkpoint from torchsx.train")
     P.add_data_args(p)
     P.add_model_args(p)
     P.add_free_args(p)
-    p.add_argument("-o", "--out", type=Path, required=True,
-                   help="output MTZ, e.g. merged.mtz; with several states one file per state, "
-                        "merged_STATE.mtz, each with its _half1/_half2 companions")
+    p.add_argument("-o", "--out", type=_mtz_out, required=True,
+                   help="output MTZ, e.g. merged.mtz, or a directory to hold merged.mtz; with "
+                        "several states one file per state, merged_STATE.mtz, each with its "
+                        "_half1/_half2 companions")
     return p
 
 

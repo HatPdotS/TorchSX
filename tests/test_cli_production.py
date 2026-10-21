@@ -2,6 +2,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import os
 import shutil
 import warnings
 
@@ -24,7 +25,24 @@ def test_public_options_and_split_inputs(module, count):
     a = parser.parse_args(prefix + ['--split','dark=dark.stream','--split','light=light.stream','-o','run'])
     assert P._splits_from_args(a) == [('dark',Path('dark.stream')),('light',Path('light.stream'))]
     a = parser.parse_args(prefix + ['combined.stream','--split-file','custom.split','-o','run'])
-    assert a.split_file == Path('custom.split')
+    assert a.split_file == Path('custom.split').absolute()
+
+
+@pytest.mark.parametrize('out,expected', [
+    ('merged.mtz', 'merged.mtz'), ('a/m.MTZ', 'a/m.MTZ'), ('merge2', 'merge2/merged.mtz'),
+    ('merge2/', 'merge2/merged.mtz'), ('.', 'merged.mtz'), ('..', '../merged.mtz'),
+    ('d.mtz/', 'd.mtz/merged.mtz')])
+def test_relative_out_paths(out, expected, tmp_path, monkeypatch):
+    work = tmp_path / 'work'; work.mkdir()
+    work = work.resolve()  # the working directory as os.getcwd() reports it
+    monkeypatch.chdir(work)
+    merge = merge_nn._build_parser().parse_args(['run/best.pt', 'x.stream', '-o', out])
+    assert merge.out == Path(os.path.normpath(work / expected))
+    assert merge.ckpt == work / 'run' / 'best.pt'
+    run = train._build_parser().parse_args(['x.stream', '-o', 'run/'])
+    assert run.out == work / 'run'
+    monkeypatch.setenv('HOME', str(tmp_path))
+    assert train._build_parser().parse_args(['x.stream', '--out=~/run']).out == tmp_path / 'run'
 
 
 def test_research_options_parse_but_stay_out_of_help():
@@ -35,7 +53,7 @@ def test_research_options_parse_but_stay_out_of_help():
     assert not [o for o in hidden if o in text]
     a = parser.parse_args(['x.stream', '-o', 'run', *(t for o, v in hidden.items() for t in (o, v))])
     assert (a.noise_lr_mult, a.peer_dim, a.context_folds, a.d_model, a.n_layers, a.eval_every, a.patience,
-            a.heldout_stream) == (10.0, '64', 0, 64, 3, 50, 2, Path('h.stream'))
+            a.heldout_stream) == (10.0, '64', 0, 64, 3, 50, 2, Path('h.stream').absolute())
     assert parser.parse_args(['x.stream', '-o', 'run']).steps == 400
 
 
