@@ -174,3 +174,25 @@ def test_format_shell_table(noisy_halves):
     assert "CC1/2" in table
     assert "R_split" in table
     assert "Overall" in table
+
+
+def test_r_split_is_the_one_definition_for_weak_intensities():
+    """Training, export and merge-stats R_split agree; negative pairs count by magnitude."""
+    from torchsx.cli.merge_nn import _split_half_stats
+    from torchsx.merge_stats import r_split as r_split_values
+
+    g = torch.Generator().manual_seed(4)
+    n = 500
+    true = 0.5 * torch.randn(n, generator=g, dtype=torch.float64).abs()
+    I1 = true + 5 * torch.randn(n, generator=g, dtype=torch.float64)
+    I2 = true + 5 * torch.randn(n, generator=g, dtype=torch.float64)
+    expected = math.sqrt(2.0) * float((I1 - I2).abs().sum()) / float((I1 + I2).abs().sum())
+    assert abs(float((I1 + I2).sum())) < 0.3 * float((I1 + I2).abs().sum())
+
+    d = torch.linspace(2.0, 10.0, n)
+    matched = MatchedHalves(F1=I1, F2=I2, d_spacing=d, hkl=torch.zeros(n, 3, dtype=torch.int16))
+    seen = torch.ones(n, dtype=torch.bool)
+    export = _split_half_stats({"I0": I1, "seen": seen}, {"I0": I2, "seen": seen}, d)
+    assert r_split(matched) == pytest.approx(expected, rel=1e-12)
+    assert export["r_split"] == pytest.approx(expected, rel=1e-12)
+    assert r_split_values(I1.numpy(), I2.numpy()) == pytest.approx(expected, rel=1e-12)

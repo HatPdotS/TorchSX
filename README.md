@@ -172,6 +172,8 @@ number under each program is the correlation of its two maps over helix F.
 - `torchsx.merge-stats A/merged.mtz B/merged.mtz -o stats/` compares merges:
   completeness, CC1/2, R_split and, for light/dark pairs, the information in
   ΔF ([docs/merge_stats.md](https://github.com/HatPdotS/TorchSX/blob/master/docs/merge_stats.md)).
+  `torchsx.merge-stats run/` finds the merges of each state in a run directory
+  and writes `run/merge_stats/`.
 - `torchsx.observation-stats indexed.stream --spacegroup 'P 63' -o figures/`
   plots the raw observations: intensity distributions, skewness, examples
   ([docs/stats.md](https://github.com/HatPdotS/TorchSX/blob/master/docs/stats.md)).

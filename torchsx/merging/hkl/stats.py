@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from torchsx._core import _SFXStreamCore
+from torchsx.merge_stats import r_split as _r_split
 
 
 def completeness(core: _SFXStreamCore, n_bins: int = 20) -> torch.Tensor:
@@ -189,13 +190,11 @@ def cc_star(cc_half_value: float) -> float:
 
 
 def r_split(matched: MatchedHalves) -> float:
+    """R_split of the matched halves (:func:`torchsx.merge_stats.r_split`); 0 when empty."""
     if matched.F1.numel() == 0:
         return 0.0
-    num = (matched.F1 - matched.F2).abs().sum()
-    den = (matched.F1 + matched.F2).sum()
-    if den == 0:
-        return 0.0
-    return (math.sqrt(2.0) * num / den).item()
+    r = _r_split(matched.F1.double(), matched.F2.double())
+    return 0.0 if math.isnan(r) else r
 
 
 @dataclass

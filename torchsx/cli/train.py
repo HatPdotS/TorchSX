@@ -11,7 +11,6 @@ import time
 import warnings
 
 import numpy as np
-import torch
 
 from torchsx.cli import _pipeline as P
 
@@ -100,6 +99,8 @@ def _batch(tr, step=None):
     ``step`` (default: the trainer's next update) fixes the draw, so a coming
     batch can be named, and read ahead, before its update runs.
     """
+    import torch
+
     step = tr.step_i if step is None else int(step)
     k = step % tr.n_conditions
     pool = tr.train_crystals[tr.condition[tr.train_crystals] == k]
@@ -218,6 +219,8 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
 
 def main(argv=None):
     args = _build_parser().parse_args(argv)
+    import torch
+
     # TF32 for the encoder's float32 matmuls; the likelihood and posterior
     # integrals are elementwise and Triton code, which this does not touch.
     torch.set_float32_matmul_precision("high")
