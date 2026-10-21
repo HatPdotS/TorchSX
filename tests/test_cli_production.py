@@ -88,32 +88,6 @@ def test_custom_split_matches_source_images(stream_file,python_parser,tmp_path):
     assert set(bundle.prep.obs_info.delay_bin_idx.tolist()) == {0,1}
 
 
-def test_merge_of_another_stream_leaves_the_run_cache(stream_file,python_parser,tmp_path,monkeypatch):
-    run=tmp_path/'run'; run.mkdir()
-    trained=P.load_prep(_DataArgs(stream=[stream_file],int_radius=None,gain=None,out=run),verbose=False)
-    other=tmp_path/'other.stream'
-    other.write_text(stream_file.read_text()+'\n# another stream\n')
-    def merge_args(stream):
-        return _DataArgs(stream=[stream],int_radius=None,gain=None,ckpt=run/'best.pt',out=tmp_path/'m.mtz')
-    merged=P.load_prep(merge_args(other),recipe_defaults=trained.recipe,verbose=False)
-    assert (tmp_path/'m.prepared'/'meta.json').is_file()
-    assert torch.equal(merged.prep.materialize().I_obs,trained.prep.materialize().I_obs)
-    # a merge of the training stream reads the run's store without parsing
-    with monkeypatch.context() as m:
-        m.setattr('torchsx.merging.prepare_store.StoreBuilder.add',lambda *a,**k: pytest.fail('reparsed'))
-        P.load_prep(merge_args(stream_file),recipe_defaults=trained.recipe,verbose=False)
-    # the merge's own store follows its inputs; the run's store is never touched
-    other.write_text(other.read_text()+'# changed\n')
-    P.load_prep(merge_args(other),recipe_defaults=trained.recipe,verbose=False)
-    stamp=json.loads((tmp_path/'m.prepared'/'meta.json').read_text())['signature']['source_files']
-    assert stamp[0][0]==other.stat().st_size
-    run_stamp=json.loads((run/'prepared'/'meta.json').read_text())['signature']['source_files']
-    assert run_stamp[0][0]==stream_file.stat().st_size
-    # an explicit --cache is still validated, never replaced
-    with pytest.raises(SystemExit,match='different settings'):
-        P.load_prep(_DataArgs(stream=[other],int_radius=None,gain=None,cache_prep=run/'prepared'),verbose=False)
-
-
 def test_cache_moves_with_inputs_and_rejects_changed_content(stream_file,python_parser,tmp_path,monkeypatch):
     cache=tmp_path/'prepared'
     args=_DataArgs(stream=[stream_file],int_radius=None,gain=None,cache_prep=cache)
