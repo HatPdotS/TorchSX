@@ -64,20 +64,32 @@ class CrystalIndex:
     ``PreparedObs`` is sorted by ``hkl_id`` (the merge needs contiguous
     reflections).  Training needs the opposite grouping, so this builds the
     permutation once and serves ``crystal -> observation rows`` from CSR
-    offsets.
+    offsets.  A :class:`~torchsx.merging.store.PreparedStore` is crystal-major
+    already: :meth:`from_counts` serves its rows with no permutation.
     """
 
     def __init__(
         self, crystal_id: Tensor, n_crystals: int, condition: Tensor | None = None,
     ) -> None:
-        order = crystal_id.argsort(stable=True)
-        counts = torch.bincount(crystal_id, minlength=n_crystals)
+        self._setup(crystal_id.argsort(stable=True),
+                    torch.bincount(crystal_id, minlength=n_crystals), condition)
+
+    @classmethod
+    def from_counts(cls, counts: Tensor, condition: Tensor | None = None) -> "CrystalIndex":
+        """Index of crystal-major rows: crystal ``c`` owns rows ``[offsets[c], offsets[c+1])``."""
+        index = cls.__new__(cls)
+        index._setup(None, counts.to(torch.long).cpu(), condition)
+        return index
+
+    def _setup(self, order: Tensor | None, counts: Tensor, condition: Tensor | None) -> None:
+        n_crystals = int(counts.numel())
         offsets = torch.zeros(n_crystals + 1, dtype=torch.long)
         offsets[1:] = counts.cumsum(0)
+        #: rows in crystal order, or None when the rows already are
         self.order = order
         self.counts = counts
         self.offsets = offsets
-        self.n_crystals = int(n_crystals)
+        self.n_crystals = n_crystals
         self.nonempty = torch.nonzero(counts > 0, as_tuple=True)[0]
         # Per-crystal condition (light/dark, delay bin).  Batches are then
         # drawn from ONE condition each: the in-batch merge target for a
@@ -118,7 +130,8 @@ class CrystalIndex:
             return torch.empty(0, dtype=torch.long)
         grp_start = torch.cumsum(counts, 0) - counts
         within = torch.arange(total, device=starts.device) - grp_start.repeat_interleave(counts)
-        return self.order[within + starts.repeat_interleave(counts)]
+        flat = within + starts.repeat_interleave(counts)
+        return flat if self.order is None else self.order[flat]
 
     def batches(
         self, max_obs: int, *, generator: torch.Generator | None = None,
@@ -333,9 +346,13 @@ class AmortizedTrainer:
         config: TrainConfig | None = None,
         is_light: Tensor | None = None,
     ) -> None:
+        from torchsx.merging.store import PreparedStore
+
         self.cfg = config or TrainConfig()
         self.device = torch.device(self.cfg.device)
         self.prep = prep
+        #: Observations on disk: batches are read per step, never held whole.
+        self._store = prep if isinstance(prep, PreparedStore) else None
         #: Updates dropped for being non-finite (see ``step``).
         self.n_skipped_steps = 0
         self.scale = scale.to(self.device)
@@ -350,8 +367,11 @@ class AmortizedTrainer:
             if oi.delay_bin_idx is not None
             else torch.zeros(oi.n_crystals, dtype=torch.long)
         )
-        self.index = CrystalIndex(oi.crystal_id.cpu(), oi.n_crystals,
-                                  condition=self.condition)
+        if self._store is not None:
+            self.index = CrystalIndex.from_counts(prep.crystal_counts(), condition=self.condition)
+        else:
+            self.index = CrystalIndex(oi.crystal_id.cpu(), oi.n_crystals,
+                                      condition=self.condition)
         self.n_conditions = self.index.n_conditions
         self._cond = 0                      # condition of the batch in flight
         if is_light is None and self.n_conditions > 1:
@@ -368,7 +388,7 @@ class AmortizedTrainer:
                   f"condition {n_per}; batches are condition-pure", flush=True)
         if self.cfg.target_redundancy is not None:
             want = int(round(self.cfg.target_redundancy * prep.n_valid))
-            avail = int(oi.crystal_id.numel())
+            avail = int(prep.n_obs_total)
             self.cfg.max_obs_per_batch = min(want, avail)
             print(
                 f"  [batch] target_redundancy={self.cfg.target_redundancy:g} "
@@ -381,11 +401,12 @@ class AmortizedTrainer:
             )
         if self.cfg.encoder_chunk_crystals:
             self.scale.set_encoder_chunking(self.cfg.encoder_chunk_crystals)
-        self.n_ph = (prep.I_obs + prep.bg).clamp(min=0)
-        self.sigma = (
-            oi.sigma if oi.sigma is not None
-            else (self.n_ph + prep.bg.clamp(min=0) + 1.0).sqrt()
-        )
+        if self._store is None:
+            self.n_ph = (prep.I_obs + prep.bg).clamp(min=0)
+            self.sigma = (
+                oi.sigma if oi.sigma is not None
+                else (self.n_ph + prep.bg.clamp(min=0) + 1.0).sqrt()
+            )
         if self.cfg.posterior_prior not in ("none", "wilson"):
             raise ValueError(f"posterior_prior must be 'none' or 'wilson', got "
                              f"{self.cfg.posterior_prior!r}")
@@ -394,7 +415,8 @@ class AmortizedTrainer:
         # per-reflection state between batches; the unity merge only starts
         # each merge's grid search and the Wilson fit.
         from torchsx.nn.posterior_target import PosteriorMergeTarget
-        I_start = unity_merge(prep.I_obs, self.sigma, prep.hkl_id, prep.n_valid)
+        I_start = (prep.unity_merge() if self._store is not None else
+                   unity_merge(prep.I_obs, self.sigma, prep.hkl_id, prep.n_valid))
         self.targets: list = []
         for _ in range(self.n_conditions):
             t = PosteriorMergeTarget(
@@ -537,20 +559,22 @@ class AmortizedTrainer:
         #: unnamed split).  Travels to the checkpoint and names the outputs.
         self.split_names: list[str] = []
 
-        # Resolution shell per observation (equal observation count, low d
-        # first), for the calibration breakdown.  Every observation of a
-        # reflection shares its d, so the ranking is done over reflections
-        # weighted by multiplicity instead of by sorting all observations
-        # twice; stored as int16 because it is one entry per observation.
+        # Resolution shell (equal observation count, low d first), for the
+        # calibration breakdown.  Every observation of a reflection shares its
+        # d, so the shells are cut over reflections weighted by multiplicity and
+        # kept per reflection; a batch looks its observations up.
         bins = self.cfg.shell_bins
-        hid = prep.hkl_id
-        counts = torch.bincount(hid, minlength=prep.n_valid).double()
-        order = prep.d_spacing.to(hid.device).argsort()
+        if self._store is not None:
+            counts = prep.obs_counts.double()
+        else:
+            counts = torch.bincount(prep.hkl_id, minlength=prep.n_valid).double()
+        order = prep.d_spacing.to(counts.device).argsort()
         below = counts[order].cumsum(0) - counts[order]
-        shell_h = torch.empty(prep.n_valid, dtype=torch.int16, device=hid.device)
-        shell_h[order] = (below / max(hid.numel(), 1) * bins).floor().clamp(
+        shell_h = torch.empty(prep.n_valid, dtype=torch.int16, device=counts.device)
+        shell_h[order] = (below / max(int(prep.n_obs_total), 1) * bins).floor().clamp(
             max=bins - 1).to(torch.int16)
-        self.shell_of_obs = shell_h[hid]
+        #: per reflection; an observation's shell is that of its reflection
+        self.shell_of_hkl = shell_h
 
         # A Wilson surface from the start, on a basis with no symmetry beyond
         # the identity; a caller that knows the space group installs its own
@@ -593,6 +617,14 @@ class AmortizedTrainer:
         only the gathered rows cross the bus; otherwise this is the plain
         indexing it replaces, so the two paths give identical tensors.
         """
+        if self._store is not None:
+            meta = self._store.batch(rows, self.device)
+            if self.n_conditions > 1 and rows.numel():
+                self._cond = int(self.condition[self._store.crystal_of_row(int(rows[0]))])
+            n_ph = (meta.I_obs + meta.bg).clamp(min=0)
+            sigma = (meta.sigma if meta.sigma is not None
+                     else (n_ph + meta.bg.clamp(min=0) + 1.0).sqrt())
+            return meta, n_ph, meta.bg, sigma
         if self.n_conditions > 1 and rows.numel():
             # The batch is condition-pure (CrystalIndex guarantees it), so the
             # first row names the condition for the whole batch.  This is the
@@ -610,6 +642,25 @@ class AmortizedTrainer:
             self.prep.bg[r].to(self.device, non_blocking=True),
             self.sigma[r].to(self.device, non_blocking=True),
         )
+
+    def prefetch(self, rows: Tensor) -> None:
+        """Start reading the observations of a coming batch (a no-op in memory)."""
+        if self._store is not None:
+            self._store.prefetch(rows)
+
+    def _batches(self, max_obs: int, **kwargs):
+        """``CrystalIndex.batches`` with the next batch read while this one is used."""
+        it = self.index.batches(max_obs, **kwargs)
+        if self._store is None:
+            yield from it
+            return
+        nxt = next(it, None)
+        while nxt is not None:
+            cur, nxt = nxt, next(it, None)
+            self.prefetch(cur[1])
+            if nxt is not None:
+                self.prefetch(nxt[1])
+            yield cur
 
     def _forward(self, rows: Tensor, *, grad: bool):
         meta, n_ph, bg, sigma = self._batch(rows)
@@ -697,7 +748,9 @@ class AmortizedTrainer:
             for grp in self.opt.param_groups:
                 grp["lr"] = self._base_lr * scale_lr * grp.get("lr_mult", 1.0)
         t0 = time.time()
+        io0 = self._store.store.wait_s if self._store is not None else 0.0
         meta, pred, tgt, nll, n_ph, bg, sigma = self._forward(rows, grad=True)
+        io_wait = (self._store.store.wait_s - io0) if self._store is not None else 0.0
 
         n_used = int(tgt.valid.sum())
         nll_data = float(nll.detach().item()) / max(n_used, 1)   # no penalty
@@ -783,6 +836,8 @@ class AmortizedTrainer:
             **shape_rec,
             "lr": float(self.opt.param_groups[0]["lr"]),
             "sec": time.time() - t0,
+            # time this update waited for its observations to be read from disk
+            "io_wait": io_wait,
             **gn,
         }
         if self.step_i % self.cfg.log_every == 0:
@@ -839,11 +894,9 @@ class AmortizedTrainer:
             out["grid_mass_p01"] = float(_diagnostic_quantile(gm, 0.01).item())
         _m_, _n_, _b_, _s_ = self._batch(rows)
         ios = (_n_ - _b_) / _s_
-        # shell_of_obs is prep-derived and stays on the host under
-        # stream_batches, while ``rows`` and z come off the device -- so the
-        # index has to go to the table, not the table to the index.
+        shell = self.shell_of_hkl.to(meta.hkl_idx.device)[meta.hkl_idx]
         out.update(calibration_metrics(
-            z, shell_id=self.shell_of_obs[rows.to(self.shell_of_obs.device)].to(z.device).long(),
+            z, shell_id=shell.to(z.device).long(),
             n_shells=self.cfg.shell_bins, i_over_sigma=ios,
         ))
         # Is the width head actually using its per-observation freedom?  var_z
@@ -888,9 +941,7 @@ class AmortizedTrainer:
             features={
                 "s_sq": meta.s_sq,
                 "ewald_offset": meta.ewald_offset,
-                # prep-derived, so host-resident under stream_batches
-                "d_rank": self.shell_of_obs[
-                    rows.to(self.shell_of_obs.device)].float().to(pred.log_K.device),
+                "d_rank": shell.float().to(pred.log_K.device),
             },
         ))
         out["spearman_log_w_ewald"] = (
@@ -923,7 +974,7 @@ class AmortizedTrainer:
         """
         self.scale.eval()
         tot, n_tot, n_hkl, recs = 0.0, 0, 0, []
-        for sel, rows in self.index.batches(
+        for sel, rows in self._batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         ):
             meta, pred, tgt, nll, *_ = self._forward(rows, grad=False)
@@ -1169,7 +1220,7 @@ class AmortizedTrainer:
         n_hkl = self.prep.n_valid
         dev = self.device
         tgt = self.target
-        batches = lambda: self.index.batches(
+        batches = lambda: self._batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         )
 
@@ -1406,7 +1457,7 @@ class AmortizedTrainer:
         start = tgt.start_centre()
         scan = tgt.scan_grid(start)
         acc_s = torch.zeros(n_hkl, scan.shape[1], device=self.device)
-        for _, r in self.index.batches(
+        for _, r in self._batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         ):
             r = r.to(self.device)
@@ -1421,7 +1472,7 @@ class AmortizedTrainer:
         v_nodes = c[:, None] + sd[:, None] * tgt.u_coarse[None, :]
         tgt._loc = (c, sd)
         acc = torch.zeros(n_hkl, v_nodes.shape[1], device=self.device)
-        for _, rows in self.index.batches(
+        for _, rows in self._batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         ):
             rows = rows.to(self.device)
@@ -1595,7 +1646,7 @@ class AmortizedTrainer:
 
     def run(self) -> None:
         for epoch in range(self.cfg.epochs):
-            for _, rows in self.index.batches(
+            for _, rows in self._batches(
                 self.cfg.max_obs_per_batch,
                 generator=self.gen,
                 crystals=self.train_crystals,

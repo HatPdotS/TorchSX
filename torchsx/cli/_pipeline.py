@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import pickle
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ READOUT_MAX_OBS = 1_500_000
 class PrepBundle:
     """A prepared data set plus everything needed to reproduce it."""
 
-    prep: object                      # PreparedObs
+    prep: object                      # PreparedStore (or PreparedObs from an older cache)
     recipe: dict                      # d_min, spacegroup, gain, radii, ...
     split_names: list[str] = field(default_factory=list)
     bg_var_factor: float = 0.0
@@ -75,8 +76,9 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dmin", type=float, default=None, help="high-resolution cut (A)")
     p.add_argument("--dmax", type=float, default=None, help="low-resolution cut (A)")
     p.add_argument("--cache", dest="cache_prep", type=Path, default=None,
-                   help="prepared cache file; default RUN/prepared.pt. "
-                        "Input content and preparation settings are validated.")
+                   help="prepared-data directory, written on first use and read in "
+                        "batches; default RUN/prepared. Input content and "
+                        "preparation settings are validated.")
     p.add_argument("--merge-friedel", action=argparse.BooleanOptionalAction,
                    default=None,
                    help="merge Friedel mates into a single reflection. "
@@ -147,17 +149,17 @@ def _splits_from_args(args) -> list[tuple[str, Path]]:
 
 
 def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True) -> PrepBundle:
-    """Streams (or a cached blob) → ``PrepBundle``.
+    """Streams (or a prepared cache) → ``PrepBundle``.
 
-    All splits go through **one** ``prepare_observations`` call, so they share a
-    single reflection index — which is what makes a difference between two
-    splits meaningful at all.
+    All splits are prepared together, so they share a single reflection index —
+    which is what makes a difference between two splits meaningful at all.  The
+    prepared observations are written to an on-disk store (``--cache``, default
+    ``RUN/prepared``) block by block and read back per batch, so host memory
+    does not grow with the observation count.
     """
     from torchsx.merging.config import MergeConfig
-    from torchsx.merging.hkl.filter import filter_resolution
     from torchsx.merging.hkl.noise import PoissonNoiseModel
-    from torchsx.merging.observations import OBSERVATION_FILTER_VERSION, prepare_observations
-    from torchsx.stream import SFXStream
+    from torchsx.merging.observations import OBSERVATION_FILTER_VERSION
     from torchsx.io.sources import inspect_source
     from torchsx.measurement import combine_measurements, resolve_measurement, validate_measurement
     import torch
@@ -178,8 +180,17 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     cache = args.cache_prep
     if cache is None and getattr(args, "out", None) is not None:
         run = args.ckpt.parent if getattr(args, "ckpt", None) else args.out
-        cache = run / "prepared.pt"
-    blob = torch.load(cache, weights_only=False) if cache is not None and cache.exists() else None
+        # a run prepared before the on-disk store keeps its blob
+        cache = run / "prepared.pt" if (run / "prepared.pt").is_file() else run / "prepared"
+    blob = stored = None
+    if cache is not None and cache.is_file():
+        blob = torch.load(cache, weights_only=False)
+    elif cache is not None and (cache / "meta.json").is_file():
+        stored = json.loads((cache / "meta.json").read_text())
+        blob = {"signature": stored.get("signature"), "recipe": stored.get("recipe")}
+    elif cache is not None and cache.exists():
+        raise SystemExit(f"--cache {cache} exists but is not a prepared cache; "
+                         "remove it or point --cache somewhere else.")
     if blob is not None:
         if (blob.get("signature") or {}).get("observation_filter_version") != OBSERVATION_FILTER_VERSION:
             raise SystemExit(
@@ -251,34 +262,118 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                 f"--cache {cache} was built with different settings "
                 f"({', '.join(differ) if differ else 'no signature recorded'}); "
                 f"delete it or point --cache somewhere else.")
+        if stored is not None:
+            from torchsx.merging.store import PreparedStore
+            prep = PreparedStore(cache)
+            bundle = PrepBundle(prep, stored["recipe"], stored.get("split_names", []),
+                                stored["bg_var_factor"])
+        else:
+            prep = blob["prep"]
+            bundle = PrepBundle(prep, blob["recipe"], blob.get("split_names", []),
+                                blob["bg_var_factor"])
         if verbose:
             print(f"prep from cache {cache} "
-                  f"({blob['prep'].n_valid:,} reflections, "
-                  f"{blob['prep'].I_obs.numel():,} obs, "
-                  f"{len(blob.get('split_names', []))} splits)", flush=True)
-        return PrepBundle(blob["prep"], blob["recipe"], blob.get("split_names", []),
-                          blob["bg_var_factor"])
+                  f"({prep.n_valid:,} reflections, {prep.n_obs_total:,} obs, "
+                  f"{len(bundle.split_names)} splits)", flush=True)
+        return bundle
 
-    parts = []
-    for name, path in splits:
+    from torchsx.merging.prepare_store import StoreBuilder, check_staging, staging_paths
+
+    if cache is None:
+        import atexit
+        import shutil
+        import tempfile
+        scratch = Path(tempfile.mkdtemp(prefix="torchsx-prepared-"))
+        atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+        cache = scratch / "prepared"
+    try:
+        # before any parsing: the build stages beside the store and replaces only
+        # directories it created itself
+        for staging in staging_paths(cache):
+            check_staging(staging)
+    except FileExistsError as exc:
+        raise SystemExit(f"--cache {cache}: {exc}") from None
+    builder = StoreBuilder(staging_paths(cache)[0], spacegroup=spacegroup,
+                           merge_friedel=merge_friedel, n_workers=_workers())
+    try:
         # --spacegroup reaches the .sfx loader too, and is applied before
         # canonicalization: an .sfx cache carries whatever group it was parsed
         # with, and reducing a P 2 21 21 data set as P 1 marks every reflection
         # acentric and gives the wrong Wilson prior for every centric one.
-        s = SFXStream.read(
-            path, spacegroup=spacegroup,
-            n_workers=_workers(), merge_friedel=merge_friedel,
-        )
-        s = SFXStream(filter_resolution(s._core, d_min=d_min, d_max=args.dmax))
+        for name, path in splits:
+            builder.add(name, path)
+        builder.filter_resolution(d_min, args.dmax)
         if verbose:
-            print(f"  {name or path.name}: {s.n_crystals:,} crystals, "
-                  f"{s.n_observations:,} obs (d >= {d_min} A)", flush=True)
-        parts.append(s)
-    stream = parts[0] if len(parts) == 1 else SFXStream.concat(parts)
-    n_per_split = [p.n_crystals for p in parts]
+            for inp in builder.inputs:
+                print(f"  {inp.name or inp.path.name}: {inp.n_crystals:,} crystals, "
+                      f"{inp.n_obs:,} obs (d >= {d_min} A)", flush=True)
+        labels, names, extra = _split_labels(args, builder, verbose=verbose)
+        builder.set_layout(extra)
 
-    # ── splits → the per-crystal label the trainer already consumes ──
+        noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2],
+                                  gain=(gain if isinstance(gain, float) else 1.0))
+        bvf = noise.n_peak / noise.n_bg
+        recipe = {}
+
+        def store_meta():
+            # after preparation: the recipe records the gain it selected
+            recipe.update(_recipe(args, d, splits, d_min, builder.spacegroup or spacegroup,
+                                  merge_friedel, gain, radii, noise, resolved, measurement))
+            return {"signature": signature, "recipe": recipe, "split_names": names,
+                    "bg_var_factor": bvf}
+
+        prep = builder.finish(
+            cache, config=MergeConfig(gain=gain), noise=noise, resolved_measurement=resolved,
+            delay_bin_idx=labels,
+            unique_timepoints=(None if labels is None
+                               else torch.arange(len(names), dtype=torch.float64)),
+            meta=store_meta)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        builder.close()
+    if verbose:
+        if labels is not None:
+            counts = torch.bincount(labels, minlength=len(names)).tolist()
+            print(f"  splits {names} -> crystals {counts}", flush=True)
+        print(f"prepared: {prep.n_valid:,} reflections, {prep.n_obs_total:,} obs, "
+              f"{prep.obs_info.n_crystals:,} crystals, n_peak/n_bg={bvf:.4f}, "
+              f"{100 * float(prep.is_centric.float().mean()):.1f} % centric", flush=True)
+        size = (cache / "obs.bin").stat().st_size
+        print(f"  prep stored -> {cache} ({size / 2**30:.1f} GiB)", flush=True)
+    return PrepBundle(prep, recipe, names, bvf)
+
+
+def _recipe(args, d, splits, d_min, spacegroup, merge_friedel, gain, radii, noise,
+            resolved, measurement) -> dict:
+    """What the prepared data was made with, for the checkpoint and the merge."""
+    recipe = {"d_min": float(d_min), "d_max": float(args.dmax),
+              "spacegroup": spacegroup or "P 1",
+              "gain": gain, "radii": list(radii),
+              "gain_tolerance": DEFAULT_GAIN_TOLERANCE,
+              "inputs": [[name, str(path.resolve())] for name, path in splits],
+              "n_peak": noise.n_peak, "n_bg": noise.n_bg,
+              "merge_friedel": merge_friedel,
+              "measurement": {**resolved.to_dict(), "gain_adu_per_photon": noise.gain,
+                              "n_peak": noise.n_peak, "n_bg": noise.n_bg,
+                              "gain_selection": noise.gain_selection,
+                              "pixel_count_definition": "nominal_integer_ring_mask",
+                              "source": measurement.to_dict() if measurement else None}}
+    previous_selection = (d.get("measurement") or {}).get("gain_selection")
+    if previous_selection and dict(resolved.provenance)["gain"] == "checkpoint":
+        recipe["measurement"]["gain_selection"] = dict(previous_selection, reused_from_checkpoint=True)
+    return recipe
+
+
+def _split_labels(args, builder, *, verbose: bool = True):
+    """``(labels, names, extra)``: the split of every prepared crystal, the split
+    names, and the masks over the surviving crystals that are prepared once
+    more (a frame named in several splits of a custom-split file)."""
+    import torch
+
     names: list[str] = []
+    extra: list[torch.Tensor] = []
+    n_surviving = len(builder.primary)
     if args.split_file is not None:
         if str(args.split_file).endswith((".pt", ".pth")):
             labels = torch.load(args.split_file).long().reshape(-1)
@@ -298,7 +393,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                 lookup.setdefault((line[0], line[1]), set()).add(line[2])
             names = sorted({name for bins in lookup.values() for name in bins})
             index = {n: i for i, n in enumerate(names)}
-            fnames, evts = stream.filenames, stream.events
+            fnames, evts = builder.surviving_filenames, builder.surviving_events
             if not fnames or not evts:
                 raise SystemExit(
                     "the stream carries no image filename/event metadata, so a "
@@ -306,9 +401,10 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                     "the .stream, or pass a .pt label tensor")
             memberships = [sorted(index[name] for name in lookup.get((f, e), ()))
                            for f, e in zip(fnames, evts)]
+            image_id = builder.surviving_image_id
             per_image = torch.tensor([bins[0] if bins else -1 for bins in memberships],
                                      dtype=torch.long)
-            labels = per_image[stream.image_id.long()]
+            labels = per_image[image_id]
             if verbose:
                 miss = int((labels < 0).sum())
                 print(f"  custom split {args.split_file.name}: {len(lookup):,} "
@@ -317,21 +413,20 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
             # The trainer consumes one label per crystal. Add another copy
             # of the frame's crystals/observations for each extra membership.
             # Sets above prevent duplicate rows from double-counting a bin.
-            parts, label_parts = [stream], [labels]
+            label_parts = [labels]
             for slot in range(1, max(map(len, memberships), default=0)):
-                extra = torch.tensor([bins[slot] if len(bins) > slot else -1
-                                      for bins in memberships], dtype=torch.long)
-                extra = extra[stream.image_id.long()]
-                mask = extra >= 0
+                more = torch.tensor([bins[slot] if len(bins) > slot else -1
+                                     for bins in memberships], dtype=torch.long)[image_id]
+                mask = more >= 0
                 if mask.any():
-                    parts.append(stream.filter_crystals(mask))
-                    label_parts.append(extra[mask])
-            stream = SFXStream.concat(parts)
+                    extra.append(mask)
+                    label_parts.append(more[mask])
             labels = torch.cat(label_parts)
-        if labels.numel() != stream.n_crystals:
+        n_total = n_surviving + sum(int(m.sum()) for m in extra)
+        if labels.numel() != n_total:
             raise SystemExit(
                 f"--split-file has {labels.numel():,} labels but the data has "
-                f"{stream.n_crystals:,} crystals (after the resolution filter)")
+                f"{n_total:,} crystals (after the resolution filter)")
         if int((labels < 0).sum()):
             raise SystemExit(f"--split-file: {int((labels < 0).sum()):,} unlabelled "
                              "crystals (-1); every crystal must belong to a split")
@@ -341,66 +436,13 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
             names = [str(i) for i in range(n_splits)]
         if len(names) != n_splits:
             raise SystemExit(f"{len(names)} split names for {n_splits} labels")
-    elif len(splits) > 1:
+        return labels, names, extra
+    if len(builder.inputs) > 1:
         labels = torch.repeat_interleave(
-            torch.arange(len(splits)), torch.tensor(n_per_split))
-        names = [n for n, _ in splits]
-    else:
-        labels = None
-
-    noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2],
-                              gain=(gain if isinstance(gain, float) else 1.0))
-    try:
-        prep = prepare_observations(stream, MergeConfig(gain=gain), poisson_noise=noise,
-                                    resolved_measurement=resolved)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-    bvf = noise.n_peak / noise.n_bg
-
-
-    if labels is not None:
-        if labels.numel() != prep.obs_info.n_crystals:
-            raise SystemExit(
-                f"{labels.numel():,} split labels but prepare_observations kept "
-                f"{prep.obs_info.n_crystals:,} crystals")
-        prep.obs_info.delay_bin_idx = labels
-        prep.obs_info.unique_timepoints = torch.arange(len(names), dtype=torch.float64)
-        if verbose:
-            counts = torch.bincount(labels, minlength=len(names)).tolist()
-            print(f"  splits {names} -> crystals {counts}", flush=True)
-
-    recipe = {"d_min": float(d_min), "d_max": float(args.dmax),
-              "spacegroup": stream._core.spacegroup or spacegroup or "P 1",
-              "gain": gain, "radii": list(radii),
-              "gain_tolerance": DEFAULT_GAIN_TOLERANCE,
-              "inputs": [[name, str(path.resolve())] for name, path in splits],
-              "n_peak": noise.n_peak, "n_bg": noise.n_bg,
-              "merge_friedel": merge_friedel,
-              "measurement": {**resolved.to_dict(), "gain_adu_per_photon": noise.gain,
-                              "n_peak": noise.n_peak, "n_bg": noise.n_bg,
-                              "gain_selection": noise.gain_selection,
-                              "pixel_count_definition": "nominal_integer_ring_mask",
-                              "source": measurement.to_dict() if measurement else None}}
-    previous_selection = (d.get("measurement") or {}).get("gain_selection")
-    if previous_selection and dict(resolved.provenance)["gain"] == "checkpoint":
-        recipe["measurement"]["gain_selection"] = dict(previous_selection, reused_from_checkpoint=True)
-    if verbose:
-        print(f"prepared: {prep.n_valid:,} reflections, {prep.I_obs.numel():,} obs, "
-              f"{prep.obs_info.n_crystals:,} crystals, n_peak/n_bg={bvf:.4f}, "
-              f"{100 * float(prep.is_centric.float().mean()):.1f} % centric", flush=True)
-    bundle = PrepBundle(prep, recipe, names, bvf)
-    if cache is not None:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_suffix(cache.suffix + ".partial")
-        torch.save({"prep": prep, "recipe": recipe, "split_names": names,
-                    "bg_var_factor": bvf, "signature": signature}, tmp)
-        # rename only once the write completed, so an interrupted run cannot
-        # leave a truncated blob that the next one would load as valid
-        tmp.replace(cache)
-        if verbose:
-            print(f"  prep cached -> {cache} "
-                  f"({cache.stat().st_size / 2**30:.1f} GiB)", flush=True)
-    return bundle
+            torch.arange(len(builder.inputs)),
+            torch.tensor([inp.n_crystals for inp in builder.inputs]))
+        return labels, [inp.name for inp in builder.inputs], extra
+    return None, names, extra
 
 
 # ── free flags ─────────────────────────────────────────────────────────
@@ -835,8 +877,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         elif noise_mode == "global_B":
             dn = DetectorNoise(1, terms="B")
         else:
-            pid = prep.obs_info.panel_id
-            n_groups = int(pid.max()) + 1 if pid is not None else 1
+            if hasattr(prep, "n_panels"):
+                n_groups = max(1, prep.n_panels)
+            else:
+                pid = prep.obs_info.panel_id
+                n_groups = int(pid.max()) + 1 if pid is not None else 1
             dn = DetectorNoise(n_groups, terms=str(getattr(args, "noise_terms", "AB") or "AB"))
         obj.detector_noise = dn.to(dev)
         if verbose:

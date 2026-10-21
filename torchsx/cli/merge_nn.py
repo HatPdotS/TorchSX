@@ -203,6 +203,10 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
             print(f"  half-datasets  posterior  CC1/2 {stats['cc_half']:.4f}  "
                   f"R_split {stats['r_split']:.4f} on {stats['n']:,} reflections", flush=True)
         summary[label] = rec
+    store = getattr(tr, "_store", None)
+    if verbose and store is not None:
+        print(f"read from {store.path} in this run: {store.store.bytes_read / 2**30:.1f} GiB, "
+              f"{store.store.wait_s:.0f} s waited", flush=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.with_suffix(".metrics.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary

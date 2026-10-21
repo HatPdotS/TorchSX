@@ -71,16 +71,16 @@ def test_custom_split_matches_source_images(stream_file,python_parser,tmp_path):
 
 
 def test_cache_moves_with_inputs_and_rejects_changed_content(stream_file,python_parser,tmp_path,monkeypatch):
-    cache=tmp_path/'prepared.pt'
+    cache=tmp_path/'prepared'
     args=_DataArgs(stream=[stream_file],int_radius=None,gain=None,cache_prep=cache)
     built=P.load_prep(args,verbose=False)
     moved=tmp_path/'moved';moved.mkdir()
     source=moved/stream_file.name;shutil.copyfile(stream_file,source)
-    relocated=moved/'prepared.pt';shutil.copyfile(cache,relocated)
+    relocated=moved/'prepared';shutil.copytree(cache,relocated)
     args.stream,args.cache_prep=[source],relocated
-    monkeypatch.setattr('torchsx.stream.SFXStream.read',lambda *a,**k: pytest.fail('cache hit reparsed observations'))
+    monkeypatch.setattr('torchsx.merging.prepare_store.StoreBuilder.add',lambda *a,**k: pytest.fail('cache hit reparsed observations'))
     loaded=P.load_prep(args,recipe_defaults=built.recipe,verbose=False)
-    assert torch.equal(loaded.prep.I_obs,built.prep.I_obs)
+    assert torch.equal(loaded.prep.materialize().I_obs,built.prep.materialize().I_obs)
     source.write_text(source.read_text()+'\n# changed input\n')
     with pytest.raises(SystemExit,match='different settings'):
         P.load_prep(args,verbose=False)

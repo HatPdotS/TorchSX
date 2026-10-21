@@ -83,6 +83,12 @@ class ObsInfo:
     # Kinetic-ensemble plumbing — both populated together or both ``None``.
     delay_bin_idx: Tensor | None = None     # (n_crystals,) int64, indexes unique_timepoints
     unique_timepoints: Tensor | None = None  # (n_timepoints,) float64, sorted
+    #: The observation's ``PreparedObs.I_obs`` and ``PreparedObs.bg``, carried
+    #: when the observations come from an on-disk store
+    #: (:class:`~torchsx.merging.store.PreparedStore`), which has no
+    #: whole-set tensors to address by ``obs_id``.
+    I_obs: Tensor | None = None
+    bg: Tensor | None = None
 
     def slice(self, s: int, e: int) -> "ObsInfo":
         """Restrict to ``obs[s:e]`` (for chunked closures)."""
@@ -105,6 +111,8 @@ class ObsInfo:
             obs_id=None if self.obs_id is None else self.obs_id[s:e],
             delay_bin_idx=self.delay_bin_idx,            # per-crystal — full table kept
             unique_timepoints=self.unique_timepoints,
+            I_obs=None if self.I_obs is None else self.I_obs[s:e],
+            bg=None if self.bg is None else self.bg[s:e],
         )
 
     def gather(self, idx: Tensor) -> "ObsInfo":
@@ -140,6 +148,8 @@ class ObsInfo:
             obs_id=self.obs_id[idx],
             delay_bin_idx=self.delay_bin_idx,
             unique_timepoints=self.unique_timepoints,
+            I_obs=_g(self.I_obs),
+            bg=_g(self.bg),
         )
 
     def to(self, device) -> "ObsInfo":
@@ -164,6 +174,8 @@ class ObsInfo:
             obs_id=_m(self.obs_id),
             delay_bin_idx=_m(self.delay_bin_idx),
             unique_timepoints=_m(self.unique_timepoints),
+            I_obs=_m(self.I_obs),
+            bg=_m(self.bg),
         )
 
 
@@ -278,8 +290,7 @@ def _ewald_offset(core, return_q: bool = False):
     Wavelength is taken as the stream-median (per-image variation at
     LCLS/EuXFEL is < 0.01 %, well below the |r| binning resolution).
     """
-    wavelength = 12398.4 / float(core.beam_energy.float().median().item())
-    k0 = 1.0 / wavelength
+    k0 = ewald_k0(core.beam_energy)
     cid = core.crystal_id.long()
     # ``symmetrize()`` replaces the observed index by its ASU representative,
     # whose excitation error is not the one that was recorded -- the other mates
@@ -307,10 +318,7 @@ def _ewald_offset(core, return_q: bool = False):
         best_offset = best_q = None
         for R in ops:
             h_op = h_c @ R                                         # (M, 3), row convention h' = h @ R
-            q = h_op[:, 0:1] * A + h_op[:, 1:2] * Bv + h_op[:, 2:3] * Cv
-            q_plus = q.clone()
-            q_plus[:, 2] += k0
-            off = q_plus.norm(dim=1) - k0
+            off, q = ewald_rows(h_op, A, Bv, Cv, k0)
             if best_offset is None:
                 best_offset, best_q = off, q
             else:
@@ -322,8 +330,27 @@ def _ewald_offset(core, return_q: bool = False):
     offset = torch.cat(parts_offset)
     q_lab = torch.cat(parts_q)
     if return_q:
-        return offset, q_lab / q_lab.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        return offset, unit_rows(q_lab)
     return offset
+
+
+def ewald_k0(beam_energy: Tensor) -> float:
+    """``1/λ`` (Å⁻¹) at the median photon energy (eV) of the images."""
+    wavelength = 12398.4 / float(beam_energy.float().median().item())
+    return 1.0 / wavelength
+
+
+def ewald_rows(hkl: Tensor, astar: Tensor, bstar: Tensor, cstar: Tensor, k0: float):
+    """Signed Ewald offset and lab-frame ``q`` of float indices ``hkl`` (M, 3)
+    against per-row reciprocal axes (M, 3) each."""
+    q = hkl[:, 0:1] * astar + hkl[:, 1:2] * bstar + hkl[:, 2:3] * cstar
+    q_plus = q.clone()
+    q_plus[:, 2] += k0
+    return q_plus.norm(dim=1) - k0, q
+
+
+def unit_rows(q: Tensor) -> Tensor:
+    return q / q.norm(dim=1, keepdim=True).clamp(min=1e-12)
 
 
 # ── Prepared-observation bundle ────────────────────────────────────────
@@ -383,6 +410,117 @@ class PreparedObs:
         )
 
 
+def resolve_gain(core, spec, resolved_measurement, config: MergeConfig,
+                 poisson_noise: PoissonNoiseModel, calibration_sample) -> float:
+    """The detector gain (ADU / photon) of a run, recorded on ``poisson_noise``.
+
+    ``core`` supplies the images' ``beam_energy`` (and, for legacy inputs, the
+    ``geometry``).  ``calibration_sample()`` returns ``(I, background,
+    ewald_offset)`` in ADU over the observations, or over a subset holding at
+    least every observation a calibration selects
+    (:func:`~torchsx.merging.hkl.noise.calibration_candidates`); it is called only
+    when the gain is calibrated.
+    """
+    from torchsx.measurement import gain_from_measurement, legacy_stream_gain, parse_gain
+
+    gain_cfg = parse_gain(resolved_measurement.gain if resolved_measurement else config.gain)
+    if isinstance(gain_cfg, (int, float)):
+        gain = float(gain_cfg)
+        gain_src = dict(resolved_measurement.provenance)["gain"] if resolved_measurement else "explicit"
+    elif gain_cfg == "trust_input":
+        mean_eV = float(core.beam_energy.float().mean().item())
+        gain = gain_from_measurement(spec, mean_eV) if spec is not None else legacy_stream_gain(core)
+        gain_src = "source measurement declaration" if spec is not None else "legacy geometry (unverified)"
+    elif gain_cfg in ("auto", "calibrate"):
+        import math
+        tolerance = float(config.gain_tolerance)
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("gain_tolerance must be finite and nonnegative")
+        declared, declaration_error = None, None
+        try:
+            declared = gain_from_measurement(spec, float(core.beam_energy.float().mean().item()))
+        except ValueError as exc:
+            declaration_error = str(exc)
+        if declared is not None:
+            poisson_noise.gain = declared
+        cal_I, cal_background, cal_ewald = calibration_sample()
+        g, mu_bias, read_var_adu_sq = poisson_noise.calibrate_sigma2_of_bg(
+            cal_I, cal_background, cal_ewald,
+        )
+        if not (poisson_noise.gain_calibration_info.get("valid", True)
+                and g is not None and math.isfinite(g) and g > 0):
+            # No off-Bragg sample (CrystFEL streams predict only near the Ewald
+            # sphere): the truncated normal on the negative sums.  Biased (see its
+            # docstring), so it decides a wrong declaration only past the tolerance.
+            off_bragg = poisson_noise.gain_calibration_info
+            g, mu_bias = poisson_noise.calibrate_gain_truncnorm(cal_I, cal_background)
+            read_var_adu_sq = 0.0
+            poisson_noise.gain_calibration_info = {
+                **poisson_noise.gain_calibration_info,
+                "fallback_reason": off_bragg.get("reason", "invalid off-Bragg calibration"),
+                "off_bragg": off_bragg}
+        calibrated = float(g) if g is not None and math.isfinite(g) and g > 0 else None
+        info = poisson_noise.gain_calibration_info
+        valid_calibration = calibrated is not None and info.get("valid", True)
+        difference = abs(calibrated - declared) / declared if declared is not None and calibrated is not None else None
+        if gain_cfg == "calibrate" and not valid_calibration:
+            raise ValueError(f"Gain calibration unavailable; supply an explicit --gain or use trust_input. {info}")
+        if valid_calibration and (gain_cfg == "calibrate" or declared is None or difference > tolerance):
+            gain = calibrated
+            reason = ("calibration_requested" if gain_cfg == "calibrate" else
+                      "declaration_unavailable" if declared is None else "disagreement_exceeds_tolerance")
+            selected = "calibration"
+        elif declared is not None:
+            gain = declared
+            reason = "within_tolerance" if valid_calibration else "calibration_unavailable"
+            selected = "input"
+        else:
+            raise ValueError("No usable stream gain or gain calibration; supply an explicit --gain. "
+                             f"Stream: {declaration_error}. Calibration: {info}")
+        poisson_noise.gain_selection = dict(mode=gain_cfg, declared_gain=declared,
+            calibrated_gain=calibrated, calibration_valid=bool(valid_calibration),
+            relative_difference=difference, tolerance=tolerance, selected=selected,
+            reason=reason, selected_gain=gain, declaration_error=declaration_error,
+            calibration={**info, "mu_bias": float(mu_bias) if math.isfinite(mu_bias) else None,
+                         "read_var_adu_sq": float(read_var_adu_sq) if math.isfinite(read_var_adu_sq) else None})
+        gain_src = f"{gain_cfg}: {selected}, {reason}; declared={declared}, calibrated={calibrated}"
+    else:
+        raise ValueError(f"Unknown config.gain: {gain_cfg!r}")
+    print(f"  gain = {gain:.4g} ADU/photon  [{gain_src}]", flush=True)
+    poisson_noise.gain = gain
+    if gain_cfg not in ("auto", "calibrate"):
+        poisson_noise.gain_selection = dict(mode=gain_cfg, selected_gain=gain, reason=gain_src)
+    return gain
+
+
+def fw_shell_ids(d_valid: Tensor, n_shells: int) -> Tensor:
+    """Equal-population resolution shell of each reflection (low d last)."""
+    n_valid = d_valid.numel()
+    rank_valid = d_valid.argsort().argsort()
+    return (rank_valid.float() / max(n_valid, 1) * n_shells).long().clamp(max=n_shells - 1)
+
+
+def centric_flags(spacegroup: str | None, hkl_valid: Tensor) -> Tensor:
+    """Centric flag per reflection; all acentric (with a warning) for P 1 or no group."""
+    import warnings
+    from torchref.symmetry import SpaceGroup
+
+    n_valid = hkl_valid.shape[0]
+    if not spacegroup or spacegroup == "P 1":
+        warnings.warn(
+            f"prepare_observations: stream.spacegroup={spacegroup!r}; centric "
+            f"detection will be no-op (all reflections marked acentric). "
+            f"Set the spacegroup on the stream before merging.",
+            stacklevel=3,
+        )
+        return torch.zeros(n_valid, dtype=torch.bool)
+    try:
+        return SpaceGroup(spacegroup).is_centric(hkl_valid.long())
+    except Exception as exc:  # noqa: BLE001 — surface the fallback
+        print(f"  [FW] centric detection failed ({exc!r}); treating all as acentric")
+        return torch.zeros(n_valid, dtype=torch.bool)
+
+
 # ── prepare_observations ────────────────────────────────────────────────
 
 
@@ -405,10 +543,7 @@ def prepare_observations(
     bit-for-bit identical to the unweighted pipeline.
     """
     from torchref.base.reciprocal.hkl import get_d_spacing
-    from torchsx.measurement import (
-        gain_from_measurement, legacy_stream_gain, parse_gain,
-        resolve_measurement, validate_measurement,
-    )
+    from torchsx.measurement import resolve_measurement, validate_measurement
 
     spec = stream.measurement
     if resolved_measurement is not None:
@@ -475,72 +610,8 @@ def prepare_observations(
     _lap("ewald offset")
 
     # ── Detector gain (ADU / photon) ──
-    gain_cfg = parse_gain(resolved_measurement.gain if resolved_measurement else config.gain)
-    if isinstance(gain_cfg, (int, float)):
-        gain = float(gain_cfg)
-        gain_src = dict(resolved_measurement.provenance)["gain"] if resolved_measurement else "explicit"
-    elif gain_cfg == "trust_input":
-        mean_eV = float(core.beam_energy.float().mean().item())
-        gain = gain_from_measurement(spec, mean_eV) if spec is not None else legacy_stream_gain(core)
-        gain_src = "source measurement declaration" if spec is not None else "legacy geometry (unverified)"
-    elif gain_cfg in ("auto", "calibrate"):
-        import math
-        tolerance = float(config.gain_tolerance)
-        if not math.isfinite(tolerance) or tolerance < 0:
-            raise ValueError("gain_tolerance must be finite and nonnegative")
-        declared, declaration_error = None, None
-        try:
-            declared = gain_from_measurement(spec, float(core.beam_energy.float().mean().item()))
-        except ValueError as exc:
-            declaration_error = str(exc)
-        if declared is not None:
-            poisson_noise.gain = declared
-        g, mu_bias, read_var_adu_sq = poisson_noise.calibrate_sigma2_of_bg(
-            core_I, core_background, ewald_offset_core,
-        )
-        if not (poisson_noise.gain_calibration_info.get("valid", True)
-                and g is not None and math.isfinite(g) and g > 0):
-            # No off-Bragg sample (CrystFEL streams predict only near the Ewald
-            # sphere): the truncated normal on the negative sums.  Biased (see its
-            # docstring), so it decides a wrong declaration only past the tolerance.
-            off_bragg = poisson_noise.gain_calibration_info
-            g, mu_bias = poisson_noise.calibrate_gain_truncnorm(core_I, core_background)
-            read_var_adu_sq = 0.0
-            poisson_noise.gain_calibration_info = {
-                **poisson_noise.gain_calibration_info,
-                "fallback_reason": off_bragg.get("reason", "invalid off-Bragg calibration"),
-                "off_bragg": off_bragg}
-        calibrated = float(g) if g is not None and math.isfinite(g) and g > 0 else None
-        info = poisson_noise.gain_calibration_info
-        valid_calibration = calibrated is not None and info.get("valid", True)
-        difference = abs(calibrated - declared) / declared if declared is not None and calibrated is not None else None
-        if gain_cfg == "calibrate" and not valid_calibration:
-            raise ValueError(f"Gain calibration unavailable; supply an explicit --gain or use trust_input. {info}")
-        if valid_calibration and (gain_cfg == "calibrate" or declared is None or difference > tolerance):
-            gain = calibrated
-            reason = ("calibration_requested" if gain_cfg == "calibrate" else
-                      "declaration_unavailable" if declared is None else "disagreement_exceeds_tolerance")
-            selected = "calibration"
-        elif declared is not None:
-            gain = declared
-            reason = "within_tolerance" if valid_calibration else "calibration_unavailable"
-            selected = "input"
-        else:
-            raise ValueError("No usable stream gain or gain calibration; supply an explicit --gain. "
-                             f"Stream: {declaration_error}. Calibration: {info}")
-        poisson_noise.gain_selection = dict(mode=gain_cfg, declared_gain=declared,
-            calibrated_gain=calibrated, calibration_valid=bool(valid_calibration),
-            relative_difference=difference, tolerance=tolerance, selected=selected,
-            reason=reason, selected_gain=gain, declaration_error=declaration_error,
-            calibration={**info, "mu_bias": float(mu_bias) if math.isfinite(mu_bias) else None,
-                         "read_var_adu_sq": float(read_var_adu_sq) if math.isfinite(read_var_adu_sq) else None})
-        gain_src = f"{gain_cfg}: {selected}, {reason}; declared={declared}, calibrated={calibrated}"
-    else:
-        raise ValueError(f"Unknown config.gain: {gain_cfg!r}")
-    print(f"  gain = {gain:.4g} ADU/photon  [{gain_src}]", flush=True)
-    poisson_noise.gain = gain
-    if gain_cfg not in ("auto", "calibrate"):
-        poisson_noise.gain_selection = dict(mode=gain_cfg, selected_gain=gain, reason=gain_src)
+    gain = resolve_gain(core, spec, resolved_measurement, config, poisson_noise,
+                        lambda: (core_I, core_background, ewald_offset_core))
 
     # ADU → photon counts for the Poisson likelihood.
     core_I = core_I / gain
@@ -588,27 +659,8 @@ def prepare_observations(
     d_valid = d_spacing_all[valid_indices]
 
     # ── French–Wilson prior metadata (per valid HKL) ──
-    rank_valid = d_valid.argsort().argsort()
-    shell_id_fw = (
-        rank_valid.float() / max(n_valid, 1) * config.fw_n_shells
-    ).long().clamp(max=config.fw_n_shells - 1)
-    import warnings
-    from torchref.symmetry import SpaceGroup
-    sg = getattr(stream, "spacegroup", None)
-    if not sg or sg == "P 1":
-        warnings.warn(
-            f"prepare_observations: stream.spacegroup={sg!r}; centric "
-            f"detection will be no-op (all reflections marked acentric). "
-            f"Set the spacegroup on the stream before merging.",
-            stacklevel=2,
-        )
-        is_centric = torch.zeros(n_valid, dtype=torch.bool)
-    else:
-        try:
-            is_centric = SpaceGroup(sg).is_centric(hkl_valid.long())
-        except Exception as exc:  # noqa: BLE001 — surface the fallback
-            print(f"  [FW] centric detection failed ({exc!r}); treating all as acentric")
-            is_centric = torch.zeros(n_valid, dtype=torch.bool)
+    shell_id_fw = fw_shell_ids(d_valid, config.fw_n_shells)
+    is_centric = centric_flags(getattr(stream, "spacegroup", None), hkl_valid)
 
     _lap("centric flags")
 

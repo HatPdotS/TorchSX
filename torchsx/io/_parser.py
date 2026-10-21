@@ -37,4 +37,5 @@ from torchsx.io._parse.orchestrator import (  # noqa: F401
     _select_head,
     _select_sampled,
     parse_stream,
+    parse_stream_blocks,
 )
