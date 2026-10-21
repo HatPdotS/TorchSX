@@ -151,6 +151,37 @@ def _splits_from_args(args) -> list[tuple[str, Path]]:
     return out
 
 
+def _run_cache(run: Path) -> Path:
+    """A run's prepared store; a run prepared before the on-disk store keeps its blob."""
+    return run / "prepared.pt" if (run / "prepared.pt").is_file() else run / "prepared"
+
+
+def _open_cache(cache: Path | None):
+    """``(blob, stored)`` of a prepared cache: the blob carries the signature and
+    recipe, ``stored`` the on-disk store's metadata; ``(None, None)`` when absent."""
+    blob = stored = None
+    if cache is not None and cache.is_file():
+        blob = torch.load(cache, weights_only=False)
+    elif cache is not None and (cache / "meta.json").is_file():
+        stored = json.loads((cache / "meta.json").read_text())
+        blob = {"signature": stored.get("signature"), "recipe": stored.get("recipe")}
+    elif cache is not None and cache.exists():
+        raise SystemExit(f"--cache {cache} exists but is not a prepared cache; "
+                         "remove it or point --cache somewhere else.")
+    return blob, stored
+
+
+def _signature_differences(blob: dict, signature: dict) -> list[str]:
+    """The preparation settings in which a cache differs from ``signature``."""
+    got = blob.get("signature")
+    comparable_got = _comparable_prep_signature(got, {})
+    comparable_signature = _comparable_prep_signature(signature, {})
+    if isinstance(signature.get("gain"), (float, int)):
+        comparable_got = _comparable_prep_signature(got, blob["recipe"])
+    return sorted(k for k in set(comparable_signature) | set(comparable_got)
+                  if comparable_got.get(k) != comparable_signature.get(k))
+
+
 def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True) -> PrepBundle:
     """Streams (or a prepared cache) → ``PrepBundle``.
 
@@ -159,6 +190,11 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     prepared observations are written to an on-disk store (``--cache``, default
     ``RUN/prepared``) block by block and read back per batch, so host memory
     does not grow with the observation count.
+
+    A merge (``args.ckpt``) without ``--cache`` reads the training run's store
+    when it was prepared from the same inputs and settings; otherwise it
+    prepares its own beside its output, ``OUT.prepared``, which it replaces
+    when a later merge to the same output gives other inputs.
     """
     from torchsx.merging.config import MergeConfig
     from torchsx.merging.hkl.noise import PoissonNoiseModel
@@ -180,20 +216,16 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     splits = _splits_from_args(args)
 
     cache = args.cache_prep
+    run_cache = None   # a merge's candidate: the training run's store
+    own = False        # the merge's own default store, replaced when stale
     if cache is None and getattr(args, "out", None) is not None:
-        run = args.ckpt.parent if getattr(args, "ckpt", None) else args.out
-        # a run prepared before the on-disk store keeps its blob
-        cache = run / "prepared.pt" if (run / "prepared.pt").is_file() else run / "prepared"
-    blob = stored = None
-    if cache is not None and cache.is_file():
-        blob = torch.load(cache, weights_only=False)
-    elif cache is not None and (cache / "meta.json").is_file():
-        stored = json.loads((cache / "meta.json").read_text())
-        blob = {"signature": stored.get("signature"), "recipe": stored.get("recipe")}
-    elif cache is not None and cache.exists():
-        raise SystemExit(f"--cache {cache} exists but is not a prepared cache; "
-                         "remove it or point --cache somewhere else.")
-    if blob is not None:
+        if getattr(args, "ckpt", None):
+            run_cache = _run_cache(args.ckpt.parent)
+            cache, own = args.out.with_name(args.out.stem + ".prepared"), True
+        else:
+            cache = _run_cache(args.out)
+    blob, stored = _open_cache(cache)
+    if blob is not None and not own:
         if (blob.get("signature") or {}).get("observation_filter_version") != OBSERVATION_FILTER_VERSION:
             raise SystemExit(
                 f"Prepared cache {cache} uses an incompatible observation filter. "
@@ -250,20 +282,30 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     except (OSError, ValueError) as exc:
         raise SystemExit(f"Cannot resolve input measurement: {exc}") from exc
 
+    if run_cache is not None:
+        try:
+            found = _open_cache(run_cache)
+        except SystemExit:
+            found = (None, None)
+        if found[0] is not None and not _signature_differences(found[0], signature):
+            cache, (blob, stored) = run_cache, found
+        elif found[0] is not None and verbose:
+            print(f"  {run_cache} holds other inputs or settings; preparing {cache}", flush=True)
+    if blob is not None and own and _signature_differences(blob, signature):
+        if verbose:
+            print(f"  replacing {cache}, prepared from other inputs or settings", flush=True)
+        if cache.is_dir():
+            import shutil
+            shutil.rmtree(cache)
+        else:
+            cache.unlink()
+        blob = stored = None
     if blob is not None:
-        got = blob.get("signature")
-        comparable_got = _comparable_prep_signature(got, {})
-        comparable_signature = _comparable_prep_signature(signature, {})
-        if isinstance(signature.get("gain"), (float, int)):
-            comparable_got = _comparable_prep_signature(got, blob["recipe"])
-        if comparable_got != comparable_signature:
-            differ = sorted(
-                k for k in set(comparable_signature) | set(comparable_got)
-                if comparable_got.get(k) != comparable_signature.get(k))
+        differ = _signature_differences(blob, signature)
+        if differ:
             raise SystemExit(
                 f"--cache {cache} was built with different settings "
-                f"({', '.join(differ) if differ else 'no signature recorded'}); "
-                f"delete it or point --cache somewhere else.")
+                f"({', '.join(differ)}); delete it or point --cache somewhere else.")
         if stored is not None:
             from torchsx.merging.store import PreparedStore
             prep = PreparedStore(cache)

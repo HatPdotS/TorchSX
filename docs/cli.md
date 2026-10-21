@@ -185,13 +185,18 @@ Poisson counting on the spot and the background estimate.
 
 ## Cache and reproducibility
 
-The prepared observations are stored in `--cache` (default `RUN/prepared`;
-`torchsx.merge` uses the checkpoint's directory). A later run with the same
-inputs and preparation settings reuses it: the store records the input
-contents and settings, and a mismatch is an error rather than a silent reparse.
-Moved but identical files are accepted. For changed inputs or split
-assignments, give a new `--cache` path. A run prepared before the store
-existed keeps its `prepared.pt`, and `torchsx.merge` reads it.
+The prepared observations are stored in `--cache` (default `RUN/prepared`).
+A later run with the same inputs and preparation settings reuses it: the store
+records the input contents and settings, and a mismatch is an error rather
+than a silent reparse. Moved but identical files are accepted. For changed
+inputs or split assignments, give a new `--cache` path. A run prepared before
+the store existed keeps its `prepared.pt`, and `torchsx.merge` reads it.
+
+Without `--cache`, `torchsx.merge` reads the checkpoint directory's store when
+it holds the same inputs and settings, as when merging the training data.
+Other streams are prepared into a store beside the output, `merged.prepared`
+for `-o merged.mtz`; a later merge to the same output with other inputs
+replaces it. The training run's store is never changed by a merge.
 
 The store holds the observations on disk; host memory holds the crystal and
 reflection tables and a few batches. Preparation reads the streams in blocks
