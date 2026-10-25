@@ -5,7 +5,7 @@ TorchSX is released as two PyPI packages from this repository: `torchsx` and
 new version only when `native/` changes; a release that leaves it unchanged
 says so below.
 
-## 1.1.0
+## 0.1.1
 
 `torchsx-native` is unchanged (0.1.0).
 
