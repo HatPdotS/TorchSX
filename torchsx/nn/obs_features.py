@@ -58,7 +58,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from torchsx.merging.observations import CRYSTAL_FEAT_COLUMNS, ObsInfo, PreparedObs
+from torchsx.merging.observations import (
+    CRYSTAL_FEAT_COLUMNS, DEFAULT_CRYSTAL_FEATURES, ObsInfo, PreparedObs,
+)
 
 __all__ = [
     "SELF_FEATURES",
@@ -87,6 +89,9 @@ SELF_FEATURES: tuple[str, ...] = (
     "h", "k", "l",     # Miller indices — see the permutation monitor
 )
 
+#: Recorded disk pixel count; constant, hence dropped, under nominal disks.
+DISK_FEATURE: str = "disk_pix"
+
 #: Measurement channels, legitimate ONLY in the leave-one-out pooled branch.
 CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
     "signed_log_I",    # sign(I)·log1p(|I|) — keeps the negatives
@@ -112,7 +117,7 @@ FORBIDDEN_IN_SELF: frozenset[str] = frozenset(CONTEXT_ONLY_FEATURES)
 #: by the encoder's crystal-level input head, once per crystal rather than once
 #: per observation.  No intensity, so no exclusion is needed.  ``beam_energy``
 #: and ``crystal_res`` also remain per-observation self features for now.
-CRYSTAL_FEATURES: tuple[str, ...] = CRYSTAL_FEAT_COLUMNS
+CRYSTAL_FEATURES: tuple[str, ...] = DEFAULT_CRYSTAL_FEATURES
 
 #: Never allowed in either tier.  See the module docstring.
 CONDITION_FEATURES: frozenset[str] = frozenset(
@@ -380,6 +385,8 @@ class ObsFeatureSpec(nn.Module):
                 out[k] = _or_zeros(meta.beam_energy, meta)
             elif k == "crystal_res":
                 out[k] = _or_zeros(meta.crystal_res, meta)
+            elif k == DISK_FEATURE:
+                out[k] = _or_zeros(meta.n_pix, meta)
             elif k == "panel":
                 out[k] = (
                     meta.panel_id.float() if meta.panel_id is not None

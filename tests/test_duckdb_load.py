@@ -465,10 +465,41 @@ def test_frame_id_is_carried_verbatim(db_path):
     assert ids[1].rsplit(":", 1)[0] == ids[2].rsplit(":", 1)[0]
 
 
+def test_feeds_the_merging_stack(db_path):
+    """The point of the loader: merging accepts it without a stream file."""
+    from torchsx.merging import MergeConfig, prepare_observations
+
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    nominal = prepare_observations(stream, MergeConfig(gain="trust_input"))
+    recorded = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded"))
+    assert nominal.obs_info.n_pix.unique().numel() == 1
+    assert sorted(recorded.obs_info.n_pix.tolist()) == [6, 7, 9, 9, 9, 9, 9]
+    for prep in (nominal, recorded):  # background 5 ADU/px over n_pix at GAIN ADU/photon
+        torch.testing.assert_close(prep.bg, 5.0 / GAIN * prep.obs_info.n_pix)
+    # the model background replaces the ring's estimate but not the measured count
+    model = prepare_observations(
+        stream, MergeConfig(gain="trust_input", disk_size="recorded", background="model"))
+    torch.testing.assert_close(model.bg, torch.full_like(model.bg, 40.0 / GAIN))
+    torch.testing.assert_close(model.I_obs + model.bg, recorded.I_obs + recorded.bg)
+
+    from torchsx.merging.hkl import compute_hkl_index, merge_intensities
+
+    idx = compute_hkl_index(stream.hkl)
+    I_m, sig_m, mult = merge_intensities(
+        idx.hkl_id, stream.I, stream.sigma, idx.n_unique
+    )
+    assert I_m.numel() == idx.n_unique
+    assert int(mult.sum()) == stream.n_observations
+    assert torch.isfinite(I_m).all() and torch.isfinite(sig_m).all()
+
+
 def test_crystal_feature_table_shape_and_dead_columns(db_path):
-    """probixi supplies 9 of 12 encoder features; 3 are structurally constant."""
+    """probixi supplies every encoder feature but the two structurally constant ones."""
+    with duckdb.connect(str(db_path)) as conn:  # a per-frame energy, as SACLA files give
+        conn.execute("UPDATE frames SET photon_energy_eV = ? + event", [PHOTON_EV])
     from torchsx.merging.observations import (
         CRYSTAL_FEAT_COLUMNS,
+        PROBIXI_CRYSTAL_FEATURES,
         _crystal_feature_table,
     )
 
@@ -481,10 +512,57 @@ def test_crystal_feature_table_shape_and_dead_columns(db_path):
         for i in range(tbl.shape[1])
         if float(tbl[:, i].std()) == 0.0
     }
-    # These three cannot vary: absent from probixi's schema or run-level in it.
-    assert {"beam_energy", "det_shift_x", "det_shift_y"} <= dead
+    # These two cannot vary: absent from probixi's schema.
+    assert {"det_shift_x", "det_shift_y"} <= dead
     # These must survive the mapping as live, varying features.
-    assert dead.isdisjoint({"log_n_refl"})
+    assert dead.isdisjoint({"log_n_refl", "beam_energy", *PROBIXI_CRYSTAL_FEATURES})
+    col = CRYSTAL_FEAT_COLUMNS.index
+    torch.testing.assert_close(tbl[:, col("log_scale")], torch.tensor([0.8, 1.2, 1.2]).log())
+    torch.testing.assert_close(tbl[:, col("log_enrich_p")], torch.tensor([1e-6, 1e-12, 1e-3]).log10())
+    torch.testing.assert_close(tbl[:, col("log_n_indexed")], torch.log1p(torch.tensor([30.0, 60.0, 20.0])))
+    torch.testing.assert_close(tbl[:, col("peak_resolution")], torch.tensor([10 / 2.8, 10 / 3.5, 10 / 3.5]))
+
+
+def test_probixi_features_reach_the_encoder(db_path):
+    from torchsx.merging import MergeConfig, prepare_observations
+    from torchsx.merging.observations import (
+        CRYSTAL_FEAT_COLUMNS, DEFAULT_CRYSTAL_FEATURES, PROBIXI_CRYSTAL_FEATURES,
+    )
+    from torchsx.merging.scale import AmortizedScale
+    from torchsx.nn.obs_features import DISK_FEATURE, SELF_FEATURES
+
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    prep = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded"))
+    scale = AmortizedScale.from_prep(
+        prep, d_model=16, n_layers=2,
+        self_features=SELF_FEATURES + (DISK_FEATURE,),
+        crystal_features=DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES,
+    )
+    feats = scale.features
+    assert feats.n_crystal == len(CRYSTAL_FEAT_COLUMNS)
+    assert not feats._const[feats._stat_names.index(DISK_FEATURE)], "recorded counts vary"
+    x_self, _, x_crys = feats.build(prep.obs_info)
+    assert x_crys.shape == (3, len(CRYSTAL_FEAT_COLUMNS))
+    assert x_self[:, feats.self_features.index(DISK_FEATURE)].std() > 0
+    # the default tiers are unchanged: no disk column, the twelve stream columns
+    plain = AmortizedScale.from_prep(prep, d_model=16, n_layers=2).features
+    assert DISK_FEATURE not in plain.self_features
+    assert plain.crystal_features == DEFAULT_CRYSTAL_FEATURES
+
+
+def test_sentinels_become_missing_values(db_path):
+    from torchsx.merging.observations import CRYSTAL_FEAT_COLUMNS, _crystal_feature_table
+
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE frames SET peak_resolution_nm_inv = NULL WHERE event = 1")
+    core = load_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    assert core.levels["image"]["peak_resolution"].tolist() == pytest.approx(
+        [float("nan"), 10 / 3.5], nan_ok=True)
+    assert core.resolution.tolist() == pytest.approx([10 / 2.5, 10 / 3.0, 10 / 2.0]), "the cut keeps its sentinel"
+    tbl = _crystal_feature_table(core, core.n_crystals)
+    col = CRYSTAL_FEAT_COLUMNS.index("peak_resolution")
+    assert tbl[:, col].tolist() == pytest.approx([10 / 3.5] * 3)
+    assert torch.isfinite(tbl).all()
 
 
 def test_hkl_dtype_and_values(db_path):

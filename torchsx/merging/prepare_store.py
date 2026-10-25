@@ -45,18 +45,23 @@ from torchsx.merging.store import RECORD, RECORD_WIDTH, PreparedStore, RecordFil
 
 #: One parsed observation before preparation, less its canonical Miller index
 #: (kept in a file of its own, the one column the resolution cut reads).
-#: ``observed`` is the measured index.  32 bytes: every field naturally aligned.
+#: ``observed`` is the measured index; unrecorded ``n_pix`` is 0, ``bg_model*`` NaN.  44 bytes.
 RAW = np.dtype([
     ("I", "<f4"), ("sigma", "<f4"), ("background", "<f4"), ("peak", "<f4"),
     ("fs", "<f4"), ("ss", "<f4"), ("observed", "<i2", (3,)), ("panel_id", "<i2"),
+    ("n_pix", "<f4"), ("bg_model", "<f4"), ("bg_model_var", "<f4"),
 ])
 HKL_BYTES = 6
 
 #: Observations parsed and processed per block; bounds the builder's memory.
 BLOCK_OBS = 4_000_000
 
-_CRYSTAL = ("cell", "astar", "bstar", "cstar", "resolution", "n_refl", "image_id")
+_CRYSTAL = ("cell", "astar", "bstar", "cstar", "profile_rad", "resolution", "n_refl", "image_id")
 _IMAGE = ("beam_energy", "det_shift_x", "det_shift_y", "n_peaks")
+#: probixi's optional diagnostics, with the neutral fill for other sources.
+_CRYSTAL_OPT = {"n_indexed": 0.0, "rmsd": 0.0, "mosaicity": 0.0, "enrichment": 1.0,
+                "n_bright": 0.0, "enrich_p": 1.0}
+_IMAGE_OPT = {"scale": 1.0, "scale_sigma": 0.0, "peak_resolution": 0.0}
 #: Per-reflection observation counts collected while parsing.
 _COUNTS = ("all", "kept", "positive", "I", "background", "sigma")
 
@@ -232,10 +237,21 @@ class StoreBuilder:
     """
 
     def __init__(self, workdir: str | Path, *, spacegroup: str | None, merge_friedel: bool = True,
-                 n_workers: int = 1, block_obs: int | None = None, verbose: bool = True):
+                 n_workers: int = 1, block_obs: int | None = None, verbose: bool = True,
+                 disk_size: str = "nominal", background: str = "annulus"):
         self.workdir = _fresh_staging(Path(workdir))
         self.spacegroup = spacegroup
         self.merge_friedel = bool(merge_friedel)
+        if disk_size not in ("nominal", "recorded"):
+            raise ValueError(f"disk_size must be 'nominal' or 'recorded', got {disk_size!r}")
+        #: see :attr:`MergeConfig.disk_size`; ``recorded`` also keeps clipped disks
+        self.disk_size = disk_size
+        if background not in ("annulus", "model"):
+            raise ValueError(f"background must be 'annulus' or 'model', got {background!r}")
+        #: see :attr:`MergeConfig.background`
+        self.background = background
+        #: Var[bg]/bg of a modelled background, set by finish
+        self.bg_var_factor: float | None = None
         self.n_workers = max(1, int(n_workers))
         self.block_obs = int(BLOCK_OBS if block_obs is None else block_obs)
         self.verbose = verbose
@@ -287,7 +303,8 @@ class StoreBuilder:
             return
         # A cache written by torchsx is read whole, then cut into blocks of crystals.
         from torchsx.merging.hkl.filter import filter_crystals
-        s = SFXStream.read(path, spacegroup=self.spacegroup, merge_friedel=self.merge_friedel)._core
+        s = SFXStream.read(path, spacegroup=self.spacegroup, merge_friedel=self.merge_friedel,
+                           clipped=self.disk_size == "recorded")._core
         self.spacegroup = self.spacegroup or s.spacegroup
         if bool((s.crystal_id[1:] < s.crystal_id[:-1]).any()):
             raise ValueError(f"{path}: observations are not ordered by crystal")
@@ -336,9 +353,14 @@ class StoreBuilder:
             for j, f in enumerate(("I", "sigma", "background", "peak", "fs", "ss")):
                 v = sigma if f == "sigma" else getattr(core, f)
                 raw[:, j] = 0.0 if v is None else v
-            tail = raw[:, 6:].view(torch.int16)
+            tail = raw[:, 6:8].view(torch.int16)
             tail[:, :3] = observed
             tail[:, 3] = core.panel_id
+            n_pix = core.levels["obs"].get("n_pixels")
+            raw[:, 8] = 0.0 if n_pix is None else n_pix.float()
+            for j, f in enumerate(("background_model", "background_model_var"), start=9):
+                v = core.levels["obs"].get(f)
+                raw[:, j] = float("nan") if v is None else v.float()
             self.clock.lap("extract")
             self._out_hkl.write(memoryview(hkl.numpy()).cast("B"))
             self._out_raw.write(memoryview(raw.numpy()).cast("B"))
@@ -363,6 +385,11 @@ class StoreBuilder:
                 self._crys.add(c, v)
             for c in _IMAGE:
                 self._img.add(c, getattr(core, c))
+            for level, tbl, opt in (("crystal", self._crys, _CRYSTAL_OPT),
+                                    ("image", self._img, _IMAGE_OPT)):
+                for c, fill in opt.items():
+                    v = core.levels[level].get(c)
+                    tbl.add(c, torch.full((core.levels[level].n,), fill) if v is None else v.float())
             meta = core.metadata.get("image", {}) if core.metadata else {}
             self._has_names &= bool(meta.get("filename")) and bool(meta.get("event"))
             self.filenames += list(meta.get("filename") or [""] * core.n_images)
@@ -387,8 +414,8 @@ class StoreBuilder:
             self.counts = self._crys.cat("counts")
             self.offsets = torch.zeros(len(self.counts) + 1, dtype=torch.int64)
             self.offsets[1:] = self.counts.cumsum(0)
-            self.crystal = {c: self._crys.cat(c) for c in _CRYSTAL}
-            self.image = {c: self._img.cat(c) for c in _IMAGE}
+            self.crystal = {c: self._crys.cat(c) for c in (*_CRYSTAL, *_CRYSTAL_OPT)}
+            self.image = {c: self._img.cat(c) for c in (*_IMAGE, *_IMAGE_OPT)}
             self._crys = self._img = None
             self.input_of_crystal = torch.zeros(len(self.counts), dtype=torch.int64)
             for k, inp in enumerate(self.inputs):
@@ -542,7 +569,13 @@ class StoreBuilder:
         order = torch.sort(local * n_valid + h, stable=True).indices
         return rows[order].cpu(), local[order].cpu(), h[order].cpu()
 
-    def _calibration_sample(self, k0: float):
+    def _k0_rows(self, rc: Tensor, k0: float, per_image: bool):
+        if not per_image:
+            return k0
+        energy = self.image["beam_energy"][self.crystal["image_id"][rc]].float()
+        return 1.0 / (12398.4 / energy.clamp(min=1.0))
+
+    def _calibration_sample(self, k0: float, per_image: bool = False):
         from torchsx.merging.hkl.noise import calibration_candidates
         from torchsx.merging.observations import ewald_rows
 
@@ -556,7 +589,7 @@ class StoreBuilder:
             rc = sel[self._local(sel)[rows]]
             off, _ = ewald_rows(torch.from_numpy(raw["observed"])[rows].float(),
                                 self.crystal["astar"][rc], self.crystal["bstar"][rc],
-                                self.crystal["cstar"][rc], k0)
+                                self.crystal["cstar"][rc], self._k0_rows(rc, k0, per_image))
             I = _field(raw, "I")[rows]
             background = _field(raw, "background")[rows]
             take = calibration_candidates(I, background, off)
@@ -614,7 +647,7 @@ class StoreBuilder:
         n_crystals = len(self.logical)
         k0 = ewald_k0(sk.beam_energy)
         gain = resolve_gain(sk, spec, resolved_measurement, config, noise,
-                            lambda: self._calibration_sample(k0))
+                            lambda: self._calibration_sample(k0, config.per_image_k0))
         self.clock.report("gain")
 
         unique_hkl = key_hkl(keys)
@@ -643,13 +676,27 @@ class StoreBuilder:
         sums = {k: torch.zeros(n_valid, dtype=torch.float32) for k in ("wI", "w", "I", "n")}
         obs_counts = torch.zeros(n_valid, dtype=torch.int64)
         n_panels = 0
+        var_sum = model_sum = 0.0
         for a, sel, inp, hkl, raw in self._logical_blocks():
             rows, local, h = self._prepared_rows(inp, sel, hkl, raw, n_valid)
             self.clock.lap("select + order")
             rc = sel[local]
 
             I_obs = _field(raw, "I")[rows] / gain
-            bg = _field(raw, "background")[rows] / gain * noise.n_peak
+            n_pix = torch.full((len(rows),), float(noise.n_peak))
+            if self.disk_size == "recorded":
+                recorded = _field(raw, "n_pix")[rows]
+                n_pix = torch.where(recorded > 0, recorded, n_pix)
+            bg = _field(raw, "background")[rows] / gain * n_pix
+            if self.background == "model":
+                # keep the measured count I + bg; move only its background estimate
+                model_adu = _field(raw, "bg_model")[rows]
+                model = model_adu / gain
+                use = torch.isfinite(model)
+                I_obs = torch.where(use, I_obs + bg - model, I_obs)
+                bg = torch.where(use, model, bg)
+                var_sum += float(_field(raw, "bg_model_var")[rows][use].double().sum())
+                model_sum += float(model_adu[use].double().sum())
             if self.has_sigma:
                 sigma = _field(raw, "sigma")[rows] / gain
             else:
@@ -657,7 +704,8 @@ class StoreBuilder:
             panel = _field(raw, "panel_id")[rows]
             off, q = ewald_rows(torch.from_numpy(raw["observed"])[rows].float(),
                                 self.crystal["astar"][rc], self.crystal["bstar"][rc],
-                                self.crystal["cstar"][rc], k0)
+                                self.crystal["cstar"][rc],
+                                self._k0_rows(rc, k0, config.per_image_k0))
             rec = torch.empty((len(rows), RECORD_WIDTH), dtype=torch.float32)
             ints = rec.view(torch.int32)
             rec[:, 0], rec[:, 1] = I_obs, bg
@@ -667,6 +715,7 @@ class StoreBuilder:
                 rec[:, j] = _field(raw, f)[rows]
             rec[:, 9] = off
             rec[:, 10:13] = unit_rows(q)
+            rec[:, 13] = n_pix
             self.clock.lap("records")
             writer.write(rec.numpy().view(RECORD).reshape(-1))
             self.clock.lap("write store")
@@ -680,6 +729,8 @@ class StoreBuilder:
             self.clock.lap("sums")
         if writer.n_obs != n_obs_total:
             raise RuntimeError(f"wrote {writer.n_obs} observations, counted {n_obs_total}")
+        if model_sum > 0:
+            self.bg_var_factor = var_sum / (gain * model_sum)  # Var[bg]/bg in photons
 
         offsets = torch.zeros(n_crystals + 1, dtype=torch.int64)
         offsets[1:] = crystal_counts.cumsum(0)

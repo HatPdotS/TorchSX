@@ -74,6 +74,7 @@ class ObsInfo:
     q_dir: Tensor | None = None          # (n, 3) unit scattering vector, LAB frame
     beam_energy: Tensor | None = None    # (n,) per-image photon energy (eV)
     crystal_res: Tensor | None = None    # (n,) per-crystal diffraction limit
+    n_pix: Tensor | None = None          # (n,) pixels summed in the disk (recorded, else nominal)
     #: Per-CRYSTAL metadata, ``(n_crystals, len(CRYSTAL_FEAT_COLUMNS))``, indexed
     #: by ``crystal_id`` -- the full table is kept under slice/gather, like
     #: ``delay_bin_idx``.  Consumed by the crystal-level input head of the scale
@@ -105,6 +106,7 @@ class ObsInfo:
             ewald_offset=None if self.ewald_offset is None else self.ewald_offset[s:e],
             sigma=None if self.sigma is None else self.sigma[s:e],
             crystal_res=None if self.crystal_res is None else self.crystal_res[s:e],
+            n_pix=None if self.n_pix is None else self.n_pix[s:e],
             beam_energy=None if self.beam_energy is None else self.beam_energy[s:e],
             q_dir=None if self.q_dir is None else self.q_dir[s:e],
             crystal_feat=self.crystal_feat,              # per-crystal — full table kept
@@ -144,6 +146,7 @@ class ObsInfo:
             q_dir=_g(self.q_dir),
             beam_energy=_g(self.beam_energy),
             crystal_res=_g(self.crystal_res),
+            n_pix=_g(self.n_pix),
             crystal_feat=self.crystal_feat,
             obs_id=self.obs_id[idx],
             delay_bin_idx=self.delay_bin_idx,
@@ -170,6 +173,7 @@ class ObsInfo:
             q_dir=_m(self.q_dir),
             beam_energy=_m(self.beam_energy),
             crystal_res=_m(self.crystal_res),
+            n_pix=_m(self.n_pix),
             crystal_feat=_m(self.crystal_feat),
             obs_id=_m(self.obs_id),
             delay_bin_idx=_m(self.delay_bin_idx),
@@ -190,7 +194,22 @@ CRYSTAL_FEAT_COLUMNS: tuple[str, ...] = (
     "log_n_refl",       # log1p(indexed reflections)
     "det_shift_x", "det_shift_y",
     "n_peaks",
+    # probixi's diagnostics; zero for other sources
+    "log_scale",        # log of the frame's fluence estimate against the calibration reference
+    "scale_sigma",      # its 1-sigma
+    "log_enrichment",   # log bright-rate of predicted spots over the background rate
+    "log_enrich_p",     # log10 chance probability of that enrichment under noise
+    "log_n_bright",     # log1p(predicted spots on bright pixels)
+    "log_n_indexed",    # log1p(peaks explained by the lattice)
+    "rmsd",             # q-residual of the orientation fit
+    "mosaicity",        # fitted mosaic spread (deg)
+    "profile_rad",      # reciprocal profile radius
+    "peak_resolution",  # the frame's peak-search resolution limit (A)
 )
+#: The columns any stream carries; the default crystal tier.
+DEFAULT_CRYSTAL_FEATURES: tuple[str, ...] = CRYSTAL_FEAT_COLUMNS[:12]
+#: The columns probixi's database adds.
+PROBIXI_CRYSTAL_FEATURES: tuple[str, ...] = CRYSTAL_FEAT_COLUMNS[12:]
 
 
 def _crystal_feature_table(core, n_crystals: int) -> Tensor:
@@ -214,13 +233,25 @@ def _crystal_feature_table(core, n_crystals: int) -> Tensor:
         cols.extend(cell[:, i] for i in range(6))
     else:
         cols.extend(torch.zeros(n_crystals) for _ in range(6))
+    log1p = lambda t: torch.log1p(t.clamp(min=0))  # noqa: E731
+    log = lambda t: t.clamp(min=1e-6).log()  # noqa: E731
     for attr, level, tf in (
         ("beam_energy", "image", None),
         ("resolution", "crystal", None),
-        ("n_refl", "crystal", lambda t: torch.log1p(t.clamp(min=0))),
+        ("n_refl", "crystal", log1p),
         ("det_shift_x", "image", None),
         ("det_shift_y", "image", None),
         ("n_peaks", "image", None),
+        ("scale", "image", log),
+        ("scale_sigma", "image", None),
+        ("enrichment", "crystal", log),
+        ("enrich_p", "crystal", lambda t: t.clamp(min=1e-30).log10()),
+        ("n_bright", "crystal", log1p),
+        ("n_indexed", "crystal", log1p),
+        ("rmsd", "crystal", None),
+        ("mosaicity", "crystal", None),
+        ("profile_rad", "crystal", None),
+        ("peak_resolution", "image", None),
     ):
         v = _col(attr, level)
         if v is None:
@@ -230,7 +261,10 @@ def _crystal_feature_table(core, n_crystals: int) -> Tensor:
         cols.append(v.reshape(n_crystals))
     table = torch.stack(cols, dim=1)
     assert table.shape[1] == len(CRYSTAL_FEAT_COLUMNS)
-    return torch.nan_to_num(table, nan=0.0, posinf=0.0, neginf=0.0)
+    # missing values take the column mean
+    table = torch.where(torch.isfinite(table), table, torch.nan)
+    mean = torch.nan_to_num(table.nanmean(dim=0), nan=0.0)
+    return torch.where(torch.isnan(table), mean.expand_as(table), table)
 
 
 def _build_delay_bins(stream, n_crystals: int) -> tuple[Tensor | None, Tensor | None]:
@@ -278,7 +312,13 @@ def _build_delay_bins(stream, n_crystals: int) -> tuple[Tensor | None, Tensor | 
     return bin_idx, uniq_vals
 
 
-def _ewald_offset(core, return_q: bool = False):
+# 1/λ (Å⁻¹) of each observation's own image
+def ewald_k0_rows(beam_energy: Tensor, image_id: Tensor, crystal_id: Tensor) -> Tensor:
+    k0 = 1.0 / (12398.4 / beam_energy.float().clamp(min=1.0))
+    return k0[image_id.long()][crystal_id.long()]
+
+
+def _ewald_offset(core, return_q: bool = False, per_image_k0: bool = False):
     """Per-observation signed Ewald sphere offset ``‖q+s₀‖ − 1/λ`` (Å⁻¹).
 
     Physically-motivated proxy for predicted partiality: large ``|r|`` →
@@ -290,8 +330,9 @@ def _ewald_offset(core, return_q: bool = False):
     Wavelength is taken as the stream-median (per-image variation at
     LCLS/EuXFEL is < 0.01 %, well below the |r| binning resolution).
     """
-    k0 = ewald_k0(core.beam_energy)
     cid = core.crystal_id.long()
+    k0 = (ewald_k0_rows(core.beam_energy, core.image_id, cid) if per_image_k0
+          else ewald_k0(core.beam_energy))
     # ``symmetrize()`` replaces the observed index by its ASU representative,
     # whose excitation error is not the one that was recorded -- the other mates
     # sit of order a reciprocal lattice spacing off the sphere.  The parser keeps
@@ -315,10 +356,11 @@ def _ewald_offset(core, return_q: bool = False):
         h_c = hkl[start:start + chunk]
         c_c = cid[start:start + chunk]
         A, Bv, Cv = core.astar[c_c], core.bstar[c_c], core.cstar[c_c]
+        k0_c = k0[start:start + chunk] if torch.is_tensor(k0) else k0
         best_offset = best_q = None
         for R in ops:
             h_op = h_c @ R                                         # (M, 3), row convention h' = h @ R
-            off, q = ewald_rows(h_op, A, Bv, Cv, k0)
+            off, q = ewald_rows(h_op, A, Bv, Cv, k0_c)
             if best_offset is None:
                 best_offset, best_q = off, q
             else:
@@ -340,7 +382,7 @@ def ewald_k0(beam_energy: Tensor) -> float:
     return 1.0 / wavelength
 
 
-def ewald_rows(hkl: Tensor, astar: Tensor, bstar: Tensor, cstar: Tensor, k0: float):
+def ewald_rows(hkl: Tensor, astar: Tensor, bstar: Tensor, cstar: Tensor, k0: float | Tensor):
     """Signed Ewald offset and lab-frame ``q`` of float indices ``hkl`` (M, 3)
     against per-row reciprocal axes (M, 3) each."""
     q = hkl[:, 0:1] * astar + hkl[:, 1:2] * bstar + hkl[:, 2:3] * cstar
@@ -606,7 +648,8 @@ def prepare_observations(
     # Per-observation signed Ewald sphere offset (Å⁻¹). Used by the σ²(bg)
     # gain calibration to gate to off-Bragg (predicted-zero-signal) obs,
     # and propagated to ObsInfo for downstream use.
-    ewald_offset_core, q_dir_core = _ewald_offset(core, return_q=True)
+    ewald_offset_core, q_dir_core = _ewald_offset(core, return_q=True,
+                                                  per_image_k0=config.per_image_k0)
     _lap("ewald offset")
 
     # ── Detector gain (ADU / photon) ──
@@ -616,6 +659,19 @@ def prepare_observations(
     # ADU → photon counts for the Poisson likelihood.
     core_I = core_I / gain
     core_background = core_background / gain
+    obs_cols = core.levels["obs"] if hasattr(core, "levels") else {}
+    n_pix_core = torch.full_like(core_I, float(poisson_noise.n_peak))
+    recorded = obs_cols.get("n_pixels")
+    if config.disk_size == "recorded" and recorded is not None:
+        n_pix_core = torch.where(recorded > 0, recorded.float(), n_pix_core)
+    bg_core = core_background * n_pix_core
+    model = obs_cols.get("background_model")
+    if config.background == "model" and model is not None:
+        # keep the measured count I + bg; move only its background estimate
+        model = model.float() / gain
+        use = torch.isfinite(model)
+        core_I = torch.where(use, core_I + bg_core - model, core_I)
+        bg_core = torch.where(use, model, bg_core)
     hkl_idx = compute_hkl_index(core.hkl)
     _lap("hkl index")
     hkl_id_raw = hkl_idx.hkl_id
@@ -651,8 +707,8 @@ def prepare_observations(
     obs_counts = torch.bincount(hkl_id, minlength=n_valid)
     n_obs_total = int(I_obs.shape[0])
 
-    bg_per_pixel = core_background[keep_all][sort_all]
-    bg = bg_per_pixel * poisson_noise.n_peak
+    bg = bg_core[keep_all][sort_all]
+    n_pix = n_pix_core[keep_all][sort_all]
     _lap("gather I/bg")
 
     hkl_valid = unique_hkl[valid_indices]
@@ -706,6 +762,7 @@ def prepare_observations(
             core.resolution[cid].float() if getattr(core, "resolution", None) is not None
             else None
         ),
+        n_pix=n_pix,
         crystal_feat=_crystal_feature_table(core, n_crystals),
         obs_id=torch.arange(n_obs_total, dtype=torch.long),
         delay_bin_idx=delay_bin_idx,

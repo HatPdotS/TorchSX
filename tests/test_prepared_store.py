@@ -19,7 +19,7 @@ from torchsx.merging.store import RECORD, ObservationStore, PreparedStore
 from torchsx.nn.merge_target import plain_mean, unity_merge
 
 OBS_FIELDS = ("crystal_id", "s_sq", "hkl_idx", "panel_id", "fs", "ss", "peak", "background",
-              "ewald_offset", "sigma", "q_dir", "beam_energy", "crystal_res")
+              "ewald_offset", "sigma", "q_dir", "beam_energy", "crystal_res", "n_pix")
 
 
 def _synthetic_core(geometry, *, n_images=40, seed=0, sigma_bad=True):

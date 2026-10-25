@@ -193,8 +193,8 @@ The store holds the observations on disk; host memory holds the crystal and
 reflection tables and a few batches. Preparation reads the streams in blocks
 into a temporary file next to the store, and training and merging read one
 batch of crystals at a time, the next while the current one is computed. The
-store needs about 52 bytes per observation of disk space, and the temporary
-file about 38 more while it is written.
+store needs about 56 bytes per observation of disk space, and the temporary
+file about 50 more while it is written.
 
 While it is built, the store stages in `CACHE.raw` and `CACHE.partial` next to
 it. A directory of either name that an interrupted build left behind is
