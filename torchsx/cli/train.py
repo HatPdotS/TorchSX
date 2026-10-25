@@ -71,6 +71,13 @@ def _build_parser():
     # Crystal context pooling: K >= 2 folds (context from the other K-1 folds of the
     # crystal, default 2), or 0 = leave-one-out; the merge inherits the checkpoint.
     p.add_argument("--context-folds", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--pseudo-translation", choices=("off", "auto"), default="off",
+                   help="for crystals with translational NCS or a lattice translocation: auto finds the "
+                        "structure's translations in the data's Patterson function and gives each reflection a "
+                        "profile (core width, and a broad part of its own area and width) that depends on its "
+                        "phase h.t; the merged intensity is the reflection's total.  Without a translation "
+                        "above the threshold the model is unchanged.  off (default).  The merge inherits the "
+                        "checkpoint")
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
@@ -168,6 +175,29 @@ def attach_heldout_stream(bundle, name: str = "heldout"):
     return ids
 
 
+def install_pseudo_translation(scale, prep, spacegroup) -> list[dict]:
+    """Find the data's pseudo-translations and, if any is strong enough, give the scale model
+    reflection-dependent profiles (:mod:`torchsx.merging.scale.pseudo_translation`)."""
+    from torchsx.merging.scale.pseudo_translation import (
+        PhaseBroad, PhaseWidth, find_pseudo_translations, select_translations,
+    )
+    peaks = find_pseudo_translations(prep, spacegroup)
+    used, why = select_translations(peaks)
+    for i, p in enumerate(peaks):
+        print(f"pseudo-translation: #{i} t ({p['t'][0]:.4f} {p['t'][1]:.4f} {p['t'][2]:.4f}) "
+              f"amplitude {p['amplitude']:.3f} significance {p['significance']:.1f}"
+              + ("" if p["harmonic_of"] is None else f" [harmonic {p['order']} of #{p['harmonic_of']}]")
+              + (" (used)" if p in used else ""), flush=True)
+    if not used:
+        print(f"pseudo-translation: {why}; one profile for every reflection", flush=True)
+        return used
+    t = [p["t"] for p in used]
+    scale.install_pseudo_translation(PhaseWidth.from_prep(prep, t, spacegroup),
+                                     PhaseBroad.from_prep(prep, t, spacegroup))
+    print(f"pseudo-translation: reflection profiles from {why}", flush=True)
+    return used
+
+
 def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
     """Run a fixed update budget, with the evaluation cadence per state;
     with ``patience`` > 0, stop after that many evaluations without a new
@@ -240,6 +270,8 @@ def main(argv=None):
     bundle = P.load_prep(args)
     heldout_ids = attach_heldout_stream(bundle) if args.heldout_stream is not None else None
     prep, params, scale, obj, settings = P.build_stack(bundle, args)
+    if args.pseudo_translation == "auto":
+        install_pseudo_translation(scale, prep, bundle.spacegroup)
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
         target_redundancy=args.redundancy, epochs=0, lr=1e-3,
