@@ -135,7 +135,16 @@ def _split_halves(tr, k: int, seed: int):
     return perm[: perm.numel() // 2], perm[perm.numel() // 2:]
 
 
-def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0") -> dict | None:
+def _agree(I1, I2) -> tuple[float, float]:
+    # CrystFEL's definition: the 1/sqrt(2) puts R_split on the scale of a
+    # full-dataset R, not of the difference between two halves.
+    if len(I1) < 3:
+        return float("nan"), float("nan")
+    cc = float(torch.corrcoef(torch.stack([I1, I2]))[0, 1])
+    return cc, float((2 ** -0.5) * (I1 - I2).abs().sum() / (0.5 * (I1 + I2)).abs().sum())
+
+
+def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0", rank=None) -> dict | None:
     """CC1/2 and R_split of two half merges on ``key``."""
     both = (a["seen"] & b["seen"]).cpu()
     I1 = a[key].detach().cpu().double(); I2 = b[key].detach().cpu().double()
@@ -144,15 +153,26 @@ def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0") -> dict | None:
     if int(ok.sum()) < 3:
         return None
     I1, I2 = I1[ok], I2[ok]
-    cc = float(torch.corrcoef(torch.stack([I1, I2]))[0, 1])
-    # CrystFEL's definition: the 1/sqrt(2) puts R_split on the scale of a
-    # full-dataset R, not of the difference between two halves.
-    rs = float((2 ** -0.5) * (I1 - I2).abs().sum() / (0.5 * (I1 + I2)).abs().sum())
+    cc, rs = _agree(I1, I2)
     dd = torch.as_tensor(d)[both][ok]
     outer = dd <= float(dd.quantile(0.10))
-    cc_o = float(torch.corrcoef(torch.stack([I1[outer], I2[outer]]))[0, 1])
+    cc_o, _ = _agree(I1[outer], I2[outer])
+    by_shell = []
+    order = torch.argsort(dd, descending=True)
+    for chunk in torch.tensor_split(order, 10):
+        c, r = _agree(I1[chunk], I2[chunk])
+        by_shell.append({"d_lo": float(dd[chunk].max()), "d_hi": float(dd[chunk].min()),
+                         "cc_half": c, "r_split": r, "n": int(chunk.numel())})
+    # quintiles ranked by the full merge, so neither half is favoured
+    score = (0.5 * (I1 + I2) if rank is None
+             else rank.detach().cpu().double()[both][ok])
+    by_quintile = []
+    for chunk in torch.tensor_split(torch.argsort(score), 5):
+        c, r = _agree(I1[chunk], I2[chunk])
+        by_quintile.append({"cc_half": c, "r_split": r, "n": int(chunk.numel())})
     return {"cc_half": cc, "r_split": rs, "cc_half_outer": cc_o,
-            "d_outer": float(dd[outer].max()), "n": int(ok.sum())}
+            "d_outer": float(dd[outer].max()), "n": int(ok.sum()),
+            "by_shell": by_shell, "by_quintile": by_quintile}
 
 
 def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
@@ -190,11 +210,15 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
                             merge_friedel=merge_friedel,
                             verbose=verbose and half == 0)
         rec = {"split": label, "products": ["posterior"], "prior": post["prior"]}
-        stats = _split_half_stats(merges[1], merges[2], d)
+        stats = _split_half_stats(merges[1], merges[2], d, rank=merges[0]["I0"])
         if stats is not None:
             rec["split_half_posterior"] = stats
             print(f"  half-datasets  posterior  CC1/2 {stats['cc_half']:.4f}  "
                   f"R_split {stats['r_split']:.4f} on {stats['n']:,} reflections", flush=True)
+            print("  R_split by intensity quintile, weak to strong: "
+                  + "  ".join(f"{100 * q['r_split']:.1f}%" for q in stats["by_quintile"])
+                  + f"; outer shell {100 * stats['by_shell'][-1]['r_split']:.1f}% "
+                  f"(CC1/2 {stats['by_shell'][-1]['cc_half']:.3f})", flush=True)
         summary[label] = rec
     store = getattr(tr, "_store", None)
     if verbose and store is not None:

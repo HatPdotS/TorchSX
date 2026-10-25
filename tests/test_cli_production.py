@@ -246,3 +246,21 @@ def test_readout_grid_rebuilds_nodes_and_interpolation():
     for key in ('u_coarse','u_fine','_lo','_hi','_t'):
         assert torch.equal(getattr(target,key),getattr(reference,key)),key
     assert target.u_coarse.numel()==15 and target.u_fine.numel()==65
+
+
+def test_split_half_stats_report_shells_and_quintiles():
+    from torchsx.cli.merge_nn import _split_half_stats
+
+    g = torch.Generator().manual_seed(0)
+    n = 500
+    truth = torch.rand(n, generator=g).double() * 100
+    a = {"seen": torch.ones(n, dtype=torch.bool), "I0": truth + torch.randn(n, generator=g).double()}
+    b = {"seen": torch.ones(n, dtype=torch.bool), "I0": truth + torch.randn(n, generator=g).double()}
+    d = torch.linspace(1.5, 20.0, n)
+    stats = _split_half_stats(a, b, d, rank=truth)
+    assert len(stats["by_shell"]) == 10 and len(stats["by_quintile"]) == 5
+    assert stats["by_shell"][0]["d_lo"] > stats["by_shell"][-1]["d_lo"]
+    assert sum(q["n"] for q in stats["by_quintile"]) == n
+    # the weakest quintile has the largest relative disagreement
+    assert stats["by_quintile"][0]["r_split"] > stats["by_quintile"][-1]["r_split"]
+    assert stats["cc_half"] > 0.99
