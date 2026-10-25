@@ -550,6 +550,41 @@ def test_probixi_features_reach_the_encoder(db_path):
     assert plain.crystal_features == DEFAULT_CRYSTAL_FEATURES
 
 
+def test_cli_switches_on_what_the_database_records(db_path, tmp_path):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging.observations import PROBIXI_CRYSTAL_FEATURES
+    from torchsx.nn.obs_features import DISK_FEATURE
+
+    args = _build_parser().parse_args([
+        str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+        "--device", "cpu", "-o", str(tmp_path / "run")])
+    bundle = P.load_prep(args, verbose=False)
+    assert bundle.recipe["disk_size"] == "recorded"
+    assert bundle.recipe["background"] == "model"
+    assert bundle.recipe["per_image_k0"] is False, "every frame at the run's energy"
+    assert bundle.recipe["measurement"]["source"]["producer"] == "probixi"
+    prep = bundle.prep
+    assert prep.n_obs_total == 7
+    rows = torch.arange(prep.n_obs_total)
+    oi = prep.obs_info.gather(rows) if hasattr(prep.obs_info, "gather") else prep.batch(rows, "cpu")
+    torch.testing.assert_close(oi.bg, torch.full_like(oi.bg, 40.0 / GAIN))
+    assert sorted(oi.n_pix.tolist()) == [6, 7, 9, 9, 9, 9, 9]
+    # Var[bg] / bg in photons from the recorded columns: 4 / (GAIN * 40)
+    assert bundle.bg_var_factor == pytest.approx(4.0 / (GAIN * 40.0))
+    _, _, scale, obj, _ = P.build_stack(bundle, args, verbose=False)
+    assert DISK_FEATURE in scale.features.self_features
+    assert set(PROBIXI_CRYSTAL_FEATURES) <= set(scale.features.crystal_features)
+    assert obj.likelihood.bg_var_factor == pytest.approx(4.0 / (GAIN * 40.0))
+    assert obj.likelihood.bg_mean_offset == 0.0
+    # a merge rebuilds the tiers its checkpoint recorded, not the defaults
+    tiers = {k: list(getattr(scale.features, k))
+             for k in ("self_features", "context_features", "crystal_features")}
+    _, _, again, _, _ = P.build_stack(bundle, args, ckpt={"scale": tiers}, verbose=False)
+    assert {k: list(getattr(again.features, k)) for k in tiers} == tiers
+    prep.close()
+
+
 def test_sentinels_become_missing_values(db_path):
     from torchsx.merging.observations import CRYSTAL_FEAT_COLUMNS, _crystal_feature_table
 
@@ -699,3 +734,61 @@ def test_calibration_provenance_and_schema_gate(db_path):
         read_measurement(db_path)
     with pytest.raises(ValueError, match="newer"):
         load_duckdb(db_path)
+
+
+def test_varying_frame_energies_switch_on_per_image_k0(db_path, tmp_path):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging import MergeConfig, prepare_observations
+
+    base = [str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input", "--device", "cpu"]
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE frames SET photon_energy_eV = 10000.0")
+    same = P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "a")]), verbose=False)
+    assert same.recipe["per_image_k0"] is False
+    assert ("photon_energy", "per-frame") not in read_measurement(db_path).provenance
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE frames SET photon_energy_eV = 10500.0 WHERE event = 8")
+    varied = P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "b")]), verbose=False)
+    assert varied.recipe["per_image_k0"] is True
+    assert ("photon_energy", "per-frame") in read_measurement(db_path).provenance
+    # the store holds the offsets at each image's own wavelength
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    median = prepare_observations(stream, MergeConfig(gain="trust_input")).obs_info.ewald_offset
+    own = prepare_observations(stream, MergeConfig(gain="trust_input", per_image_k0=True)).obs_info.ewald_offset
+    stored = varied.prep.batch(torch.arange(varied.prep.n_obs_total), "cpu").ewald_offset
+    torch.testing.assert_close(stored.sort().values, own.sort().values)
+    assert not torch.allclose(stored.sort().values, median.sort().values)
+    same.prep.close()
+    varied.prep.close()
+
+
+def test_dmin_defaults_to_the_crystals_diffraction_limits(db_path, tmp_path):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE crystals SET diffraction_limit_nm_inv = 10.0 / 1.5")  # 1.5 A everywhere
+    spec = read_measurement(db_path)
+    assert dict(spec.provenance)["diffraction_limit_p10_A"] == "1.500"
+    args = _build_parser().parse_args([str(db_path), "--spacegroup", "P 43 21 2", "--gain", "trust_input",
+                                       "--device", "cpu", "-o", str(tmp_path / "run")])
+    bundle = P.load_prep(args, verbose=False)
+    assert bundle.recipe["d_min"] == pytest.approx(1.5)
+
+
+def test_cache_survives_a_provenance_only_change(db_path, tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    import torchsx.io._duckdb as D
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+
+    base = [str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+            "--device", "cpu", "--cache", str(tmp_path / "store")]
+    P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "a")]), verbose=False)
+    original = D._measurement
+    monkeypatch.setattr(D, "_measurement", lambda conn, path: replace(
+        original(conn, path), provenance=original(conn, path).provenance + (("new_entry", "1"),)))
+    bundle = P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "b")]), verbose=False)
+    assert bundle.prep.n_obs_total > 0

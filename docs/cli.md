@@ -15,7 +15,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 
 | Option | Default | |
 |---|---|---|
-| `STREAM` | | CrystFEL `.stream` (or a prepared `.sfx`) input. |
+| `STREAM` | | CrystFEL `.stream`, a prepared `.sfx`, or a probixi `.duckdb` run (see [probixi input](#probixi-input)). |
 | `--split NAME=PATH` | | A named state, one stream each; repeatable. Each state is merged on its own. |
 | `--split-file FILE` | | States for a single stream (see [States](#states)). |
 | `--spacegroup SG` | | Space group, e.g. `'P 63'`. Required for `.stream` input. |
@@ -119,6 +119,35 @@ must be labelled. A frame listed under several dataset names goes into each of
 those states; a repeated identical row counts once. States from a split file
 are ordered by name, states from `--split` in the order given. The first state
 supplies the validation crystals.
+
+## probixi input
+
+A probixi database carries what a stream cannot, and its presence switches
+this on; a checkpoint keeps what it was trained with:
+
+- the integration radii and gain of the run, from its `integration` and
+  `calibration` tables; the calibration's probixi version, schema version and
+  noise-model settings are recorded as provenance, and a database whose schema
+  is newer than this TorchSX supports is refused;
+- every predicted reflection, including the disks the stream writer drops
+  because the mask, the frame edge or a neighbouring disk clipped them, with
+  the background summed over the pixels actually integrated (`n_pixels`),
+  which the scale network also sees;
+- the noise model's background under each disk (`background_model`) in place
+  of the annulus mean, with its measured variance in place of the ring's
+  Poisson law and no mean correction; the intensity is re-referenced so that
+  intensity plus background stays the measured count;
+- the run's per-crystal diagnostics in the network's crystal head: the frame's
+  fluence scale, enrichment, bright and indexed peak counts, the indexing
+  rmsd, mosaicity, profile radius and peak resolution;
+- when the frames' photon energies differ, the Ewald offsets at each image's
+  own wavelength rather than the median one.
+
+Without `--dmin`, a probixi database is cut at the 10th percentile of its
+crystals' diffraction limits, so shells with no signal do not enter the merge
+or its statistics.
+
+A custom-split file names a database's frames as CrystFEL does, `filename //event`.
 
 ## Gain
 

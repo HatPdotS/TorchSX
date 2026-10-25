@@ -48,8 +48,8 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
     A merge reads the recipe off its checkpoint; the flags then act as overrides.
     """
     p.add_argument("stream", type=Path, nargs="*",
-                   help=".stream or .sfx input.  Omit when every input is "
-                        "given as --split NAME=PATH.")
+                   help=".stream, .sfx or probixi .duckdb input.  Omit when every "
+                        "input is given as --split NAME=PATH.")
     p.add_argument("--split", action="append", default=[], metavar="NAME=PATH",
                    help="a named crystal split, one stream each; repeatable. "
                         "Splits are merged separately and never pooled in an "
@@ -116,6 +116,7 @@ def _comparable_prep_signature(signature: dict | None, recipe: dict) -> dict:
     if measurement is not None:
         if measurement.get("source"):
             measurement["source"].pop("source_files", None)
+            measurement["source"].pop("provenance", None)  # informational; settings live elsewhere
         measurement.pop("resolved", None)  # radii/gain already occur at top level
         numeric = (recipe.get("measurement") or {}).get("gain_adu_per_photon")
         if numeric is not None:
@@ -166,6 +167,15 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
     d = dict(recipe_defaults or {})
     d_min = args.dmin if args.dmin is not None else d.get("d_min")
+    if d_min is None and not d:
+        # a probixi database records its crystals' diffraction limits
+        limits = [dict(s.provenance).get("diffraction_limit_p10_A")
+                  for s in (inspect_source(path) for _, path in _splits_from_args(args)) if s is not None]
+        if limits and all(limits):
+            d_min = max(float(x) for x in limits)
+            if verbose:
+                print(f"  --dmin not given: {d_min:.2f} A, the 10th percentile of the crystals' "
+                      f"diffraction limits", flush=True)
     spacegroup = args.spacegroup or d.get("spacegroup")
     merge_friedel = (bool(args.merge_friedel) if args.merge_friedel is not None
                      else bool(d.get("merge_friedel", True)))
@@ -209,7 +219,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
     signature = {
         "observation_filter_version": OBSERVATION_FILTER_VERSION,
-        "cache_schema": 2,
+        "cache_schema": 1,
         "splits": [n for n, _ in splits],
         "d_min": float(d_min), "d_max": float(args.dmax),
         "spacegroup": spacegroup,
@@ -223,6 +233,12 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     try:
         specs = [inspect_source(path) for path in sources]
         measurement = combine_measurements(specs)
+        # a probixi database switches on what it records; a checkpoint keeps its recipe
+        auto = bool(measurement is not None and measurement.producer == "probixi" and not d)
+        disk_size = d.get("disk_size") or ("recorded" if auto else "nominal")
+        background = d.get("background") or ("model" if auto else "annulus")
+        per_frame = auto and dict(measurement.provenance).get("photon_energy") == "per-frame"
+        per_image_k0 = bool(d.get("per_image_k0") if d else per_frame)
         resolved = resolve_measurement(measurement, radii=args.int_radius,
                                        gain=args.gain, defaults=d)
         explicit_rings = args.int_radius is not None or d.get("radii") is not None
@@ -233,14 +249,16 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
             signature["gain_policy_version"] = GAIN_POLICY_VERSION
         if gain == "auto":
             signature["gain_tolerance"] = DEFAULT_GAIN_TOLERANCE
-        signature.update(radii=list(radii), gain=gain,
+        signature.update(radii=list(radii), gain=gain, disk_size=disk_size, background=background,
+                         per_image_k0=per_image_k0,
                          measurement={"source": measurement.to_dict() if measurement else None,
                                       "resolved": resolved.to_dict()},
                          source_files=[_stamp(path) for _, path in splits])
         if verbose:
             origins = dict(resolved.provenance)
             print(f"  measurement: radii={radii} [{origins['radii']}], "
-                  f"gain={gain} [{origins['gain']}]", flush=True)
+                  f"gain={gain} [{origins['gain']}], disks={disk_size}, "
+                  f"background={background}", flush=True)
             for override in resolved.overrides:
                 print(f"    override: {override}", flush=True)
             if measurement and measurement.unresolved:
@@ -294,7 +312,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     except FileExistsError as exc:
         raise SystemExit(f"--cache {cache}: {exc}") from None
     builder = StoreBuilder(staging_paths(cache)[0], spacegroup=spacegroup,
-                           merge_friedel=merge_friedel, n_workers=_workers())
+                           merge_friedel=merge_friedel, n_workers=_workers(),
+                           disk_size=disk_size, background=background)
     try:
         # --spacegroup reaches the .sfx loader too, and is applied before
         # canonicalization: an .sfx cache carries whatever group it was parsed
@@ -312,18 +331,23 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
         noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2],
                                   gain=(gain if isinstance(gain, float) else 1.0))
-        bvf = noise.n_peak / noise.n_bg
-        recipe = {}
+        recipe, meta_out = {}, {}
 
         def store_meta():
-            # after preparation: the recipe records the gain it selected
+            # after preparation: the recipe records the selected gain and variance factor
+            bvf = (builder.bg_var_factor if builder.bg_var_factor is not None
+                   else noise.n_peak / noise.n_bg)
             recipe.update(_recipe(args, d, splits, d_min, builder.spacegroup or spacegroup,
-                                  merge_friedel, gain, radii, noise, resolved, measurement))
-            return {"signature": signature, "recipe": recipe, "split_names": names,
-                    "bg_var_factor": bvf}
+                                  merge_friedel, gain, radii, noise, resolved, measurement,
+                                  disk_size, background, per_image_k0))
+            meta_out.update({"signature": signature, "recipe": recipe, "split_names": names,
+                             "bg_var_factor": bvf})
+            return meta_out
 
         prep = builder.finish(
-            cache, config=MergeConfig(gain=gain), noise=noise, resolved_measurement=resolved,
+            cache, config=MergeConfig(gain=gain, disk_size=disk_size, background=background,
+                                      per_image_k0=per_image_k0),
+            noise=noise, resolved_measurement=resolved,
             delay_bin_idx=labels,
             unique_timepoints=(None if labels is None
                                else torch.arange(len(names), dtype=torch.float64)),
@@ -332,6 +356,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         raise SystemExit(str(exc)) from exc
     finally:
         builder.close()
+    bvf = meta_out["bg_var_factor"]
     if verbose:
         if labels is not None:
             counts = torch.bincount(labels, minlength=len(names)).tolist()
@@ -345,7 +370,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
 
 def _recipe(args, d, splits, d_min, spacegroup, merge_friedel, gain, radii, noise,
-            resolved, measurement) -> dict:
+            resolved, measurement, disk_size="nominal", background="annulus",
+            per_image_k0=False) -> dict:
     """What the prepared data was made with, for the checkpoint and the merge."""
     recipe = {"d_min": float(d_min), "d_max": float(args.dmax),
               "spacegroup": spacegroup or "P 1",
@@ -354,15 +380,24 @@ def _recipe(args, d, splits, d_min, spacegroup, merge_friedel, gain, radii, nois
               "inputs": [[name, str(path.resolve())] for name, path in splits],
               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
               "merge_friedel": merge_friedel,
+              "disk_size": disk_size, "background": background,
+              "per_image_k0": per_image_k0,
               "measurement": {**resolved.to_dict(), "gain_adu_per_photon": noise.gain,
                               "n_peak": noise.n_peak, "n_bg": noise.n_bg,
                               "gain_selection": noise.gain_selection,
-                              "pixel_count_definition": "nominal_integer_ring_mask",
+                              "pixel_count_definition": ("recorded_per_observation"
+                                                         if disk_size == "recorded"
+                                                         else "nominal_integer_ring_mask"),
                               "source": measurement.to_dict() if measurement else None}}
     previous_selection = (d.get("measurement") or {}).get("gain_selection")
     if previous_selection and dict(resolved.provenance)["gain"] == "checkpoint":
         recipe["measurement"]["gain_selection"] = dict(previous_selection, reused_from_checkpoint=True)
     return recipe
+
+
+# a custom-split file names events //N; a database records the integer
+def _event_key(event) -> str:
+    return event if isinstance(event, str) else f"//{int(event)}"
 
 
 def _split_labels(args, builder, *, verbose: bool = True):
@@ -397,7 +432,7 @@ def _split_labels(args, builder, *, verbose: bool = True):
                     "the stream carries no image filename/event metadata, so a "
                     "custom-split file cannot be matched to it; re-parse from "
                     "the .stream, or pass a .pt label tensor")
-            memberships = [sorted(index[name] for name in lookup.get((f, e), ()))
+            memberships = [sorted(index[name] for name in lookup.get((f, _event_key(e)), ()))
                            for f, e in zip(fnames, evts)]
             image_id = builder.surviving_image_id
             per_image = torch.tensor([bins[0] if bins else -1 for bins in memberships],
@@ -778,6 +813,20 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     n_components = int(scat.get("n_components") or DEFAULTS["scatter_components"])
     scatter_shape = str(scat.get("component_shape") or ("shared" if ck else DEFAULTS["scatter_shape"]))
     beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
+    # feature tiers: a checkpoint's record wins, else what the prepared data carries
+    from torchsx.merging.observations import DEFAULT_CRYSTAL_FEATURES, PROBIXI_CRYSTAL_FEATURES
+    from torchsx.nn.obs_features import DISK_FEATURE, SELF_FEATURES
+    context_features = None
+    if ck:
+        self_features = tuple(sc["self_features"]) if sc.get("self_features") else None
+        context_features = tuple(sc["context_features"]) if sc.get("context_features") else None
+        crystal_features = tuple(sc["crystal_features"]) if sc.get("crystal_features") else None
+    else:
+        recorded = bundle.recipe.get("disk_size") == "recorded"
+        self_features = SELF_FEATURES + ((DISK_FEATURE,) if recorded else ())
+        producer = ((bundle.recipe.get("measurement") or {}).get("source") or {}).get("producer")
+        crystal_features = (DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
+                            if producer == "probixi" else None)
     kw = dict(
         d_model=enc.get("d_model") or sc.get("d_model") or getattr(args, "d_model", None) or DEFAULTS["d_model"],
         n_layers=enc.get("n_layers") or sc.get("n_layers") or getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
@@ -807,12 +856,16 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         anchor_stat=sc.get("anchor_stat",
                             "median" if ck else DEFAULTS["gauge_anchor"]),
         predict_skew=bool(skew),
+        self_features=self_features, context_features=context_features,
+        crystal_features=crystal_features,
     )
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
     scale.set_encoder_chunking(400)
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
-    bg_mean_offset = bg_mean_offset_from_ckpt(ck, bvf) if ck else float(bvf)
+    # the +c mean correction applies to the annulus estimate only
+    bg_mean_offset = (bg_mean_offset_from_ckpt(ck, bvf) if ck
+                      else 0.0 if bundle.recipe.get("background") == "model" else float(bvf))
     if bg_mean_offset and float(bvf) <= 0.0:
         raise SystemExit(
             f"Background mean offset {bg_mean_offset:g} requires a positive "
