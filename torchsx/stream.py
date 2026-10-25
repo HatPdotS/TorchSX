@@ -38,8 +38,8 @@ class SFXStream:
     def read(cls, source: str | Path | SourceInput, **kwargs) -> SFXStream:
         """Read a path or :class:`torchsx.io.sources.SourceInput`.
 
-        CrystFEL ``.stream`` and TorchSX ``.sfx`` are supported. Named Probixi
-        and DIALS inputs reserve extension points for future adapters.
+        CrystFEL ``.stream``, TorchSX ``.sfx`` and probixi ``.duckdb`` are
+        supported; a named DIALS input reserves an extension point.
         Parser controls are the same as :meth:`from_stream`.
         """
         from torchsx.io.sources import read_source
@@ -156,6 +156,7 @@ class SFXStream:
         spacegroup: str | None = None,
         merge_friedel: bool = True,
         geometry=None,
+        clipped: bool = False,
     ) -> SFXStream:
         """Load a probixi DuckDB run (its ``.duckdb`` output).
 
@@ -174,6 +175,7 @@ class SFXStream:
         merge_friedel : if True, canonicalize HKL to merge Friedel mates.
         geometry : optional :class:`~torchsx.geometry.Geometry`; by default the
             embedded geometry text is parsed, with support for legacy file paths.
+        clipped : keep disks clipped by the mask, the frame edge or a neighbour.
         """
         import warnings
         from torchsx.io._duckdb import load_duckdb
@@ -188,7 +190,8 @@ class SFXStream:
             )
             spacegroup = "P 1"
 
-        stream = cls(load_duckdb(path, spacegroup=spacegroup, geometry=geometry))
+        stream = cls(load_duckdb(path, spacegroup=spacegroup, geometry=geometry,
+                                 clipped=clipped))
         return stream.symmetrize(separate_friedel=not merge_friedel)
 
     def save(self, path: str | Path):

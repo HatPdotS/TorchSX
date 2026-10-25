@@ -52,8 +52,8 @@ stream = SFXStream.load("data.sfx")
 - `observed_hkl` and `source_lattice_index` are ordinary level columns, so the
   existing tensor transforms preserve them without special filtering code.
   Per-image `source_file`, `filename` and `event` identify source observations.
-- Probixi and DIALS are reserved dispatcher kinds. Probixi's existing direct
-  reader stays usable; no DIALS parser or dependency is added in this phase.
+- A probixi `.duckdb` dispatches to `_duckdb.py` (`SFXStream.read` and the
+  CLIs take it like a stream); DIALS stays a reserved kind.
 - Imports are lazy (`__getattr__`) so heavy or optional modules (duckdb, h5py,
   the native module) are not loaded until used.
 - Malformed stream content is excluded, not fatal: a bad reflection line, a
