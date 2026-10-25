@@ -180,6 +180,8 @@ def test_checkpoint_carries_the_recipe(tmp_path):
     assert ck["scatter"]["predict_skew"]
     assert ck["quadrature"] == {"kind": "SplitLogGrid", "n_points": 64}
     assert ck["scale"]["predict_shape"] is False
+    for tier in ("self_features", "context_features", "crystal_features"):
+        assert ck["scale"][tier] == list(getattr(scale.features, tier)), tier
     assert ck["splits"] == ["dark"]
     # no held-out set here: the current state is written rather than nothing
     assert set(ck["state_dict"]) == set(scale.state_dict())
