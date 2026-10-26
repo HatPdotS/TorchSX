@@ -34,10 +34,9 @@ def source_input(source: str | Path | SourceInput) -> SourceInput:
 
 
 def _path(source: SourceInput) -> Path:
-    if source.kind in ("probixi", "dials"):
-        extra = " Use SFXStream.from_duckdb for the existing Probixi reader." if source.kind == "probixi" else ""
-        raise NotImplementedError(f"The {source.kind} measurement adapter is not implemented yet.{extra}")
-    name = {"crystfel": "stream", "sfx": "cache"}.get(source.kind)
+    if source.kind == "dials":
+        raise NotImplementedError("The dials measurement adapter is not implemented yet.")
+    name = {"crystfel": "stream", "sfx": "cache", "probixi": "database"}.get(source.kind)
     if name is None:
         raise ValueError(f"Unknown datasource kind {source.kind!r}")
     if set(source.files) != {name}:
@@ -49,6 +48,7 @@ def read_source(source, **kwargs):
     from torchsx.stream import SFXStream
     source = source_input(source)
     path = _path(source)
+    clipped = kwargs.pop("clipped", False)  # probixi only: keep clipped disks
     if source.kind == "crystfel":
         return SFXStream.from_stream(path, **kwargs)
     # Parser-only controls have no meaning for an already parsed .sfx, but the
@@ -59,6 +59,9 @@ def read_source(source, **kwargs):
         kwargs.pop(key, None)
     if kwargs:
         raise TypeError(f"Unexpected read options: {', '.join(kwargs)}")
+    if source.kind == "probixi":
+        return SFXStream.from_duckdb(path, spacegroup=spacegroup, merge_friedel=merge_friedel,
+                                     clipped=clipped)
     return SFXStream.load(path, merge_friedel=merge_friedel, spacegroup=spacegroup)
 
 
@@ -69,6 +72,9 @@ def inspect_source(source) -> MeasurementSpec | None:
     path = _path(source)
     if source.kind == "crystfel":
         from torchsx.io._crystfel import read_measurement
+        return read_measurement(path)
+    if source.kind == "probixi":
+        from torchsx.io._duckdb import read_measurement
         return read_measurement(path)
     with open(path.with_suffix(path.suffix + ".json")) as f:
         sidecar = json.load(f)

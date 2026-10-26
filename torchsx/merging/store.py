@@ -44,14 +44,15 @@ STORE_FORMAT = "torchsx-prepared-store"
 STORE_VERSION = 1
 
 #: One observation.  ``I_obs``, ``bg`` and ``sigma`` are in photons (divided by
-#: the detector gain; ``bg`` summed over the peak pixels), ``background`` and
-#: ``peak`` are the stream's per-pixel ADU values, ``q`` the lab-frame unit
-#: scattering vector.  Every field is four bytes wide.
+#: the detector gain; ``bg`` summed over the ``n_pix`` pixels of the disk),
+#: ``background`` and ``peak`` are the stream's per-pixel ADU values, ``q`` the
+#: lab-frame unit scattering vector.  Every field is four bytes wide.
 RECORD = np.dtype([
     ("I_obs", "<f4"), ("bg", "<f4"), ("sigma", "<f4"),
     ("hkl_idx", "<i4"), ("panel_id", "<i4"),
     ("fs", "<f4"), ("ss", "<f4"), ("peak", "<f4"), ("background", "<f4"),
     ("ewald_offset", "<f4"), ("qx", "<f4"), ("qy", "<f4"), ("qz", "<f4"),
+    ("n_pix", "<f4"),
 ])
 RECORD_WIDTH = len(RECORD.names)
 _COL = {name: i for i, name in enumerate(RECORD.names)}
@@ -379,6 +380,7 @@ class PreparedStore:
             ewald_offset=col("ewald_offset"),
             sigma=col("sigma") if self.obs_info.has_sigma else None,
             q_dir=f[:, _COL["qx"]:_COL["qz"] + 1].contiguous(),
+            n_pix=col("n_pix"),
             beam_energy=t["energy"][cid],
             crystal_res=t["res"][cid],
             crystal_feat=t["feat"],

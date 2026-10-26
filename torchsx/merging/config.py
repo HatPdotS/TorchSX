@@ -41,6 +41,14 @@ class MergeConfig:
     fw_n_shells
         Equal-population resolution shells for the French-Wilson prior
         metadata attached to each surviving reflection.
+    disk_size
+        Disk pixels per observation: ``nominal`` (the ring mask) or ``recorded``
+        (the source's own count, probixi's ``n_pixels``).
+    background
+        ``annulus`` (ring mean times disk pixels) or ``model`` (the source's
+        background model, probixi's ``background_model``).
+    per_image_k0
+        Ewald offsets at each image's own wavelength instead of the median.
     """
 
     min_obs: int = 0
@@ -50,3 +58,6 @@ class MergeConfig:
     gain: str | float = "auto"
     gain_tolerance: float = DEFAULT_GAIN_TOLERANCE
     fw_n_shells: int = 20
+    disk_size: str = "nominal"
+    background: str = "annulus"
+    per_image_k0: bool = False

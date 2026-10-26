@@ -155,8 +155,16 @@ class AmortizedScale(ScaleModel):
         scatter_family: str = "gengauss",
         n_components: int = 3,
         component_shape: str = "shared",
+        self_features: tuple[str, ...] | None = None,
+        context_features: tuple[str, ...] | None = None,
+        crystal_features: tuple[str, ...] | None = None,
     ) -> "AmortizedScale":
-        features = ObsFeatureSpec(prep, include_hkl=include_hkl)
+        # None keeps each tier's default; a checkpoint passes its recorded tiers
+        features = ObsFeatureSpec(
+            prep, include_hkl=include_hkl, context_features=context_features,
+            crystal_features=crystal_features,
+            **({} if self_features is None else {"self_features": tuple(self_features)}),
+        )
         enc = DeepSetsEncoder(
             features.n_self, features.n_context,
             d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
