@@ -32,12 +32,14 @@ and bounded.  The scale model reads the observation's Ewald offset in units of
 ``w(h)`` for the core and of ``w(h) W(h)`` for the broad part (a second pass of
 the per-observation branch of the encoder, sharing the crystal context), and
 
-    K = [K_core(e / w) / w + rho K_core(e / (w W)) / (w W)] / (1 + rho),
+    K = K_core(e / w) / w + rho K_core(e / (w W)) / (w W),
 
-a profile with the area of the shared one.  The merged intensity of a
-reflection is therefore its total recorded intensity, core and broad part
-together.  The coefficients start at the shared profile with a small broad
-part and are fitted with the network.
+a profile with ``1 + rho`` times the shared one's area.  The fit measures the
+core's intensity; the merge reports ``1 + rho`` times it
+(:meth:`~torchsx.merging.scale.AmortizedScale.readout_log_factor`), the
+reflection's total recorded intensity, core and broad part together.  The
+coefficients start at the shared profile with a small broad part and are
+fitted with the network.
 
 Rotations act on Miller indices as rows, ``h' = h @ R``.
 """
