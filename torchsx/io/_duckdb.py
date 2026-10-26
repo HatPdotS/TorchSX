@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
 import torch
 
 from torchsx._core import _SFXStreamCore
@@ -163,8 +164,6 @@ def _measurement(conn, path: Path) -> MeasurementSpec:
 
 def read_measurement(path: str | Path) -> MeasurementSpec:
     """Measurement spec of a probixi run, read from its run-level tables."""
-    import duckdb
-
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"no such DuckDB run: {path}")
@@ -207,8 +206,6 @@ def load_duckdb(
         Wrap with ``SFXStream(core)``, or call
         :meth:`~torchsx.stream.SFXStream.from_duckdb`.
     """
-    import duckdb
-
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"no such DuckDB run: {path}")

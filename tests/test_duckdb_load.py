@@ -10,14 +10,13 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import duckdb
 import pytest
 import torch
 
-duckdb = pytest.importorskip("duckdb")
-
-from torchsx.io._duckdb import load_duckdb, read_measurement  # noqa: E402
-from torchsx.io.sources import inspect_source, read_source  # noqa: E402
-from torchsx.stream import SFXStream  # noqa: E402
+from torchsx.io._duckdb import load_duckdb, read_measurement
+from torchsx.io.sources import inspect_source, read_source
+from torchsx.stream import SFXStream
 
 # Verbatim from probixi.io.db._SCHEMA (v0.10.0, schema 1).
 _SCHEMA = """
