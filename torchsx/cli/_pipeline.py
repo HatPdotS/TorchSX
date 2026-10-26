@@ -869,6 +869,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     )
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
     scale.set_encoder_chunking(400)
+    if sc.get("pseudo_translation"):
+        from torchsx.merging.scale.pseudo_translation import PhaseBroad, PhaseWidth
+        pt = sc["pseudo_translation"]
+        scale.install_pseudo_translation(PhaseWidth.from_definition(pt["width"], prep),
+                                         PhaseBroad.from_definition(pt["broad"], prep))
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
     # the +c mean correction applies to the annulus estimate only

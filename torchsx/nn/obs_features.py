@@ -151,6 +151,13 @@ class ObsFeatureSpec(nn.Module):
         #: Recorded so a checkpoint can say which feature set it was fitted
         #: under; the flag itself is consumed a few lines below.
         self.include_hkl = bool(include_hkl)
+        #: Optional reflection-dependent profile (installed by
+        #: :meth:`~torchsx.merging.scale.AmortizedScale.install_pseudo_translation`):
+        #: the Ewald offset is read in units of the reflection's own core width,
+        #: and :meth:`build_self` gives the self features of the broad component.
+        self.phase_width = None
+        self.phase_broad = None
+        self._extra_log_width = None
 
         if context_features is None:
             context_features = tuple(self_features) + CONTEXT_ONLY_FEATURES
@@ -371,7 +378,12 @@ class ObsFeatureSpec(nn.Module):
             if k == "s_sq":
                 out[k] = meta.s_sq.float()
             elif k == "ewald_offset":
-                out[k] = _or_zeros(meta.ewald_offset, meta)
+                off = _or_zeros(meta.ewald_offset, meta)
+                if self.phase_width is not None:
+                    off = off * torch.exp(-self.phase_width.log_width(meta.hkl_idx)).to(off.device)
+                if self._extra_log_width is not None:
+                    off = off * torch.exp(-self._extra_log_width).to(off.device)
+                out[k] = off
             elif k == "fs":
                 out[k] = _or_zeros(meta.fs, meta)
             elif k == "ss":
@@ -450,6 +462,16 @@ class ObsFeatureSpec(nn.Module):
             raise ValueError("ObsFeatureSpec.build needs ObsInfo.obs_id")
         x_ctx = self._matrix(meta, self.context_features)
         return self._matrix(meta, self.self_features), x_ctx, self.crystal_matrix()
+
+    def build_self(self, meta: ObsInfo, extra_log_width: Tensor) -> Tensor:
+        """``x_self`` with every observation's Ewald offset further divided by
+        ``exp(extra_log_width)`` (per row): the self features of the broad
+        profile component."""
+        self._extra_log_width = extra_log_width
+        try:
+            return self._matrix(meta, self.self_features)
+        finally:
+            self._extra_log_width = None
 
 
 def _or_zeros(t: Tensor | None, meta: ObsInfo) -> Tensor:

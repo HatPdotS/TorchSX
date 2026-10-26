@@ -472,12 +472,18 @@ class DeepSetsEncoder(nn.Module):
 
     def forward(
         self,
-        x_self: Tensor,        # (n, n_self_features)
+        x_self: Tensor | tuple[Tensor, ...],   # (n, n_self_features), or several
         x_ctx: Tensor,         # (n, n_context_features)
         group_id: Tensor,      # (n,) int64 crystal index
         n_groups: int,
         x_crys: Tensor | None = None,   # (n_groups, n_crystal_features)
-    ) -> Tensor:               # (n, d_model)
+    ) -> Tensor | tuple[Tensor, ...]:   # (n, d_model), one per x_self
+        """Encode the observations; a tuple of ``x_self`` tables (the same rows
+        with different self features) shares one context and gives one
+        embedding per table."""
+        multi = isinstance(x_self, (tuple, list))
+        selves = tuple(x_self) if multi else (x_self,)
+        x_self = selves[0]
         n = x_self.shape[0]
         if x_ctx.shape[0] != n or group_id.shape[0] != n:
             raise ValueError(
@@ -538,23 +544,26 @@ class DeepSetsEncoder(nn.Module):
             table = self._run(self.self_blocks[: self.n_layers - L_s], table, obs=False)
             ctx = table.index_select(0, lid * K + fold)
 
-        z = self.input_self(x_self) + ctx
-        if self.peer_attention_layers:
-            # keys/values: the per-observation encodings h, which have seen no
-            # other row; only the query stream z is updated.  Each bucket is
-            # packed once and runs every layer before it is unpacked.
-            run = self._peer_stack
-            if self.peer_compile and z.is_cuda:
-                if self._peer_compiled is None:
-                    self._peer_compiled = torch.compile(self._peer_stack, dynamic=True)
-                run = self._peer_compiled
-            use_ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
-            for idx, valid in peer_layout(group_id, self.peer_budget):
-                zq, hk = z[idx], h[idx]
-                zq = (torch.utils.checkpoint.checkpoint(run, zq, hk, valid, use_reentrant=False)
-                      if use_ckpt else run(zq, hk, valid))
-                z = z.index_put((idx[valid],), zq[valid])
-        return self._run(self.self_blocks[self.n_layers - L_s:], z, obs=True)
+        outs = []
+        for xs in selves:
+            z = self.input_self(xs) + ctx
+            if self.peer_attention_layers:
+                # keys/values: the per-observation encodings h, which have seen no
+                # other row; only the query stream z is updated.  Each bucket is
+                # packed once and runs every layer before it is unpacked.
+                run = self._peer_stack
+                if self.peer_compile and z.is_cuda:
+                    if self._peer_compiled is None:
+                        self._peer_compiled = torch.compile(self._peer_stack, dynamic=True)
+                    run = self._peer_compiled
+                use_ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
+                for idx, valid in peer_layout(group_id, self.peer_budget):
+                    zq, hk = z[idx], h[idx]
+                    zq = (torch.utils.checkpoint.checkpoint(run, zq, hk, valid, use_reentrant=False)
+                          if use_ckpt else run(zq, hk, valid))
+                    z = z.index_put((idx[valid],), zq[valid])
+            outs.append(self._run(self.self_blocks[self.n_layers - L_s:], z, obs=True))
+        return tuple(outs) if multi else outs[0]
 
     def _peer_stack(self, zq: Tensor, hk: Tensor, valid: Tensor) -> Tensor:
         """Every peer-attention layer on one packed ``(B, L, D)`` block."""

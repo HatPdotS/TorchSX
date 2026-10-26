@@ -21,6 +21,8 @@ Usage::
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 from torch import Tensor
 
@@ -273,6 +275,11 @@ class AmortizedScale(ScaleModel):
             # checkpoint is what is conditional on grad, not the chunking.
             return self._predict_chunked(meta, n_chunk)
         x_self, x_ctx, x_crys = self.features.build(meta)
+        broad = getattr(self.features, "phase_broad", None)
+        if broad is not None:
+            x_broad = self.features.build_self(meta, broad.log_width(meta.hkl_idx))
+            z, zb = self.encoder((x_self, x_broad), x_ctx, meta.crystal_id, self.n_crystals, x_crys=x_crys)
+            return self._anchor(self._pseudo_translation(self.heads(z), meta, self.heads(zb).log_K), meta)
         z = self.encoder(x_self, x_ctx, meta.crystal_id, self.n_crystals, x_crys=x_crys)
         pred = self.heads(z)
         return self._anchor(pred, meta)
@@ -304,22 +311,34 @@ class AmortizedScale(ScaleModel):
         if mixture:
             names.append("mix")
 
-        def run(xs, xc, ci, xcr):
-            z = self.encoder(xs, xc, ci, self.n_crystals, x_crys=xcr)
+        broad = getattr(self.features, "phase_broad", None)
+        x_broad = (self.features.build_self(meta, broad.log_width(meta.hkl_idx))
+                   if broad is not None else None)
+
+        def run(xs, xc, ci, xcr, xb=None):
+            if xb is None:
+                z = self.encoder(xs, xc, ci, self.n_crystals, x_crys=xcr)
+                p = self.heads(z)
+                return tuple(getattr(p, name) for name in names)
+            z, zb = self.encoder((xs, xb), xc, ci, self.n_crystals, x_crys=xcr)
             p = self.heads(z)
-            return tuple(getattr(p, name) for name in names)
+            return tuple(getattr(p, name) for name in names) + (self.heads(zb).log_K,)
 
         ckpt = torch.is_grad_enabled() and self.training
         parts = [
             torch.utils.checkpoint.checkpoint(
-                run, x_self[a:b], x_ctx[a:b], cid[a:b], x_crys, use_reentrant=False
+                run, x_self[a:b], x_ctx[a:b], cid[a:b], x_crys,
+                None if x_broad is None else x_broad[a:b], use_reentrant=False
             )
-            if ckpt else run(x_self[a:b], x_ctx[a:b], cid[a:b], x_crys)
+            if ckpt else run(x_self[a:b], x_ctx[a:b], cid[a:b], x_crys,
+                             None if x_broad is None else x_broad[a:b])
             for a, b in spans
         ]
 
-        pred = ScalePrediction(**{name: torch.cat(t) for name, t in zip(names, zip(*parts))})
-        return self._anchor(pred, meta)
+        cols = list(zip(*parts))
+        pred = ScalePrediction(**{name: torch.cat(t) for name, t in zip(names, cols)})
+        log_K_broad = torch.cat(cols[len(names)]) if x_broad is not None else None
+        return self._anchor(self._pseudo_translation(pred, meta, log_K_broad), meta)
 
     def predict_split(
         self, meta_self: ObsInfo, meta_ctx: ObsInfo
@@ -343,6 +362,47 @@ class AmortizedScale(ScaleModel):
     def set_gauge_basis(self, phi: Tensor) -> None:
         """Install the per-reflection basis rows (``n_hkl x p``) for the ``basis`` anchor."""
         self.gauge_phi = phi.detach().to(torch.float32).clone()
+
+    def install_pseudo_translation(self, width, broad) -> None:
+        """Give reflections profiles that depend on the structure's pseudo-translations.
+
+        ``width`` (:class:`~torchsx.merging.scale.pseudo_translation.PhaseWidth`)
+        sets each reflection's core width ``w(h)``; ``broad``
+        (:class:`~torchsx.merging.scale.pseudo_translation.PhaseBroad`) adds a
+        component of relative area ``rho(h)`` and width ``W(h)`` times the core's.
+        The features read the Ewald offset over ``w(h)``; the self branch is
+        evaluated a second time with the offset over ``w(h) W(h)``; and
+
+            K = K_core(e / w) / w + rho K_core(e / (w W)) / (w W),
+
+        so the profile has ``1 + rho`` times the shared profile's area: the
+        fitted intensity is the core's, and the merge reports ``1 + rho`` times
+        it, the reflection's total recorded intensity, core and broad part
+        (:meth:`readout_log_factor`).
+        """
+        dev = next(self.parameters()).device
+        self.features.phase_width = width.to(dev)
+        self.features.phase_broad = broad.to(dev)
+
+    def _pseudo_translation(self, pred: ScalePrediction, meta: ObsInfo,
+                            log_K_broad: Tensor | None = None) -> ScalePrediction:
+        if log_K_broad is None:
+            return pred
+        pw = self.features.phase_width
+        broad = self.features.phase_broad
+        lw = pw.log_width(meta.hkl_idx).to(pred.log_K)
+        lW = broad.log_width(meta.hkl_idx).to(pred.log_K)
+        lrho = broad.log_fraction(meta.hkl_idx).to(pred.log_K)
+        log_K = torch.logaddexp(pred.log_K - lw, lrho + log_K_broad - lw - lW)
+        return dataclasses.replace(pred, log_K=log_K)
+
+    def readout_log_factor(self, hkl_idx: Tensor) -> Tensor | None:
+        """``log(1 + rho(h))``, from the fitted (core) intensity to the total
+        the merge reports; ``None`` with one profile for every reflection."""
+        broad = getattr(self.features, "phase_broad", None)
+        if broad is None:
+            return None
+        return torch.nn.functional.softplus(broad.log_fraction(hkl_idx))
 
     def _anchor(self, pred: ScalePrediction, meta: ObsInfo) -> ScalePrediction:
         """Pin the gauge of ``log K`` for one batch.
