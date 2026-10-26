@@ -219,7 +219,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
     signature = {
         "observation_filter_version": OBSERVATION_FILTER_VERSION,
-        "cache_schema": 1,
+        "cache_schema": 3,
         "splits": [n for n, _ in splits],
         "d_min": float(d_min), "d_max": float(args.dmax),
         "spacegroup": spacegroup,

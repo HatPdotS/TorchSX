@@ -5,7 +5,7 @@ parse their arguments (and answer ``--help``) without importing torch.
 """
 import importlib
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _EXPORTS = {
     "SFXStream": "torchsx.stream",
