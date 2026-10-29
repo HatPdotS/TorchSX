@@ -730,6 +730,8 @@ DEFAULTS = dict(
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_degree=4, gauge_anchor="basis",
     scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
+    # --encoder fold: K masked runs per crystal, context self-attention, per-reflection queries
+    encoder="deepsets", fold_folds=5, ctx_layers=2, query_layers=1,
 )
 
 
@@ -835,6 +837,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         producer = ((bundle.recipe.get("measurement") or {}).get("source") or {}).get("producer")
         crystal_features = (DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
                             if producer == "probixi" else None)
+    # encoder: a checkpoint's record wins (no kind = Deep Sets), else --encoder
+    encoder = (enc.get("kind") or "deepsets") if ck else (getattr(args, "encoder", None) or DEFAULTS["encoder"])
     kw = dict(
         d_model=enc.get("d_model") or sc.get("d_model") or getattr(args, "d_model", None) or DEFAULTS["d_model"],
         n_layers=enc.get("n_layers") or sc.get("n_layers") or getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
@@ -867,6 +871,19 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         self_features=self_features, context_features=context_features,
         crystal_features=crystal_features,
     )
+    if encoder == "fold":
+        if ck:
+            fold = {k: int(enc[k]) for k in ("context_folds", "ctx_layers", "query_layers")}
+            fold["peer_heads"] = int(enc["n_heads"])
+        else:
+            def flag(name, default):
+                v = getattr(args, name, None)
+                return default if v is None else int(v)
+            fold = dict(context_folds=flag("context_folds", DEFAULTS["fold_folds"]),
+                        ctx_layers=flag("ctx_layers", DEFAULTS["ctx_layers"]),
+                        query_layers=flag("query_layers", DEFAULTS["query_layers"]),
+                        peer_heads=DEFAULTS["peer_heads"])
+        kw.update(encoder="fold", **fold)
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
     scale.set_encoder_chunking(400)
     if sc.get("pseudo_translation"):

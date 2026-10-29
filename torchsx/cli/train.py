@@ -71,6 +71,13 @@ def _build_parser():
     # Crystal context pooling: K >= 2 folds (context from the other K-1 folds of the
     # crystal, default 2), or 0 = leave-one-out; the merge inherits the checkpoint.
     p.add_argument("--context-folds", type=int, default=None, help=argparse.SUPPRESS)
+    # Scale encoder: deepsets (default) or fold, the masked-fold transformer (K =
+    # --context-folds runs per crystal, default 5); the merge inherits the checkpoint.
+    p.add_argument("--encoder", choices=("deepsets", "fold"), default=None, help=argparse.SUPPRESS)
+    # Fold transformer depth: self-attention blocks over each run (default 2) and
+    # cross-attention blocks from each masked observation onto its run (default 1).
+    p.add_argument("--ctx-layers", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--query-layers", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--pseudo-translation", choices=("off", "auto"), default="off",
                    help="for crystals with translational NCS or a lattice translocation: auto finds the "
                         "structure's translations in the data's Patterson function and gives each reflection a "

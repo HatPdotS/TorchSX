@@ -32,6 +32,7 @@ from torchsx.merging.scale.base import ScaleModel
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 from torchsx.nn.deepsets import DeepSetsEncoder, ScaleEncoder
+from torchsx.nn.fold_transformer import FoldTransformerEncoder
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
 from torchsx.nn.obs_features import ObsFeatureSpec
 
@@ -158,25 +159,44 @@ class AmortizedScale(ScaleModel):
         self_features: tuple[str, ...] | None = None,
         context_features: tuple[str, ...] | None = None,
         crystal_features: tuple[str, ...] | None = None,
+        encoder: str = "deepsets",
+        ctx_layers: int = 2,
+        query_layers: int = 1,
     ) -> "AmortizedScale":
+        """``encoder="fold"`` builds :class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`
+        with ``context_folds`` folds, ``ctx_layers`` / ``query_layers`` blocks and
+        ``peer_heads`` heads; the Deep Sets arguments are then unused."""
         # None keeps each tier's default; a checkpoint passes its recorded tiers
         features = ObsFeatureSpec(
             prep, include_hkl=include_hkl, context_features=context_features,
             crystal_features=crystal_features,
             **({} if self_features is None else {"self_features": tuple(self_features)}),
         )
-        enc = DeepSetsEncoder(
-            features.n_self, features.n_context,
-            d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
-            dropout=dropout,
-            n_crystal_features=features.n_crystal,
-            context_folds=context_folds,
-            obs_context_layers=obs_context_layers,
-            obs_self_layers=obs_self_layers,
-            peer_attention_layers=peer_attention_layers,
-            peer_heads=peer_heads,
-            peer_dim=peer_dim,
-        )
+        if encoder not in ("deepsets", "fold"):
+            raise ValueError(f"encoder must be 'deepsets' or 'fold', got {encoder!r}")
+        if encoder == "fold":
+            # the measurement: what a visible token carries beyond the geometry
+            geometry = set(features.self_features)
+            meas = [i for i, f in enumerate(features.context_features) if f not in geometry]
+            enc = FoldTransformerEncoder(
+                features.n_self, features.n_context, meas,
+                d_model=d_model, n_heads=peer_heads, folds=context_folds,
+                ctx_layers=ctx_layers, query_layers=query_layers, d_hidden=d_hidden,
+                n_crystal_features=features.n_crystal,
+            )
+        else:
+            enc = DeepSetsEncoder(
+                features.n_self, features.n_context,
+                d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
+                dropout=dropout,
+                n_crystal_features=features.n_crystal,
+                context_folds=context_folds,
+                obs_context_layers=obs_context_layers,
+                obs_self_layers=obs_self_layers,
+                peer_attention_layers=peer_attention_layers,
+                peer_heads=peer_heads,
+                peer_dim=peer_dim,
+            )
         heads = ScaleHeads(
             d_model,
             w_init=w_init,
@@ -214,7 +234,9 @@ class AmortizedScale(ScaleModel):
         recompute and keep the per-block boundaries we are trying to drop.
         """
         n = int(crystals_per_chunk)
-        self.chunk_crystals = max(n, 0)
+        # an encoder that runs each crystal several times takes fewer per chunk
+        div = int(getattr(self.encoder, "chunk_divisor", 1))
+        self.chunk_crystals = max(n // div, 1) if n > 0 else 0
         self.encoder.checkpoint = not (n > 0)
 
     @staticmethod

@@ -11,6 +11,7 @@ itself is :class:`torchsx.merging.scale.AmortizedScale`, because it must be a
 """
 
 from torchsx.nn.deepsets import DeepSetsEncoder, ResidualFF, ScaleEncoder
+from torchsx.nn.fold_transformer import FoldTransformerEncoder
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
 from torchsx.nn.merge_target import MergeTargetOut
 from torchsx.nn.metrics import (
@@ -30,7 +31,7 @@ __all__ = [
     "group_offsets_from_counts", "pack", "unpack",
     # amortised scale model
     "leave_one_out_mean", "loo_weighted_mean",
-    "ScaleEncoder", "ResidualFF", "DeepSetsEncoder",
+    "ScaleEncoder", "ResidualFF", "DeepSetsEncoder", "FoldTransformerEncoder",
     "ScaleHeads", "ScalePrediction",
     "ObsFeatureSpec",
     "MergeTargetOut",
