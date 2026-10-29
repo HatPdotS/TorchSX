@@ -10,7 +10,8 @@ import torch
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
 from torchsx.merging.scale import AmortizedScale
-from torchsx.nn.objective import MarginalNLL, wide_log_grid
+from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
+from torchsx.nn.objective import MarginalNLL
 from torchsx.nn.posterior_target import PosteriorMergeTarget
 from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 from tests.test_amortized_training import _synthetic
@@ -47,7 +48,7 @@ def test_a_batch_result_depends_on_the_batch_alone(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8, n_cond=2)
     scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
     tr = AmortizedTrainer(
-        prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
+        prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
                            posterior_k_coarse=5, posterior_m_fine=17),
     )

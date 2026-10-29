@@ -235,13 +235,13 @@ def test_anchor_pins_the_gauge():
 def test_marginal_nll_backward_reaches_the_network():
     """prime() -> quadrature marginal -> backward, gradients on encoder+heads."""
     from torchsx.merging.likelihood import Poisson
-    from torchsx.nn.objective import wide_log_grid
+    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
     from torchsx.merging.config import MergeConfig
 
     prep = _toy_prep()
     params = _params(prep)
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    quad = wide_log_grid()
+    quad = SplitLogGrid(n_points=96)
     lik = Poisson()
 
     # Heads are zero-initialised, so at step 0 the encoder correctly receives
@@ -275,13 +275,13 @@ def test_zero_init_still_bootstraps_the_heads():
     """At exact zero-init the encoder gets no gradient (dL/dz = W = 0), but the
     head weights do — which is how training starts moving at all."""
     from torchsx.merging.likelihood import Poisson
-    from torchsx.nn.objective import wide_log_grid
+    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
     from torchsx.merging.config import MergeConfig
 
     prep = _toy_prep()
     params = _params(prep)
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    quad = wide_log_grid()
+    quad = SplitLogGrid(n_points=96)
 
     meta = prep.obs_info
     pred = scale.prime(meta)
@@ -442,7 +442,7 @@ def test_encoder_chunking_is_exact_in_value_and_gradient():
         scale.set_encoder_chunking(chunk)
         scale.zero_grad(set_to_none=True)
         pred = scale.predict(meta)
-        loss = (pred.log_K.square().sum() + pred.log_w.sum() + pred.mix.sum())
+        loss = pred.log_K.square().sum() + pred.log_w.sum() + pred.log_e_s.sum()
         loss.backward()
         g = torch.cat([p.grad.flatten() for p in scale.parameters()
                        if p.grad is not None])
@@ -620,7 +620,7 @@ def test_fold_chunking_is_exact_in_value_and_gradient(split):
         scale.set_encoder_chunking(chunk)
         scale.zero_grad(set_to_none=True)
         pred = scale.predict(meta)
-        loss = (pred.log_K.square().sum() + pred.log_w.sum() + pred.mix.sum())
+        loss = pred.log_K.square().sum() + pred.log_w.sum() + pred.log_e_s.sum()
         loss.backward()
         g = torch.cat([p.grad.flatten() for p in scale.parameters()
                        if p.grad is not None])

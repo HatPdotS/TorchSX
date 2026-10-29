@@ -22,7 +22,7 @@ from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
-from torchsx.nn.objective import wide_log_grid
+from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.scale import AmortizedScale
 from torchsx.merging.scatter_shape import FreePerHKLShape
 from torchsx.nn.metrics import scale_metrics, spearman
@@ -98,7 +98,7 @@ def test_leave_one_out_context_recovers_a_hidden_per_crystal_scale(tmp_path):
     scale = AmortizedScale.from_prep(
         prep, d_model=64, n_layers=3
     )
-    obj = MarginalNLL(wide_log_grid(), Poisson())
+    obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
     # ~30 updates to converge from zero-init.  The scale ramps up from 0 and
     # OVERSHOOTS around update 10 (slope of predicted-on-true peaks near 1.6
     # before settling at ~0.94), so a short run measures the overshoot, not the
@@ -229,7 +229,7 @@ def test_batches_are_condition_pure_and_complete():
 def _two_condition_trainer(tmp_path, **cfg_kw):
     prep, params, log_G, cid, per = _synthetic(n_hkl=40, n_xtal=120, per=40, n_cond=2)
     scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2)
-    obj = MarginalNLL(wide_log_grid(), Poisson())
+    obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
     cfg = TrainConfig(
         max_obs_per_batch=1000, lr=1e-3, log_every=1,
         heldout_frac=0.2, device="cpu", outdir=str(tmp_path),
@@ -307,7 +307,7 @@ def test_evaluation_changes_no_state(tmp_path, prior):
         prep, d_model=8, n_layers=1, context_folds=2,
     )
     tr = AmortizedTrainer(
-        prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
+        prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(
             max_obs_per_batch=24, heldout_frac=0.25, device="cpu", outdir=str(tmp_path),
             posterior_prior=prior, posterior_k_coarse=5, posterior_m_fine=17,
@@ -416,7 +416,7 @@ def test_deferred_encoder_backward_is_the_one_pass_gradient(tmp_path):
     scale.encoder.tokens = 1 << 8                     # several blocks
     cfg = TrainConfig(max_obs_per_batch=10 ** 6, lr=3e-3, heldout_frac=0.0,
                       device="cpu", outdir=str(tmp_path))
-    tr = AmortizedTrainer(prep, scale, MarginalNLL(wide_log_grid(), Poisson()), params, config=cfg)
+    tr = AmortizedTrainer(prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params, config=cfg)
     assert scale.defer_encoder_backward
     rows = tr.index.rows(tr.index.nonempty)
     grads = []

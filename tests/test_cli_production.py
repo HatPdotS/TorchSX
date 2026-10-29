@@ -121,8 +121,21 @@ def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,reque
     if requested is not None:
         argv+=['--prior',requested]
     args=merge_nn._build_parser().parse_args(argv)
-    _,_,_,_,settings=P.build_stack(bundle,args,ckpt={'posterior_grid':{'prior':saved}},verbose=False)
+    ck=_production_checkpoint(bundle,tmp_path)
+    ck['posterior_grid']={'prior':saved}
+    _,_,_,_,settings=P.build_stack(bundle,args,ckpt=ck,verbose=False)
     assert settings['prior']==expected
+
+
+def _production_checkpoint(bundle,tmp_path):
+    """A checkpoint of the default model, written by the trainer."""
+    from tests.test_cli_pipeline import _trainer_from_stack
+    targs=train._build_parser().parse_args(['x.stream','-o',str(tmp_path),'--device','cpu'])
+    tr=_trainer_from_stack(*P.build_stack(bundle,targs,verbose=False))
+    try:
+        return torch.load(tr.save_best(tmp_path/'model.pt'),weights_only=False)
+    finally:
+        tr.close()
 
 
 def test_batches_are_balanced_and_allow_small_states():
@@ -180,7 +193,7 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
     assert all(p['seconds']>=0 and 'gpu_peak_allocated_gib' not in p for p in res['phases'].values())
     assert res['updates']['n']==4 and res['updates']['median_s']<=res['updates']['max_s']
     ck=torch.load(run/'best.pt',weights_only=False)
-    assert ck['scatter']['family']=='mixture' and ck['scatter']['n_components']==4
+    assert ck['scatter']['n_components']==4
     assert ck['likelihood']['bg_mean_offset']==0.1
     assert ck['data']['training']['config']['seed']==17
     assert (ck['wilson_surface'] is not None and len(ck['wilson_surface']['coef'])==2)

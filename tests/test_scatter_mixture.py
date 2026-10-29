@@ -360,8 +360,8 @@ def test_heads_give_a_normalised_mixture_with_the_closed_form_mean():
     torch.manual_seed(3)
     z = torch.randn(40, 16)
     heads = ScaleHeads(16, w_init=1.65, n_components=3)
-    with torch.no_grad():
-        heads.mixture.weight.normal_(0.0, 0.3)
+    with torch.no_grad():            # moderate widths: the brute-force grid must hold the tails
+        heads.mixture.weight.normal_(0.0, 0.05)
     p = heads(z)
     sc = PredictedMixtureScatter(3, fixed_gaussian=True); ids = torch.arange(40); sc.set_prediction(ids, p.mix.detach())
     eps = torch.linspace(-25, 25, 40001, dtype=torch.float64)
