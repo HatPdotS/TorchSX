@@ -243,6 +243,13 @@ class TrainConfig:
     #: small gradients would be decayed hardest -- the decay strength ends up
     #: coupled to gradient history rather than being a clean prior.
     weight_decay: float = 0.0
+    #: Optimiser for the encoder's block matrices (attention and feed-forward
+    #: weights): ``"adamw"``, with every other parameter, or ``"muon"`` --
+    #: orthogonalised Nesterov momentum (``torch.optim.Muon``, momentum 0.95,
+    #: update RMS matched to AdamW so ``lr`` keeps its meaning, decayed by
+    #: ``weight_decay``).  Embeddings, biases, norm gains, heads and the
+    #: objective's parameters stay on AdamW either way.
+    optimizer: str = "adamw"
     grad_clip: float = 1.0
     #: Penalty on the predicted scatter width, ``lam_spread * mean(log w)``.
     #: The GenGauss normaliser already contains -log(alpha), so no explicit
@@ -475,7 +482,9 @@ class AmortizedTrainer:
             ref_train = perm[n_held:]
         self.train_crystals = torch.cat([ref_train, other])
 
-        decay, no_decay, mixture, profile = [], [], [], []
+        if self.cfg.optimizer not in ("adamw", "muon"):
+            raise ValueError(f"optimizer must be 'adamw' or 'muon', got {self.cfg.optimizer!r}")
+        decay, no_decay, mixture, profile, hidden = [], [], [], [], []
         for name, prm in self.scale.named_parameters():
             if not prm.requires_grad:
                 continue
@@ -484,6 +493,10 @@ class AmortizedTrainer:
                 continue
             if name.startswith(("features.phase_width.", "features.phase_broad.")):
                 profile.append(prm)
+                continue
+            if (self.cfg.optimizer == "muon" and name.startswith("encoder.")
+                    and "blocks." in name and prm.ndim == 2):
+                hidden.append(prm)
                 continue
             (no_decay if prm.ndim <= 1 else decay).append(prm)
         # the objective may carry its own scalars (the miss fraction); they are
@@ -552,7 +565,10 @@ class AmortizedTrainer:
                            "lr": self.cfg.lr * self.cfg.pseudo_translation_lr_mult,
                            "lr_mult": float(self.cfg.pseudo_translation_lr_mult)})
         self.opt = torch.optim.AdamW(groups, lr=self.cfg.lr)
-        self.n_decayed = sum(p.numel() for p in decay)
+        #: the encoder's block matrices with ``optimizer="muon"``, else None
+        self.opt_muon = (torch.optim.Muon(hidden, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay,
+                                          adjust_lr_fn="match_rms_adamw") if hidden else None)
+        self.n_decayed = sum(p.numel() for p in (*decay, *hidden))
         self.n_undecayed = sum(p.numel() for p in no_decay)
         self._base_lr = self.cfg.lr
         self.logger = MetricLogger(self.cfg.outdir)
@@ -752,13 +768,17 @@ class AmortizedTrainer:
         self.scale.clear()
         return float(nll.item()) / max(int(tgt.valid.sum()), 1)
 
+    def _optimizers(self) -> list:
+        return [o for o in (self.opt, getattr(self, "opt_muon", None)) if o is not None]
+
     def step(self, rows: Tensor) -> dict:
         self.scale.train()
         if self.cfg.warmup_steps > 0 or self.cfg.lr_schedule != "constant":
             scale_lr = lr_factor(self.step_i, warmup=self.cfg.warmup_steps, total=self.cfg.total_steps,
                                  schedule=self.cfg.lr_schedule, min_frac=self.cfg.min_lr_frac)
-            for grp in self.opt.param_groups:
-                grp["lr"] = self._base_lr * scale_lr * grp.get("lr_mult", 1.0)
+            for opt in self._optimizers():
+                for grp in opt.param_groups:
+                    grp["lr"] = self._base_lr * scale_lr * grp.get("lr_mult", 1.0)
         t0 = time.time()
         io0 = self._store.store.wait_s if self._store is not None else 0.0
         meta, pred, tgt, nll, n_ph, bg, sigma = self._forward(rows, grad=True)
@@ -777,7 +797,8 @@ class AmortizedTrainer:
             loss = loss + self.cfg.lam_shape_prior * kl
             shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar,
                          "shape_prior_off_grid": out_bar}
-        self.opt.zero_grad(set_to_none=True)
+        for opt in self._optimizers():
+            opt.zero_grad(set_to_none=True)
         if self.cfg.posterior_prior == "wilson" and self.targets[0].wilson_coef_param is None:
             raise RuntimeError("the Wilson surface is trained with the network and needs a "
                                "reciprocal basis: prep.median_cell or set_reciprocal_basis()")
@@ -796,13 +817,15 @@ class AmortizedTrainer:
             torch.isfinite(loss.detach()))
         if skipped:
             self.n_skipped_steps += 1
-            self.opt.zero_grad(set_to_none=True)
+            for opt in self._optimizers():
+                opt.zero_grad(set_to_none=True)
             total_norm = torch.tensor(float("nan"))
         else:
             total_norm = torch.nn.utils.clip_grad_norm_(
                 self.scale.parameters(), self.cfg.grad_clip
             )
-            self.opt.step()
+            for opt in self._optimizers():
+                opt.step()
             dn = getattr(self.objective, "detector_noise", None)
             if dn is not None:
                 dn.project()          # the noise terms stay inside their bounds

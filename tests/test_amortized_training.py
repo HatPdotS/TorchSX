@@ -424,3 +424,28 @@ def test_one_sided_curve_is_integrated_on_its_support(k_coarse, m_fine, tol):
     # coverage: nothing sits at the grid edge
     n_edge = max(1, m_fine // 20)
     assert float((w_post[:, :n_edge].sum(1) + w_post[:, -n_edge:].sum(1)).max()) < 0.01
+
+
+@pytest.mark.parametrize("encoder", ["deepsets", "fold"])
+def test_muon_takes_the_encoder_block_matrices_and_trains_them(tmp_path, encoder):
+    prep, params, *_ = _synthetic(n_xtal=40, per=20)
+    kw = (dict(encoder="fold", context_folds=3, ctx_layers=1, query_layers=1) if encoder == "fold"
+          else dict(context_folds=2, peer_attention_layers=1))
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False,
+                                     peer_heads=4, **kw)
+    cfg = TrainConfig(max_obs_per_batch=400, epochs=3, lr=3e-3, log_every=5, heldout_frac=0.1,
+                      device="cpu", outdir=str(tmp_path), optimizer="muon")
+    tr = AmortizedTrainer(prep, scale, MarginalNLL(wide_log_grid(), Poisson()), params, config=cfg)
+    in_muon = {id(p) for g in tr.opt_muon.param_groups for p in g["params"]}
+    in_adam = {id(p) for g in tr.opt.param_groups for p in g["params"]}
+    assert not in_muon & in_adam
+    named = dict(scale.named_parameters())
+    muon_names = [n for n, p in named.items() if id(p) in in_muon]
+    assert muon_names and all(n.startswith("encoder.") and "blocks." in n and named[n].ndim == 2
+                              for n in muon_names)
+    assert all(id(p) in in_muon | in_adam for p in scale.parameters() if p.requires_grad)
+    assert not [n for n in named if n.startswith("heads.") and id(named[n]) in in_muon]
+    before = {n: named[n].detach().clone() for n in muon_names}
+    tr.run()
+    assert all(torch.isfinite(p).all() for p in scale.parameters())
+    assert [n for n in muon_names if not torch.equal(named[n], before[n])], "Muon moved nothing"

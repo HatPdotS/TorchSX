@@ -78,6 +78,8 @@ def _build_parser():
     # cross-attention blocks from each masked observation onto its run (default 1).
     p.add_argument("--ctx-layers", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--query-layers", type=int, default=None, help=argparse.SUPPRESS)
+    # Optimiser of the encoder's block matrices: adamw (default) or muon.
+    p.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw", help=argparse.SUPPRESS)
     p.add_argument("--pseudo-translation", choices=("off", "auto"), default="off",
                    help="for crystals with translational NCS or a lattice translocation: auto finds the "
                         "structure's translations in the data's Patterson function and gives each reflection a "
@@ -293,7 +295,7 @@ def main(argv=None):
         stream_batches=True, split_half_every=0, heldout_frac=0.05,
         device=settings["device"], outdir=str(args.out), seed=args.seed,
         heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),
-        noise_lr_mult=args.noise_lr_mult,
+        noise_lr_mult=args.noise_lr_mult, optimizer=args.optimizer,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     try:
@@ -319,7 +321,7 @@ def main(argv=None):
             return
         tr.restore_best()
         tr.scale.eval()
-        tr.opt = None
+        tr.opt = tr.opt_muon = None
         tr.cfg.max_obs_per_batch = P.READOUT_MAX_OBS
         if str(tr.device).startswith("cuda"):
             torch.cuda.empty_cache()
