@@ -1,27 +1,18 @@
 """Training loop for the amortised scale model.
 
-Batches are drawn over **crystals**, not observations, because the
-leave-one-out context pool needs a crystal's reflections to be complete: a
-truncated crystal gives a biased context.  The merge target is the opposite —
-it is an average, so a subsample of each reflection's observations is unbiased,
-and a batch of a few thousand crystals holds tens of observations per reflection.
+Batches are drawn as complete crystals, because the encoder reads each
+observation's context from the other observations of its crystal: a truncated
+crystal gives a biased context.  The batch is sized by observations per
+reflection (``target_redundancy``) rather than by crystal count, since how many
+observations of a reflection a batch holds is what constrains that reflection.
 
-That is why the batch is sized in *observations* rather than crystals: crystals
-carry a variable number (long tail), so a fixed crystal count makes
-memory jump around while a fixed observation budget keeps it flat.
-
-Each step is two passes:
-
-1. ``no_grad``: predict, then build the leave-one-out merge target from
-   **detached** ``K`` and ``w``.
-2. with grad: predict again, form ``log_mean = log I0^(-j) + log K``, and
-   evaluate the marginal NLL.
-
-Detaching the target is what makes the scheme well defined.  Leave-one-out
-blocks an observation from pulling its *own* target; detachment blocks the
-network from pulling the whole merge toward itself collectively.
-
-Adam only — no LBFGS anywhere, on the network or elsewhere.
+Each update is one forward pass.  The network predicts ``log K`` and the
+scatter of every observation; the posterior merge target
+(:mod:`torchsx.nn.posterior_target`) integrates each reflection's intensity out
+under the intensity prior and returns the per-reflection evidence ``log Z_h``.
+The loss is ``-sum_h log Z_h`` over the reflections in the batch, so no point
+estimate of the intensity enters it.  The network, the prior surface and the
+objective's own scalars are optimised with AdamW.
 """
 
 from __future__ import annotations
