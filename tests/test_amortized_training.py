@@ -352,7 +352,6 @@ def test_evaluation_changes_no_state(tmp_path, prior):
             before = state()
             first = tr.evaluate(tr.heldout_crystals)
             second = tr.evaluate(tr.heldout_crystals)
-            tr._canonical_nll(tr.index.rows(tr.heldout_crystals))
             assert math.isfinite(first["nll_per_obs"])
             assert first["nll_per_obs"] == second["nll_per_obs"]
             for name, value in state().items():

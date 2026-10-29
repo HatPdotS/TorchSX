@@ -46,7 +46,6 @@ from torchsx.nn.metrics import (
     hkl_permutation_sensitivity_shape,
     scale_metrics,
 )
-from torchsx.nn.shape_prior import pack_single, shape_prior_kl
 
 __all__ = ["CrystalIndex", "TrainConfig", "AmortizedTrainer"]
 
@@ -207,10 +206,6 @@ class TrainConfig:
     target_redundancy: float | None = None
     epochs: int = 10
     lr: float = 1e-3
-    #: Learning-rate multiplier for the mixture head's parameters.  The head
-    #: reads the full embedding like the other heads; a large multiplier drives
-    #: the lower widths to extreme alpha within a few hundred updates.
-    mixture_lr_mult: float = 1.0
     #: Learning-rate multiplier for the pseudo-translation profile coefficients
     #: (``PhaseWidth``, ``PhaseBroad``): a handful of scalars that must travel
     #: O(1) in log width and log fraction, where Adam at the network's rate
@@ -243,19 +238,6 @@ class TrainConfig:
     #: coupled to gradient history rather than being a clean prior.
     weight_decay: float = 0.0
     grad_clip: float = 1.0
-    #: Penalty on the predicted scatter width, ``lam_spread * mean(log w)``.
-    #: The GenGauss normaliser already contains -log(alpha), so no explicit
-    #: penalty on w is needed *at the likelihood optimum*; that says nothing
-    #: about which optimum you reach.  The model can settle into a wide-scatter
-    #: minimum where the width absorbs nearly all per-observation variation,
-    #: and there is then almost no gradient pressure left to
-    #: refine K per observation.  This penalty is a tool for escaping that
-    #: basin, not a claim about the statistics -- so it is annealed away and
-    #: the final w is judged on calibration (var_z), not on this term.
-    lam_spread: float = 0.0
-    #: Halflife of the spread penalty in steps; ``0`` disables the ramp and
-    #: holds ``lam_spread`` constant for the whole run.
-    lam_spread_halflife_steps: int = 400
     #: Recompute each outer quadrature node in backward instead of keeping all
     #: ``k_coarse`` node graphs alive at once.  Trades ~2x compute in
     #: ``accumulate`` for a large drop in retained activations.  Only worth it
@@ -286,16 +268,6 @@ class TrainConfig:
     wilson_degree: int = 4
     #: Outer grid half-width cap in nats (see PosteriorMergeTarget.max_halfwidth).
     posterior_max_halfwidth: float = 12.0
-    #: Hierarchical prior on each observation's scatter density
-    #: (:mod:`torchsx.nn.shape_prior`): ``lam_shape_prior`` pseudo-observations
-    #: per observation drawn from the batch's population density, i.e.
-    #: ``lam * mean_j KL(p_bar || p_j)`` added to the per-observation loss.
-    #: Weak observations, whose likelihood barely depends on their scatter
-    #: shape, take the population shape; strong ones keep what their data say.
-    #: Constant over the run (it is a prior, not an escape schedule).
-    lam_shape_prior: float = 0.0
-    #: observations sampled per update to estimate the prior term
-    shape_prior_sample: int = 2048
     log_every: int = 10
     heldout_frac: float = 0.05
     #: Condition (``ObsInfo.delay_bin_idx`` value) the held-out crystals and
@@ -477,12 +449,9 @@ class AmortizedTrainer:
             ref_train = perm[n_held:]
         self.train_crystals = torch.cat([ref_train, other])
 
-        decay, no_decay, mixture, profile = [], [], [], []
+        decay, no_decay, profile = [], [], []
         for name, prm in self.scale.named_parameters():
             if not prm.requires_grad:
-                continue
-            if name.startswith("heads.mixture.") and self.cfg.mixture_lr_mult != 1.0:
-                mixture.append(prm)
                 continue
             if name.startswith(("features.phase_width.", "features.phase_broad.")):
                 profile.append(prm)
@@ -541,10 +510,6 @@ class AmortizedTrainer:
             {"params": decay, "weight_decay": self.cfg.weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ]
-        if mixture:
-            groups.append({"params": mixture, "weight_decay": 0.0,
-                           "lr": self.cfg.lr * self.cfg.mixture_lr_mult,
-                           "lr_mult": float(self.cfg.mixture_lr_mult)})
         if noise:
             groups.append({"params": noise, "weight_decay": 0.0,
                            "lr": self.cfg.lr * self.cfg.noise_lr_mult,
@@ -605,22 +570,6 @@ class AmortizedTrainer:
     def target(self):
         """Merge target of the condition currently in flight."""
         return self.targets[self._cond]
-
-    # ── schedule ───────────────────────────────────────────────────────
-
-    def _lam_spread(self) -> float:
-        if self.cfg.lam_spread <= 0:
-            return 0.0
-        hl = self.cfg.lam_spread_halflife_steps
-        if hl <= 0:
-            # No ramp: hold the penalty constant.  A decaying penalty makes the
-            # optimised loss non-comparable across a run for a reason that has
-            # nothing to do with the model -- and a strong decaying penalty can
-            # drive the per-shell CC1/2 non-monotone in resolution, which is
-            # not physically possible.  A weak constant penalty is a prior, not a
-            # schedule, and is what the shrinkage is meant to be.
-            return self.cfg.lam_spread
-        return self.cfg.lam_spread * (0.5 ** (self.step_i / hl))
 
     # ── one step ───────────────────────────────────────────────────────
 
@@ -737,23 +686,6 @@ class AmortizedTrainer:
         )
         return tgt, post.log_Z
 
-    @torch.no_grad()
-    def _canonical_nll(self, rows: Tensor) -> float:
-        """Data NLL on this batch in eval mode and with no penalty.
-
-        The optimised loss moves for reasons that have nothing to do with the
-        model getting better while ``lam_spread`` anneals, so the training
-        curve is not comparable across a run.  This is the same batch scored
-        under conditions that never change.
-        """
-        self.scale.eval()
-        try:
-            _, _, tgt, nll, *_ = self._forward(rows, grad=False)
-        finally:
-            self.scale.train()
-        self.scale.clear()
-        return float(nll.item()) / max(int(tgt.valid.sum()), 1)
-
     def step(self, rows: Tensor) -> dict:
         self.scale.train()
         if self.cfg.warmup_steps > 0 or self.cfg.lr_schedule != "constant":
@@ -767,18 +699,8 @@ class AmortizedTrainer:
         io_wait = (self._store.store.wait_s - io0) if self._store is not None else 0.0
 
         n_used = int(tgt.valid.sum())
-        nll_data = float(nll.detach().item()) / max(n_used, 1)   # no penalty
+        nll_data = float(nll.detach().item()) / max(n_used, 1)
         loss = nll / max(n_used, 1)
-        lam_s = self._lam_spread()
-        if lam_s > 0:
-            loss = loss + lam_s * pred.log_w.mean()
-        shape_rec = {}
-        if self.cfg.lam_shape_prior > 0:
-            mix = pred.mix if pred.mix is not None else pack_single(pred.log_alpha, pred.beta, pred.log_alpha_hi)
-            kl, sd_bar, out_bar = shape_prior_kl(mix, pred.log_e_s, n_sample=self.cfg.shape_prior_sample)
-            loss = loss + self.cfg.lam_shape_prior * kl
-            shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar,
-                         "shape_prior_off_grid": out_bar}
         self.opt.zero_grad(set_to_none=True)
         if self.cfg.posterior_prior == "wilson" and self.targets[0].wilson_coef_param is None:
             raise RuntimeError("the Wilson surface is trained with the network and needs a "
@@ -786,12 +708,11 @@ class AmortizedTrainer:
         loss.backward()
         # everything the record needs from the batch's forward tensors, then the
         # tensors themselves are released before the encoder's backward pass
-        loss_total, loss_finite = float(loss.item()), bool(torch.isfinite(loss.detach()))
+        loss_finite = bool(torch.isfinite(loss.detach()))
         n_crystals, n_floored = int(meta.crystal_id.unique().numel()), tgt.n_floored
         diag = (self._diagnostics(meta, pred, tgt, rows)
                 if self.step_i % self.cfg.log_every == 0 else {})
-        mix = kl = None
-        del meta, pred, tgt, nll, n_ph, bg, sigma, loss, mix, kl
+        del meta, pred, tgt, nll, n_ph, bg, sigma, loss
         if hasattr(self.scale, "encoder_backward"):
             self.scale.encoder_backward()
         gn = grad_norms(self.scale)
@@ -827,13 +748,7 @@ class AmortizedTrainer:
         rec = {
             "step": self.step_i,
             "phase": "train",
-            # What the optimiser actually minimised (penalty included).
-            "loss_total": loss_total,
-            # ``nll_per_obs`` is the DATA term in both train and held-out
-            # records, the penalty-free objective ``evaluate()`` writes under
-            # the same key.  ``loss_total`` includes the spread penalty
-            # (negative, since log w < 0), which can fall while the data term
-            # rises and would otherwise look like training progress.
+            # the same quantity ``evaluate()`` writes for the held-out set
             "nll_per_obs": nll_data,
             "nll_data": nll_data,
             # Under ``loss="evidence"`` the numerator is a sum over
@@ -855,8 +770,6 @@ class AmortizedTrainer:
             "n_crystals": n_crystals,
             "n_used": n_used,
             "n_floored": n_floored,
-            "lam_spread": lam_s,
-            **shape_rec,
             "lr": float(self.opt.param_groups[0]["lr"]),
             "sec": time.time() - t0,
             # time this update waited for its observations to be read from disk
@@ -864,9 +777,6 @@ class AmortizedTrainer:
             **gn,
         }
         if self.step_i % self.cfg.log_every == 0:
-            # No-penalty score on this same batch: the only training number
-            # that is comparable across the whole run.
-            rec["nll_canonical"] = self._canonical_nll(rows)
             rec.update(diag)
         self.step_i += 1
         self.logger.log(rec)
