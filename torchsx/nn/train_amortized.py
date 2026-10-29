@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -334,7 +334,6 @@ class TrainConfig:
     outdir: str = "."
     device: str = "cuda"
     shell_bins: int = 10
-    extra: dict = field(default_factory=dict)
 
 
 class AmortizedTrainer:

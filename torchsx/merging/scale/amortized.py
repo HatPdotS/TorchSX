@@ -1,22 +1,15 @@
-"""Amortised scale model — one network is the sole scale source.
+"""Amortised scale model: one network is the only source of scale.
 
-Drops into the existing pipeline as a :class:`ScaleModel`, so the production
-merge, the posterior moments and the residual diagnostics all consume it
-unchanged.  It additionally owns a
-:class:`~torchsx.merging.scatter.predicted.PredictedGenGaussScatter`, because
-the same forward pass produces the scale *and* the scatter shape, and
-recomputing the network for each would double the cost.
-
-``ScaleBPerCrystal`` is deliberately **not** composed with this.  Two competing
-scale sources — one parametric, one flexible — is an identifiability mess; the
-amortised model must be the only place a scale can come from.
+One forward pass produces each observation's ``log K`` and its scatter
+parameters, which :meth:`AmortizedScale.prime` installs into the predicted
+scatter the quadrature integrates over.
 
 Usage::
 
     scale = AmortizedScale.from_prep(prep)
-    pred  = scale.prime(meta)                 # one forward; installs the scatter
-    log_K = pred.log_K                        # or scale.log_k(params, meta)
-    nll   = quadrature.marginalize_signal(scale.scatter, likelihood, ...)
+    pred  = scale.prime(meta)        # one forward: pred.log_K, scatter installed
+    ...                              # integrate over scale.scatter
+    scale.clear()
 """
 
 from __future__ import annotations
@@ -24,11 +17,10 @@ from __future__ import annotations
 import dataclasses
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from torchsx.merging.observations import ObsInfo, PreparedObs
-from torchsx.merging.parameters import Parameters
-from torchsx.merging.scale.base import ScaleModel
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 from torchsx.nn.deepsets import DeepSetsEncoder, ScaleEncoder
@@ -39,7 +31,7 @@ from torchsx.nn.obs_features import ObsFeatureSpec
 __all__ = ["AmortizedScale"]
 
 
-class AmortizedScale(ScaleModel):
+class AmortizedScale(nn.Module):
     """Network-predicted ``log K`` (and scatter) per observation.
 
     Parameters
@@ -52,7 +44,7 @@ class AmortizedScale(ScaleModel):
     heads
         :class:`~torchsx.nn.heads.ScaleHeads`.
     n_crystals
-        Group count for the leave-one-out pool.
+        Number of crystals, the encoder's group count.
     anchor_log_k
         Pin the gauge by subtracting a batch location statistic from
         ``log K``.  ``K → cK, I0 → I0/c`` leaves the likelihood exactly
@@ -114,8 +106,6 @@ class AmortizedScale(ScaleModel):
                             fixed_gaussian=heads.mixture.shape in ("gaussian", "partiality"),
                         ) if fam == "mixture"
                         else PredictedGenGaussScatter())
-        self._cached_obs_id: Tensor | None = None
-        self._cached_pred: ScalePrediction | None = None
 
     # ── construction ───────────────────────────────────────────────────
 
@@ -223,14 +213,6 @@ class AmortizedScale(ScaleModel):
             n_crystals=prep.obs_info.n_crystals,
             anchor_log_k=anchor_log_k,
             anchor_stat=anchor_stat,
-        )
-
-    @classmethod
-    def from_obs_info(cls, obs_info: ObsInfo, **kwargs) -> "AmortizedScale":
-        raise TypeError(
-            "AmortizedScale needs the full PreparedObs (it reads I, bg and the "
-            "Miller table for its context features). Use "
-            "AmortizedScale.from_prep(prep) and pass the instance to Merger."
         )
 
     # ── forward ────────────────────────────────────────────────────────
@@ -610,12 +592,7 @@ class AmortizedScale(ScaleModel):
         return smooth
 
     def prime(self, meta: ObsInfo) -> ScalePrediction:
-        """Predict, install into the scatter, and cache for :meth:`log_k`.
-
-        Call once per batch/chunk.  The cache is keyed on the ``obs_id`` tensor
-        so a mismatched later call raises rather than silently returning a
-        stale prediction.
-        """
+        """Predict and install the scatter parameters; call once per batch or chunk."""
         pred = self.predict(meta)
         if pred.mix is not None:
             self.scatter.set_prediction(meta.obs_id, pred.mix)
@@ -623,28 +600,8 @@ class AmortizedScale(ScaleModel):
             self.scatter.set_prediction(
                 meta.obs_id, pred.log_alpha, torch.log(pred.beta), pred.log_alpha_hi
             )
-        self._cached_obs_id = meta.obs_id
-        self._cached_pred = pred
         return pred
 
     def clear(self) -> None:
-        self._cached_obs_id = None
-        self._cached_pred = None
         self._deferred = None
         self.scatter.clear_prediction()
-
-    def log_k(
-        self,
-        params: Parameters,
-        meta: ObsInfo,
-        obs_range: tuple[int, int] | None = None,
-    ) -> Tensor:
-        del params, obs_range          # addressed by obs_id, not position
-        if (
-            self._cached_pred is not None
-            and self._cached_obs_id is not None
-            and self._cached_obs_id.shape == meta.obs_id.shape
-            and torch.equal(self._cached_obs_id, meta.obs_id)
-        ):
-            return self._cached_pred.log_K
-        return self.predict(meta).log_K

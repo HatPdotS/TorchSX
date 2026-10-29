@@ -3,7 +3,7 @@
 Three quantities per observation:
 
 ======  ==========================================================
-log K   the scale — this is the ``ScaleModel.log_k`` contract
+log K   the scale
 log w   scatter **width**, as the actual SD of the log-scatter
 β       scatter **shape**, via a bounded sigmoid
 ======  ==========================================================
