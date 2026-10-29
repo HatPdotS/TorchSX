@@ -39,7 +39,6 @@ from torchsx.merging.observations import PreparedObs
 from torchsx.nn.merge_target import MergeTargetOut, unity_merge
 from torchsx.nn.metrics import (
     MetricLogger,
-    _diagnostic_quantile,
     calibration_metrics,
     condition_auc,
     grad_norms,
@@ -918,14 +917,6 @@ class AmortizedTrainer:
             # detached gradient is wrong, not merely unnecessary.
             out["posterior_edge_mass_med"] = float(em.median().item())
             out["posterior_edge_mass_max"] = float(em.max().item())
-        gm = getattr(self.objective, "last_grid_mass", None)
-        if gm is not None:
-            # Share of the scatter density actually inside the quadrature grid.
-            # Near 1 => the truncation correction is immaterial; well below 1
-            # => the scatter is wider than the grid can represent and the
-            # likelihood is only a density because we divided this out.
-            out["grid_mass_median"] = float(gm.median().item())
-            out["grid_mass_p01"] = float(_diagnostic_quantile(gm, 0.01).item())
         _m_, _n_, _b_, _s_ = self._batch(rows)
         ios = (_n_ - _b_) / _s_
         shell = self.shell_of_hkl.to(meta.hkl_idx.device)[meta.hkl_idx]

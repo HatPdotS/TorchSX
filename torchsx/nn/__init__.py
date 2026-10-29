@@ -21,21 +21,19 @@ from torchsx.nn.metrics import (
     hkl_permutation_sensitivity,
     scale_metrics,
 )
-from torchsx.nn.objective import AgreementNLL, MarginalNLL
+from torchsx.nn.objective import MarginalNLL
 from torchsx.nn.obs_features import ObsFeatureSpec
-from torchsx.nn.pad import group_offsets_from_counts, pack, unpack
 from torchsx.nn.pooling import leave_one_out_mean, loo_weighted_mean
 from torchsx.nn.train_amortized import AmortizedTrainer, CrystalIndex, TrainConfig
 
 __all__ = [
-    "group_offsets_from_counts", "pack", "unpack",
     # amortised scale model
     "leave_one_out_mean", "loo_weighted_mean",
     "ScaleEncoder", "ResidualFF", "DeepSetsEncoder", "FoldTransformerEncoder",
     "ScaleHeads", "ScalePrediction",
     "ObsFeatureSpec",
     "MergeTargetOut",
-    "MarginalNLL", "AgreementNLL",
+    "MarginalNLL",
     "MetricLogger", "calibration_metrics", "scale_metrics",
     "condition_auc", "hkl_permutation_sensitivity",
     "AmortizedTrainer", "TrainConfig", "CrystalIndex",
