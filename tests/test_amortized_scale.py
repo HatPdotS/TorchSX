@@ -120,28 +120,19 @@ def test_features_are_normalised_against_the_full_dataset():
 
 def test_init_gives_unity_scale_and_seeded_scatter():
     """Zero-init heads -> K == 1, so the first merge is a unity merge."""
+    from torchsx.merging.scatter.mixture import split_mix
     prep = _toy_prep()
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
     pred = scale.predict(prep.obs_info)
     assert torch.allclose(pred.log_K, torch.zeros_like(pred.log_K), atol=1e-6)
-    assert torch.allclose(pred.log_w.exp(), torch.full_like(pred.log_w, 1.65), atol=1e-5)
-    assert torch.allclose(pred.beta, torch.full_like(pred.beta, 2.0), atol=1e-5)
-    # beta = 2 is Gaussian-in-log, so alpha = w*sqrt(2)
-    torch.testing.assert_close(
-        pred.log_alpha.exp(),
-        torch.full_like(pred.log_alpha, 1.65 * math.sqrt(2)),
-        rtol=1e-4, atol=1e-4,
-    )
-
-
-def test_ablation_switches_hold_width_and_shape_fixed():
-    prep = _toy_prep()
-    scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2, predict_width=False, predict_shape=False
-    )
-    names = {n for n, _ in scale.heads.named_parameters()}
-    assert "head_log_w.weight" not in names and "head_beta.weight" not in names
-    assert {"global_log_w", "global_beta_raw"} <= names
+    log_pi, offset, la_lo, la_hi, log_beta = split_mix(pred.mix, scale.heads.n_components)
+    # Gaussian components (beta = 2, so alpha = w * sqrt(2)); component 0 is
+    # centred, at width w_init, and carries the most weight
+    assert torch.equal(log_beta, torch.full_like(log_beta, math.log(2.0)))
+    for la in (la_lo[:, 0], la_hi[:, 0]):
+        torch.testing.assert_close(la.exp(), torch.full_like(la, 1.65 * math.sqrt(2)), rtol=1e-4, atol=1e-4)
+    assert torch.equal(offset[:, 0], torch.zeros_like(offset[:, 0]))
+    assert bool((log_pi.argmax(dim=1) == 0).all())
 
 
 # ── the leakage guarantee, at model level ──────────────────────────────
@@ -258,7 +249,7 @@ def test_marginal_nll_backward_reaches_the_network():
     # weights first (they do get gradient, asserted below).  Perturb them here
     # so this test exercises the full graph rather than that first step.
     torch.manual_seed(3)
-    for h in ("head_log_K", "head_log_w", "head_beta"):
+    for h in ("head_log_K", "head_log_w", "mixture"):
         torch.nn.init.normal_(getattr(scale.heads, h).weight, std=0.1)
 
     meta = prep.obs_info
@@ -266,7 +257,7 @@ def test_marginal_nll_backward_reaches_the_network():
     n_ph = (prep.I_obs + prep.bg).clamp(min=0)
     log_mean = params.log_I0[meta.hkl_idx] + pred.log_K
 
-    log_p = quad.marginalize_signal(
+    log_p = quad.marginalize_mixture(
         scale.scatter, lik, log_mean, n_ph, prep.bg, params, meta,
         obs_range=(0, prep.n_obs_total),
     )
@@ -277,7 +268,7 @@ def test_marginal_nll_backward_reaches_the_network():
     assert any("encoder" in n for n in got), "no gradient reached the encoder"
     assert any("head_log_K" in n for n in got), "no gradient reached the log K head"
     assert any("head_log_w" in n for n in got), "no gradient reached the width head"
-    assert any("head_beta" in n for n in got), "no gradient reached the shape head"
+    assert any("heads.mixture" in n for n in got), "no gradient reached the mixture head"
 
 
 def test_zero_init_still_bootstraps_the_heads():
@@ -295,7 +286,7 @@ def test_zero_init_still_bootstraps_the_heads():
     meta = prep.obs_info
     pred = scale.prime(meta)
     log_mean = params.log_I0[meta.hkl_idx] + pred.log_K
-    log_p = quad.marginalize_signal(
+    log_p = quad.marginalize_mixture(
         scale.scatter, Poisson(), log_mean,
         (prep.I_obs + prep.bg).clamp(min=0), prep.bg, params, meta,
         obs_range=(0, prep.n_obs_total),
@@ -306,21 +297,15 @@ def test_zero_init_still_bootstraps_the_heads():
 
 
 def test_scatter_hook_is_what_the_quadrature_reads():
-    """The predicted (alpha, beta) must actually reach the density."""
+    """The predicted mixture must actually reach the density."""
     prep = _toy_prep()
-    params = _params(prep)
     scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
     meta = prep.obs_info
     pred = scale.prime(meta)
-
-    la, lb = scale.scatter.log_alpha_beta_obs(params, meta)
-    torch.testing.assert_close(la, pred.log_alpha)
-    torch.testing.assert_close(lb, torch.log(pred.beta))
-
+    torch.testing.assert_close(scale.scatter.mixture_obs(meta), pred.mix)
     # ...and under an arbitrary gather it still resolves by obs_id.
     idx = torch.tensor([31, 4, 77, 12])
-    la_g, _ = scale.scatter.log_alpha_beta_obs(params, meta.gather(idx))
-    torch.testing.assert_close(la_g, pred.log_alpha[idx])
+    torch.testing.assert_close(scale.scatter.mixture_obs(meta.gather(idx)), pred.mix[idx])
 
 
 def test_stale_prediction_raises_rather_than_silently_resolving():
@@ -457,8 +442,7 @@ def test_encoder_chunking_is_exact_in_value_and_gradient():
         scale.set_encoder_chunking(chunk)
         scale.zero_grad(set_to_none=True)
         pred = scale.predict(meta)
-        loss = (pred.log_K.square().sum() + pred.log_w.sum()
-                + pred.beta.sum() + pred.log_alpha.sum())
+        loss = (pred.log_K.square().sum() + pred.log_w.sum() + pred.mix.sum())
         loss.backward()
         g = torch.cat([p.grad.flatten() for p in scale.parameters()
                        if p.grad is not None])
@@ -636,8 +620,7 @@ def test_fold_chunking_is_exact_in_value_and_gradient(split):
         scale.set_encoder_chunking(chunk)
         scale.zero_grad(set_to_none=True)
         pred = scale.predict(meta)
-        loss = (pred.log_K.square().sum() + pred.log_w.sum()
-                + pred.beta.sum() + pred.log_alpha.sum())
+        loss = (pred.log_K.square().sum() + pred.log_w.sum() + pred.mix.sum())
         loss.backward()
         g = torch.cat([p.grad.flatten() for p in scale.parameters()
                        if p.grad is not None])
@@ -733,10 +716,8 @@ def test_basis_anchor_removes_a_planted_common_mode_exactly():
     phi_b = basis.phi[meta.hkl_idx]
     c = torch.tensor([0.7, -2.0, 1.3])
     from torchsx.nn.heads import ScalePrediction
-    planted = ScalePrediction(
-        log_K=pred.log_K + phi_b @ c, log_w=pred.log_w, beta=pred.beta,
-        log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
-    )
+    planted = ScalePrediction(log_K=pred.log_K + phi_b @ c, log_w=pred.log_w,
+                              log_e_s=pred.log_e_s, mix=pred.mix)
     # The toy crystals each see a few reflections only, so the two-way fit separates
     # crystal effects from the smooth term approximately; on a full-coverage batch
     # (next test) it is exact.
@@ -771,7 +752,7 @@ def test_basis_anchor_is_exact_on_full_coverage_and_keeps_crystal_scales():
     raw = torch.randn(meta.hkl_idx.numel()) * 0.3
     zeros = torch.zeros_like(raw)
     def pred_of(x):
-        return ScalePrediction(log_K=x, log_w=zeros, beta=zeros + 1, log_alpha=zeros, log_e_s=zeros, log_alpha_hi=zeros)
+        return ScalePrediction(log_K=x, log_w=zeros, log_e_s=zeros, mix=zeros[:, None])
     ref = scale._anchor(pred_of(raw), meta).log_K
     # (a) a planted common mode phi @ c is removed exactly
     c = torch.tensor([0.7, -2.0, 1.3])
@@ -807,8 +788,7 @@ def test_basis_anchor_keeps_per_crystal_differences():
     from torchsx.nn.heads import ScalePrediction
     pred = scale.predict(meta)
     shifted = scale._anchor(ScalePrediction(
-        log_K=pred.log_K + offsets, log_w=pred.log_w, beta=pred.beta,
-        log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
+        log_K=pred.log_K + offsets, log_w=pred.log_w, log_e_s=pred.log_e_s, mix=pred.mix,
     ), meta).log_K
     # Two observations of the same reflection share a basis row, so their
     # difference is untouched by the projection: it changes by the crystal offsets alone.
@@ -845,10 +825,8 @@ def test_basis_anchor_gradient_ignores_the_common_mode():
     torch.manual_seed(13)
     raw = torch.randn(meta.hkl_idx.numel()) * 0.3
     zeros = torch.zeros_like(raw)
-    planted = ScalePrediction(
-        log_K=raw + basis.phi[meta.hkl_idx] @ c, log_w=zeros, beta=zeros + 1,
-        log_alpha=zeros, log_e_s=zeros, log_alpha_hi=zeros,
-    )
+    planted = ScalePrediction(log_K=raw + basis.phi[meta.hkl_idx] @ c, log_w=zeros,
+                              log_e_s=zeros, mix=zeros[:, None])
     loss = (scale._anchor(planted, meta).log_K ** 2).sum()
     loss.backward()
     assert c.grad.abs().max() < 1e-4

@@ -97,7 +97,7 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
     args=train._build_parser().parse_args(['x.stream','-o',str(tmp_path),'--device','cpu'])
     host,_,scale,obj,S=P.build_stack(bundle,args,verbose=False)
     assert host is prep
-    assert (scale.heads.scatter_family,scale.heads.n_components,scale.heads.mixture.shape)==('mixture',4,'gaussian')
+    assert scale.heads.n_components==4
     assert obj.likelihood.bg_mean_offset==0.125
     assert S['prior']=='wilson'
     oldscale,oldobj,tr=_stack(prep,params,tmp_path)
@@ -105,7 +105,6 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
         ck=torch.load(tr.save_best(),weights_only=False)
         _,_,rebuilt,oldlik,_=P.build_stack(bundle,args,ckpt=ck,verbose=False)
         rebuilt.load_state_dict(ck['state_dict'])
-        assert rebuilt.heads.scatter_family=='gengauss'
         assert oldlik.likelihood.bg_mean_offset==0.0
     finally:
         tr.close()

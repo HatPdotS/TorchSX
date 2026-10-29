@@ -174,26 +174,21 @@ def test_split_triton_asym_matches_eager(bvf):
     assert float((g_s[1] - g_a[1] - g_a[3]).abs().max()) < 1e-3 * float(g_s[1].abs().max()) + 1e-4
 
 
-# ---------------------------------------------------------------- heads + miss
+# ---------------------------------------------------------------- predicted scatter + miss
 
-def test_heads_skew_zero_init_is_symmetric_and_prime_passes_widths():
-    from torchsx.nn.heads import ScaleHeads
-    torch.manual_seed(6)
-    z = torch.randn(50, 16)
-    sym = ScaleHeads(16, w_init=1.65, beta_init=1.0, predict_skew=False)(z)
-    skw = ScaleHeads(16, w_init=1.65, beta_init=1.0, predict_skew=True)(z)
-    assert skw.log_alpha_hi is not None
-    assert torch.allclose(skw.log_alpha, sym.log_alpha) and torch.allclose(skw.log_alpha_hi, sym.log_alpha)
-    assert torch.allclose(skw.log_e_s, sym.log_e_s, atol=1e-6)
+def test_predicted_scatter_passes_both_widths():
     from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
+    torch.manual_seed(6)
+    la = torch.randn(50) * 0.1 + math.log(1.65 * math.sqrt(2.0))
+    lb = torch.full((50,), math.log(2.0))
     sc = PredictedGenGaussScatter()
     ids = torch.arange(50)
-    sc.set_prediction(ids, skw.log_alpha, skw.beta.log(), skw.log_alpha_hi + 0.3)
+    sc.set_prediction(ids, la, lb, la + 0.3)
 
     class M:  # minimal meta
         obs_id = ids[::2]
-    assert torch.allclose(sc.log_alpha_hi_obs(None, M), skw.log_alpha[::2] + 0.3)
-    sc.set_prediction(ids, skw.log_alpha, skw.beta.log())
+    assert torch.allclose(sc.log_alpha_hi_obs(None, M), la[::2] + 0.3)
+    sc.set_prediction(ids, la, lb)
     assert sc.log_alpha_hi_obs(None, M) is None
 
 

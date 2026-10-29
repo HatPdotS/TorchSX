@@ -726,8 +726,6 @@ class AmortizedTrainer:
             # which is invisible in the total.
             "median_w": float(pred.log_w.exp().median().item()),
             "mean_log_w": float(pred.log_w.mean().item()),
-            "median_beta": float(pred.beta.median().item()),
-            "mean_log_alpha": float(pred.log_alpha.mean().item()),
             # F. is the width head doing anything?
             "var_frac_scatter": float(tgt.var_frac_scatter.median().item()),
             # The in-batch merge needs within-batch agreement: with n_hkl
@@ -775,32 +773,24 @@ class AmortizedTrainer:
             if int((dec == d).sum()) > 8 else float("nan")
             for d in range(10)
         ]
-        out["median_beta_by_isigma_decile"] = [
-            float(pred.beta[dec == d].median().item())
-            if int((dec == d).sum()) > 8 else float("nan")
-            for d in range(10)
-        ]
         out["var_frac_scatter_by_isigma_decile"] = [
             float(tgt.var_frac_scatter[dec == d].median().item())
             if int((dec == d).sum()) > 8 else float("nan")
             for d in range(10)
         ]
-        if pred.mix is not None:
-            from torchsx.merging.scatter.mixture import split_mix
-            from torchsx.merging.scatter.mixture import N_BLOCKS
-            K = pred.mix.shape[1] // N_BLOCKS
-            log_pi, offset, la_lo, la_hi, lb = split_mix(pred.mix.detach(), K)
-            out["mix_weight_median"] = [float(v) for v in log_pi.exp().median(dim=0).values]
-            out["mix_offset_median"] = [float(v) for v in offset.median(dim=0).values]
-            out["mix_alpha_lo_median"] = [float(v) for v in la_lo.exp().median(dim=0).values]
-            out["mix_alpha_hi_median"] = [float(v) for v in la_hi.exp().median(dim=0).values]
-            out["mix_beta_median"] = [float(v) for v in lb.exp().median(dim=0).values]
-            out["mix_log_e_s_median"] = float(pred.log_e_s.median().item())
-            out["mix_weight_median_by_isigma_decile"] = [
-                [float(v) for v in log_pi[dec == d].exp().median(dim=0).values]
-                if int((dec == d).sum()) > 8 else [float("nan")] * K
-                for d in range(10)
-            ]
+        from torchsx.merging.scatter.mixture import split_mix
+        K = self.scale.heads.n_components
+        log_pi, offset, la_lo, la_hi, _ = split_mix(pred.mix.detach(), K)
+        out["mix_weight_median"] = [float(v) for v in log_pi.exp().median(dim=0).values]
+        out["mix_offset_median"] = [float(v) for v in offset.median(dim=0).values]
+        out["mix_alpha_lo_median"] = [float(v) for v in la_lo.exp().median(dim=0).values]
+        out["mix_alpha_hi_median"] = [float(v) for v in la_hi.exp().median(dim=0).values]
+        out["mix_log_e_s_median"] = float(pred.log_e_s.median().item())
+        out["mix_weight_median_by_isigma_decile"] = [
+            [float(v) for v in log_pi[dec == d].exp().median(dim=0).values]
+            if int((dec == d).sum()) > 8 else [float("nan")] * K
+            for d in range(10)
+        ]
         out.update(scale_metrics(
             pred.log_K, meta.crystal_id, meta.n_crystals,
             features={
@@ -952,8 +942,6 @@ class AmortizedTrainer:
                     "self_features": list(getattr(self.scale.features, "self_features", ())),
                     "context_features": list(getattr(self.scale.features, "context_features", ())),
                     "crystal_features": list(getattr(self.scale.features, "crystal_features", ())),
-                    "predict_width": bool(getattr(self.scale.heads, "predict_width", True)),
-                    "predict_shape": bool(getattr(self.scale.heads, "predict_shape", True)),
                     "anchor_log_k": bool(getattr(self.scale, "anchor_log_k", True)),
                     "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
                     "pseudo_translation": (
@@ -965,11 +953,7 @@ class AmortizedTrainer:
                 # scatter family and miss component, so a merge rebuilds the
                 # SAME likelihood the network was fitted under
                 "scatter": {
-                    "predict_skew": bool(getattr(self.scale.heads, "predict_skew", False)),
-                    "family": getattr(self.scale.heads, "scatter_family", "gengauss"),
-                    "n_components": int(getattr(self.scale.heads, "n_components", 1)),
-                    "component_shape": (self.scale.heads.mixture.shape
-                                        if getattr(self.scale.heads, "scatter_family", "gengauss") == "mixture" else None),
+                    "n_components": int(self.scale.heads.n_components),
                     "miss_logit": (None if getattr(self.objective, "miss_logit", None) is None
                                    else float((getattr(self, "_best_obj_state", None) or {}).get(
                                        "miss_logit", self.objective.miss_logit.detach()))),

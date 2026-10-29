@@ -459,6 +459,6 @@ def test_fold_predictions_without_autograd_run_flex_and_match_the_masked_kernel(
         with torch.no_grad():
             out[flex] = scale.predict(meta)
     assert not out[True].log_K.requires_grad and out[False].log_K.std() > 0
-    for name in ("log_K", "log_w", "beta"):
+    for name in ("log_K", "log_w", "log_e_s"):
         a, b = getattr(out[True], name), getattr(out[False], name)
         assert (a - b).norm() / b.norm() < 2e-2, name

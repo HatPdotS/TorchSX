@@ -22,7 +22,6 @@ from torch import Tensor
 
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
-from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 from torchsx.nn.deepsets import DeepSetsEncoder, ScaleEncoder
 from torchsx.nn.fold_transformer import FoldTransformerEncoder, scatter_positions
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
@@ -100,12 +99,7 @@ class AmortizedScale(nn.Module):
                 f"anchor_stat must be 'median', 'mean' or 'basis', got {anchor_stat!r}"
             )
         self.anchor_stat = anchor_stat
-        fam = getattr(heads, "scatter_family", "gengauss")
-        self.scatter = (PredictedMixtureScatter(
-                            heads.n_components,
-                            fixed_gaussian=heads.mixture.shape in ("gaussian", "partiality"),
-                        ) if fam == "mixture"
-                        else PredictedGenGaussScatter())
+        self.scatter = PredictedMixtureScatter(heads.n_components, fixed_gaussian=True)
 
     # ── construction ───────────────────────────────────────────────────
 
@@ -124,16 +118,10 @@ class AmortizedScale(nn.Module):
         peer_heads: int = 8,
         peer_dim: int | list[int] | None = None,
         w_init: float = 1.65,
-        beta_init: float = 2.0,
-        predict_width: bool = True,
-        predict_shape: bool = True,
-        predict_skew: bool = False,
+        n_components: int = 4,
         anchor_log_k: bool = True,
         anchor_stat: str = "median",
         dropout: float = 0.0,
-        scatter_family: str = "gengauss",
-        n_components: int = 3,
-        component_shape: str = "shared",
         self_features: tuple[str, ...] | None = None,
         context_features: tuple[str, ...] | None = None,
         crystal_features: tuple[str, ...] | None = None,
@@ -180,17 +168,7 @@ class AmortizedScale(nn.Module):
                 peer_heads=peer_heads,
                 peer_dim=peer_dim,
             )
-        heads = ScaleHeads(
-            d_model,
-            w_init=w_init,
-            beta_init=beta_init,
-            predict_width=predict_width,
-            predict_shape=predict_shape,
-            predict_skew=predict_skew,
-            scatter_family=scatter_family,
-            n_components=n_components,
-            component_shape=component_shape,
-        )
+        heads = ScaleHeads(d_model, w_init=w_init, n_components=n_components)
         return cls(
             features, enc, heads,
             n_crystals=prep.obs_info.n_crystals,
@@ -334,13 +312,7 @@ class AmortizedScale(nn.Module):
 
     def _prediction_names(self) -> list[str]:
         """The :class:`ScalePrediction` fields the heads fill."""
-        mixture = getattr(self.heads, "scatter_family", "gengauss") == "mixture"
-        names = ["log_K", "log_w", "beta", "log_alpha", "log_e_s"]
-        if self.heads.predict_skew or mixture:
-            names.append("log_alpha_hi")
-        if mixture:
-            names.append("mix")
-        return names
+        return ["log_K", "log_w", "log_e_s", "mix"]
 
     def _predict_fold(self, meta: ObsInfo) -> ScalePrediction:
         """The fold transformer and the heads, one packed block at a time.
@@ -520,11 +492,7 @@ class AmortizedScale(nn.Module):
         else:
             loc = pred.log_K.median() if self.anchor_stat == "median" else pred.log_K.mean()
             log_K = pred.log_K - loc
-        return ScalePrediction(
-            log_K=log_K, log_w=pred.log_w, beta=pred.beta,
-            log_alpha=pred.log_alpha, log_e_s=pred.log_e_s,
-            log_alpha_hi=pred.log_alpha_hi, mix=pred.mix,
-        )
+        return dataclasses.replace(pred, log_K=log_K)
 
     def _smooth_common_mode(self, log_K: Tensor, meta: ObsInfo, sweeps: int = 3) -> Tensor:
         """``phi(h) @ beta`` from the two-way fit ``log K ~ c_crystal + phi(h) @ beta``.
@@ -559,12 +527,7 @@ class AmortizedScale(nn.Module):
     def prime(self, meta: ObsInfo) -> ScalePrediction:
         """Predict and install the scatter parameters; call once per batch or chunk."""
         pred = self.predict(meta)
-        if pred.mix is not None:
-            self.scatter.set_prediction(meta.obs_id, pred.mix)
-        else:
-            self.scatter.set_prediction(
-                meta.obs_id, pred.log_alpha, torch.log(pred.beta), pred.log_alpha_hi
-            )
+        self.scatter.set_prediction(meta.obs_id, pred.mix)
         return pred
 
     def clear(self) -> None:
