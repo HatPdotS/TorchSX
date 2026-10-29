@@ -57,17 +57,12 @@ def main(argv: list[str] | None = None) -> None:
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     tr.set_reciprocal_basis(S["basis"])
     restore_wilson_surface(tr, prep, ckpt, names=bundle.split_names)
-    # Checkpoints written before the data buffers were made non-persistent
-    # carry the training set's own _I/_bg/_sigma, whose length is that data
-    # set's observation count; drop them rather than refuse to merge a
-    # different set.  Everything the model actually needs must be present.
-    want = scale.state_dict()
-    have = {k: v for k, v in ckpt["state_dict"].items() if k in want}
-    missing = [k for k in want if k not in have]
-    if missing:
-        raise SystemExit(f"checkpoint is missing {len(missing)} parameters, "
-                         f"first {missing[:3]}")
-    scale.load_state_dict(have)
+    # Strict: a checkpoint from another version of the model fails here rather
+    # than merging with some of its weights silently left out.
+    try:
+        scale.load_state_dict(ckpt["state_dict"])
+    except RuntimeError as exc:
+        raise SystemExit(f"checkpoint does not match this version's model; retrain it.\n{exc}")
     # The network weights, the fitted feature standardisation and the Wilson
     # surface come from the checkpoint; everything per reflection is formed
     # from the supplied data, as in training.
