@@ -46,8 +46,7 @@ def main(argv: list[str] | None = None) -> None:
     prep, params, scale, obj, S = P.build_stack(bundle, args, ckpt=ckpt)
 
     cfg = TrainConfig(
-        max_obs_per_batch=P.READOUT_MAX_OBS, epochs=0,
-        posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
+        max_obs_per_batch=P.READOUT_MAX_OBS, posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
         posterior_n_sigma=S["n_sigma"], posterior_max_halfwidth=S["max_halfwidth"],
         stream_batches=True, encoder_chunk_crystals=400,
         locate_windows=(8.0, 1.0, 0.125),

@@ -49,7 +49,7 @@ def test_a_batch_result_depends_on_the_batch_alone(tmp_path):
     tr = AmortizedTrainer(
         prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
         config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
-                           posterior_k_coarse=5, posterior_m_fine=17, split_half_every=0),
+                           posterior_k_coarse=5, posterior_m_fine=17),
     )
     try:
         crystals = tr.train_crystals[tr.condition[tr.train_crystals] == 0][:6]

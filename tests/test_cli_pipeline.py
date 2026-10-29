@@ -31,12 +31,12 @@ from tests.test_amortized_training import _synthetic
 
 
 def _stack(prep, params, tmp_path, *, skew=True, n_cond=1):
-    kw = dict(d_model=32, n_layers=2, include_hkl=False, predict_shape=False,
+    kw = dict(d_model=32, n_layers=2, predict_shape=False,
               beta_init=1.0, w_init=1.65, predict_skew=skew)
     scale = AmortizedScale.from_prep(prep, **kw)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
     cfg = TrainConfig(
-        max_obs_per_batch=6000, epochs=0, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
+        max_obs_per_batch=6000, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
         posterior_prior="wilson",
         posterior_k_coarse=15, posterior_m_fine=65, posterior_n_sigma=8.0,
         device="cpu", outdir=str(tmp_path),
@@ -546,7 +546,7 @@ def test_merge_survives_a_non_finite_batch(tmp_path):
 
 def _trainer_from_stack(prep, params, scale, obj, S):
     cfg = TrainConfig(
-        epochs=0, posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
+        posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
         posterior_k_coarse=9, posterior_m_fine=33, device="cpu", heldout_frac=0.1,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)

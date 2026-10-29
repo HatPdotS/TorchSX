@@ -82,7 +82,7 @@ def _trainer(tmp_path, **cfg_kw):
     return AmortizedTrainer(
         prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
         config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
-                           posterior_k_coarse=5, posterior_m_fine=17, split_half_every=0, **cfg_kw),
+                           posterior_k_coarse=5, posterior_m_fine=17, **cfg_kw),
     )
 
 

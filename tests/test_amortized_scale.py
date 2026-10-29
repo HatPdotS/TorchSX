@@ -408,7 +408,7 @@ def test_constant_features_are_zeroed_not_standardised():
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        spec = ObsFeatureSpec(prep, include_hkl=False)
+        spec = ObsFeatureSpec(prep)
     assert any("carry no information" in str(c.message) for c in caught)
 
     x_self, x_ctx, _ = spec.build(prep.obs_info)
@@ -423,7 +423,7 @@ def test_varying_features_are_still_standardised():
     from torchsx.nn.obs_features import ObsFeatureSpec
 
     prep = _toy_prep()
-    spec = ObsFeatureSpec(prep, include_hkl=False)
+    spec = ObsFeatureSpec(prep)
     x_self, _, _ = spec.build(prep.obs_info)
     i = spec.self_features.index("s_sq")
     assert x_self[:, i].std() > 0.5

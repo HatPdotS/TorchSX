@@ -18,7 +18,6 @@ from torchsx.nn.metrics import (
     MetricLogger,
     calibration_metrics,
     condition_auc,
-    hkl_permutation_sensitivity,
     scale_metrics,
 )
 from torchsx.nn.objective import MarginalNLL
@@ -35,6 +34,6 @@ __all__ = [
     "MergeTargetOut",
     "MarginalNLL",
     "MetricLogger", "calibration_metrics", "scale_metrics",
-    "condition_auc", "hkl_permutation_sensitivity",
+    "condition_auc",
     "AmortizedTrainer", "TrainConfig", "CrystalIndex",
 ]

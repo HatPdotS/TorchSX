@@ -88,9 +88,9 @@ def test_trainer_installs_basis_on_targets_and_replaces_the_default():
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
     prep, params, _, _, _ = _synthetic(n_hkl=60, n_xtal=60, per=30, seed=3)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=1, include_hkl=False)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=1)
     obj = MarginalNLL(wide_log_grid(), Poisson())
-    cfg = TrainConfig(epochs=0, posterior_prior="wilson", device="cpu", heldout_frac=0.1)
+    cfg = TrainConfig(posterior_prior="wilson", device="cpu", heldout_frac=0.1)
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     basis = ReciprocalBasis.from_hkl(prep.hkl_valid.long(), prep.median_cell, "P 1", degree=2, aniso=False)
     before = tr.targets[0].wilson_sigma.clone()

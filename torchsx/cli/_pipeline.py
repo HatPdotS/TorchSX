@@ -725,7 +725,7 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 #: observation onto the other observations of its crystal.  A checkpoint's own
 #: record overrides these in a merge.
 DEFAULTS = dict(
-    d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
+    d_model=128, n_layers=5, predict_shape=False,
     beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
     obs_self_layers=2, peer_attention=2, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
@@ -955,7 +955,6 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     kw = dict(
         d_model=enc.get("d_model") or sc.get("d_model") or getattr(args, "d_model", None) or DEFAULTS["d_model"],
         n_layers=enc.get("n_layers") or sc.get("n_layers") or getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
-        include_hkl=bool(sc.get("include_hkl", DEFAULTS["include_hkl"])),
         predict_shape=bool(sc.get("predict_shape", DEFAULTS["predict_shape"])),
         beta_init=beta_init, w_init=w_init,
         context_folds=enc.get("context_folds", DEFAULTS["context_folds"] if getattr(args, "context_folds", None) is None

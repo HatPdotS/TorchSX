@@ -289,7 +289,7 @@ def main(argv=None):
         install_pseudo_translation(scale, prep, bundle.spacegroup)
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
-        target_redundancy=args.redundancy, epochs=0, lr=1e-3,
+        target_redundancy=args.redundancy, lr=1e-3,
         warmup_steps=(25 if args.warmup is None else args.warmup) * n_states,
         lr_schedule=args.lr_schedule, total_steps=args.steps,
         grad_clip=20.0, log_every=25,
@@ -298,7 +298,7 @@ def main(argv=None):
         locate_windows=(8.0, 1.0, 0.125), posterior_prior=settings["prior"],
         wilson_degree=settings["wilson_degree"],
         posterior_checkpoint_nodes=True, encoder_chunk_crystals=400,
-        stream_batches=True, split_half_every=0, heldout_frac=0.05,
+        stream_batches=True, heldout_frac=0.05,
         device=settings["device"], outdir=str(args.out), seed=args.seed,
         heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),
         noise_lr_mult=args.noise_lr_mult,

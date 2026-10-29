@@ -109,22 +109,6 @@ class AmortizedScale(nn.Module):
 
     # ── construction ───────────────────────────────────────────────────
 
-    #: hkl defaults OFF.  With hkl enabled, ``hkl_permutation_sensitivity``
-    #: can show most of the predicted scale's variance moving when hkl labels
-    #: are permuted, ``sd(log K)`` blowing up, and most of that variance
-    #: *within* crystal, i.e. per reflection.  That is the scale absorbing
-    #: I0, which is degenerate by construction and is the one channel that can
-    #: manufacture a difference peak.
-    #:
-    #: The failure has a signature worth remembering: training converges
-    #: normally (var_z near 1, held-out NLL falling) and only *then*
-    #: collapses (held-out NLL and var_z jump).  The network learns
-    #: the legitimate scale first and discovers the shortcut second, so a short
-    #: run looks healthy.
-    #:
-    #: ``s_sq`` stays in: resolution dependence of the scale is a real physical
-    #: effect (a B-factor), and the permutation monitor tests the h/k/l channel
-    #: specifically, leaving s_sq untouched.
     @classmethod
     def from_prep(
         cls,
@@ -133,7 +117,6 @@ class AmortizedScale(nn.Module):
         d_model: int = 128,
         n_layers: int = 5,
         d_hidden: int | None = None,
-        include_hkl: bool = False,
         context_folds: int = 0,
         obs_context_layers: int | None = None,
         obs_self_layers: int | None = None,
@@ -165,7 +148,7 @@ class AmortizedScale(nn.Module):
         then unused."""
         # None keeps each tier's default; a checkpoint passes its recorded tiers
         features = ObsFeatureSpec(
-            prep, include_hkl=include_hkl, context_features=context_features,
+            prep, context_features=context_features,
             crystal_features=crystal_features,
             **({} if self_features is None else {"self_features": tuple(self_features)}),
         )
@@ -450,24 +433,6 @@ class AmortizedScale(nn.Module):
         z, correction = self.encoder.encode(x_self, x_ctx, x_crys, group_id, idx, valid)
         p = self.heads(z.flatten(0, 1))
         return tuple(getattr(p, name) for name in self._prediction_names()) + (correction,)
-
-    def predict_split(
-        self, meta_self: ObsInfo, meta_ctx: ObsInfo
-    ) -> ScalePrediction:
-        """Predict with the self branch and context branch fed *different* metas.
-
-        Used by the hkl-permutation monitor to isolate the degeneracy that
-        actually matters: whether ``log_K[j]`` depends on ``j``'s own
-        reflection identity.  A whole-meta permutation cannot answer that once
-        the context carries per-reflection channels (the peers' rank within
-        their reflection and its brightness), because permuting hkl also
-        permutes those lookups — which is legitimate use, not leakage.
-        """
-        x_self, _, _ = self.features.build(meta_self)
-        _, x_ctx, x_crys = self.features.build(meta_ctx)
-        z = self.encoder(x_self, x_ctx, meta_ctx.crystal_id, self.n_crystals, x_crys=x_crys)
-        pred = self.heads(z)
-        return self._anchor(pred, meta_self)
 
     @torch.no_grad()
     def set_gauge_basis(self, phi: Tensor) -> None:

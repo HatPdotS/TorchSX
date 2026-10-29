@@ -44,7 +44,7 @@ def test_training_leaves_the_features_where_the_data_put_them(tmp_path):
     tr = AmortizedTrainer(
         prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
         config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
-                           posterior_k_coarse=5, posterior_m_fine=17, split_half_every=0),
+                           posterior_k_coarse=5, posterior_m_fine=17),
     )
     feats = scale.features
     before = {k: getattr(feats, k).clone() for k in ("_I_mean", "_mean", "_std")}

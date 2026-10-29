@@ -198,7 +198,7 @@ def test_mixture_scale_model_primes_the_mixture_scatter_and_chunks_exactly():
     from tests.test_amortized_training import _synthetic
     from torchsx.merging.scale import AmortizedScale
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=12)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, predict_shape=False,
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, predict_shape=False,
                                      beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture", n_components=3)
     assert isinstance(scale.scatter, PredictedMixtureScatter) and scale.scatter.n_components == 3
     # break the zero init so chunking has something non-trivial to reproduce
@@ -309,52 +309,25 @@ def test_mixture_trainer_step_runs_and_trains_the_mixture_head(tmp_path):
     from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
     from torchsx.merging.scale import AmortizedScale
     from torchsx.nn.objective import MarginalNLL
+    from torchsx.cli.train import run_updates
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
     torch.manual_seed(0)
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=16)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, predict_shape=False,
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, predict_shape=False,
                                      beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture", n_components=3)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1), miss_frac=0.03)
-    cfg = TrainConfig(max_obs_per_batch=6000, epochs=1, lr=1e-2, log_every=10 ** 9,
+    cfg = TrainConfig(max_obs_per_batch=6000, lr=1e-2, log_every=10 ** 9,
                       heldout_frac=0.0, posterior_k_coarse=9, posterior_m_fine=33,
-                      device="cpu", outdir=str(tmp_path), split_half_every=0)
+                      device="cpu", outdir=str(tmp_path))
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     before = scale.heads.mixture.l2.weight.detach().clone()
-    tr.run()
+    run_updates(tr, 1)
     assert not torch.equal(scale.heads.mixture.l2.weight.detach(), before), "mixture head did not move"
     res = tr.merge(estimator="posterior")
     assert torch.isfinite(res["F"]).all() and torch.isfinite(res["I0"]).all()
     pooled = tr.merge(estimator="pooled")
     assert torch.isfinite(pooled["I"]).all()
 
-
-
-def test_shape_permutation_check_separates_hkl_free_and_hkl_fed_shapes(tmp_path):
-    from tests.test_amortized_training import _synthetic
-    from torchsx.merging.likelihood import Poisson
-    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
-    from torchsx.merging.scale import AmortizedScale
-    from torchsx.nn.metrics import hkl_permutation_sensitivity_shape
-    from torchsx.nn.objective import MarginalNLL
-    from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
-    torch.manual_seed(0)
-    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=16)
-    obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1), miss_frac=0.03)
-    cfg = TrainConfig(max_obs_per_batch=6000, epochs=0, device="cpu", outdir=str(tmp_path), split_half_every=0)
-    fracs = {}
-    for include_hkl in (False, True):
-        scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=include_hkl, predict_shape=False,
-                                         beta_init=1.0, w_init=1.65, predict_skew=True, scatter_family="mixture",
-                                         n_components=3)
-        with torch.no_grad():                        # give the zero-initialised head an input dependence
-            scale.heads.mixture.l2.weight.normal_(0.0, 0.3)
-        tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
-        rows = tr.index.rows(tr.train_crystals[:8])
-        if not include_hkl:
-            assert tr.audit(rows)["hkl_permutation_frac_shape"] < 1e-6
-        meta, *_ = tr._batch(rows)
-        fracs[include_hkl] = hkl_permutation_sensitivity_shape(scale, meta)
-    assert fracs[False] < 1e-6 and fracs[True] > 1e-3
 
 
 # ---------------------------------------------------------------- CLI and checkpoint
