@@ -15,7 +15,7 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file, python_parser
 
 
-@pytest.mark.parametrize('module,count', [(train,37), (merge_nn,14)])
+@pytest.mark.parametrize('module,count', [(train,38), (merge_nn,14)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
@@ -32,12 +32,14 @@ def test_research_options_parse_but_stay_out_of_help():
     hidden = {'--noise-lr-mult': '10', '--peer-dim': '64', '--context-folds': '0', '--d-model': '64',
               '--n-layers': '3', '--eval-every': '50', '--patience': '2', '--heldout-stream': 'h.stream',
               '--encoder': 'fold', '--ctx-layers': '4', '--query-layers': '0', '--optimizer': 'muon'}
+    flags = ['--query-peers']
     text = parser.format_help()
     assert not [o for o in hidden if o in text]
-    a = parser.parse_args(['x.stream', '-o', 'run', *(t for o, v in hidden.items() for t in (o, v))])
+    assert not [o for o in flags if o in text]
+    a = parser.parse_args(['x.stream', '-o', 'run', *(t for o, v in hidden.items() for t in (o, v)), *flags])
     assert (a.noise_lr_mult, a.peer_dim, a.context_folds, a.d_model, a.n_layers, a.eval_every, a.patience,
             a.heldout_stream) == (10.0, '64', 0, 64, 3, 50, 2, Path('h.stream'))
-    assert (a.encoder, a.ctx_layers, a.query_layers, a.optimizer) == ('fold', 4, 0, 'muon')
+    assert (a.encoder, a.ctx_layers, a.query_layers, a.optimizer, a.query_peers) == ('fold', 4, 0, 'muon', True)
     assert parser.parse_args(['x.stream', '-o', 'run']).steps == 400
 
 

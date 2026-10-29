@@ -875,6 +875,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         if ck:
             fold = {k: int(enc[k]) for k in ("context_folds", "ctx_layers", "query_layers")}
             fold["peer_heads"] = int(enc["n_heads"])
+            fold["query_peers"] = bool(enc.get("query_peers", False))
         else:
             def flag(name, default):
                 v = getattr(args, name, None)
@@ -882,6 +883,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             fold = dict(context_folds=flag("context_folds", DEFAULTS["fold_folds"]),
                         ctx_layers=flag("ctx_layers", DEFAULTS["ctx_layers"]),
                         query_layers=flag("query_layers", DEFAULTS["query_layers"]),
+                        query_peers=bool(getattr(args, "query_peers", False)),
                         peer_heads=DEFAULTS["peer_heads"])
         kw.update(encoder="fold", **fold)
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)

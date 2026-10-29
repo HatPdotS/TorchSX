@@ -78,6 +78,9 @@ def _build_parser():
     # cross-attention blocks from each masked observation onto its run (default 1).
     p.add_argument("--ctx-layers", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--query-layers", type=int, default=None, help=argparse.SUPPRESS)
+    # Fold transformer: the last query block also reads every other observation's
+    # own token, the observation's own masked (all n - 1 peers).
+    p.add_argument("--query-peers", action="store_true", help=argparse.SUPPRESS)
     # Optimiser of the encoder's block matrices: adamw (default) or muon.
     p.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw", help=argparse.SUPPRESS)
     p.add_argument("--pseudo-translation", choices=("off", "auto"), default="off",

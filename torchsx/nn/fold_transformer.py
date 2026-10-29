@@ -15,7 +15,8 @@ the number of observations whose measurement the run shows::
                            memory_f
                                │ keys / values
         query j of fold f = j's own token after the stack
-        query_layers x [ cross-attention  q_j -> memory_f  + FF ]     queries read only memory_f
+        query_layers x [ cross-attention  q_j -> memory_f  + FF ]     queries never see each other
+        last query layer, with query_peers: also q_j -> { token_i : i != j }
                                │
                               z_j
 
@@ -27,6 +28,14 @@ context tokens therefore exchange information through any number of layers,
 and each query reads a context that has already been worked over as a whole.
 An observation's context is the ``(K - 1) / K`` of its crystal outside its
 fold, and each crystal is encoded ``K`` times.
+
+With ``query_peers`` the last query layer reads, next to ``memory_f``, every
+other observation of the crystal through its own token: its geometry and
+measurement embedded alone, through one residual block that sees no other
+observation.  Observation ``j``'s own token is masked, so this read is exact
+in the same sense, over all ``n - 1`` peers including ``j``'s fold mates.
+The run memories of the other runs are never read: there ``j`` is visible,
+and after one self-attention layer every token of such a run carries it.
 
 Geometry comes from ``x_self`` for every token.  The measurement is the part
 of ``x_ctx`` that ``x_self`` lacks (``meas_idx``): the context-only channels
@@ -132,6 +141,9 @@ class FoldTransformerEncoder(nn.Module):
     query_layers
         Cross-attention blocks from each masked observation onto its run's
         output.  ``0`` reads the embedding straight off the masked token.
+    query_peers
+        The last query block also reads every other observation's own token
+        (module docstring).  Needs ``query_layers >= 1``.
     n_heads
         Attention heads in every block.
     n_crystal_features
@@ -161,6 +173,7 @@ class FoldTransformerEncoder(nn.Module):
         folds: int = 5,
         ctx_layers: int = 2,
         query_layers: int = 1,
+        query_peers: bool = False,
         d_hidden: int | None = None,
         activation: type[nn.Module] = nn.SiLU,
         n_crystal_features: int = 0,
@@ -174,6 +187,8 @@ class FoldTransformerEncoder(nn.Module):
             raise ValueError(f"folds must be >= 2, got {folds}")
         if ctx_layers < 0 or query_layers < 0:
             raise ValueError("ctx_layers and query_layers must be >= 0")
+        if query_peers and query_layers < 1:
+            raise ValueError("query_peers reads the peers in the last query layer; it needs query_layers >= 1")
         meas = [int(i) for i in meas_idx]
         if not meas or min(meas) < 0 or max(meas) >= n_context_features:
             raise ValueError(f"meas_idx {meas} must select columns of x_ctx (width {n_context_features})")
@@ -184,6 +199,7 @@ class FoldTransformerEncoder(nn.Module):
         #: K, recorded under the same name as the Deep Sets fold count
         self.context_folds = int(folds)
         self.ctx_layers, self.query_layers = int(ctx_layers), int(query_layers)
+        self.query_peers = bool(query_peers)
         self.n_heads = int(n_heads)
         self.budget = int(budget)
         self.checkpoint = bool(checkpoint)
@@ -214,6 +230,11 @@ class FoldTransformerEncoder(nn.Module):
                            activation=activation, bf16=bf16)
             for _ in range(self.query_layers)
         )
+        if self.query_peers:
+            #: marks a key as a peer's own token rather than a run-memory token
+            self.peer_embedding = nn.Parameter(torch.zeros(d_model))
+            #: each peer's own encoding: one residual block on its token alone
+            self.peer_ff = ResidualFF(d_model, d_hidden, activation=activation)
 
     def forward(
         self,
@@ -272,8 +293,23 @@ class FoldTransformerEncoder(nn.Module):
         for blk in self.ctx_blocks:
             x = blk(x, None, keep)
         # run f's queries are its own fold's slots f, f + K, f + 2K, ...
-        q = x[:, :L].reshape(K, B, L // K, K, D)[runs, :, :, runs].reshape(K * B, L // K, D)
-        for blk in self.query_blocks:
-            q = blk(q, x, keep)
+        Lq = L // K
+        q = x[:, :L].reshape(K, B, Lq, K, D)[runs, :, :, runs].reshape(K * B, Lq, D)
+        last_kv, last_keep = x, keep
+        if self.query_peers:
+            # every observation's own token, encoded alone; padded to a multiple of 8 keys
+            own = self.peer_ff(g + m + self.peer_embedding).masked_fill(~valid[:, :, None], 0.0)
+            pad_p = -L % 8
+            own = torch.cat([own, own.new_zeros(B, pad_p, D)], dim=1)
+            slot = torch.arange(L + pad_p, device=g.device)
+            own_slot = torch.arange(Lq, device=g.device)[None, :] * K + runs[:, None]      # (K, Lq)
+            peer_keep = (torch.cat([valid, valid.new_zeros(B, pad_p)], dim=1)[None, :, None, :]
+                         & (slot[None, None, None, :] != own_slot[:, None, :, None]))  # (K, B, Lq, Lp)
+            last_kv = torch.cat([x, own[None].expand(K, -1, -1, -1).reshape(K * B, -1, D)], dim=1)
+            last_keep = torch.cat([keep.expand(-1, -1, Lq, -1),
+                                   peer_keep.reshape(K * B, 1, Lq, -1)], dim=-1)
+        for i, blk in enumerate(self.query_blocks):
+            last = i == len(self.query_blocks) - 1
+            q = blk(q, last_kv if last else x, last_keep if last else keep)
         # [f, b, j] -> slot j K + f
         return q.reshape(K, B, L // K, D).permute(1, 2, 0, 3).reshape(B, L, D)

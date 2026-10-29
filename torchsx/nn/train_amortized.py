@@ -1102,7 +1102,7 @@ class AmortizedTrainer:
                               "obs_self_layers", "d_model", "n_layers",
                               "n_crystal_features", "peer_attention_layers",
                               "peer_heads", "peer_dim", "ctx_layers",
-                              "query_layers", "n_heads")
+                              "query_layers", "query_peers", "n_heads")
                 },
                 # everything a merge must not have to guess: the likelihood it
                 # was fitted under, the data recipe, and the scale geometry.  A
