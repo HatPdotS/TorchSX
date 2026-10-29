@@ -230,3 +230,102 @@ def test_compiled_bf16_is_close_and_keeps_the_exclusion(peers):
     if not peers:
         assert torch.equal(moved[own], base[own])
     assert (moved[same & ~own] - base[same & ~own]).abs().max() > 1e-2
+
+
+# ── geometry correction ────────────────────────────────────────────────
+
+GEO_MEAN = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.1, 9000.0])
+GEO_STD = torch.tensor([1e-3, 0.5, 0.5, 0.5, 0.05, 10.0])
+
+
+def _geo_encoder(refine=True, **kw):
+    """Self features = the six geometry columns; context = them plus three measurement columns."""
+    torch.manual_seed(0)
+    enc = FoldTransformerEncoder(6, 9, [6, 7, 8], d_model=16, n_heads=4, folds=3, ctx_layers=2,
+                                 query_layers=1, compile=False, refine_geometry=refine,
+                                 geometry={"cols": list(range(6)), "mean": GEO_MEAN, "std": GEO_STD}
+                                 if refine else None, **kw)
+    for prm in enc.parameters():
+        if prm.dim() > 1:
+            torch.nn.init.normal_(prm, std=0.3)
+    torch.nn.init.normal_(enc.mask_embedding, std=0.3)
+    return enc
+
+
+def _geo_batch(sizes, seed=1):
+    g = torch.Generator().manual_seed(seed)
+    gid = torch.repeat_interleave(torch.arange(len(sizes)), torch.tensor(sizes))
+    xs = torch.randn(gid.numel(), 6, generator=g)
+    xc = torch.cat([xs, torch.randn(gid.numel(), 3, generator=g)], dim=1)
+    return gid, xs, xc
+
+
+def test_geometry_change_matches_the_exact_rotation_and_energy_shift():
+    enc = _geo_encoder().double()
+    g = torch.Generator().manual_seed(4)
+    direction = torch.nn.functional.normalize(torch.randn(2, 7, 3, generator=g, dtype=torch.float64), dim=-1)
+    s_sq = 0.02 + 0.2 * torch.rand(2, 7, 1, generator=g, dtype=torch.float64)
+    q0 = 2 * s_sq.sqrt() * direction
+    k0 = torch.full((2, 7), 9000.0 / enc.HC, dtype=torch.float64)
+    K = 1
+    corr = torch.tensor([[0.8, -0.5, 0.3, 1.5], [-0.2, 0.9, -0.7, -2.0]], dtype=torch.float64)
+    got = enc._geometry_change(q0, k0, corr, K) * enc.geo_std[:4].double()
+    delta = corr[:, :3] * enc.ROT_SCALE
+    skew = torch.zeros(2, 3, 3, dtype=torch.float64)
+    skew[:, 0, 1], skew[:, 0, 2], skew[:, 1, 2] = -delta[:, 2], delta[:, 1], -delta[:, 0]
+    skew = skew - skew.transpose(1, 2)
+    q1 = torch.einsum("bij,blj->bli", torch.linalg.matrix_exp(skew), q0)
+    k1 = k0 * (1 + corr[:, 3:] * enc.ENERGY_SCALE)
+    ewald = lambda v, k: torch.sqrt(v[..., 0] ** 2 + v[..., 1] ** 2 + (v[..., 2] + k) ** 2) - k  # noqa: E731
+    torch.testing.assert_close(got[..., 0], ewald(q1, k1) - ewald(q0, k0), rtol=0, atol=2e-6)
+    unit = lambda v: v / v.norm(dim=-1, keepdim=True)  # noqa: E731
+    torch.testing.assert_close(got[..., 1:], unit(q1) - unit(q0), rtol=0, atol=2e-6)
+    # no correction, no change
+    assert torch.equal(enc._geometry_change(q0, k0, torch.zeros_like(corr), K), torch.zeros(2, 7, 4, dtype=torch.float64))
+
+
+def test_refined_geometry_keeps_the_exclusion():
+    enc = _geo_encoder()
+    for h in enc.geometry_heads:                    # a correction that actually moves the geometry
+        torch.nn.init.normal_(h.weight, std=0.5)
+    gid, xs, xc = _geo_batch([5, 13, 9])
+    xc = xc.clone().requires_grad_(True)
+    z = enc(xs, xc, gid, 3)
+    assert enc.last_correction.shape == (3 * 3, 4) and enc.last_correction[:, :3].abs().max() > 0
+    fold = fold_ids(gid, 3, 3)
+    j = int((gid == 1).nonzero()[6])
+    z[j].square().sum().backward()
+    own = (gid == gid[j]) & (fold == fold[j])
+    assert torch.equal(xc.grad[own][:, 6:], torch.zeros_like(xc.grad[own][:, 6:]))
+    assert xc.grad[(gid == gid[j]) & ~own][:, 6:].abs().max() > 0
+    with torch.no_grad():
+        moved_in = xc.detach().clone()
+        moved_in[j, 6:] += 5.0
+        moved = enc(xs, moved_in, gid, 3)
+        base = enc(xs, xc.detach(), gid, 3)
+    assert torch.equal(moved[own], base[own])
+
+
+def test_zero_geometry_heads_change_nothing():
+    plain = _geo_encoder(refine=False)
+    refined = _geo_encoder(refine=True)
+    sd = refined.state_dict()
+    sd.update(plain.state_dict())
+    refined.load_state_dict(sd)
+    for h in refined.geometry_heads:
+        torch.nn.init.zeros_(h.weight); torch.nn.init.zeros_(h.bias)
+    gid, xs, xc = _geo_batch([4, 11, 7])
+    torch.testing.assert_close(refined(xs, xc, gid, 3), plain(xs, xc, gid, 3), rtol=0, atol=0)
+
+
+def test_geometry_heads_receive_gradient():
+    enc = _geo_encoder()
+    gid, xs, xc = _geo_batch([6, 12])
+    enc(xs, xc, gid, 2).square().sum().backward()
+    assert any(h.weight.grad is not None and h.weight.grad.abs().sum() > 0 for h in enc.geometry_heads)
+
+
+def test_refine_needs_context_and_geometry():
+    with pytest.raises(ValueError, match="ctx_layers >= 1"):
+        FoldTransformerEncoder(6, 9, [6, 7, 8], d_model=16, n_heads=4, ctx_layers=0, refine_geometry=True,
+                               geometry={"cols": list(range(6)), "mean": GEO_MEAN, "std": GEO_STD})

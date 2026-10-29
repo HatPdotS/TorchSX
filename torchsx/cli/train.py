@@ -81,6 +81,11 @@ def _build_parser():
     # Fold transformer: the last query block also reads every other observation's
     # own token, the observation's own masked (all n - 1 peers).
     p.add_argument("--query-peers", action="store_true", help=argparse.SUPPRESS)
+    # Fold transformer: correct each run's geometry (a crystal rotation and an energy
+    # shift, predicted from its context) and recompute the excitation errors.
+    p.add_argument("--refine-geometry", action="store_true", help=argparse.SUPPRESS)
+    # Scale features without the excitation error and the lab-frame direction.
+    p.add_argument("--drop-geometry", action="store_true", help=argparse.SUPPRESS)
     # Optimiser of the encoder's block matrices: adamw (default) or muon.
     p.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw", help=argparse.SUPPRESS)
     p.add_argument("--pseudo-translation", choices=("off", "auto"), default="off",

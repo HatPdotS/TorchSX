@@ -834,6 +834,12 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     else:
         recorded = bundle.recipe.get("disk_size") == "recorded"
         self_features = SELF_FEATURES + ((DISK_FEATURE,) if recorded else ())
+        if getattr(args, "drop_geometry", False):
+            # the orientation-dependent geometry: excitation error and lab-frame direction
+            if getattr(args, "refine_geometry", False):
+                raise SystemExit("--drop-geometry and --refine-geometry exclude each other")
+            self_features = tuple(f for f in self_features
+                                  if f not in ("ewald_offset", "qx", "qy", "qz"))
         producer = ((bundle.recipe.get("measurement") or {}).get("source") or {}).get("producer")
         crystal_features = (DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
                             if producer == "probixi" else None)
@@ -876,6 +882,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             fold = {k: int(enc[k]) for k in ("context_folds", "ctx_layers", "query_layers")}
             fold["peer_heads"] = int(enc["n_heads"])
             fold["query_peers"] = bool(enc.get("query_peers", False))
+            fold["refine_geometry"] = bool(enc.get("refine_geometry", False))
         else:
             def flag(name, default):
                 v = getattr(args, name, None)
@@ -884,6 +891,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                         ctx_layers=flag("ctx_layers", DEFAULTS["ctx_layers"]),
                         query_layers=flag("query_layers", DEFAULTS["query_layers"]),
                         query_peers=bool(getattr(args, "query_peers", False)),
+                        refine_geometry=bool(getattr(args, "refine_geometry", False)),
                         peer_heads=DEFAULTS["peer_heads"])
         kw.update(encoder="fold", **fold)
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)

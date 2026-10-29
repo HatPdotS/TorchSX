@@ -37,6 +37,19 @@ in the same sense, over all ``n - 1`` peers including ``j``'s fold mates.
 The run memories of the other runs are never read: there ``j`` is visible,
 and after one self-attention layer every token of such a run carries it.
 
+With ``refine_geometry`` the geometry itself is corrected inside each run.
+The excitation error and lab-frame direction of an observation follow from
+its scattering vector ``q`` and the beam's ``k0 = 1/lambda`` as
+``|q + k0 z| - k0``, and the commonest errors in them are one small rotation
+of the crystal and one photon-energy offset.  After every context block a
+head on the run's crystal token adds to a running correction (rotation
+``delta``, relative energy shift), every token's excitation error and
+direction are recomputed from the rotated ``q`` and the shifted ``k0``, and
+the change is added to the residual stream through the geometry embedding.
+Later blocks and the queries read corrected geometry.  The correction of run
+``f`` comes from run ``f``'s crystal token, so it carries no fold-``f``
+measurement either.
+
 Geometry comes from ``x_self`` for every token.  The measurement is the part
 of ``x_ctx`` that ``x_self`` lacks (``meas_idx``): the context-only channels
 of :class:`~torchsx.nn.obs_features.ObsFeatureSpec`.
@@ -144,6 +157,14 @@ class FoldTransformerEncoder(nn.Module):
     query_peers
         The last query block also reads every other observation's own token
         (module docstring).  Needs ``query_layers >= 1``.
+    geometry
+        Where the geometry sits in ``x_self`` and how it was standardised:
+        ``{"cols": [ewald_offset, qx, qy, qz, s_sq, beam_energy], "mean",
+        "std"}`` (columns of ``x_self`` and the six statistics).  Needed by
+        ``refine_geometry``.
+    refine_geometry
+        Correct each run's geometry from its context (module docstring).
+        Needs ``ctx_layers >= 1``.
     n_heads
         Attention heads in every block.
     n_crystal_features
@@ -174,6 +195,8 @@ class FoldTransformerEncoder(nn.Module):
         ctx_layers: int = 2,
         query_layers: int = 1,
         query_peers: bool = False,
+        geometry: dict | None = None,
+        refine_geometry: bool = False,
         d_hidden: int | None = None,
         activation: type[nn.Module] = nn.SiLU,
         n_crystal_features: int = 0,
@@ -189,6 +212,9 @@ class FoldTransformerEncoder(nn.Module):
             raise ValueError("ctx_layers and query_layers must be >= 0")
         if query_peers and query_layers < 1:
             raise ValueError("query_peers reads the peers in the last query layer; it needs query_layers >= 1")
+        if refine_geometry and (ctx_layers < 1 or geometry is None):
+            raise ValueError("refine_geometry corrects the geometry from the context; it needs "
+                             "ctx_layers >= 1 and the geometry columns")
         meas = [int(i) for i in meas_idx]
         if not meas or min(meas) < 0 or max(meas) >= n_context_features:
             raise ValueError(f"meas_idx {meas} must select columns of x_ctx (width {n_context_features})")
@@ -200,6 +226,7 @@ class FoldTransformerEncoder(nn.Module):
         self.context_folds = int(folds)
         self.ctx_layers, self.query_layers = int(ctx_layers), int(query_layers)
         self.query_peers = bool(query_peers)
+        self.refine_geometry = bool(refine_geometry)
         self.n_heads = int(n_heads)
         self.budget = int(budget)
         self.checkpoint = bool(checkpoint)
@@ -235,6 +262,28 @@ class FoldTransformerEncoder(nn.Module):
             self.peer_embedding = nn.Parameter(torch.zeros(d_model))
             #: each peer's own encoding: one residual block on its token alone
             self.peer_ff = ResidualFF(d_model, d_hidden, activation=activation)
+        #: last correction per crystal-run, ``(runs, 4)``: rotation (rad) and relative energy shift
+        self.last_correction: Tensor | None = None
+        if self.refine_geometry:
+            cols = [int(c) for c in geometry["cols"]]
+            if len(cols) != 6:
+                raise ValueError("geometry needs the columns of ewald_offset, qx, qy, qz, s_sq, beam_energy")
+            self.register_buffer("geo_cols", torch.tensor(cols, dtype=torch.long), persistent=False)
+            # persistent: x_self is standardised with the statistics the model was trained under
+            self.register_buffer("geo_mean", torch.as_tensor(geometry["mean"], dtype=torch.float32).clone())
+            self.register_buffer("geo_std", torch.as_tensor(geometry["std"], dtype=torch.float32).clone())
+            #: one head per context block on the crystal token: an increment of
+            #: (rotation x 3, relative energy shift); zero-initialised, so no correction at step 0
+            self.geometry_heads = nn.ModuleList(nn.Linear(d_model, 4) for _ in range(self.ctx_layers))
+            for h in self.geometry_heads:
+                nn.init.zeros_(h.weight)
+                nn.init.zeros_(h.bias)
+
+    #: radians and relative energy shift per unit of the geometry heads' output
+    ROT_SCALE = 1e-2
+    ENERGY_SCALE = 1e-3
+    #: hc in eV Angstrom: k0 = E / HC
+    HC = 12398.4
 
     def forward(
         self,
@@ -264,17 +313,25 @@ class FoldTransformerEncoder(nn.Module):
             run = self._compiled
         use_ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
         z = g.new_zeros(n, self.d_model)
+        corrections = []
         for idx, valid in fold_layout(group_id, self.context_folds, self.budget):
             crys = (x_crys.index_select(0, group_id[idx[:, 0]]) if self.n_crystal_features
                     else g.new_zeros(idx.shape[0], 0))
-            args = (g[idx], m[idx], crys, valid)
-            zb = (torch.utils.checkpoint.checkpoint(run, *args, use_reentrant=False)
-                  if use_ckpt else run(*args))
+            xs = x_self[idx] if self.refine_geometry else g.new_zeros(0)
+            args = (g[idx], m[idx], crys, valid, xs)
+            zb, corr = (torch.utils.checkpoint.checkpoint(run, *args, use_reentrant=False)
+                        if use_ckpt else run(*args))
             z = z.index_put((idx[valid],), zb[valid])
+            corrections.append(corr.detach())
+        if self.refine_geometry:
+            self.last_correction = torch.cat(corrections)
         return z
 
-    def _block(self, g: Tensor, m: Tensor, crys: Tensor, valid: Tensor) -> Tensor:
-        """Every run of one packed block: ``(B, L, D)`` embeddings, slot ``l`` read from run ``l % K``."""
+    def _block(self, g: Tensor, m: Tensor, crys: Tensor, valid: Tensor,
+               xs: Tensor) -> tuple[Tensor, Tensor]:
+        """Every run of one packed block: ``(B, L, D)`` embeddings, slot ``l`` read from
+        run ``l % K``, and each run's geometry correction ``(K * B, 4)`` (empty without
+        ``refine_geometry``)."""
         K = self.context_folds
         B, L, D = g.shape
         runs = torch.arange(K, device=g.device)
@@ -290,8 +347,21 @@ class FoldTransformerEncoder(nn.Module):
         x = x.reshape(K * B, L + 1 + pad, D)
         keep = torch.cat([valid, valid.new_ones(B, 1), valid.new_zeros(B, pad)], dim=1)
         keep = keep[None].expand(K, -1, -1).reshape(K * B, 1, 1, -1)
-        for blk in self.ctx_blocks:
+        correction = x.new_zeros(0, 4)
+        if self.refine_geometry:
+            q0, k0 = self._raw_geometry(xs)                                           # (B, L, 3), (B, L)
+            w_geo = self.input_geometry.weight.index_select(1, self.geo_cols[:4])     # (D, 4)
+            live = valid[None].expand(K, -1, -1).reshape(K * B, L, 1)
+            correction = x.new_zeros(K * B, 4)
+            applied = None
+        for i, blk in enumerate(self.ctx_blocks):
             x = blk(x, None, keep)
+            if self.refine_geometry:
+                correction = correction + self.geometry_heads[i](x[:, L])
+                emb = (self._geometry_change(q0, k0, correction, K) @ w_geo.T) * live   # (K * B, L, D)
+                step = emb if applied is None else emb - applied
+                x = torch.cat([x[:, :L] + step, x[:, L:]], dim=1)
+                applied = emb
         # run f's queries are its own fold's slots f, f + K, f + 2K, ...
         Lq = L // K
         q = x[:, :L].reshape(K, B, Lq, K, D)[runs, :, :, runs].reshape(K * B, Lq, D)
@@ -312,4 +382,41 @@ class FoldTransformerEncoder(nn.Module):
             last = i == len(self.query_blocks) - 1
             q = blk(q, last_kv if last else x, last_keep if last else keep)
         # [f, b, j] -> slot j K + f
-        return q.reshape(K, B, L // K, D).permute(1, 2, 0, 3).reshape(B, L, D)
+        z = q.reshape(K, B, L // K, D).permute(1, 2, 0, 3).reshape(B, L, D)
+        if self.refine_geometry:
+            correction = torch.cat([correction[:, :3] * self.ROT_SCALE,
+                                    correction[:, 3:] * self.ENERGY_SCALE], dim=1)
+        return z, correction
+
+    def _raw_geometry(self, xs: Tensor) -> tuple[Tensor, Tensor]:
+        """Scattering vector ``q`` (lab frame, 1/Angstrom) and ``k0`` of each slot from its
+        standardised self features (a constant column reads back as its mean)."""
+        raw = xs.index_select(-1, self.geo_cols) * self.geo_std + self.geo_mean
+        direction = raw[..., 1:4]
+        direction = direction / direction.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        q = 2.0 * raw[..., 4:5].clamp(min=0.0).sqrt() * direction      # |q| = 1/d = 2 sqrt(s_sq)
+        k0 = raw[..., 5].clamp(min=1.0) / self.HC
+        return q, k0
+
+    def _geometry_change(self, q0: Tensor, k0: Tensor, correction: Tensor, K: int) -> Tensor:
+        """Standardised change of (ewald_offset, qx, qy, qz) under each run's correction,
+        ``(K * B, L, 4)``: the crystal rotated by ``delta`` (to second order) and ``k0``
+        scaled by ``1 + epsilon``."""
+        B, L, _ = q0.shape
+        delta = (correction[:, :3] * self.ROT_SCALE).view(K, B, 1, 3)
+        eps = (correction[:, 3] * self.ENERGY_SCALE).view(K, B, 1)
+        q = q0[None].expand(K, -1, -1, -1)
+        dq = torch.cross(delta.expand_as(q), q, dim=-1)
+        q1 = q + dq + 0.5 * torch.cross(delta.expand_as(q), dq, dim=-1)
+        k1 = k0[None] * (1.0 + eps)
+
+        def ewald(v: Tensor, k: Tensor) -> Tensor:
+            return torch.sqrt(v[..., 0] ** 2 + v[..., 1] ** 2 + (v[..., 2] + k) ** 2) - k
+
+        def unit(v: Tensor) -> Tensor:
+            return v / v.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+
+        de = ewald(q1, k1) - ewald(q, k0[None])
+        ddir = unit(q1) - unit(q)
+        change = torch.cat([de[..., None], ddir], dim=-1) / self.geo_std[:4]
+        return change.reshape(K * B, L, 4)

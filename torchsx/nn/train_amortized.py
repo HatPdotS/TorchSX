@@ -912,6 +912,13 @@ class AmortizedTrainer:
             ),
             "reflections_in_batch": int(meta.hkl_idx.unique().numel()),
         }
+        corr = getattr(self.scale.encoder, "last_correction", None)
+        if corr is not None and corr.numel():
+            # the geometry correction the encoder applied, over the crystal-runs of its last chunk
+            rot = corr[:, :3].norm(dim=1) * (180.0 / math.pi)
+            out["geometry_rot_deg_median"] = float(rot.median().item())
+            out["geometry_rot_deg_p90"] = float(torch.quantile(rot.float(), 0.9).item())
+            out["geometry_energy_rel_median"] = float(corr[:, 3].abs().median().item())
         em = getattr(self, "last_edge_mass", None)
         if em is not None:
             # Validity condition for detaching the grid geometry: if the grid
@@ -1102,7 +1109,7 @@ class AmortizedTrainer:
                               "obs_self_layers", "d_model", "n_layers",
                               "n_crystal_features", "peer_attention_layers",
                               "peer_heads", "peer_dim", "ctx_layers",
-                              "query_layers", "query_peers", "n_heads")
+                              "query_layers", "query_peers", "refine_geometry", "n_heads")
                 },
                 # everything a merge must not have to guess: the likelihood it
                 # was fitted under, the data recipe, and the scale geometry.  A
