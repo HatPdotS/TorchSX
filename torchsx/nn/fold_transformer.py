@@ -67,28 +67,64 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from torchsx.nn.deepsets import ResidualFF, peer_layout
+from torchsx.nn.deepsets import ResidualFF
 
-__all__ = ["AttentionBlock", "FoldTransformerEncoder", "fold_layout"]
+__all__ = ["AttentionBlock", "FoldTransformerEncoder", "fold_layout", "scatter_positions"]
 
 
-def fold_layout(group_id: Tensor, folds: int, budget: int = 1 << 24) -> list[tuple[Tensor, Tensor]]:
+def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 19) -> list[tuple[Tensor, Tensor]]:
     """Pack each crystal's rows into padded ``(B, L)`` blocks, ``L`` a multiple of ``folds``.
 
-    :func:`~torchsx.nn.deepsets.peer_layout` with the budget shared by the
-    ``folds`` runs, each block padded on the right to a multiple of ``folds``.
-    Within a crystal the rows keep their arrival order, so slot ``l`` holds the
-    crystal's ``l``-th row and its fold is ``l % folds``.  Returns
-    ``[(idx, valid)]`` as :func:`peer_layout` does.
+    Crystals are sorted by size and dealt into blocks.  A block's ``L`` is its
+    largest crystal rounded up to a multiple of 8 and then of ``folds``, and a
+    block closes before its ``folds`` runs would hold more than ``tokens``
+    tokens (``folds * B * L``); a crystal larger than that gets a block of its
+    own.  Within a crystal the rows keep their arrival order, so slot ``l``
+    holds the crystal's ``l``-th row and its fold is ``l % folds``.  One host
+    sync per call.  Returns ``[(idx, valid)]`` as
+    :func:`~torchsx.nn.deepsets.peer_layout` does.
     """
-    blocks = []
-    for idx, valid in peer_layout(group_id, max(1, budget // folds)):
-        pad = -idx.shape[1] % folds
-        if pad:
-            idx = torch.cat([idx, idx[:, -1:].expand(-1, pad)], dim=1)
-            valid = torch.cat([valid, valid.new_zeros(valid.shape[0], pad)], dim=1)
-        blocks.append((idx, valid))
+    order = torch.argsort(group_id, stable=True)
+    _, counts = torch.unique_consecutive(group_id[order], return_counts=True)
+    starts = torch.cumsum(counts, 0) - counts
+    by_size = torch.argsort(counts, stable=True)
+    sizes = counts[by_size].tolist()
+
+    def padded(n: int) -> int:
+        n = -(-n // 8) * 8
+        return n + (-n % folds)
+
+    blocks: list[tuple[Tensor, Tensor]] = []
+    i, G = 0, len(sizes)
+    while i < G:
+        j, L = i, 0
+        while j < G:
+            L_j = padded(sizes[j])
+            if j > i and folds * (j - i + 1) * L_j > tokens:
+                break
+            L, j = L_j, j + 1
+        sel = by_size[i:j]
+        c, st = counts[sel], starts[sel]
+        ar = torch.arange(L, device=group_id.device)
+        valid = ar[None, :] < c[:, None]
+        pos = st[:, None] + torch.minimum(ar[None, :], (c - 1)[:, None])
+        blocks.append((order[pos], valid))
+        i = j
     return blocks
+
+
+def scatter_positions(dest: list[Tensor], n: int) -> Tensor:
+    """Where each of ``n`` rows sits among the concatenated slots of the packed blocks.
+
+    ``dest`` holds, per block, the row of every flattened slot, ``n`` for a
+    padding slot; every row fills exactly one slot.  Gathering the
+    concatenated slot outputs at the result puts them back in row order,
+    without a host sync.
+    """
+    flat = torch.cat(dest)
+    pos = torch.zeros(n + 1, dtype=torch.long, device=flat.device)
+    pos.index_put_((flat,), torch.arange(flat.numel(), device=flat.device))
+    return pos[:n]
 
 
 class AttentionBlock(nn.Module):
@@ -169,16 +205,17 @@ class FoldTransformerEncoder(nn.Module):
         Attention heads in every block.
     n_crystal_features
         Width of the per-crystal table ``x_crys`` read by the crystal token.
-    budget
-        Bound on ``folds * B * L * L`` for one packed call
+    tokens
+        Bound on the tokens of one packed block, ``folds * B * L``
         (:func:`fold_layout`).
     compile, bf16
-        Run the per-block stack through ``torch.compile(dynamic=True)`` on
-        CUDA, and the attention itself in bfloat16 on CUDA.  ``None`` reads
-        ``TORCHSX_PEER_COMPILE`` / ``TORCHSX_PEER_BF16`` (default on).
+        Run each packed block (:meth:`encode`) through
+        ``torch.compile(dynamic=True)`` on CUDA, and the attention itself in
+        bfloat16 on CUDA.  ``None`` reads ``TORCHSX_PEER_COMPILE`` /
+        ``TORCHSX_PEER_BF16`` (default on).
     checkpoint
-        Recompute each packed block's stack in the backward pass instead of
-        storing its activations.
+        Recompute each packed block in the backward pass instead of storing
+        its activations.
     """
 
     kind = "fold"
@@ -200,7 +237,7 @@ class FoldTransformerEncoder(nn.Module):
         d_hidden: int | None = None,
         activation: type[nn.Module] = nn.SiLU,
         n_crystal_features: int = 0,
-        budget: int = 1 << 24,
+        tokens: int = 1 << 19,
         compile: bool | None = None,
         bf16: bool | None = None,
         checkpoint: bool = True,
@@ -228,11 +265,8 @@ class FoldTransformerEncoder(nn.Module):
         self.query_peers = bool(query_peers)
         self.refine_geometry = bool(refine_geometry)
         self.n_heads = int(n_heads)
-        self.budget = int(budget)
+        self.tokens = int(tokens)
         self.checkpoint = bool(checkpoint)
-        #: one encoder chunk of ``n`` crystals holds ``K`` runs of each, so
-        #: :meth:`AmortizedScale.set_encoder_chunking` divides by this
-        self.chunk_divisor = self.context_folds
         self.register_buffer("meas_idx", torch.tensor(meas, dtype=torch.long), persistent=False)
 
         self.input_geometry = nn.Linear(n_self_features, d_model)
@@ -304,28 +338,39 @@ class FoldTransformerEncoder(nn.Module):
             if x_crys is None or x_crys.shape[1] != self.n_crystal_features:
                 raise ValueError(f"encoder was built with n_crystal_features="
                                  f"{self.n_crystal_features}; x_crys does not match")
-        g = self.input_geometry(x_self)
-        m = self.input_measurement(x_ctx.index_select(1, self.meas_idx))
-        run = self._block
-        if self.compile and g.is_cuda:
+        run = self.encode
+        if self.compile and x_self.is_cuda:
             if self._compiled is None:
-                self._compiled = torch.compile(self._block, dynamic=True)
+                self._compiled = torch.compile(self.encode, dynamic=True)
             run = self._compiled
         use_ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
-        z = g.new_zeros(n, self.d_model)
-        corrections = []
-        for idx, valid in fold_layout(group_id, self.context_folds, self.budget):
-            crys = (x_crys.index_select(0, group_id[idx[:, 0]]) if self.n_crystal_features
-                    else g.new_zeros(idx.shape[0], 0))
-            xs = x_self[idx] if self.refine_geometry else g.new_zeros(0)
-            args = (g[idx], m[idx], crys, valid, xs)
+        zs, dest, corrections = [], [], []
+        for idx, valid in self.layout(group_id):
+            args = (x_self, x_ctx, x_crys, group_id, idx, valid)
             zb, corr = (torch.utils.checkpoint.checkpoint(run, *args, use_reentrant=False)
                         if use_ckpt else run(*args))
-            z = z.index_put((idx[valid],), zb[valid])
+            zs.append(zb.flatten(0, 1))
+            dest.append(torch.where(valid, idx, n).flatten())
             corrections.append(corr.detach())
         if self.refine_geometry:
             self.last_correction = torch.cat(corrections)
-        return z
+        return torch.cat(zs).index_select(0, scatter_positions(dest, n))
+
+    def layout(self, group_id: Tensor) -> list[tuple[Tensor, Tensor]]:
+        """The packed blocks of one batch (:func:`fold_layout` under ``tokens``)."""
+        return fold_layout(group_id, self.context_folds, self.tokens)
+
+    def encode(self, x_self: Tensor, x_ctx: Tensor, x_crys: Tensor | None, group_id: Tensor,
+               idx: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
+        """One packed block from the batch tables: ``(B, L, D)`` embeddings of its slots
+        and each run's geometry correction (:meth:`_block`)."""
+        rows_self = x_self[idx]
+        g = self.input_geometry(rows_self)
+        m = self.input_measurement(x_ctx[idx].index_select(-1, self.meas_idx))
+        crys = (x_crys.index_select(0, group_id[idx[:, 0]]) if self.n_crystal_features
+                else g.new_zeros(idx.shape[0], 0))
+        xs = rows_self if self.refine_geometry else g.new_zeros(0)
+        return self._block(g, m, crys, valid, xs)
 
     def _block(self, g: Tensor, m: Tensor, crys: Tensor, valid: Tensor,
                xs: Tensor) -> tuple[Tensor, Tensor]:
@@ -341,11 +386,13 @@ class FoldTransformerEncoder(nn.Module):
         n_vis = (valid[None] & ~masked[:, None]).sum(-1).clamp(min=1)                 # (K, B)
         ct = self.input_crystal(torch.cat(
             [crys[None].expand(K, -1, -1), n_vis.to(g.dtype).log()[..., None]], dim=-1))
-        # observations, the crystal token, empty keys up to a multiple of 8
+        # the crystal token first (slot 0, so no index depends on L), the
+        # observations, empty keys up to a multiple of 8: at least one for
+        # folds <= 8 (fold_layout's L), so no size is specialised when compiled
         pad = -(L + 1) % 8
-        x = torch.cat([tok, ct[:, :, None], tok.new_zeros(K, B, pad, D)], dim=2)
-        x = x.reshape(K * B, L + 1 + pad, D)
-        keep = torch.cat([valid, valid.new_ones(B, 1), valid.new_zeros(B, pad)], dim=1)
+        x = torch.cat([ct[:, :, None], tok, tok.new_zeros(K, B, pad, D)], dim=2)
+        x = x.reshape(K * B, 1 + L + pad, D)
+        keep = torch.cat([valid.new_ones(B, 1), valid, valid.new_zeros(B, pad)], dim=1)
         keep = keep[None].expand(K, -1, -1).reshape(K * B, 1, 1, -1)
         correction = x.new_zeros(0, 4)
         if self.refine_geometry:
@@ -357,23 +404,22 @@ class FoldTransformerEncoder(nn.Module):
         for i, blk in enumerate(self.ctx_blocks):
             x = blk(x, None, keep)
             if self.refine_geometry:
-                correction = correction + self.geometry_heads[i](x[:, L])
+                correction = correction + self.geometry_heads[i](x[:, 0])
                 emb = (self._geometry_change(q0, k0, correction, K) @ w_geo.T) * live   # (K * B, L, D)
                 step = emb if applied is None else emb - applied
-                x = torch.cat([x[:, :L] + step, x[:, L:]], dim=1)
+                x = torch.cat([x[:, :1], x[:, 1:1 + L] + step, x[:, 1 + L:]], dim=1)
                 applied = emb
         # run f's queries are its own fold's slots f, f + K, f + 2K, ...
         Lq = L // K
-        q = x[:, :L].reshape(K, B, Lq, K, D)[runs, :, :, runs].reshape(K * B, Lq, D)
+        q = x[:, 1:1 + L].reshape(K, B, Lq, K, D)[runs, :, :, runs].reshape(K * B, Lq, D)
         last_kv, last_keep = x, keep
         if self.query_peers:
-            # every observation's own token, encoded alone; padded to a multiple of 8 keys
+            # every observation's own token, encoded alone, in the run memory's slots
             own = self.peer_ff(g + m + self.peer_embedding).masked_fill(~valid[:, :, None], 0.0)
-            pad_p = -L % 8
-            own = torch.cat([own, own.new_zeros(B, pad_p, D)], dim=1)
-            slot = torch.arange(L + pad_p, device=g.device)
-            own_slot = torch.arange(Lq, device=g.device)[None, :] * K + runs[:, None]      # (K, Lq)
-            peer_keep = (torch.cat([valid, valid.new_zeros(B, pad_p)], dim=1)[None, :, None, :]
+            own = torch.cat([own.new_zeros(B, 1, D), own, own.new_zeros(B, pad, D)], dim=1)
+            slot = torch.arange(1 + L + pad, device=g.device)
+            own_slot = 1 + torch.arange(Lq, device=g.device)[None, :] * K + runs[:, None]  # (K, Lq)
+            peer_keep = (keep.reshape(K, B, 1, -1) & (slot != 0)
                          & (slot[None, None, None, :] != own_slot[:, None, :, None]))  # (K, B, Lq, Lp)
             last_kv = torch.cat([x, own[None].expand(K, -1, -1, -1).reshape(K * B, -1, D)], dim=1)
             last_keep = torch.cat([keep.expand(-1, -1, Lq, -1),

@@ -914,7 +914,7 @@ class AmortizedTrainer:
         }
         corr = getattr(self.scale.encoder, "last_correction", None)
         if corr is not None and corr.numel():
-            # the geometry correction the encoder applied, over the crystal-runs of its last chunk
+            # the geometry correction the encoder applied, over the crystal-runs of its last forward
             rot = corr[:, :3].norm(dim=1) * (180.0 / math.pi)
             out["geometry_rot_deg_median"] = float(rot.median().item())
             out["geometry_rot_deg_p90"] = float(torch.quantile(rot.float(), 0.9).item())

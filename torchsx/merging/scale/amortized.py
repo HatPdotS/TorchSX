@@ -32,7 +32,7 @@ from torchsx.merging.scale.base import ScaleModel
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 from torchsx.nn.deepsets import DeepSetsEncoder, ScaleEncoder
-from torchsx.nn.fold_transformer import FoldTransformerEncoder
+from torchsx.nn.fold_transformer import FoldTransformerEncoder, scatter_positions
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
 from torchsx.nn.obs_features import ObsFeatureSpec
 
@@ -97,6 +97,8 @@ class AmortizedScale(ScaleModel):
         #: See :meth:`predict` -- the encoder is separable across crystals, so
         #: chunking is exact and moves the checkpoint boundary off the blocks.
         self.chunk_crystals = 0
+        #: the fold path's per-block function, compiled on first use on CUDA
+        self._fold_compiled = None
         self.anchor_log_k = bool(anchor_log_k)
         if anchor_stat not in ("median", "mean", "basis"):
             raise ValueError(
@@ -240,9 +242,7 @@ class AmortizedScale(ScaleModel):
         recompute and keep the per-block boundaries we are trying to drop.
         """
         n = int(crystals_per_chunk)
-        # an encoder that runs each crystal several times takes fewer per chunk
-        div = int(getattr(self.encoder, "chunk_divisor", 1))
-        self.chunk_crystals = max(n // div, 1) if n > 0 else 0
+        self.chunk_crystals = max(n, 0)
         self.encoder.checkpoint = not (n > 0)
 
     @staticmethod
@@ -290,8 +290,12 @@ class AmortizedScale(ScaleModel):
         128``), and every one of them is interior -- only ``log_K``,
         ``log_w`` and ``beta`` leave.  Storing the chunk's inputs and outputs
         instead is ~52 B per observation, and the 16 are rematerialised one
-        chunk at a time in backward.
+        chunk at a time in backward.  The fold transformer packs and
+        checkpoints its own blocks (:meth:`_predict_fold`) and ignores the
+        chunk size.
         """
+        if getattr(self.encoder, "kind", None) == "fold":
+            return self._predict_fold(meta)
         n_chunk = int(getattr(self, "chunk_crystals", 0) or 0)
         if n_chunk > 0:
             # Chunk in EVERY mode, not only when building a graph.  The
@@ -331,14 +335,7 @@ class AmortizedScale(ScaleModel):
                 "use AmortizedScale.set_encoder_chunking() to set both"
             )
 
-        skew = self.heads.predict_skew
-        mixture = getattr(self.heads, "scatter_family", "gengauss") == "mixture"
-        names = ["log_K", "log_w", "beta", "log_alpha", "log_e_s"]
-        if skew or mixture:
-            names.append("log_alpha_hi")
-        if mixture:
-            names.append("mix")
-
+        names = self._prediction_names()
         broad = getattr(self.features, "phase_broad", None)
         x_broad = (self.features.build_self(meta, broad.log_width(meta.hkl_idx))
                    if broad is not None else None)
@@ -367,6 +364,61 @@ class AmortizedScale(ScaleModel):
         pred = ScalePrediction(**{name: torch.cat(t) for name, t in zip(names, cols)})
         log_K_broad = torch.cat(cols[len(names)]) if x_broad is not None else None
         return self._anchor(self._pseudo_translation(pred, meta, log_K_broad), meta)
+
+    def _prediction_names(self) -> list[str]:
+        """The :class:`ScalePrediction` fields the heads fill."""
+        mixture = getattr(self.heads, "scatter_family", "gengauss") == "mixture"
+        names = ["log_K", "log_w", "beta", "log_alpha", "log_e_s"]
+        if self.heads.predict_skew or mixture:
+            names.append("log_alpha_hi")
+        if mixture:
+            names.append("mix")
+        return names
+
+    def _predict_fold(self, meta: ObsInfo) -> ScalePrediction:
+        """The fold transformer and the heads, one packed block at a time.
+
+        The encoder packs the batch's crystals into blocks once
+        (:meth:`~torchsx.nn.fold_transformer.FoldTransformerEncoder.layout`).
+        Each block runs gather, encoder and heads as one function: compiled on
+        CUDA (``encoder.compile``), and in training one checkpoint, so only
+        the batch tables and the block's outputs are stored.  One gather puts
+        the outputs back in row order.
+        """
+        if getattr(self.features, "phase_broad", None) is not None:
+            raise NotImplementedError("the fold transformer takes one x_self table "
+                                      "(no pseudo-translation profiles)")
+        x_self, x_ctx, x_crys = self.features.build(meta)
+        enc = self.encoder
+        run = self._fold_block
+        if enc.compile and x_self.is_cuda:
+            if self._fold_compiled is None:
+                self._fold_compiled = torch.compile(self._fold_block, dynamic=True)
+            run = self._fold_compiled
+        ckpt = torch.is_grad_enabled() and self.training
+        n = x_self.shape[0]
+        parts, dest, corrections = [], [], []
+        for idx, valid in enc.layout(meta.crystal_id):
+            args = (x_self, x_ctx, x_crys, meta.crystal_id, idx, valid)
+            out = (torch.utils.checkpoint.checkpoint(run, *args, use_reentrant=False)
+                   if ckpt else run(*args))
+            parts.append(out[:-1])
+            corrections.append(out[-1].detach())
+            dest.append(torch.where(valid, idx, n).flatten())
+        if enc.refine_geometry:
+            enc.last_correction = torch.cat(corrections)
+        pos = scatter_positions(dest, n)
+        pred = ScalePrediction(**{name: torch.cat(t).index_select(0, pos)
+                                  for name, t in zip(self._prediction_names(), zip(*parts))})
+        return self._anchor(pred, meta)
+
+    def _fold_block(self, x_self: Tensor, x_ctx: Tensor, x_crys: Tensor | None, group_id: Tensor,
+                    idx: Tensor, valid: Tensor) -> tuple[Tensor, ...]:
+        """Heads on every slot of one packed block (padding included), flattened, and
+        the block's geometry correction last."""
+        z, correction = self.encoder.encode(x_self, x_ctx, x_crys, group_id, idx, valid)
+        p = self.heads(z.flatten(0, 1))
+        return tuple(getattr(p, name) for name in self._prediction_names()) + (correction,)
 
     def predict_split(
         self, meta_self: ObsInfo, meta_ctx: ObsInfo

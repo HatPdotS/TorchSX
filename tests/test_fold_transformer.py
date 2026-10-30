@@ -1,4 +1,4 @@
-"""Fold transformer: the exclusion, the layout, the identity at step 0, chunking and packing."""
+"""Fold transformer: the exclusion, the layout, the identity at step 0, packing and compiling."""
 from __future__ import annotations
 
 import pytest
@@ -90,8 +90,8 @@ def test_layout_folds_are_fold_ids():
     gid = gid[torch.randperm(gid.numel(), generator=torch.Generator().manual_seed(0))]
     for K in (2, 3, 5):
         fold = fold_ids(gid, sizes.numel(), K)
-        for budget in (64, 4096, 1 << 24):
-            blocks = fold_layout(gid, K, budget)
+        for tokens in (1, 64, 4096, 1 << 19):
+            blocks = fold_layout(gid, K, tokens)
             seen = torch.cat([idx[valid] for idx, valid in blocks])
             assert torch.equal(seen.sort().values, torch.arange(gid.numel()))
             for idx, valid in blocks:
@@ -135,9 +135,9 @@ def test_packing_does_not_change_the_prediction(peers):
     sizes = torch.tensor([3, 11, 7, 20, 1, 6])
     gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes)
     xs, xc = torch.randn(gid.numel(), 4), torch.randn(gid.numel(), 7)
-    enc.budget = 1 << 24
+    enc.tokens = 1 << 19
     a = enc(xs, xc, gid, sizes.numel())
-    enc.budget = 64                                     # one crystal per call
+    enc.tokens = 1                                      # one crystal per block
     b = enc(xs, xc, gid, sizes.numel())
     torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-6)
 
@@ -153,7 +153,9 @@ def test_predictions_do_not_depend_on_row_grouping():
     torch.testing.assert_close(b, a[order], rtol=1e-5, atol=1e-6)
 
 
-def test_chunking_is_exact_in_value_and_gradient():
+def test_packing_is_exact_in_value_and_gradient():
+    """The scale's fold path (checkpointed blocks, heads per block, one gather back to
+    row order) against the whole batch in one block, rows in arrival order."""
     torch.manual_seed(0)
     prep = _toy_prep_with_crystal_feat()
     scale = _scale(prep)
@@ -161,23 +163,42 @@ def test_chunking_is_exact_in_value_and_gradient():
         if prm.dim() >= 1:
             torch.nn.init.normal_(prm, std=0.05)
     scale.train()
-    order = torch.argsort(prep.obs_info.crystal_id, stable=True)
-    meta = prep.obs_info.gather(order)
+    meta = prep.obs_info
 
-    def run(chunk):
-        scale.set_encoder_chunking(chunk)
+    def run(tokens):
+        scale.encoder.tokens = tokens
         scale.zero_grad(set_to_none=True)
         pred = scale.predict(meta)
         (pred.log_K.square().sum() + pred.log_w.sum()).backward()
         g = torch.cat([p.grad.flatten() for p in scale.parameters() if p.grad is not None])
         return pred.log_K.detach().clone(), g
 
-    k0, g0 = run(0)
-    for chunk in (3, 9):                  # 1 and 3 crystals per chunk at K = 3
-        k1, g1 = run(chunk)
-        assert scale.chunk_crystals == chunk // 3
+    k0, g0 = run(1 << 19)
+    assert len(scale.encoder.layout(meta.crystal_id)) == 1
+    for tokens in (1, 64):                # one crystal per block, a few per block
+        k1, g1 = run(tokens)
         torch.testing.assert_close(k1, k0, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(g1, g0, rtol=1e-4, atol=1e-6)
+    # the encoder alone, then the heads on every row
+    x_self, x_ctx, x_crys = scale.features.build(meta)
+    z = scale.encoder(x_self, x_ctx, meta.crystal_id, meta.n_crystals, x_crys=x_crys)
+    torch.testing.assert_close(scale.predict(meta).log_K, scale._anchor(scale.heads(z), meta).log_K,
+                               rtol=1e-5, atol=1e-6)
+
+
+def test_packed_block_compiles_once_for_every_length():
+    """Blocks of different B and L run one graph: no size is specialised."""
+    import torch._dynamo
+    torch._dynamo.reset()
+    enc = _geo_encoder(query_peers=True).eval()
+    fn = torch.compile(enc.encode, dynamic=True, backend="aot_eager")
+    with torch.no_grad():
+        for i, sizes in enumerate(([20, 24, 17], [40, 33], [9, 12, 7, 11], [60, 58, 61])):
+            gid, xs, xc = _geo_batch(sizes, seed=i)
+            (idx, valid), = enc.layout(gid)
+            with torch._dynamo.config.patch(error_on_recompile=i > 0):
+                got = fn(xs, xc, None, gid, idx, valid)[0]
+            torch.testing.assert_close(got, enc.encode(xs, xc, None, gid, idx, valid)[0])
 
 
 def test_measurement_columns_are_the_context_only_features():
@@ -205,7 +226,7 @@ def test_compiled_bf16_is_close_and_keeps_the_exclusion(peers):
     gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes).cuda()
     xs, xc = torch.randn(gid.numel(), 6, device="cuda"), torch.randn(gid.numel(), 9, device="cuda")
     for enc in (ref, fast):
-        enc.budget = 1 << 16                          # several buckets
+        enc.tokens = 1 << 9                           # several blocks
         enc.train()
     outs, grads = [], []
     for enc in (ref, fast):
