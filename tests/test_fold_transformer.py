@@ -1,11 +1,13 @@
 """Fold transformer: the exclusion, the layout, the identity at step 0, packing and compiling."""
 from __future__ import annotations
 
+import itertools
+
 import pytest
 import torch
 
 from torchsx.merging.scale import AmortizedScale
-from torchsx.nn.fold_transformer import FoldTransformerEncoder, fold_layout
+from torchsx.nn.fold_transformer import FoldTransformerEncoder, fold_layout, key_prefix_mask
 from torchsx.nn.pooling import fold_ids
 
 from tests.test_amortized_scale import _randomise, _toy_prep_with_crystal_feat
@@ -211,16 +213,59 @@ def test_measurement_columns_are_the_context_only_features():
     assert not set(meas) & set(feats.self_features)
 
 
+@pytest.mark.parametrize("q_len,kv_len", [(40, 300), (200, 385), (256, 384), (300, 300), (128, 129)])
+def test_key_prefix_mask_is_create_block_mask(q_len, kv_len):
+    """Block for block (the visited sets; order past each count is free) against
+    flex attention's own builder on the dense rule."""
+    from torch.nn.attention.flex_attention import create_block_mask
+    n_keys = torch.tensor([1, 40, 127, 128, 129, 256, 257, kv_len]).clamp(max=kv_len)
+    ours = key_prefix_mask(n_keys, q_len, kv_len)
+    ref = create_block_mask(lambda b, h, q, kv: kv < n_keys[b], n_keys.numel(), None, q_len, kv_len,
+                            device="cpu")
+    assert ours.seq_lengths == ref.seq_lengths
+    for num, idx in (("kv_num_blocks", "kv_indices"), ("full_kv_num_blocks", "full_kv_indices"),
+                     ("q_num_blocks", "q_indices"), ("full_q_num_blocks", "full_q_indices")):
+        a_num, a_idx = getattr(ours, num), getattr(ours, idx)
+        b_num, b_idx = getattr(ref, num), getattr(ref, idx)
+        assert a_num.shape == b_num.shape and a_idx.shape == b_idx.shape
+        assert torch.equal(a_num, b_num), num
+        for row in itertools.product(*map(range, a_num.shape)):
+            k = int(a_num[row])
+            assert sorted(a_idx[row][:k].tolist()) == sorted(b_idx[row][:k].tolist()), (idx, row)
+
+
+def test_flex_attention_on_the_prefix_mask_is_masked_attention():
+    from torch.nn.attention.flex_attention import flex_attention
+    g = torch.Generator().manual_seed(0)
+    n_keys = torch.tensor([1, 40, 128, 200, 257])
+    q, k, v = (torch.randn(5, 2, 260, 16, generator=g) for _ in range(3))
+    keep = (torch.arange(260)[None, :] < n_keys[:, None])[:, None, None, :]
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+    got = flex_attention(q, k, v, block_mask=key_prefix_mask(n_keys, 260, 260))
+    torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_flex_needs_heads_of_at_least_16():
+    kw = dict(d_model=32, compile=False, flex=True)
+    assert FoldTransformerEncoder(4, 7, [4, 5, 6], n_heads=2, **kw).flex
+    assert not FoldTransformerEncoder(4, 7, [4, 5, 6], n_heads=4, **kw).flex
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
-@pytest.mark.parametrize("peers", [False, True])
-def test_compiled_bf16_is_close_and_keeps_the_exclusion(peers):
+@pytest.mark.parametrize("peers,flex", [(False, False), (False, True), (True, True)])
+def test_compiled_bf16_is_close_and_keeps_the_exclusion(peers, flex):
+    """The compiled bf16 block (flex attention or the masked kernel) against the eager
+    float32 reference, and the exclusion bit for bit."""
+    import torch._dynamo
+    torch._dynamo.reset()
     torch.manual_seed(0)
-    kw = dict(d_model=32, n_heads=4, folds=5, ctx_layers=2, query_layers=1, query_peers=peers)
+    kw = dict(d_model=64, n_heads=4, folds=5, ctx_layers=2, query_layers=1, query_peers=peers)
     ref = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=False, bf16=False, **kw).cuda()
     for prm in ref.parameters():
         if prm.dim() > 1:
-            torch.nn.init.normal_(prm, std=0.2)
-    fast = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=True, bf16=True, **kw).cuda()
+            torch.nn.init.normal_(prm, std=0.15)
+    fast = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=True, bf16=True, flex=flex, **kw).cuda()
+    assert fast.flex == flex
     fast.load_state_dict(ref.state_dict())
     sizes = torch.tensor([1, 5, 12, 30, 7, 64, 3, 19, 120])
     gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes).cuda()
@@ -239,18 +284,70 @@ def test_compiled_bf16_is_close_and_keeps_the_exclusion(peers):
     assert (grads[1] - grads[0]).norm() / grads[0].norm() < 5e-2
     fast.eval()
     j = int(sizes[:5].sum()) + 2                      # a row of the 64-row crystal
-    with torch.no_grad():
-        base = fast(xs, xc, gid, sizes.numel())
-        xc2 = xc.clone()
-        xc2[j, 6:] -= 30.0
-        moved = fast(xs, xc2, gid, sizes.numel())
+    xc2 = xc.clone()
+    xc2[j, 6:] -= 30.0
     fold = fold_ids(gid, sizes.numel(), 5)
     same = gid == gid[j]
     own = same & (fold == fold[j])
-    assert torch.equal(moved[j], base[j])
-    if not peers:
-        assert torch.equal(moved[own], base[own])
-    assert (moved[same & ~own] - base[same & ~own]).abs().max() > 1e-2
+    for grad in (True, False):                        # flex attention with autograd, masked without
+        with torch.set_grad_enabled(grad):
+            base = fast(xs, xc, gid, sizes.numel()).detach()
+            moved = fast(xs, xc2, gid, sizes.numel()).detach()
+        assert torch.equal(moved[j], base[j])
+        if not peers:
+            assert torch.equal(moved[own], base[own])
+        assert (moved[same & ~own] - base[same & ~own]).abs().max() > 1e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
+@pytest.mark.parametrize("q_len", [40, 300])
+def test_compiled_flex_on_the_prefix_mask_is_masked_attention(q_len):
+    """The inductor kernels on the block mask (a short query block, a ragged one), in
+    float32 against masked SDPA: value and gradient."""
+    import torch._dynamo
+    from torch.nn.attention.flex_attention import flex_attention
+    torch._dynamo.reset()
+    g = torch.Generator(device="cuda").manual_seed(0)
+    n_keys = torch.tensor([1, 40, 128, 200, 256, 257, 300], device="cuda")
+    q = torch.randn(7, 2, q_len, 16, device="cuda", generator=g)
+    k, v = (torch.randn(7, 2, 300, 16, device="cuda", generator=g) for _ in range(2))
+    keep = (torch.arange(300, device="cuda")[None, :] < n_keys[:, None])[:, None, None, :]
+    fn = torch.compile(lambda q, k, v, n: flex_attention(q, k, v, block_mask=key_prefix_mask(
+        n, q.shape[-2], k.shape[-2])), dynamic=True, fullgraph=True)
+    w = torch.randn(7, 2, q_len, 16, device="cuda", generator=g)
+    outs = []
+    for attend in (lambda *a: fn(*a, n_keys),
+                   lambda *a: torch.nn.functional.scaled_dot_product_attention(*a, attn_mask=keep)):
+        qkv = [t.clone().requires_grad_() for t in (q, k, v)]
+        out = attend(*qkv)
+        (out * w).sum().backward()
+        outs.append((out.detach(), *(t.grad for t in qkv)))
+    for got, ref in zip(*outs):
+        torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
+def test_flex_block_is_one_graph_for_every_key_block_count():
+    """No graph break, and no size specialised by the number of key blocks (autograd on,
+    where flex attention runs; blocks of two or more crystals: one crystal alone is a
+    shape of its own)."""
+    import torch._dynamo
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    enc = FoldTransformerEncoder(6, 9, [6, 7, 8], d_model=64, n_heads=4, folds=5, ctx_layers=2,
+                                 query_layers=1, bf16=True, flex=True).cuda().eval()
+    for prm in enc.parameters():
+        if prm.dim() > 1:
+            torch.nn.init.normal_(prm, std=0.1)
+    fn = torch.compile(enc.encode, dynamic=True, fullgraph=True)
+    # every run's queries number at least 128, the key blocks 6 to 11
+    for i, sizes in enumerate(([650, 700], [900, 820, 777], [1300, 1250], [640, 1000, 1001])):
+        gid, xs, xc = (t.cuda() for t in _geo_batch(sizes, seed=i))
+        (idx, valid), = enc.layout(gid)
+        with torch._dynamo.config.patch(error_on_recompile=i > 0):
+            got = fn(xs, xc, None, gid, idx, valid)[0].detach()
+        ref = enc.encode(xs, xc, None, gid, idx, valid)[0].detach()
+        assert (got - ref)[valid].norm() / ref[valid].norm() < 1e-3
 
 
 # ── geometry correction ────────────────────────────────────────────────

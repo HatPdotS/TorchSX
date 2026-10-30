@@ -66,10 +66,12 @@ import os
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 from torchsx.nn.deepsets import ResidualFF
 
-__all__ = ["AttentionBlock", "FoldTransformerEncoder", "fold_layout", "scatter_positions"]
+__all__ = ["AttentionBlock", "FoldTransformerEncoder", "fold_layout", "key_prefix_mask",
+           "scatter_positions"]
 
 
 def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 19) -> list[tuple[Tensor, Tensor]]:
@@ -127,14 +129,63 @@ def scatter_positions(dest: list[Tensor], n: int) -> Tensor:
     return pos[:n]
 
 
+def key_prefix_mask(n_keys: Tensor, q_len, kv_len, mask_mod=None, block: int = 128) -> BlockMask:
+    """Flex-attention block mask in which row ``b`` reads its first ``n_keys[b]`` keys.
+
+    Built from the counts alone, with no dense mask, and equal to
+    ``create_block_mask`` on the same rule: in every complete query block of
+    row ``b`` the key blocks wholly inside the prefix are full (no mask
+    evaluated), the block holding its end is partial, and the rest are
+    skipped, so padding costs no attention work; a last, incomplete query
+    block reads every key block of the prefix as partial (the kernel masks
+    only partial blocks, and that block runs past ``q_len``).  Every tensor
+    is built at its full shape (no expand of a size-1 dim), so no block
+    count is specialised when compiled.  ``mask_mod`` (same signature as
+    flex attention's) is the element mask of the partial blocks; it must keep
+    the same prefix, and it reads the counts by default.
+    """
+    B, dev, i32 = n_keys.shape[0], n_keys.device, torch.int32
+    nq, nk = -(-q_len // block), -(-kv_len // block)
+    n_complete = q_len // block                                               # query blocks inside q_len
+    full = (n_keys // block).to(i32)[:, None, None]                          # (B, 1, 1)
+    part = (n_keys % block != 0).to(i32)[:, None, None]
+    k_blocks = torch.arange(nk, device=dev, dtype=i32)
+    q_blocks = torch.arange(nq, device=dev, dtype=i32)
+    # key side, per query block: in a complete one full blocks 0 .. full-1 and the
+    # partial one at `full`; in the incomplete one blocks 0 .. full+part-1, all partial
+    complete = (torch.zeros(B, 1, nq, dtype=i32, device=dev) + q_blocks < n_complete).to(i32)
+    full_kv_num = full * complete
+    kv_num = part * complete + (full + part) * (1 - complete)
+    full_kv_idx = torch.zeros(B, 1, nq, nk, dtype=i32, device=dev) + k_blocks
+    kv_idx = (full_kv_idx + (full * complete)[..., None]) % nk
+    # query side (the backward), per key block: the complete query blocks 0 ..
+    # n_complete-1 when it is full or partial there, then the incomplete one
+    blk = torch.zeros(B, 1, nk, dtype=i32, device=dev) + k_blocks
+    edge = ((blk == full) & (part > 0)).to(i32)
+    ragged = torch.zeros(1, dtype=i32, device=dev) + (nq - n_complete)         # 1 if q_len % block
+    tail = (blk < full + part).to(i32) * ragged
+    full_q_num = (blk < full).to(i32) * n_complete
+    q_num = edge * n_complete + tail
+    full_q_idx = torch.zeros(B, 1, nk, nq, dtype=i32, device=dev) + q_blocks
+    q_idx = (full_q_idx + ((1 - edge) * n_complete)[..., None]) % nq
+
+    if mask_mod is None:
+        def mask_mod(b, h, q, kv):
+            return kv < n_keys[b]
+    return BlockMask((q_len, kv_len), kv_num, kv_idx, full_kv_num, full_kv_idx,
+                     q_num, q_idx, full_q_num, full_q_idx, (block, block), mask_mod)
+
+
 class AttentionBlock(nn.Module):
     """Pre-norm multi-head attention of a query stream onto a key/value set, plus a residual FF.
 
     ``forward(q, kv, keep)`` on ``(B, Lq, D)`` queries and ``(B, Lk, D)``
     keys/values; ``keep`` is the ``(B, 1, 1, Lk)`` set of keys every query may
-    read.  With ``self_attention`` the block reads its own input (``kv`` is
-    ignored) through one norm.  The output projection is zero-initialised, so
-    the block starts as the identity.
+    read.  ``block_mask``, when given, is the same set as a flex-attention
+    :class:`BlockMask` and is used in place of ``keep``.  With
+    ``self_attention`` the block reads its own input (``kv`` is ignored)
+    through one norm.  The output projection is zero-initialised, so the block
+    starts as the identity.
     """
 
     def __init__(self, d_model: int, n_heads: int, d_hidden: int | None = None, *,
@@ -158,7 +209,8 @@ class AttentionBlock(nn.Module):
         nn.init.zeros_(self.w_o.bias)
         self.ff = ResidualFF(d_model, d_hidden, activation=activation)
 
-    def forward(self, q: Tensor, kv: Tensor | None, keep: Tensor) -> Tensor:
+    def forward(self, q: Tensor, kv: Tensor | None, keep: Tensor,
+                block_mask: BlockMask | None = None) -> Tensor:
         B, Lq, D = q.shape
         H, dh = self.n_heads, self.d_head
         qn = self.norm_q(q)
@@ -169,7 +221,10 @@ class AttentionBlock(nn.Module):
         V = self.w_v(kvn).view(B, Lk, H, dh).transpose(1, 2)
         if self.bf16 and q.is_cuda:
             Q, K, V = Q.to(torch.bfloat16), K.to(torch.bfloat16), V.to(torch.bfloat16)
-        a = torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=keep).to(q.dtype)
+        if block_mask is not None:
+            a = flex_attention(Q, K, V, block_mask=block_mask).to(q.dtype)
+        else:
+            a = torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=keep).to(q.dtype)
         return self.ff(q + self.w_o(a.transpose(1, 2).reshape(B, Lq, D)))
 
 
@@ -213,6 +268,14 @@ class FoldTransformerEncoder(nn.Module):
         ``torch.compile(dynamic=True)`` on CUDA, and the attention itself in
         bfloat16 on CUDA.  ``None`` reads ``TORCHSX_PEER_COMPILE`` /
         ``TORCHSX_PEER_BF16`` (default on).
+    flex
+        Inside the compiled block, with autograd on, attention reads each
+        run's keys through flex attention, which skips the padding instead of
+        masking it (the same keys; heads at least 16 wide, a power of two).
+        Without autograd, and in the last query layer under ``query_peers``,
+        the masked kernel runs: inductor inlines the block-mask arithmetic into
+        a forward-only flex kernel, which then reads out of bounds.  ``None``
+        reads ``TORCHSX_FOLD_FLEX`` (default on).
     checkpoint
         Recompute each packed block in the backward pass instead of storing
         its activations.
@@ -240,6 +303,7 @@ class FoldTransformerEncoder(nn.Module):
         tokens: int = 1 << 19,
         compile: bool | None = None,
         bf16: bool | None = None,
+        flex: bool | None = None,
         checkpoint: bool = True,
     ) -> None:
         super().__init__()
@@ -280,6 +344,10 @@ class FoldTransformerEncoder(nn.Module):
         if bf16 is None:
             bf16 = os.environ.get("TORCHSX_PEER_BF16", "1") != "0"
         self.compile = bool(compile)
+        if flex is None:
+            flex = os.environ.get("TORCHSX_FOLD_FLEX", "1") != "0"
+        d_head = self.d_model // self.n_heads
+        self.flex = bool(flex) and d_head >= 16 and d_head & (d_head - 1) == 0
         self._compiled = None
         self.ctx_blocks = nn.ModuleList(
             AttentionBlock(d_model, n_heads, d_hidden, self_attention=True,
@@ -394,6 +462,17 @@ class FoldTransformerEncoder(nn.Module):
         x = x.reshape(K * B, 1 + L + pad, D)
         keep = torch.cat([valid.new_ones(B, 1), valid, valid.new_zeros(B, pad)], dim=1)
         keep = keep[None].expand(K, -1, -1).reshape(K * B, 1, 1, -1)
+        ctx_mask = query_mask = None
+        if self.flex and g.is_cuda and torch.is_grad_enabled() and torch.compiler.is_compiling():
+            # every run reads its crystal token and its observations: a prefix of the keys
+            n_keys = (1 + valid.sum(-1)).repeat(K)                                    # (K * B,)
+
+            def is_key(b, h, q, kv):
+                # read off ``valid`` itself, a graph input: inductor cannot index
+                # a buffer computed inside the graph from a flex kernel everywhere
+                return (kv == 0) | ((kv <= L) & valid[b % B, (kv - 1).clamp(0, L - 1)])
+            ctx_mask = key_prefix_mask(n_keys, 1 + L + pad, 1 + L + pad, is_key)
+            query_mask = key_prefix_mask(n_keys, L // K, 1 + L + pad, is_key)
         correction = x.new_zeros(0, 4)
         if self.refine_geometry:
             q0, k0 = self._raw_geometry(xs)                                           # (B, L, 3), (B, L)
@@ -402,7 +481,7 @@ class FoldTransformerEncoder(nn.Module):
             correction = x.new_zeros(K * B, 4)
             applied = None
         for i, blk in enumerate(self.ctx_blocks):
-            x = blk(x, None, keep)
+            x = blk(x, None, keep, ctx_mask)
             if self.refine_geometry:
                 correction = correction + self.geometry_heads[i](x[:, 0])
                 emb = (self._geometry_change(q0, k0, correction, K) @ w_geo.T) * live   # (K * B, L, D)
@@ -426,7 +505,8 @@ class FoldTransformerEncoder(nn.Module):
                                    peer_keep.reshape(K * B, 1, Lq, -1)], dim=-1)
         for i, blk in enumerate(self.query_blocks):
             last = i == len(self.query_blocks) - 1
-            q = blk(q, last_kv if last else x, last_keep if last else keep)
+            q = (blk(q, last_kv, last_keep) if last and self.query_peers
+                 else blk(q, x, keep, query_mask))
         # [f, b, j] -> slot j K + f
         z = q.reshape(K, B, L // K, D).permute(1, 2, 0, 3).reshape(B, L, D)
         if self.refine_geometry:
