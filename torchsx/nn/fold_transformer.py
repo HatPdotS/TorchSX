@@ -200,9 +200,10 @@ class AttentionBlock(nn.Module):
             raise ValueError(f"d_model {d_model} not divisible by n_heads {n_heads}")
         self.n_heads, self.d_head = int(n_heads), d_model // n_heads
         self.self_attention = bool(self_attention)
-        #: attention in bfloat16 on CUDA; projections, norms and the residual
-        #: stream stay float32
+        #: attention in half precision on CUDA (``half``, set by the encoder for
+        #: its device); projections, norms and the residual stream stay float32
         self.bf16 = bool(bf16)
+        self.half = torch.bfloat16
         self.norm_q = nn.RMSNorm(d_model)
         self.norm_kv = None if self.self_attention else nn.RMSNorm(d_model)
         self.w_q = nn.Linear(d_model, d_model, bias=False)
@@ -224,7 +225,7 @@ class AttentionBlock(nn.Module):
         K = self.w_k(kvn).view(B, Lk, H, dh).transpose(1, 2)
         V = self.w_v(kvn).view(B, Lk, H, dh).transpose(1, 2)
         if self.bf16 and q.is_cuda:
-            Q, K, V = Q.to(torch.bfloat16), K.to(torch.bfloat16), V.to(torch.bfloat16)
+            Q, K, V = Q.to(self.half), K.to(self.half), V.to(self.half)
         if block_mask is not None:
             a = flex_attention(Q, K, V, block_mask=block_mask).to(q.dtype)
         else:
@@ -270,8 +271,10 @@ class FoldTransformerEncoder(nn.Module):
     compile, bf16
         Run each packed block (:meth:`encode`) through
         ``torch.compile(dynamic=True)`` on CUDA, and the attention itself in
-        bfloat16 on CUDA.  ``None`` reads ``TORCHSX_PEER_COMPILE`` /
-        ``TORCHSX_PEER_BF16`` (default on).
+        half precision on CUDA: bfloat16, or float16 on GPUs of compute
+        capability below 8.0, which have no bfloat16 (:meth:`fit_device`).
+        ``None`` reads ``TORCHSX_PEER_COMPILE`` / ``TORCHSX_PEER_BF16``
+        (default on).
     flex
         Inside the compiled block, with autograd on, attention reads each
         run's keys through flex attention, which skips the padding instead of
@@ -279,7 +282,8 @@ class FoldTransformerEncoder(nn.Module):
         Without autograd, and in the last query layer under ``query_peers``,
         the masked kernel runs: inductor inlines the block-mask arithmetic into
         a forward-only flex kernel, which then reads out of bounds.  ``None``
-        reads ``TORCHSX_FOLD_FLEX`` (default on).
+        reads ``TORCHSX_FOLD_FLEX`` (default on).  GPUs of compute capability
+        below 8.0 run the masked kernel throughout.
     checkpoint
         Recompute each packed block in the backward pass instead of storing
         its activations.
@@ -352,6 +356,9 @@ class FoldTransformerEncoder(nn.Module):
             flex = os.environ.get("TORCHSX_FOLD_FLEX", "1") != "0"
         d_head = self.d_model // self.n_heads
         self.flex = bool(flex) and d_head >= 16 and d_head & (d_head - 1) == 0
+        #: flex attention on this device (:meth:`fit_device`)
+        self.flex_device = True
+        self._device = None
         self._compiled = None
         self.ctx_blocks = nn.ModuleList(
             AttentionBlock(d_model, n_heads, d_hidden, self_attention=True,
@@ -410,6 +417,7 @@ class FoldTransformerEncoder(nn.Module):
             if x_crys is None or x_crys.shape[1] != self.n_crystal_features:
                 raise ValueError(f"encoder was built with n_crystal_features="
                                  f"{self.n_crystal_features}; x_crys does not match")
+        self.fit_device(x_self.device)
         run = self.encode
         if self.compile and x_self.is_cuda:
             if self._compiled is None:
@@ -427,6 +435,20 @@ class FoldTransformerEncoder(nn.Module):
         if self.refine_geometry:
             self.last_correction = torch.cat(corrections)
         return torch.cat(zs).index_select(0, scatter_positions(dest, n))
+
+    def fit_device(self, device: torch.device, capability: tuple[int, int] | None = None) -> None:
+        """Attention for ``device``: on GPUs of compute capability 8.0 and up in
+        bfloat16 with flex attention, on older GPUs in float16 on the masked kernel.
+        ``capability`` stands in for the device's own."""
+        if device == self._device and capability is None:
+            return
+        self._device = device
+        if capability is None and device.type == "cuda":
+            capability = torch.cuda.get_device_capability(device)
+        has_bf16 = capability is None or capability[0] >= 8
+        self.flex_device = has_bf16
+        for blk in (*self.ctx_blocks, *self.query_blocks):
+            blk.half = torch.bfloat16 if has_bf16 else torch.float16
 
     def layout(self, group_id: Tensor) -> list[tuple[Tensor, Tensor]]:
         """The packed blocks of one batch (:func:`fold_layout` under ``tokens``)."""
@@ -467,7 +489,8 @@ class FoldTransformerEncoder(nn.Module):
         keep = torch.cat([valid.new_ones(B, 1), valid, valid.new_zeros(B, pad)], dim=1)
         keep = keep[None].expand(K, -1, -1).reshape(K * B, 1, 1, -1)
         ctx_mask = query_mask = None
-        if self.flex and g.is_cuda and torch.is_grad_enabled() and torch.compiler.is_compiling():
+        if (self.flex and self.flex_device and g.is_cuda and torch.is_grad_enabled()
+                and torch.compiler.is_compiling()):
             # every run reads its crystal token and its observations: a prefix of the keys
             n_keys = (1 + valid.sum(-1)).repeat(K)                                    # (K * B,)
 

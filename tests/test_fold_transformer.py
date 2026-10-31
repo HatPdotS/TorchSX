@@ -357,6 +357,45 @@ def test_flex_block_is_one_graph_for_every_block_count():
         assert (got - ref)[valid].norm() / ref[valid].norm() < 2 ** -8
 
 
+def test_fit_device_picks_bfloat16_and_flex_from_compute_capability_8():
+    enc = FoldTransformerEncoder(6, 9, [6, 7, 8], d_model=32, n_heads=2, compile=False)
+    blocks = (*enc.ctx_blocks, *enc.query_blocks)
+    for cap, half, flex in (((7, 0), torch.float16, False), ((8, 0), torch.bfloat16, True),
+                            ((9, 0), torch.bfloat16, True)):
+        enc.fit_device(torch.device("cuda", 0), capability=cap)
+        assert enc.flex_device == flex and all(b.half == half for b in blocks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
+def test_gpus_without_bfloat16_run_float16_on_the_masked_kernel():
+    """Below compute capability 8.0 the compiled block runs attention in float16 on the
+    masked kernel: values and gradients close to the eager float32 reference."""
+    import torch._dynamo
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    kw = dict(d_model=64, n_heads=4, folds=5, ctx_layers=2, query_layers=1)
+    ref = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=False, bf16=False, **kw).cuda()
+    for prm in ref.parameters():
+        if prm.dim() > 1:
+            torch.nn.init.normal_(prm, std=0.15)
+    old = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=True, bf16=True, flex=True, **kw).cuda()
+    old.load_state_dict(ref.state_dict())
+    old.fit_device(torch.device("cuda", torch.cuda.current_device()), capability=(7, 0))
+    assert not old.flex_device and {b.half for b in (*old.ctx_blocks, *old.query_blocks)} == {torch.float16}
+    sizes = torch.tensor([1, 5, 12, 30, 7, 64, 3, 19, 120])
+    gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes).cuda()
+    xs, xc = torch.randn(gid.numel(), 6, device="cuda"), torch.randn(gid.numel(), 9, device="cuda")
+    outs, grads = [], []
+    for enc in (ref, old):
+        enc.train()
+        z = enc(xs, xc, gid, sizes.numel())
+        z.square().sum().backward()
+        outs.append(z.detach())
+        grads.append(torch.cat([p.grad.flatten() for p in enc.parameters() if p.grad is not None]))
+    assert (outs[1] - outs[0]).norm() / outs[0].norm() < 1e-2
+    assert (grads[1] - grads[0]).norm() / grads[0].norm() < 2e-2
+
+
 # ── geometry correction ────────────────────────────────────────────────
 
 GEO_MEAN = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.1, 9000.0])

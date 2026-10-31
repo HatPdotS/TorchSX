@@ -390,6 +390,7 @@ class AmortizedScale(ScaleModel):
                                       "(no pseudo-translation profiles)")
         x_self, x_ctx, x_crys = self.features.build(meta)
         enc = self.encoder
+        enc.fit_device(x_self.device)
         run = self._fold_block
         if enc.compile and x_self.is_cuda:
             if self._fold_compiled is None:
