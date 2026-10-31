@@ -61,7 +61,6 @@ embedding.
 
 from __future__ import annotations
 
-import math
 import os
 
 import torch
@@ -72,7 +71,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torchsx.nn.deepsets import ResidualFF
 
 __all__ = ["AttentionBlock", "FoldTransformerEncoder", "fold_layout", "key_prefix_mask",
-           "scatter_positions", "slot_unit"]
+           "scatter_positions"]
 
 #: tiles, warps and pipeline stages of the flex attention kernels (``fwd_*`` /
 #: ``bwd_*`` keys of ``flex_attention``'s ``kernel_options``): the backward
@@ -82,22 +81,16 @@ FLEX_KERNEL_OPTIONS: dict | None = dict(bwd_BLOCK_M1=64, bwd_BLOCK_N1=128, bwd_B
                                          bwd_BLOCK_N2=64, bwd_num_warps=4, bwd_num_stages=2)
 
 
-def slot_unit(folds: int) -> int:
-    """Slots per group of a packed row (:func:`fold_layout`): the least common
-    multiple of 8 and ``folds``."""
-    return math.lcm(8, int(folds))
-
-
 def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 18,
                 rows: int = 2) -> list[tuple[Tensor, Tensor]]:
     """Pack each crystal's rows into padded blocks of ``B`` rows of ``L`` slots.
 
     Crystals are sorted by size and dealt into blocks.  A block's ``L`` is its
-    largest crystal rounded up to a multiple of ``U = slot_unit(folds)``, and
-    at least 127, so a run (the crystal token and ``L`` slots) fills at least
-    one 128-key block.  A block closes before its ``folds``
-    runs would hold more than ``tokens`` tokens (``folds * B * L``), and a
-    crystal larger than that gets a block of its own.  A block of fewer than
+    largest crystal rounded up to a multiple of ``folds``, and at least 127,
+    so a run (the crystal token and ``L`` slots) fills at least one 128-key
+    block.  A block closes before its ``folds`` runs would hold more than
+    ``tokens`` tokens (``folds * B * L``), and a crystal larger than that gets
+    a block of its own.  A block of fewer than
     ``rows`` crystals (the last one, or one such crystal) is filled up with
     empty rows, which hold no valid slot, so ``B`` is never 1.  Within a
     crystal the rows keep their arrival order, so slot ``l`` holds the
@@ -105,11 +98,11 @@ def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 18,
     call.
 
     Returns ``[(idx, valid)]`` as :func:`~torchsx.nn.deepsets.peer_layout`
-    does, each shaped ``(B, L // U, U)``: slot ``l`` of row ``b`` at
-    ``[b, l // U, l % U]`` (an empty row's ``idx`` repeats a row of the
-    block).  The last dimension is marked static for ``torch.compile``, so
-    every length in a compiled block is a multiple of the one size ``L // U``
-    and one graph serves every block.
+    does, each shaped ``(B, L // folds, folds)``: slot ``l`` of row ``b`` at
+    ``[b, l // folds, l % folds]``, the last index its fold (an empty row's
+    ``idx`` repeats a row of the block).  The last dimension is marked static
+    for ``torch.compile``, so every length in a compiled block is a multiple
+    of the one size ``L // folds`` and one graph serves every block.
     """
     order = torch.argsort(group_id, stable=True)
     _, counts = torch.unique_consecutive(group_id[order], return_counts=True)
@@ -117,7 +110,7 @@ def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 18,
     by_size = torch.argsort(counts, stable=True)
     sizes = counts[by_size].tolist()
 
-    U = slot_unit(folds)
+    U = int(folds)
     r_min = -(-127 // U)
 
     def padded(n: int) -> int:
@@ -509,11 +502,10 @@ class FoldTransformerEncoder(nn.Module):
                xs: Tensor) -> tuple[Tensor, Tensor]:
         """Every run of one packed block: ``(B, L, D)`` embeddings, slot ``l`` read from
         run ``l % K``, and each run's geometry correction ``(K * B, 4)`` (empty without
-        ``refine_geometry``).  ``valid`` in the layout's ``(B, L // U, U)``."""
+        ``refine_geometry``).  ``valid`` in the layout's ``(B, L // K, K)``."""
         K = self.context_folds
         B, L, D = g.shape
         slots, valid = valid, valid.flatten(1)
-        U = slots.shape[2]
         runs = torch.arange(K, device=g.device)
         masked = (torch.arange(L, device=g.device) % K)[None, :] == runs[:, None]    # (K, L)
         tok = g[None] + torch.where(masked[:, None, :, None], self.mask_embedding, m[None])
@@ -522,9 +514,9 @@ class FoldTransformerEncoder(nn.Module):
         ct = self.input_crystal(torch.cat(
             [crys[None].expand(K, -1, -1), n_vis.to(g.dtype).log()[..., None]], dim=-1))
         # the crystal token first (slot 0, so no index depends on L), then the
-        # observations: 1 + L keys, an odd count (L is a multiple of 8).  A size
-        # with only even terms, such as 40 R + 8, makes the compiler's size
-        # arithmetic replace ceil(n / s) by n / s in split reductions.
+        # observations: 1 + L keys, with no padding.  A size whose terms are all
+        # even, such as 40 R + 8, makes the compiler's size arithmetic replace
+        # ceil(n / s) by n / s in split reductions.
         x = torch.cat([ct[:, :, None], tok], dim=2).reshape(K * B, 1 + L, D)
         keep = torch.cat([valid.new_ones(B, 1), valid], dim=1)
         keep = keep[None].expand(K, -1, -1).reshape(K * B, 1, 1, -1)
@@ -533,15 +525,14 @@ class FoldTransformerEncoder(nn.Module):
                 and torch.compiler.is_compiling()):
             # every run reads its crystal token and its observations: a prefix of the keys
             n_keys = (1 + valid.sum(-1)).repeat(K)                                    # (K * B,)
-
             R = slots.shape[1]
 
             def is_key(b, h, q, kv):
                 # read off ``valid`` itself, a graph input: inductor cannot index
                 # a buffer computed inside the graph from a flex kernel everywhere;
-                # the sizes it reads are the inputs' own (B, R), not L = R * U
+                # the sizes it reads are the inputs' own (B, R), not L = R * K
                 s = (kv - 1).clamp(min=0)
-                return (kv == 0) | slots[b % B, (s // U).clamp(max=R - 1), s % U]
+                return (kv == 0) | slots[b % B, (s // K).clamp(max=R - 1), s % K]
             ctx_mask = key_prefix_mask(n_keys, 1 + L, 1 + L, is_key)
             query_mask = key_prefix_mask(n_keys, L // K, 1 + L, is_key)
         correction = x.new_zeros(0, 4)
