@@ -97,8 +97,10 @@ def test_layout_folds_are_fold_ids():
             seen = torch.cat([idx[valid] for idx, valid in blocks])
             assert torch.equal(seen.sort().values, torch.arange(gid.numel()))
             for idx, valid in blocks:
+                U = idx.shape[2]
+                assert U % K == 0 and U % 8 == 0 and idx.shape[1] * U >= 120 and idx.shape[0] >= 2
+                idx, valid = idx.flatten(1), valid.flatten(1)
                 L = idx.shape[1]
-                assert L % K == 0
                 slot = torch.arange(L).expand_as(idx)
                 assert torch.equal(fold[idx[valid]], slot[valid] % K)
                 assert (gid[idx] == gid[idx[:, :1]]).all()
@@ -195,7 +197,7 @@ def test_packed_block_compiles_once_for_every_length():
     enc = _geo_encoder(query_peers=True).eval()
     fn = torch.compile(enc.encode, dynamic=True, backend="aot_eager")
     with torch.no_grad():
-        for i, sizes in enumerate(([20, 24, 17], [40, 33], [9, 12, 7, 11], [60, 58, 61])):
+        for i, sizes in enumerate(([20, 24, 17], [70, 33], [9, 12, 7, 11], [100, 58, 61], [30])):
             gid, xs, xc = _geo_batch(sizes, seed=i)
             (idx, valid), = enc.layout(gid)
             with torch._dynamo.config.patch(error_on_recompile=i > 0):
@@ -333,9 +335,8 @@ def test_compiled_flex_on_the_prefix_mask_is_masked_attention(q_len):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
 def test_flex_block_is_one_graph_for_every_block_count():
     """No graph break, and no size specialised by the number of query or key blocks, one
-    or several (autograd on, where flex attention runs; blocks of two or more crystals:
-    one crystal alone is a shape of its own, as are runs of fewer than 128 queries, which
-    take the flex decoding kernel)."""
+    or several, or by a crystal alone in its block (autograd on, where flex attention
+    runs; runs of fewer than 128 queries are a shape of their own: the flex decoding check)."""
     import torch._dynamo
     torch._dynamo.reset()
     torch.manual_seed(0)
@@ -345,8 +346,8 @@ def test_flex_block_is_one_graph_for_every_block_count():
         if prm.dim() > 1:
             torch.nn.init.normal_(prm, std=0.1)
     fn = torch.compile(enc.encode, dynamic=True, fullgraph=True)
-    # the runs' queries one block (128) or several (141 to 261), their keys one block to 11
-    sizes = ([650, 700], [636, 100, 90], [900, 820, 777], [40, 1000, 1001], [1300, 1250])
+    # the runs' queries one block (128) or several (144 to 264), their keys 6 to 11 blocks
+    sizes = ([650, 700], [636, 100, 90], [900, 820, 777], [40, 1000, 1001], [1300, 1250], [1100])
     for i, s in enumerate(sizes):
         gid, xs, xc = (t.cuda() for t in _geo_batch(s, seed=i))
         (idx, valid), = enc.layout(gid)
@@ -354,7 +355,8 @@ def test_flex_block_is_one_graph_for_every_block_count():
             got = fn(xs, xc, None, gid, idx, valid)[0].detach()
         ref = enc.encode(xs, xc, None, gid, idx, valid)[0].detach()
         # within one bf16 rounding unit
-        assert (got - ref)[valid].norm() / ref[valid].norm() < 2 ** -8
+        live = valid.flatten(1)
+        assert (got - ref)[live].norm() / ref[live].norm() < 2 ** -8
 
 
 def test_fit_device_picks_bfloat16_and_flex_from_compute_capability_8():
@@ -487,6 +489,21 @@ def test_geometry_heads_receive_gradient():
     gid, xs, xc = _geo_batch([6, 12])
     enc(xs, xc, gid, 2).square().sum().backward()
     assert any(h.weight.grad is not None and h.weight.grad.abs().sum() > 0 for h in enc.geometry_heads)
+
+
+def test_empty_rows_change_nothing_and_record_no_correction():
+    enc = _geo_encoder()
+    for h in enc.geometry_heads:
+        torch.nn.init.normal_(h.weight, std=0.5)
+    gid, xs, xc = _geo_batch([5, 13, 9])
+    a, corr_a = enc(xs, xc, gid, 3), enc.last_correction
+    enc.tokens = 1                                      # one crystal per block, and one empty row
+    b, corr_b = enc(xs, xc, gid, 3), enc.last_correction
+    torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-6)
+    assert corr_b.shape == (3 * 2 * 3, 4)
+    empty = corr_b.isnan().all(1)
+    assert int(empty.sum()) == 3 * 3 and not corr_b[~empty].isnan().any()
+    torch.testing.assert_close(corr_b[~empty].sort(0).values, corr_a.sort(0).values, rtol=1e-5, atol=1e-7)
 
 
 def test_refine_needs_context_and_geometry():

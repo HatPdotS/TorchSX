@@ -449,3 +449,61 @@ def test_muon_takes_the_encoder_block_matrices_and_trains_them(tmp_path, encoder
     tr.run()
     assert all(torch.isfinite(p).all() for p in scale.parameters())
     assert [n for n in muon_names if not torch.equal(named[n], before[n])], "Muon moved nothing"
+
+
+def test_deferred_encoder_backward_is_the_one_pass_gradient(tmp_path):
+    """The fold path's blocks back-propagated after the loss (the trainer's default)
+    give every parameter the gradient of the single checkpointed pass."""
+    prep, params, *_ = _synthetic(n_xtal=40, per=20)
+    torch.manual_seed(0)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, peer_heads=4,
+                                     encoder="fold", context_folds=3, ctx_layers=2, query_layers=1)
+    scale.encoder.tokens = 1 << 8                     # several blocks
+    cfg = TrainConfig(max_obs_per_batch=10 ** 6, epochs=1, lr=3e-3, heldout_frac=0.0,
+                      device="cpu", outdir=str(tmp_path))
+    tr = AmortizedTrainer(prep, scale, MarginalNLL(wide_log_grid(), Poisson()), params, config=cfg)
+    assert scale.defer_encoder_backward
+    rows = tr.index.rows(tr.index.nonempty)
+    grads = []
+    for defer in (False, True):
+        scale.defer_encoder_backward = defer
+        scale.train()
+        scale.zero_grad(set_to_none=True)
+        _, _, tgt, nll, *_ = tr._forward(rows, grad=True)
+        (nll / max(int(tgt.valid.sum()), 1)).backward()
+        scale.encoder_backward()
+        assert scale._deferred is None
+        grads.append({n: p.grad.clone() for n, p in scale.named_parameters() if p.grad is not None})
+        scale.clear()
+    assert grads[0].keys() == grads[1].keys()
+    assert any(n.startswith("encoder.") for n in grads[0])
+    for n in grads[0]:
+        torch.testing.assert_close(grads[1][n], grads[0][n], rtol=1e-5, atol=1e-7, msg=n)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled fold path runs on CUDA only")
+def test_fold_predictions_without_autograd_run_flex_and_match_the_masked_kernel():
+    """Without autograd the fold path runs each block under a checkpoint with autograd
+    (flex attention); the predictions agree with the masked kernel's to bf16 rounding."""
+    import torch._dynamo
+    torch._dynamo.reset()
+    prep, params, *_ = _synthetic(n_xtal=40, per=20)
+    torch.manual_seed(0)
+    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, include_hkl=False, peer_heads=2,
+                                     encoder="fold", context_folds=3, ctx_layers=2, query_layers=1,
+                                     anchor_stat="median").cuda()
+    scale.encoder.tokens = 1 << 9                     # several blocks
+    for prm in scale.parameters():                    # away from the unity-scale start
+        torch.nn.init.normal_(prm, std=0.1)
+    meta = prep.obs_info.gather(torch.argsort(prep.obs_info.crystal_id, stable=True)).to("cuda")
+    scale.eval()
+    out = {}
+    for flex in (True, False):
+        scale.encoder.flex_device = flex
+        scale.encoder._device = torch.device("cuda", torch.cuda.current_device())
+        with torch.no_grad():
+            out[flex] = scale.predict(meta)
+    assert not out[True].log_K.requires_grad and out[False].log_K.std() > 0
+    for name in ("log_K", "log_w", "beta"):
+        a, b = getattr(out[True], name), getattr(out[False], name)
+        assert (a - b).norm() / b.norm() < 2e-2, name

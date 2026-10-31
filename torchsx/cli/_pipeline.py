@@ -736,6 +736,27 @@ DEFAULTS = dict(
 )
 
 
+def configure_torch() -> None:
+    """Torch settings shared by training and the merge, before CUDA is first used.
+
+    TF32 for the encoder's float32 matmuls (the likelihood and posterior
+    integrals are elementwise and Triton code, which this does not touch), and
+    CUDA memory in expandable segments unless ``PYTORCH_ALLOC_CONF`` (or the
+    older ``PYTORCH_CUDA_ALLOC_CONF``) says otherwise: the packed encoder blocks
+    change size every batch, and fixed segments sized to earlier blocks fill
+    the cache with pieces the next block cannot use.
+    """
+    import torch
+
+    torch.set_float32_matmul_precision("high")
+    if "PYTORCH_ALLOC_CONF" not in os.environ and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        name = ("PYTORCH_ALLOC_CONF" if torch.torch_version.TorchVersion(torch.__version__) >= "2.9"
+                else "PYTORCH_CUDA_ALLOC_CONF")
+        os.environ[name] = "expandable_segments:True"
+        if torch.cuda.is_initialized():
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+
+
 def add_model_args(p: argparse.ArgumentParser) -> None:
     """Flags shared by every command that builds the merge stack."""
     p.add_argument("--device", default=None, help="cuda | cpu")

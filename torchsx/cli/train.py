@@ -270,9 +270,7 @@ def main(argv=None):
     args = _build_parser().parse_args(argv)
     import torch
 
-    # TF32 for the encoder's float32 matmuls; the likelihood and posterior
-    # integrals are elementwise and Triton code, which this does not touch.
-    torch.set_float32_matmul_precision("high")
+    P.configure_torch()
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
     from torchsx.cli.merge_nn import merge_products
 
