@@ -71,8 +71,8 @@ def _build_parser():
     # Crystal context pooling: K >= 2 folds (context from the other K-1 folds of the
     # crystal, default 2), or 0 = leave-one-out; the merge inherits the checkpoint.
     p.add_argument("--context-folds", type=int, default=None, help=argparse.SUPPRESS)
-    # Scale encoder: deepsets (default) or fold, the masked-fold transformer (K =
-    # --context-folds runs per crystal, default 5); the merge inherits the checkpoint.
+    # Scale encoder: fold (default), the masked-fold transformer (K = --context-folds
+    # runs per crystal, default 5), or deepsets; the merge inherits the checkpoint.
     p.add_argument("--encoder", choices=("deepsets", "fold"), default=None, help=argparse.SUPPRESS)
     # Fold transformer depth: self-attention blocks over each run (default 2) and
     # cross-attention blocks from each masked observation onto its run (default 1).
@@ -82,8 +82,10 @@ def _build_parser():
     # own token, the observation's own masked (all n - 1 peers).
     p.add_argument("--query-peers", action="store_true", help=argparse.SUPPRESS)
     # Fold transformer: correct each run's geometry (a crystal rotation and an energy
-    # shift, predicted from its context) and recompute the excitation errors.
-    p.add_argument("--refine-geometry", action="store_true", help=argparse.SUPPRESS)
+    # shift, predicted from its context) and recompute the excitation errors (default
+    # on; off with --no-refine-geometry or --drop-geometry).
+    p.add_argument("--refine-geometry", action=argparse.BooleanOptionalAction, default=None,
+                   help=argparse.SUPPRESS)
     # Scale features without the excitation error and the lab-frame direction.
     p.add_argument("--drop-geometry", action="store_true", help=argparse.SUPPRESS)
     # Optimiser of the encoder's block matrices: adamw (default) or muon.

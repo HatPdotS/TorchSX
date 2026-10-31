@@ -213,10 +213,12 @@ def test_measurement_columns_are_the_context_only_features():
     assert not set(meas) & set(feats.self_features)
 
 
-@pytest.mark.parametrize("q_len,kv_len", [(40, 300), (200, 385), (256, 384), (300, 300), (128, 129)])
+@pytest.mark.parametrize("q_len,kv_len", [(40, 300), (200, 385), (256, 384), (300, 300), (128, 129),
+                                          (40, 90)])
 def test_key_prefix_mask_is_create_block_mask(q_len, kv_len):
-    """Block for block (the visited sets; order past each count is free) against
-    flex attention's own builder on the dense rule."""
+    """Block for block over the blocks of the lengths (the visited sets; order past
+    each count is free) against flex attention's own builder on the dense rule; the
+    tables hold one block a side more."""
     from torch.nn.attention.flex_attention import create_block_mask
     n_keys = torch.tensor([1, 40, 127, 128, 129, 256, 257, kv_len]).clamp(max=kv_len)
     ours = key_prefix_mask(n_keys, q_len, kv_len)
@@ -227,10 +229,12 @@ def test_key_prefix_mask_is_create_block_mask(q_len, kv_len):
                      ("q_num_blocks", "q_indices"), ("full_q_num_blocks", "full_q_indices")):
         a_num, a_idx = getattr(ours, num), getattr(ours, idx)
         b_num, b_idx = getattr(ref, num), getattr(ref, idx)
-        assert a_num.shape == b_num.shape and a_idx.shape == b_idx.shape
-        assert torch.equal(a_num, b_num), num
-        for row in itertools.product(*map(range, a_num.shape)):
-            k = int(a_num[row])
+        n, m = b_idx.shape[-2:]
+        assert a_idx.shape[:2] == b_idx.shape[:2] and a_idx.shape[-2:] == (n + 1, m + 1)
+        assert torch.equal(a_num[..., :n], b_num), num
+        assert ((a_idx >= 0) & (a_idx < m)).all(), idx
+        for row in itertools.product(*map(range, b_num.shape)):
+            k = int(b_num[row])
             assert sorted(a_idx[row][:k].tolist()) == sorted(b_idx[row][:k].tolist()), (idx, row)
 
 
@@ -327,10 +331,11 @@ def test_compiled_flex_on_the_prefix_mask_is_masked_attention(q_len):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
-def test_flex_block_is_one_graph_for_every_key_block_count():
-    """No graph break, and no size specialised by the number of key blocks (autograd on,
-    where flex attention runs; blocks of two or more crystals: one crystal alone is a
-    shape of its own)."""
+def test_flex_block_is_one_graph_for_every_block_count():
+    """No graph break, and no size specialised by the number of query or key blocks, one
+    or several (autograd on, where flex attention runs; blocks of two or more crystals:
+    one crystal alone is a shape of its own, as are runs of fewer than 128 queries, which
+    take the flex decoding kernel)."""
     import torch._dynamo
     torch._dynamo.reset()
     torch.manual_seed(0)
@@ -340,14 +345,16 @@ def test_flex_block_is_one_graph_for_every_key_block_count():
         if prm.dim() > 1:
             torch.nn.init.normal_(prm, std=0.1)
     fn = torch.compile(enc.encode, dynamic=True, fullgraph=True)
-    # every run's queries number at least 128, the key blocks 6 to 11
-    for i, sizes in enumerate(([650, 700], [900, 820, 777], [1300, 1250], [640, 1000, 1001])):
-        gid, xs, xc = (t.cuda() for t in _geo_batch(sizes, seed=i))
+    # the runs' queries one block (128) or several (141 to 261), their keys one block to 11
+    sizes = ([650, 700], [636, 100, 90], [900, 820, 777], [40, 1000, 1001], [1300, 1250])
+    for i, s in enumerate(sizes):
+        gid, xs, xc = (t.cuda() for t in _geo_batch(s, seed=i))
         (idx, valid), = enc.layout(gid)
         with torch._dynamo.config.patch(error_on_recompile=i > 0):
             got = fn(xs, xc, None, gid, idx, valid)[0].detach()
         ref = enc.encode(xs, xc, None, gid, idx, valid)[0].detach()
-        assert (got - ref)[valid].norm() / ref[valid].norm() < 1e-3
+        # within one bf16 rounding unit
+        assert (got - ref)[valid].norm() / ref[valid].norm() < 2 ** -8
 
 
 # ── geometry correction ────────────────────────────────────────────────

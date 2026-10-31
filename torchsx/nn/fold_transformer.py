@@ -138,36 +138,40 @@ def key_prefix_mask(n_keys: Tensor, q_len, kv_len, mask_mod=None, block: int = 1
     evaluated), the block holding its end is partial, and the rest are
     skipped, so padding costs no attention work; a last, incomplete query
     block reads every key block of the prefix as partial (the kernel masks
-    only partial blocks, and that block runs past ``q_len``).  Every tensor
-    is built at its full shape (no expand of a size-1 dim), so no block
-    count is specialised when compiled.  ``mask_mod`` (same signature as
+    only partial blocks, and that block runs past ``q_len``).  The tables
+    hold one block a side more than the lengths (the kernels index them by
+    their strides and visit only the blocks of the lengths): a block count of
+    one is a size of one, specialised when compiled.  ``mask_mod`` (same signature as
     flex attention's) is the element mask of the partial blocks; it must keep
     the same prefix, and it reads the counts by default.
     """
     B, dev, i32 = n_keys.shape[0], n_keys.device, torch.int32
     nq, nk = -(-q_len // block), -(-kv_len // block)
+    tq, tk = nq + 1, nk + 1                                                   # table sizes
     n_complete = q_len // block                                               # query blocks inside q_len
     full = (n_keys // block).to(i32)[:, None, None]                          # (B, 1, 1)
     part = (n_keys % block != 0).to(i32)[:, None, None]
-    k_blocks = torch.arange(nk, device=dev, dtype=i32)
-    q_blocks = torch.arange(nq, device=dev, dtype=i32)
+    k_blocks = torch.arange(tk, device=dev, dtype=i32)
+    q_blocks = torch.arange(tq, device=dev, dtype=i32)
     # key side, per query block: in a complete one full blocks 0 .. full-1 and the
     # partial one at `full`; in the incomplete one blocks 0 .. full+part-1, all partial
-    complete = (torch.zeros(B, 1, nq, dtype=i32, device=dev) + q_blocks < n_complete).to(i32)
+    complete = (torch.zeros(B, 1, tq, dtype=i32, device=dev) + q_blocks < n_complete).to(i32)
     full_kv_num = full * complete
     kv_num = part * complete + (full + part) * (1 - complete)
-    full_kv_idx = torch.zeros(B, 1, nq, nk, dtype=i32, device=dev) + k_blocks
-    kv_idx = (full_kv_idx + (full * complete)[..., None]) % nk
+    blocks = torch.zeros(B, 1, tq, tk, dtype=i32, device=dev) + k_blocks
+    full_kv_idx = blocks % nk
+    kv_idx = (blocks + (full * complete)[..., None]) % nk
     # query side (the backward), per key block: the complete query blocks 0 ..
     # n_complete-1 when it is full or partial there, then the incomplete one
-    blk = torch.zeros(B, 1, nk, dtype=i32, device=dev) + k_blocks
+    blk = torch.zeros(B, 1, tk, dtype=i32, device=dev) + k_blocks
     edge = ((blk == full) & (part > 0)).to(i32)
     ragged = torch.zeros(1, dtype=i32, device=dev) + (nq - n_complete)         # 1 if q_len % block
     tail = (blk < full + part).to(i32) * ragged
     full_q_num = (blk < full).to(i32) * n_complete
     q_num = edge * n_complete + tail
-    full_q_idx = torch.zeros(B, 1, nk, nq, dtype=i32, device=dev) + q_blocks
-    q_idx = (full_q_idx + ((1 - edge) * n_complete)[..., None]) % nq
+    blocks = torch.zeros(B, 1, tk, tq, dtype=i32, device=dev) + q_blocks
+    full_q_idx = blocks % nq
+    q_idx = (blocks + ((1 - edge) * n_complete)[..., None]) % nq
 
     if mask_mod is None:
         def mask_mod(b, h, q, kv):

@@ -730,8 +730,9 @@ DEFAULTS = dict(
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_degree=4, gauge_anchor="basis",
     scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
-    # --encoder fold: K masked runs per crystal, context self-attention, per-reflection queries
-    encoder="deepsets", fold_folds=5, ctx_layers=2, query_layers=1,
+    # --encoder fold: K masked runs per crystal, context self-attention, per-reflection queries,
+    # each run's geometry refined
+    encoder="fold", fold_folds=5, ctx_layers=2, query_layers=1, refine_geometry=True,
 )
 
 
@@ -794,6 +795,15 @@ def _peer_layers(args) -> int:
     return DEFAULTS["peer_attention"] if n is None else int(n)
 
 
+def _refine_geometry(args) -> bool:
+    """``--refine-geometry`` / ``--no-refine-geometry``; by default on, unless the
+    geometry features are dropped."""
+    v = getattr(args, "refine_geometry", None)
+    if v is None:
+        return DEFAULTS["refine_geometry"] and not getattr(args, "drop_geometry", False)
+    return bool(v)
+
+
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                 verbose: bool = True):
     """Build the production model, preserving recorded checkpoint geometry."""
@@ -836,7 +846,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         self_features = SELF_FEATURES + ((DISK_FEATURE,) if recorded else ())
         if getattr(args, "drop_geometry", False):
             # the orientation-dependent geometry: excitation error and lab-frame direction
-            if getattr(args, "refine_geometry", False):
+            if getattr(args, "refine_geometry", None):
                 raise SystemExit("--drop-geometry and --refine-geometry exclude each other")
             self_features = tuple(f for f in self_features
                                   if f not in ("ewald_offset", "qx", "qy", "qz"))
@@ -891,7 +901,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                         ctx_layers=flag("ctx_layers", DEFAULTS["ctx_layers"]),
                         query_layers=flag("query_layers", DEFAULTS["query_layers"]),
                         query_peers=bool(getattr(args, "query_peers", False)),
-                        refine_geometry=bool(getattr(args, "refine_geometry", False)),
+                        refine_geometry=_refine_geometry(args),
                         peer_heads=DEFAULTS["peer_heads"])
         kw.update(encoder="fold", **fold)
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
