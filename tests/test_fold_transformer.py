@@ -98,7 +98,7 @@ def test_layout_folds_are_fold_ids():
             assert torch.equal(seen.sort().values, torch.arange(gid.numel()))
             for idx, valid in blocks:
                 U = idx.shape[2]
-                assert U % K == 0 and U % 8 == 0 and idx.shape[1] * U >= 120 and idx.shape[0] >= 2
+                assert U % K == 0 and U % 8 == 0 and idx.shape[1] * U >= 127 and idx.shape[0] >= 2
                 idx, valid = idx.flatten(1), valid.flatten(1)
                 L = idx.shape[1]
                 slot = torch.arange(L).expand_as(idx)

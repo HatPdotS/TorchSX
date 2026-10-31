@@ -94,8 +94,8 @@ def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 18,
 
     Crystals are sorted by size and dealt into blocks.  A block's ``L`` is its
     largest crystal rounded up to a multiple of ``U = slot_unit(folds)``, and
-    at least 120, so a run (the crystal token, ``L`` slots and 7 empty keys)
-    fills at least one 128-key block.  A block closes before its ``folds``
+    at least 127, so a run (the crystal token and ``L`` slots) fills at least
+    one 128-key block.  A block closes before its ``folds``
     runs would hold more than ``tokens`` tokens (``folds * B * L``), and a
     crystal larger than that gets a block of its own.  A block of fewer than
     ``rows`` crystals (the last one, or one such crystal) is filled up with
@@ -118,7 +118,7 @@ def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 18,
     sizes = counts[by_size].tolist()
 
     U = slot_unit(folds)
-    r_min = -(-120 // U)
+    r_min = -(-127 // U)
 
     def padded(n: int) -> int:
         return U * max(r_min, -(-n // U))
@@ -521,12 +521,12 @@ class FoldTransformerEncoder(nn.Module):
         n_vis = (valid[None] & ~masked[:, None]).sum(-1).clamp(min=1)                 # (K, B)
         ct = self.input_crystal(torch.cat(
             [crys[None].expand(K, -1, -1), n_vis.to(g.dtype).log()[..., None]], dim=-1))
-        # the crystal token first (slot 0, so no index depends on L), the
-        # observations, 7 empty keys: L is a multiple of 8, so every run is too
-        pad = 7
-        x = torch.cat([ct[:, :, None], tok, tok.new_zeros(K, B, pad, D)], dim=2)
-        x = x.reshape(K * B, 1 + L + pad, D)
-        keep = torch.cat([valid.new_ones(B, 1), valid, valid.new_zeros(B, pad)], dim=1)
+        # the crystal token first (slot 0, so no index depends on L), then the
+        # observations: 1 + L keys, an odd count (L is a multiple of 8).  A size
+        # with only even terms, such as 40 R + 8, makes the compiler's size
+        # arithmetic replace ceil(n / s) by n / s in split reductions.
+        x = torch.cat([ct[:, :, None], tok], dim=2).reshape(K * B, 1 + L, D)
+        keep = torch.cat([valid.new_ones(B, 1), valid], dim=1)
         keep = keep[None].expand(K, -1, -1).reshape(K * B, 1, 1, -1)
         ctx_mask = query_mask = None
         if (self.flex and self.flex_device and g.is_cuda and torch.is_grad_enabled()
@@ -541,9 +541,9 @@ class FoldTransformerEncoder(nn.Module):
                 # a buffer computed inside the graph from a flex kernel everywhere;
                 # the sizes it reads are the inputs' own (B, R), not L = R * U
                 s = (kv - 1).clamp(min=0)
-                return (kv == 0) | ((kv <= R * U) & slots[b % B, (s // U).clamp(max=R - 1), s % U])
-            ctx_mask = key_prefix_mask(n_keys, 1 + L + pad, 1 + L + pad, is_key)
-            query_mask = key_prefix_mask(n_keys, L // K, 1 + L + pad, is_key)
+                return (kv == 0) | slots[b % B, (s // U).clamp(max=R - 1), s % U]
+            ctx_mask = key_prefix_mask(n_keys, 1 + L, 1 + L, is_key)
+            query_mask = key_prefix_mask(n_keys, L // K, 1 + L, is_key)
         correction = x.new_zeros(0, 4)
         if self.refine_geometry:
             q0, k0 = self._raw_geometry(xs)                                           # (B, L, 3), (B, L)
@@ -557,21 +557,20 @@ class FoldTransformerEncoder(nn.Module):
                 correction = correction + self.geometry_heads[i](x[:, 0])
                 emb = (self._geometry_change(q0, k0, correction, K) @ w_geo.T) * live   # (K * B, L, D)
                 step = emb if applied is None else emb - applied
-                x = torch.cat([x[:, :1], x[:, 1:1 + L] + step, x[:, 1 + L:]], dim=1)
+                x = torch.cat([x[:, :1], x[:, 1:] + step], dim=1)
                 applied = emb
         # run f's queries are its own fold's slots f, f + K, f + 2K, ...
         Lq = L // K
-        q = x[:, 1:1 + L].reshape(K, B, Lq, K, D)[runs, :, :, runs].reshape(K * B, Lq, D)
+        q = x[:, 1:].reshape(K, B, Lq, K, D)[runs, :, :, runs].reshape(K * B, Lq, D)
         last_kv, last_keep = x, keep
         if self.query_peers:
-            # every observation's own token, encoded alone, in the run memory's slots
+            # every observation's own token, encoded alone, after the run memory
             own = self.peer_ff(g + m + self.peer_embedding).masked_fill(~valid[:, :, None], 0.0)
-            own = torch.cat([own.new_zeros(B, 1, D), own, own.new_zeros(B, pad, D)], dim=1)
-            slot = torch.arange(1 + L + pad, device=g.device)
-            own_slot = 1 + torch.arange(Lq, device=g.device)[None, :] * K + runs[:, None]  # (K, Lq)
-            peer_keep = (keep.reshape(K, B, 1, -1) & (slot != 0)
-                         & (slot[None, None, None, :] != own_slot[:, None, :, None]))  # (K, B, Lq, Lp)
-            last_kv = torch.cat([x, own[None].expand(K, -1, -1, -1).reshape(K * B, -1, D)], dim=1)
+            slot = torch.arange(L, device=g.device)
+            own_slot = torch.arange(Lq, device=g.device)[None, :] * K + runs[:, None]  # (K, Lq)
+            peer_keep = (valid[None, :, None, :]
+                         & (slot[None, None, None, :] != own_slot[:, None, :, None]))  # (K, B, Lq, L)
+            last_kv = torch.cat([x, own[None].expand(K, -1, -1, -1).reshape(K * B, L, D)], dim=1)
             last_keep = torch.cat([keep.expand(-1, -1, Lq, -1),
                                    peer_keep.reshape(K * B, 1, Lq, -1)], dim=-1)
         for i, blk in enumerate(self.query_blocks):
