@@ -177,6 +177,10 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
                 '--prior',prior])
     summary=json.loads((run/'training_summary.json').read_text())
     assert summary['updates_per_state']==[2,2]
+    res=summary['resources']
+    assert list(res['phases'])==['prepare','train','readout']
+    assert all(p['seconds']>=0 and 'gpu_peak_allocated_gib' not in p for p in res['phases'].values())
+    assert res['updates']['n']==4 and res['updates']['median_s']<=res['updates']['max_s']
     ck=torch.load(run/'best.pt',weights_only=False)
     assert ck['scatter']['family']=='mixture' and ck['scatter']['n_components']==4
     assert ck['likelihood']['bg_mean_offset']==0.1
@@ -196,6 +200,7 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
     monkeypatch.setattr(P,'write_mtz',capture)
     merge_nn.main([str(run/'best.pt'),'x.stream','-o',str(tmp_path/'again.mtz'),'--device','cpu'])
     assert all(r['prior']==prior for r in json.loads((tmp_path/'again.metrics.json').read_text()).values())
+    assert list(json.loads((tmp_path/'again.resources.json').read_text())['phases'])==['prepare','readout']
     assert len(exported)==6
     import gemmi
     for path,F,sd,keep in exported:

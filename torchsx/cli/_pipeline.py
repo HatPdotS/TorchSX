@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import pickle
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -755,6 +756,90 @@ def configure_torch() -> None:
         os.environ[name] = "expandable_segments:True"
         if torch.cuda.is_initialized():
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+
+
+class ResourceProbe:
+    """Wall time and GPU memory of a run, phase by phase.
+
+    :meth:`begin` ends the running phase and starts the next; :meth:`end` ends
+    the last.  A phase records its seconds and, on CUDA, the caching
+    allocator's peak allocated and reserved memory and the most device memory
+    seen in use, sampled at every update and at the phase's ends.  Device
+    memory is what ``nvidia-smi`` shows for the whole GPU: the reserved cache,
+    the CUDA context and any other process on the same device.  :meth:`update`
+    records an update's wall seconds; the first includes compilation.  The
+    probe never initialises CUDA itself: a phase that starts before the first
+    CUDA call counts from that call.
+    """
+
+    def __init__(self, device):
+        import torch
+
+        self._torch = torch
+        self.cuda = str(device or "").startswith("cuda") and torch.cuda.is_available()
+        self.phases: dict[str, dict] = {}
+        self.update_s: list[float] = []
+        self._name = None
+
+    def _live(self) -> bool:
+        return self.cuda and self._torch.cuda.is_initialized()
+
+    def _sample(self) -> None:
+        if self._live():
+            free, total = self._torch.cuda.mem_get_info()
+            self._device_used = max(self._device_used, (total - free) / 2**30)
+
+    def begin(self, name: str) -> None:
+        self.end()
+        if self._live():
+            self._torch.cuda.synchronize()
+            self._torch.cuda.reset_peak_memory_stats()
+        self._name, self._t0, self._device_used = name, time.time(), 0.0
+        self._sample()
+
+    def end(self) -> None:
+        if self._name is None:
+            return
+        rec = {}
+        if self._live():
+            self._torch.cuda.synchronize()
+            self._sample()
+            cuda = self._torch.cuda
+            rec = dict(gpu_peak_allocated_gib=cuda.max_memory_allocated() / 2**30,
+                       gpu_peak_reserved_gib=cuda.max_memory_reserved() / 2**30,
+                       gpu_device_used_gib=self._device_used)
+        self.phases[self._name] = dict(seconds=time.time() - self._t0, **rec)
+        self._name = None
+
+    def update(self, seconds: float) -> None:
+        self.update_s.append(float(seconds))
+        self._sample()
+
+    def summary(self) -> dict:
+        out = dict(phases=dict(self.phases))
+        if self.cuda:
+            out["gpu"] = self._torch.cuda.get_device_name()
+        if self.update_s:
+            s = sorted(self.update_s[1:]) or self.update_s
+            out["updates"] = dict(
+                n=len(self.update_s), first_s=self.update_s[0], median_s=s[len(s) // 2],
+                p90_s=s[int(0.9 * (len(s) - 1))], max_s=s[-1], total_s=sum(self.update_s))
+        return out
+
+    def report(self) -> str:
+        lines = []
+        for name, r in self.phases.items():
+            line = f"{name}: {r['seconds']:.0f} s"
+            if "gpu_peak_allocated_gib" in r:
+                line += (f", GPU peak {r['gpu_peak_allocated_gib']:.2f} GiB allocated, "
+                         f"{r['gpu_peak_reserved_gib']:.2f} reserved, "
+                         f"{r['gpu_device_used_gib']:.2f} in use on the device")
+            lines.append(line)
+        u = self.summary().get("updates")
+        if u:
+            lines.append(f"updates: {u['n']}, median {u['median_s']:.2f} s, p90 {u['p90_s']:.2f} s, "
+                         f"max {u['max_s']:.1f} s, first {u['first_s']:.0f} s")
+        return "\n".join(lines)
 
 
 def add_model_args(p: argparse.ArgumentParser) -> None:
