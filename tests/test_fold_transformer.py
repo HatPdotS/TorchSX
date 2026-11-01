@@ -194,14 +194,15 @@ def test_packed_block_compiles_once_for_every_length():
     import torch._dynamo
     torch._dynamo.reset()
     enc = _geo_encoder(query_peers=True).eval()
-    fn = torch.compile(enc.encode, dynamic=True, backend="aot_eager")
+    fn = torch.compile(enc.network, dynamic=True, backend="aot_eager")
     with torch.no_grad():
         for i, sizes in enumerate(([20, 24, 17], [70, 33], [9, 12, 7, 11], [100, 58, 61], [30])):
             gid, xs, xc = _geo_batch(sizes, seed=i)
             (idx, valid), = enc.layout(gid)
+            args = enc.gather(xs, xc, None, gid, idx, valid)
             with torch._dynamo.config.patch(error_on_recompile=i > 0):
-                got = fn(xs, xc, None, gid, idx, valid)[0]
-            torch.testing.assert_close(got, enc.encode(xs, xc, None, gid, idx, valid)[0])
+                got = fn(*args)[0]
+            torch.testing.assert_close(got, enc.network(*args)[0])
 
 
 def test_measurement_columns_are_the_context_only_features():
@@ -344,15 +345,16 @@ def test_flex_block_is_one_graph_for_every_block_count():
     for prm in enc.parameters():
         if prm.dim() > 1:
             torch.nn.init.normal_(prm, std=0.1)
-    fn = torch.compile(enc.encode, dynamic=True, fullgraph=True)
+    fn = torch.compile(enc.network, dynamic=True, fullgraph=True)
     # the runs' queries one block (128) or several (144 to 264), their keys 6 to 11 blocks
     sizes = ([650, 700], [636, 100, 90], [900, 820, 777], [40, 1000, 1001], [1300, 1250], [1100])
     for i, s in enumerate(sizes):
         gid, xs, xc = (t.cuda() for t in _geo_batch(s, seed=i))
         (idx, valid), = enc.layout(gid)
+        args = enc.gather(xs, xc, None, gid, idx, valid)
         with torch._dynamo.config.patch(error_on_recompile=i > 0):
-            got = fn(xs, xc, None, gid, idx, valid)[0].detach()
-        ref = enc.encode(xs, xc, None, gid, idx, valid)[0].detach()
+            got = fn(*args)[0].detach()
+        ref = enc.network(*args)[0].detach()
         # within one bf16 rounding unit
         live = valid.flatten(1)
         assert (got - ref)[live].norm() / ref[live].norm() < 2 ** -8

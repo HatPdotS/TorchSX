@@ -97,8 +97,6 @@ class AmortizedScale(ScaleModel):
         #: See :meth:`predict` -- the encoder is separable across crystals, so
         #: chunking is exact and moves the checkpoint boundary off the blocks.
         self.chunk_crystals = 0
-        #: the fold path's per-block function, compiled on first use on CUDA
-        self._fold_compiled = None
         #: fold path in training: the blocks' outputs enter the graph as leaves
         #: and :meth:`encoder_backward` back-propagates them through the blocks
         #: after the loss's backward pass (:meth:`_predict_fold`)
@@ -385,10 +383,10 @@ class AmortizedScale(ScaleModel):
 
         The encoder packs the batch's crystals into blocks once
         (:meth:`~torchsx.nn.fold_transformer.FoldTransformerEncoder.layout`).
-        Each block runs gather, encoder and heads as one function: compiled on
-        CUDA (``encoder.compile``), and in training one checkpoint, so only
-        the batch tables and the block's outputs are stored.  One gather puts
-        the outputs back in row order.
+        Each block gathers its rows, runs the network (compiled on CUDA,
+        ``encoder.compile``) and the heads, in training under one checkpoint,
+        so only the batch tables and the block's outputs are stored.  One
+        gather puts the outputs back in row order.
 
         Without autograd (evaluation, the merge) each block runs the same way,
         under a checkpoint with autograd on, its outputs detached: flex
@@ -410,13 +408,9 @@ class AmortizedScale(ScaleModel):
         enc = self.encoder
         enc.fit_device(x_self.device)
         run = self._fold_block
-        if enc.compile and x_self.is_cuda:
-            if self._fold_compiled is None:
-                self._fold_compiled = torch.compile(self._fold_block, dynamic=True)
-            run = self._fold_compiled
         ckpt = torch.is_grad_enabled() and self.training
         defer = ckpt and self.defer_encoder_backward
-        flex_only = (not torch.is_grad_enabled() and run is not self._fold_block and enc.flex
+        flex_only = (not torch.is_grad_enabled() and enc.compile and x_self.is_cuda and enc.flex
                      and enc.flex_device and any(p.requires_grad for p in enc.parameters()))
         n = x_self.shape[0]
         parts, dest, corrections, blocks = [], [], [], []

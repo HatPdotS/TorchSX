@@ -299,7 +299,8 @@ class FoldTransformerEncoder(nn.Module):
         backward pass, grow with it.  ``None`` reads ``TORCHSX_FOLD_TOKENS``
         (default ``2**18``).
     compile, bf16
-        Run each packed block (:meth:`encode`) through
+        Run the network on each packed block (:meth:`network`; the rows are
+        gathered eagerly, :meth:`gather`) through
         ``torch.compile(dynamic=True)`` on CUDA, and the attention itself in
         half precision on CUDA: bfloat16, or float16 on GPUs of compute
         capability below 8.0, which have no bfloat16 (:meth:`fit_device`).
@@ -449,17 +450,12 @@ class FoldTransformerEncoder(nn.Module):
                 raise ValueError(f"encoder was built with n_crystal_features="
                                  f"{self.n_crystal_features}; x_crys does not match")
         self.fit_device(x_self.device)
-        run = self.encode
-        if self.compile and x_self.is_cuda:
-            if self._compiled is None:
-                self._compiled = torch.compile(self.encode, dynamic=True)
-            run = self._compiled
         use_ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
         zs, dest, corrections = [], [], []
         for idx, valid in self.layout(group_id):
             args = (x_self, x_ctx, x_crys, group_id, idx, valid)
-            zb, corr = (torch.utils.checkpoint.checkpoint(run, *args, use_reentrant=False)
-                        if use_ckpt else run(*args))
+            zb, corr = (torch.utils.checkpoint.checkpoint(self.encode, *args, use_reentrant=False)
+                        if use_ckpt else self.encode(*args))
             zs.append(zb.flatten(0, 1))
             dest.append(torch.where(valid, idx, n).flatten())
             corrections.append(corr.detach())
@@ -487,18 +483,48 @@ class FoldTransformerEncoder(nn.Module):
 
     def encode(self, x_self: Tensor, x_ctx: Tensor, x_crys: Tensor | None, group_id: Tensor,
                idx: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
-        """One packed block (:func:`fold_layout`) from the batch tables: ``(B, L, D)``
-        embeddings of its slots and each run's geometry correction (:meth:`_block`)."""
-        idx = idx.flatten(1)
-        rows_self = x_self[idx]
-        g = self.input_geometry(rows_self)
-        m = self.input_measurement(x_ctx[idx].index_select(-1, self.meas_idx))
-        crys = (x_crys.index_select(0, group_id[idx[:, 0]]) if self.n_crystal_features
-                else g.new_zeros(idx.shape[0], 0))
-        xs = rows_self if self.refine_geometry else g.new_zeros(0)
-        return self._block(g, m, crys, valid, xs)
+        """One packed block (:func:`fold_layout`) from the batch tables: its rows
+        gathered (:meth:`gather`) and the network run on them (:meth:`network`),
+        compiled on CUDA.  ``(B, L, D)`` embeddings of its slots and each run's
+        geometry correction."""
+        args = self.gather(x_self, x_ctx, x_crys, group_id, idx, valid)
+        run = self.network
+        if self.compile and x_self.is_cuda:
+            if self._compiled is None:
+                self._compiled = torch.compile(self.network, dynamic=True)
+            run = self._compiled
+        return run(*args)
 
-    def _block(self, g: Tensor, m: Tensor, crys: Tensor, valid: Tensor,
+    def gather(self, x_self: Tensor, x_ctx: Tensor, x_crys: Tensor | None, group_id: Tensor,
+               idx: Tensor, valid: Tensor) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
+        """The network's inputs for one packed block, read from the batch tables: the
+        self features and the measurement of every slot, ``(B, L // K, K, .)`` with the
+        fold axis marked static as in ``valid``, the crystal table's row of every
+        row ``(B, .)`` (``None`` without crystal features), and ``valid``.  The
+        feature axes are marked static too: a block whose ``B`` equals a feature
+        width would otherwise share its size symbol, and the input layers'
+        weights would fix both."""
+        rows_self = x_self[idx]
+        rows_meas = x_ctx[idx].index_select(-1, self.meas_idx)
+        crys = (x_crys.index_select(0, group_id[idx[:, 0, 0]]) if self.n_crystal_features
+                else None)
+        for t in (rows_self, rows_meas):
+            torch._dynamo.mark_static(t, 2)
+            torch._dynamo.mark_static(t, 3)
+        if crys is not None:
+            torch._dynamo.mark_static(crys, 1)
+        return rows_self, rows_meas, crys, valid
+
+    def network(self, rows_self: Tensor, rows_meas: Tensor, crys: Tensor | None,
+                valid: Tensor) -> tuple[Tensor, Tensor]:
+        """The network on one packed block's gathered rows (:meth:`gather`): the input
+        embeddings and every run (:meth:`_block`)."""
+        xs = rows_self.flatten(1, 2)
+        g = self.input_geometry(xs)
+        m = self.input_measurement(rows_meas.flatten(1, 2))
+        return self._block(g, m, crys, valid, xs if self.refine_geometry else g.new_zeros(0))
+
+    def _block(self, g: Tensor, m: Tensor, crys: Tensor | None, valid: Tensor,
                xs: Tensor) -> tuple[Tensor, Tensor]:
         """Every run of one packed block: ``(B, L, D)`` embeddings, slot ``l`` read from
         run ``l % K``, and each run's geometry correction ``(K * B, 4)`` (empty without
@@ -511,8 +537,10 @@ class FoldTransformerEncoder(nn.Module):
         tok = g[None] + torch.where(masked[:, None, :, None], self.mask_embedding, m[None])
         tok = tok.masked_fill(~valid[None, :, :, None], 0.0)                          # (K, B, L, D)
         n_vis = (valid[None] & ~masked[:, None]).sum(-1).clamp(min=1)                 # (K, B)
-        ct = self.input_crystal(torch.cat(
-            [crys[None].expand(K, -1, -1), n_vis.to(g.dtype).log()[..., None]], dim=-1))
+        ct = n_vis.to(g.dtype).log()[..., None]
+        if crys is not None:
+            ct = torch.cat([crys[None].expand(K, -1, -1), ct], dim=-1)
+        ct = self.input_crystal(ct)
         # the crystal token first (slot 0, so no index depends on L), then the
         # observations: 1 + L keys, with no padding.  A size whose terms are all
         # even, such as 40 R + 8, makes the compiler's size arithmetic replace
