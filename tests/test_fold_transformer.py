@@ -13,11 +13,11 @@ from torchsx.nn.pooling import fold_ids
 from tests.test_amortized_scale import _randomise, _toy_prep_with_crystal_feat
 
 
-def _scale(prep, *, folds=3, ctx=2, query=1, peers=False, seed=3, heads=4):
+def _scale(prep, *, folds=3, ctx=2, query=1, seed=3, heads=4):
     torch.manual_seed(seed)
     return AmortizedScale.from_prep(prep, d_model=16, anchor_log_k=False, encoder="fold",
                                     context_folds=folds, ctx_layers=ctx, query_layers=query,
-                                    query_peers=peers, peer_heads=heads)
+                                    peer_heads=heads)
 
 
 def _encoder(folds=3, ctx=2, query=1, n_self=4, n_ctx=7, meas=(4, 5, 6), **kw):
@@ -28,18 +28,15 @@ def _encoder(folds=3, ctx=2, query=1, n_self=4, n_ctx=7, meas=(4, 5, 6), **kw):
         if prm.dim() > 1:
             torch.nn.init.normal_(prm, std=0.3)
     torch.nn.init.normal_(enc.mask_embedding, std=0.3)
-    if enc.query_peers:
-        torch.nn.init.normal_(enc.peer_embedding, std=0.3)
     return enc
 
 
-@pytest.mark.parametrize("query,peers", [(0, False), (1, False), (2, True)])
-def test_own_fold_cannot_see_own_intensity(query, peers):
-    """Bit-exact: perturbing I_j changes nothing in j's own output (nor in j's
-    fold, unless the peers are read), something in the crystal's other folds,
-    nothing in any other crystal."""
+@pytest.mark.parametrize("query", [0, 1, 2])
+def test_own_fold_cannot_see_own_intensity(query):
+    """Bit-exact: perturbing I_j changes nothing in j's own output nor in j's
+    fold, something in the crystal's other folds, nothing in any other crystal."""
     prep = _toy_prep_with_crystal_feat()
-    scale = _scale(prep, query=query, peers=peers)
+    scale = _scale(prep, query=query)
     _randomise(scale)
     meta = prep.obs_info
     base = scale.predict(meta).log_K.detach().clone()
@@ -50,19 +47,13 @@ def test_own_fold_cannot_see_own_intensity(query, peers):
     same_c = meta.crystal_id == meta.crystal_id[j]
     own = same_c & (fold == fold[j])
     assert torch.equal(moved[j], base[j]), "j saw its own intensity"
-    mates = own.clone(); mates[j] = False
-    if peers:
-        # the fold mates read j's own token as a peer
-        assert (moved[mates] - base[mates]).abs().max() > 1e-4, "fold mates do not read j"
-    else:
-        assert torch.equal(moved[own], base[own]), "j's fold saw j's intensity"
+    assert torch.equal(moved[own], base[own]), "j's fold saw j's intensity"
     assert (moved[same_c & ~own] - base[same_c & ~own]).abs().max() > 1e-4, "other folds do not see j"
     assert torch.equal(moved[~same_c], base[~same_c])
 
 
-@pytest.mark.parametrize("peers", [False, True])
-def test_gradient_of_own_fold_to_its_measurement_is_exactly_zero(peers):
-    enc = _encoder(query_peers=peers)
+def test_gradient_of_own_fold_to_its_measurement_is_exactly_zero():
+    enc = _encoder()
     sizes = torch.tensor([1, 4, 9, 13, 6])
     gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes)
     gid = gid[torch.randperm(gid.numel(), generator=torch.Generator().manual_seed(1))]
@@ -74,12 +65,7 @@ def test_gradient_of_own_fold_to_its_measurement_is_exactly_zero(peers):
     z[j].square().sum().backward()
     own = (gid == gid[j]) & (fold == fold[j])
     others = (gid == gid[j]) & ~own
-    assert torch.equal(xc.grad[j, 4:], torch.zeros_like(xc.grad[j, 4:]))
-    mates = own.clone(); mates[j] = False
-    if peers:
-        assert xc.grad[mates][:, 4:].abs().max() > 0, "the peer read does not reach the fold mates"
-    else:
-        assert torch.equal(xc.grad[own][:, 4:], torch.zeros_like(xc.grad[own][:, 4:]))
+    assert torch.equal(xc.grad[own][:, 4:], torch.zeros_like(xc.grad[own][:, 4:]))
     assert xc.grad[others][:, 4:].abs().max() > 0
     # the geometry columns of x_ctx are not read at all: geometry comes from x_self
     assert torch.equal(xc.grad[:, :4], torch.zeros_like(xc.grad[:, :4]))
@@ -105,24 +91,16 @@ def test_layout_folds_are_fold_ids():
                 assert (gid[idx] == gid[idx[:, :1]]).all()
 
 
-@pytest.mark.parametrize("peers", [False, True])
-def test_step_zero_embedding_is_the_masked_token(peers):
-    enc = FoldTransformerEncoder(4, 7, [4, 5, 6], d_model=16, n_heads=4, folds=3, compile=False,
-                                 query_peers=peers)
+def test_step_zero_embedding_is_the_masked_token():
+    enc = FoldTransformerEncoder(4, 7, [4, 5, 6], d_model=16, n_heads=4, folds=3, compile=False)
     gid = torch.repeat_interleave(torch.arange(3), torch.tensor([5, 1, 8]))
     xs, xc = torch.randn(gid.numel(), 4), torch.randn(gid.numel(), 7)
     z = enc(xs, xc, gid, 3)
     torch.testing.assert_close(z, enc.input_geometry(xs) + enc.mask_embedding, rtol=0, atol=1e-6)
 
 
-def test_peers_need_a_query_layer():
-    with pytest.raises(ValueError, match="query_layers >= 1"):
-        FoldTransformerEncoder(4, 7, [4, 5, 6], d_model=16, n_heads=4, query_layers=0, query_peers=True)
-
-
-@pytest.mark.parametrize("peers", [False, True])
-def test_singleton_crystal_stays_finite(peers):
-    enc = _encoder(query_peers=peers)
+def test_singleton_crystal_stays_finite():
+    enc = _encoder()
     gid = torch.tensor([0, 0, 0, 1, 2, 2])
     xs, xc = torch.randn(6, 4), torch.randn(6, 7)
     z = enc(xs, xc, gid, 3)
@@ -132,9 +110,8 @@ def test_singleton_crystal_stays_finite(peers):
     assert torch.equal(enc(xs, xc2, gid, 3)[3], z[3])
 
 
-@pytest.mark.parametrize("peers", [False, True])
-def test_packing_does_not_change_the_prediction(peers):
-    enc = _encoder(query_peers=peers)
+def test_packing_does_not_change_the_prediction():
+    enc = _encoder()
     sizes = torch.tensor([3, 11, 7, 20, 1, 6])
     gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes)
     xs, xc = torch.randn(gid.numel(), 4), torch.randn(gid.numel(), 7)
@@ -193,7 +170,7 @@ def test_packed_block_compiles_once_for_every_length():
     """Blocks of different B and L run one graph: no size is specialised."""
     import torch._dynamo
     torch._dynamo.reset()
-    enc = _geo_encoder(query_peers=True).eval()
+    enc = _geo_encoder().eval()
     fn = torch.compile(enc.network, dynamic=True, backend="aot_eager")
     with torch.no_grad():
         for i, sizes in enumerate(([20, 24, 17], [70, 33], [9, 12, 7, 11], [100, 58, 61], [30])):
@@ -258,14 +235,14 @@ def test_flex_needs_heads_of_at_least_16():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
-@pytest.mark.parametrize("peers,flex", [(False, False), (False, True), (True, True)])
-def test_compiled_bf16_is_close_and_keeps_the_exclusion(peers, flex):
+@pytest.mark.parametrize("flex", [False, True])
+def test_compiled_bf16_is_close_and_keeps_the_exclusion(flex):
     """The compiled bf16 block (flex attention or the masked kernel) against the eager
     float32 reference, and the exclusion bit for bit."""
     import torch._dynamo
     torch._dynamo.reset()
     torch.manual_seed(0)
-    kw = dict(d_model=64, n_heads=4, folds=5, ctx_layers=2, query_layers=1, query_peers=peers)
+    kw = dict(d_model=64, n_heads=4, folds=5, ctx_layers=2, query_layers=1)
     ref = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=False, bf16=False, **kw).cuda()
     for prm in ref.parameters():
         if prm.dim() > 1:
@@ -300,8 +277,7 @@ def test_compiled_bf16_is_close_and_keeps_the_exclusion(peers, flex):
             base = fast(xs, xc, gid, sizes.numel()).detach()
             moved = fast(xs, xc2, gid, sizes.numel()).detach()
         assert torch.equal(moved[j], base[j])
-        if not peers:
-            assert torch.equal(moved[own], base[own])
+        assert torch.equal(moved[own], base[own])
         assert (moved[same & ~own] - base[same & ~own]).abs().max() > 1e-2
 
 

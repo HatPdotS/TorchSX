@@ -78,18 +78,11 @@ def _build_parser():
     # cross-attention blocks from each masked observation onto its run (default 1).
     p.add_argument("--ctx-layers", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--query-layers", type=int, default=None, help=argparse.SUPPRESS)
-    # Fold transformer: the last query block also reads every other observation's
-    # own token, the observation's own masked (all n - 1 peers).
-    p.add_argument("--query-peers", action="store_true", help=argparse.SUPPRESS)
     # Fold transformer: correct each run's geometry (a crystal rotation and an energy
     # shift, predicted from its context) and recompute the excitation errors (default
-    # on; off with --no-refine-geometry or --drop-geometry).
+    # on; off with --no-refine-geometry).
     p.add_argument("--refine-geometry", action=argparse.BooleanOptionalAction, default=None,
                    help=argparse.SUPPRESS)
-    # Scale features without the excitation error and the lab-frame direction.
-    p.add_argument("--drop-geometry", action="store_true", help=argparse.SUPPRESS)
-    # Optimiser of the encoder's block matrices: adamw (default) or muon.
-    p.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw", help=argparse.SUPPRESS)
     p.add_argument("--pseudo-translation", choices=("off", "auto"), default="off",
                    help="for crystals with translational NCS or a lattice translocation: auto finds the "
                         "structure's translations in the data's Patterson function and gives each reflection a "
@@ -308,7 +301,7 @@ def main(argv=None):
         stream_batches=True, split_half_every=0, heldout_frac=0.05,
         device=settings["device"], outdir=str(args.out), seed=args.seed,
         heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),
-        noise_lr_mult=args.noise_lr_mult, optimizer=args.optimizer,
+        noise_lr_mult=args.noise_lr_mult,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     try:
@@ -340,7 +333,7 @@ def main(argv=None):
         probe.begin("readout")
         tr.restore_best()
         tr.scale.eval()
-        tr.opt = tr.opt_muon = None
+        tr.opt = None
         tr.cfg.max_obs_per_batch = P.READOUT_MAX_OBS
         if str(tr.device).startswith("cuda"):
             torch.cuda.empty_cache()

@@ -167,13 +167,12 @@ class AmortizedScale(ScaleModel):
         encoder: str = "deepsets",
         ctx_layers: int = 2,
         query_layers: int = 1,
-        query_peers: bool = False,
         refine_geometry: bool = False,
     ) -> "AmortizedScale":
         """``encoder="fold"`` builds :class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`
         with ``context_folds`` folds, ``ctx_layers`` / ``query_layers`` blocks,
-        ``query_peers``, ``refine_geometry`` and ``peer_heads`` heads; the Deep Sets
-        arguments are then unused."""
+        ``refine_geometry`` and ``peer_heads`` heads; the Deep Sets arguments are
+        then unused."""
         # None keeps each tier's default; a checkpoint passes its recorded tiers
         features = ObsFeatureSpec(
             prep, include_hkl=include_hkl, context_features=context_features,
@@ -189,7 +188,7 @@ class AmortizedScale(ScaleModel):
             enc = FoldTransformerEncoder(
                 features.n_self, features.n_context, meas,
                 d_model=d_model, n_heads=peer_heads, folds=context_folds,
-                ctx_layers=ctx_layers, query_layers=query_layers, query_peers=query_peers,
+                ctx_layers=ctx_layers, query_layers=query_layers,
                 refine_geometry=refine_geometry,
                 geometry=features.geometry_columns() if refine_geometry else None,
                 d_hidden=d_hidden,

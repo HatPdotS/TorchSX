@@ -609,7 +609,6 @@ def test_defaults_are_the_wilson_prior_and_basis_anchor(tmp_path):
 
 
 @pytest.mark.parametrize("flags,kind,refine", [([], "fold", True), (["--no-refine-geometry"], "fold", False),
-                                              (["--drop-geometry"], "fold", False),
                                               (["--encoder", "deepsets"], "deepsets", None)])
 def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path, flags, kind, refine):
     from torchsx.cli import _pipeline as P
