@@ -78,7 +78,7 @@ run/
 ├── last.pt                 the network after the last update
 ├── prepared/               the prepared observations on disk, reused by later runs on the same input
 ├── run.json                the resolved settings
-├── training_summary.json   updates, best step and run time
+├── training_summary.json   updates, best step, run time; time and GPU memory by phase
 └── metrics.jsonl           training log: one line per update and per validation
 ```
 

@@ -446,6 +446,19 @@ class ObsFeatureSpec(nn.Module):
     def n_crystal(self) -> int:
         return len(self.crystal_features)
 
+    #: the self features the fold transformer's geometry correction reads, in its order
+    GEOMETRY = ("ewald_offset", "qx", "qy", "qz", "s_sq", "beam_energy")
+
+    def geometry_columns(self) -> dict:
+        """Columns of ``x_self`` holding the geometry, and their standardisation
+        (:class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`'s ``geometry``)."""
+        missing = [f for f in self.GEOMETRY if f not in self.self_features]
+        if missing:
+            raise ValueError(f"geometry correction needs the self features {missing}")
+        stat = [self._stat_names.index(f) for f in self.GEOMETRY]
+        return {"cols": [self.self_features.index(f) for f in self.GEOMETRY],
+                "mean": self._mean[stat].clone(), "std": self._std[stat].clone()}
+
     def crystal_matrix(self) -> Tensor:
         """``(n_crystals, n_crystal)`` standardised per-crystal table."""
         x = (self._crys_raw - self._crys_mean) / self._crys_std

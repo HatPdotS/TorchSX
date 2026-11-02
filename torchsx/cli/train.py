@@ -71,6 +71,18 @@ def _build_parser():
     # Crystal context pooling: K >= 2 folds (context from the other K-1 folds of the
     # crystal, default 2), or 0 = leave-one-out; the merge inherits the checkpoint.
     p.add_argument("--context-folds", type=int, default=None, help=argparse.SUPPRESS)
+    # Scale encoder: fold (default), the masked-fold transformer (K = --context-folds
+    # runs per crystal, default 5), or deepsets; the merge inherits the checkpoint.
+    p.add_argument("--encoder", choices=("deepsets", "fold"), default=None, help=argparse.SUPPRESS)
+    # Fold transformer depth: self-attention blocks over each run (default 2) and
+    # cross-attention blocks from each masked observation onto its run (default 1).
+    p.add_argument("--ctx-layers", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--query-layers", type=int, default=None, help=argparse.SUPPRESS)
+    # Fold transformer: correct each run's geometry (a crystal rotation and an energy
+    # shift, predicted from its context) and recompute the excitation errors (default
+    # on; off with --no-refine-geometry).
+    p.add_argument("--refine-geometry", action=argparse.BooleanOptionalAction, default=None,
+                   help=argparse.SUPPRESS)
     p.add_argument("--pseudo-translation", choices=("off", "auto"), default="off",
                    help="for crystals with translational NCS or a lattice translocation: auto finds the "
                         "structure's translations in the data's Patterson function and gives each reflection a "
@@ -198,10 +210,11 @@ def install_pseudo_translation(scale, prep, spacegroup) -> list[dict]:
     return used
 
 
-def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
+def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=None):
     """Run a fixed update budget, with the evaluation cadence per state;
     with ``patience`` > 0, stop after that many evaluations without a new
-    held-out minimum."""
+    held-out minimum.  ``probe`` (:class:`~torchsx.cli._pipeline.ResourceProbe`)
+    records every update's time."""
     evaluate_every = max(1, int(eval_every)) * tr.n_conditions
     stale = 0
     updates = [0] * tr.n_conditions
@@ -227,6 +240,8 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0):
         if rec.get("step_skipped") or not rec.get("n_used"):
             raise FloatingPointError(f"Update {tr.step_i} for state {k} was unusable; see metrics.jsonl")
         updates[k] += 1
+        if probe is not None:
+            probe.update(rec["sec"])
         if tr.step_i % 25 == 0 or sum(updates) == steps:
             print(f"update {tr.step_i}/{steps}: per-state {updates}, "
                   f"nll/obs {rec['nll_per_obs']:.5f}", flush=True)
@@ -251,9 +266,7 @@ def main(argv=None):
     args = _build_parser().parse_args(argv)
     import torch
 
-    # TF32 for the encoder's float32 matmuls; the likelihood and posterior
-    # integrals are elementwise and Triton code, which this does not touch.
-    torch.set_float32_matmul_precision("high")
+    P.configure_torch()
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
     from torchsx.cli.merge_nn import merge_products
 
@@ -263,6 +276,8 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    probe = P.ResourceProbe(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    probe.begin("prepare")
     if args.heldout_stream is not None:
         if not args.split:
             raise SystemExit("--heldout-stream needs named inputs (--split NAME=PATH)")
@@ -304,12 +319,18 @@ def main(argv=None):
         (args.out / "run.json").write_text(json.dumps(tr.data_recipe, indent=2) + "\n")
         print(f"train {tr.train_crystals.numel():,}, validation {tr.heldout_crystals.numel():,} crystals; "
               f"{args.steps} total updates across {tr.n_conditions} states", flush=True)
-        updates = run_updates(tr, args.steps, eval_every=args.eval_every, patience=args.patience)
-        (args.out / "training_summary.json").write_text(json.dumps(dict(
-            steps=args.steps, updates_per_state=updates, best_step=tr.best_step,
-            elapsed_seconds=time.time()-t0), indent=2) + "\n")
+        probe.begin("train")
+        updates = run_updates(tr, args.steps, eval_every=args.eval_every, patience=args.patience,
+                              probe=probe)
+        probe.end()
+        summary_path = args.out / "training_summary.json"
+        summary = dict(steps=args.steps, updates_per_state=updates, best_step=tr.best_step,
+                       elapsed_seconds=time.time()-t0, resources=probe.summary())
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
         if args.no_merge:
+            print(probe.report(), flush=True)
             return
+        probe.begin("readout")
         tr.restore_best()
         tr.scale.eval()
         tr.opt = None
@@ -322,8 +343,12 @@ def main(argv=None):
         args.out = args.out / "merged.mtz"
         merge_products(tr, prep, args, bundle.split_names or [""], list(range(tr.n_conditions)),
                        spacegroup=bundle.spacegroup, merge_friedel=bundle.merge_friedel)
+        probe.end()
+        summary.update(elapsed_seconds=time.time()-t0, resources=probe.summary())
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     finally:
         tr.close()
+    print(probe.report(), flush=True)
     print(f"total {time.time()-t0:.0f}s", flush=True)
 
 

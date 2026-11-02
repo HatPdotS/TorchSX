@@ -608,6 +608,22 @@ def test_defaults_are_the_wilson_prior_and_basis_anchor(tmp_path):
     assert TrainConfig().posterior_prior == "wilson"
 
 
+@pytest.mark.parametrize("flags,kind,refine", [([], "fold", True), (["--no-refine-geometry"], "fold", False),
+                                              (["--encoder", "deepsets"], "deepsets", None)])
+def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path, flags, kind, refine):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser as train_parser
+    from torchsx.nn.fold_transformer import FoldTransformerEncoder
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", *flags])
+    enc = P.build_stack(bundle, targs, verbose=False)[2].encoder
+    assert isinstance(enc, FoldTransformerEncoder) == (kind == "fold")
+    if kind == "fold":
+        assert (enc.context_folds, len(enc.ctx_blocks), len(enc.query_blocks)) == (5, 2, 1)
+        assert enc.refine_geometry == refine
+
+
 # ── detector noise under the gain policy ───────────────────────────────
 
 

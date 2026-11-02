@@ -361,6 +361,10 @@ class AmortizedTrainer:
         #: Updates dropped for being non-finite (see ``step``).
         self.n_skipped_steps = 0
         self.scale = scale.to(self.device)
+        # the fold transformer's blocks are back-propagated after the loss's
+        # backward pass, one at a time (AmortizedScale.encoder_backward)
+        if hasattr(self.scale, "encoder_backward"):
+            self.scale.defer_encoder_backward = True
         self.objective = objective
         self.params = params
 
@@ -782,6 +786,16 @@ class AmortizedTrainer:
             raise RuntimeError("the Wilson surface is trained with the network and needs a "
                                "reciprocal basis: prep.median_cell or set_reciprocal_basis()")
         loss.backward()
+        # everything the record needs from the batch's forward tensors, then the
+        # tensors themselves are released before the encoder's backward pass
+        loss_total, loss_finite = float(loss.item()), bool(torch.isfinite(loss.detach()))
+        n_crystals, n_floored = int(meta.crystal_id.unique().numel()), tgt.n_floored
+        diag = (self._diagnostics(meta, pred, tgt, rows)
+                if self.step_i % self.cfg.log_every == 0 else {})
+        mix = kl = None
+        del meta, pred, tgt, nll, n_ph, bg, sigma, loss, mix, kl
+        if hasattr(self.scale, "encoder_backward"):
+            self.scale.encoder_backward()
         gn = grad_norms(self.scale)
         for t in self.targets:
             p = getattr(t, "wilson_coef_param", None)
@@ -792,8 +806,7 @@ class AmortizedTrainer:
         # poisoned, n_used goes to 0 and the remaining epochs compute nothing.
         # One batch's worth of gradient is not worth that, so drop it and carry
         # on from the last good weights.  Counted, never silent.
-        skipped = bool(gn.get("n_nonfinite_grads", 0)) or not bool(
-            torch.isfinite(loss.detach()))
+        skipped = bool(gn.get("n_nonfinite_grads", 0)) or not loss_finite
         if skipped:
             self.n_skipped_steps += 1
             self.opt.zero_grad(set_to_none=True)
@@ -817,7 +830,7 @@ class AmortizedTrainer:
             "step": self.step_i,
             "phase": "train",
             # What the optimiser actually minimised (penalty included).
-            "loss_total": float(loss.item()),
+            "loss_total": loss_total,
             # ``nll_per_obs`` is the DATA term in both train and held-out
             # records, the penalty-free objective ``evaluate()`` writes under
             # the same key.  ``loss_total`` includes the spread penalty
@@ -841,9 +854,9 @@ class AmortizedTrainer:
             ),
             "n_hkl_used": getattr(self, "last_n_hkl", 0),
             "n_obs": int(rows.numel()),
-            "n_crystals": int(meta.crystal_id.unique().numel()),
+            "n_crystals": n_crystals,
             "n_used": n_used,
-            "n_floored": tgt.n_floored,
+            "n_floored": n_floored,
             "lam_spread": lam_s,
             **shape_rec,
             "lr": float(self.opt.param_groups[0]["lr"]),
@@ -856,7 +869,7 @@ class AmortizedTrainer:
             # No-penalty score on this same batch: the only training number
             # that is comparable across the whole run.
             rec["nll_canonical"] = self._canonical_nll(rows)
-            rec.update(self._diagnostics(meta, pred, tgt, rows))
+            rec.update(diag)
         self.step_i += 1
         self.logger.log(rec)
         return rec
@@ -889,6 +902,15 @@ class AmortizedTrainer:
             ),
             "reflections_in_batch": int(meta.hkl_idx.unique().numel()),
         }
+        corr = getattr(self.scale.encoder, "last_correction", None)
+        if corr is not None:
+            corr = corr[~corr.isnan().any(1)]
+        if corr is not None and corr.numel():
+            # the geometry correction the encoder applied, over the crystal-runs of its last forward
+            rot = corr[:, :3].norm(dim=1) * (180.0 / math.pi)
+            out["geometry_rot_deg_median"] = float(rot.median().item())
+            out["geometry_rot_deg_p90"] = float(torch.quantile(rot.float(), 0.9).item())
+            out["geometry_energy_rel_median"] = float(corr[:, 3].abs().median().item())
         em = getattr(self, "last_edge_mass", None)
         if em is not None:
             # Validity condition for detaching the grid geometry: if the grid
@@ -1075,10 +1097,11 @@ class AmortizedTrainer:
                 # so a later merge builds the SAME forward, not the default one
                 "encoder": {
                     k: getattr(self.scale.encoder, k, None)
-                    for k in ("context_folds", "obs_context_layers",
+                    for k in ("kind", "context_folds", "obs_context_layers",
                               "obs_self_layers", "d_model", "n_layers",
                               "n_crystal_features", "peer_attention_layers",
-                              "peer_heads", "peer_dim")
+                              "peer_heads", "peer_dim", "ctx_layers",
+                              "query_layers", "refine_geometry", "n_heads")
                 },
                 # everything a merge must not have to guess: the likelihood it
                 # was fitted under, the data recipe, and the scale geometry.  A

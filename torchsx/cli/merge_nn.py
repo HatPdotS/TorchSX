@@ -23,7 +23,8 @@ def _build_parser():
     P.add_free_args(p)
     p.add_argument("-o", "--out", type=Path, required=True,
                    help="output MTZ, e.g. merged.mtz; with several states one file per state, "
-                        "merged_STATE.mtz, each with its _half1/_half2 companions")
+                        "merged_STATE.mtz, each with its _half1/_half2 companions; time and GPU "
+                        "memory by phase go to merged.resources.json")
     return p
 
 
@@ -31,11 +32,11 @@ def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
     import torch
 
-    # TF32 for the encoder's float32 matmuls; the likelihood and posterior
-    # integrals are elementwise and Triton code, which this does not touch.
-    torch.set_float32_matmul_precision("high")
+    P.configure_torch()
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
+    probe = P.ResourceProbe(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    probe.begin("prepare")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     print(f"checkpoint {args.ckpt} (step {ckpt.get('best_step')}, "
           f"heldout {ckpt.get('best_heldout')})", flush=True)
@@ -75,11 +76,16 @@ def main(argv: list[str] | None = None) -> None:
     names = bundle.split_names or [""]
     if tr.n_conditions != max(len(names), 1) and tr.n_conditions > 1:
         names = [str(i) for i in range(tr.n_conditions)]
+    out = args.out
     try:
+        probe.begin("readout")
         merge_products(tr, prep, args, names, list(range(tr.n_conditions)),
                        spacegroup=bundle.spacegroup, merge_friedel=bundle.merge_friedel)
+        probe.end()
+        out.with_suffix(".resources.json").write_text(json.dumps(probe.summary(), indent=2) + "\n")
     finally:
         tr.close()
+    print(probe.report(), flush=True)
 
 
 def restore_wilson_surface(tr, prep, ckpt, names=None) -> None:

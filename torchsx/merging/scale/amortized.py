@@ -32,6 +32,7 @@ from torchsx.merging.scale.base import ScaleModel
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 from torchsx.merging.scatter.predicted import PredictedGenGaussScatter
 from torchsx.nn.deepsets import DeepSetsEncoder, ScaleEncoder
+from torchsx.nn.fold_transformer import FoldTransformerEncoder, scatter_positions
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
 from torchsx.nn.obs_features import ObsFeatureSpec
 
@@ -96,6 +97,11 @@ class AmortizedScale(ScaleModel):
         #: See :meth:`predict` -- the encoder is separable across crystals, so
         #: chunking is exact and moves the checkpoint boundary off the blocks.
         self.chunk_crystals = 0
+        #: fold path in training: the blocks' outputs enter the graph as leaves
+        #: and :meth:`encoder_backward` back-propagates them through the blocks
+        #: after the loss's backward pass (:meth:`_predict_fold`)
+        self.defer_encoder_backward = False
+        self._deferred = None
         self.anchor_log_k = bool(anchor_log_k)
         if anchor_stat not in ("median", "mean", "basis"):
             raise ValueError(
@@ -158,25 +164,49 @@ class AmortizedScale(ScaleModel):
         self_features: tuple[str, ...] | None = None,
         context_features: tuple[str, ...] | None = None,
         crystal_features: tuple[str, ...] | None = None,
+        encoder: str = "deepsets",
+        ctx_layers: int = 2,
+        query_layers: int = 1,
+        refine_geometry: bool = False,
     ) -> "AmortizedScale":
+        """``encoder="fold"`` builds :class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`
+        with ``context_folds`` folds, ``ctx_layers`` / ``query_layers`` blocks,
+        ``refine_geometry`` and ``peer_heads`` heads; the Deep Sets arguments are
+        then unused."""
         # None keeps each tier's default; a checkpoint passes its recorded tiers
         features = ObsFeatureSpec(
             prep, include_hkl=include_hkl, context_features=context_features,
             crystal_features=crystal_features,
             **({} if self_features is None else {"self_features": tuple(self_features)}),
         )
-        enc = DeepSetsEncoder(
-            features.n_self, features.n_context,
-            d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
-            dropout=dropout,
-            n_crystal_features=features.n_crystal,
-            context_folds=context_folds,
-            obs_context_layers=obs_context_layers,
-            obs_self_layers=obs_self_layers,
-            peer_attention_layers=peer_attention_layers,
-            peer_heads=peer_heads,
-            peer_dim=peer_dim,
-        )
+        if encoder not in ("deepsets", "fold"):
+            raise ValueError(f"encoder must be 'deepsets' or 'fold', got {encoder!r}")
+        if encoder == "fold":
+            # the measurement: what a visible token carries beyond the geometry
+            geometry = set(features.self_features)
+            meas = [i for i, f in enumerate(features.context_features) if f not in geometry]
+            enc = FoldTransformerEncoder(
+                features.n_self, features.n_context, meas,
+                d_model=d_model, n_heads=peer_heads, folds=context_folds,
+                ctx_layers=ctx_layers, query_layers=query_layers,
+                refine_geometry=refine_geometry,
+                geometry=features.geometry_columns() if refine_geometry else None,
+                d_hidden=d_hidden,
+                n_crystal_features=features.n_crystal,
+            )
+        else:
+            enc = DeepSetsEncoder(
+                features.n_self, features.n_context,
+                d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
+                dropout=dropout,
+                n_crystal_features=features.n_crystal,
+                context_folds=context_folds,
+                obs_context_layers=obs_context_layers,
+                obs_self_layers=obs_self_layers,
+                peer_attention_layers=peer_attention_layers,
+                peer_heads=peer_heads,
+                peer_dim=peer_dim,
+            )
         heads = ScaleHeads(
             d_model,
             w_init=w_init,
@@ -262,8 +292,12 @@ class AmortizedScale(ScaleModel):
         128``), and every one of them is interior -- only ``log_K``,
         ``log_w`` and ``beta`` leave.  Storing the chunk's inputs and outputs
         instead is ~52 B per observation, and the 16 are rematerialised one
-        chunk at a time in backward.
+        chunk at a time in backward.  The fold transformer packs and
+        checkpoints its own blocks (:meth:`_predict_fold`) and ignores the
+        chunk size.
         """
+        if getattr(self.encoder, "kind", None) == "fold":
+            return self._predict_fold(meta)
         n_chunk = int(getattr(self, "chunk_crystals", 0) or 0)
         if n_chunk > 0:
             # Chunk in EVERY mode, not only when building a graph.  The
@@ -303,14 +337,7 @@ class AmortizedScale(ScaleModel):
                 "use AmortizedScale.set_encoder_chunking() to set both"
             )
 
-        skew = self.heads.predict_skew
-        mixture = getattr(self.heads, "scatter_family", "gengauss") == "mixture"
-        names = ["log_K", "log_w", "beta", "log_alpha", "log_e_s"]
-        if skew or mixture:
-            names.append("log_alpha_hi")
-        if mixture:
-            names.append("mix")
-
+        names = self._prediction_names()
         broad = getattr(self.features, "phase_broad", None)
         x_broad = (self.features.build_self(meta, broad.log_width(meta.hkl_idx))
                    if broad is not None else None)
@@ -339,6 +366,108 @@ class AmortizedScale(ScaleModel):
         pred = ScalePrediction(**{name: torch.cat(t) for name, t in zip(names, cols)})
         log_K_broad = torch.cat(cols[len(names)]) if x_broad is not None else None
         return self._anchor(self._pseudo_translation(pred, meta, log_K_broad), meta)
+
+    def _prediction_names(self) -> list[str]:
+        """The :class:`ScalePrediction` fields the heads fill."""
+        mixture = getattr(self.heads, "scatter_family", "gengauss") == "mixture"
+        names = ["log_K", "log_w", "beta", "log_alpha", "log_e_s"]
+        if self.heads.predict_skew or mixture:
+            names.append("log_alpha_hi")
+        if mixture:
+            names.append("mix")
+        return names
+
+    def _predict_fold(self, meta: ObsInfo) -> ScalePrediction:
+        """The fold transformer and the heads, one packed block at a time.
+
+        The encoder packs the batch's crystals into blocks once
+        (:meth:`~torchsx.nn.fold_transformer.FoldTransformerEncoder.layout`).
+        Each block gathers its rows, runs the network (compiled on CUDA,
+        ``encoder.compile``) and the heads, in training under one checkpoint,
+        so only the batch tables and the block's outputs are stored.  One
+        gather puts the outputs back in row order.
+
+        Without autograd (evaluation, the merge) each block runs the same way,
+        under a checkpoint with autograd on, its outputs detached: flex
+        attention runs only in autograd graphs, and the masked kernel of a
+        forward-only graph expands every run's key mask to its score matrix.
+
+        With ``defer_encoder_backward`` (training) the outputs are detached and
+        enter the rest of the graph as leaves, in row order: the loss's
+        backward pass then holds no encoder block and no feature table, and
+        :meth:`encoder_backward` builds the features again and runs each block
+        again, alone, from the gradient its rows received.  The gradient is the
+        same; the encoder's activations and the batch-wide graph of the
+        likelihood are never in memory together.
+        """
+        if getattr(self.features, "phase_broad", None) is not None:
+            raise NotImplementedError("the fold transformer takes one x_self table "
+                                      "(no pseudo-translation profiles)")
+        x_self, x_ctx, x_crys = self.features.build(meta)
+        enc = self.encoder
+        enc.fit_device(x_self.device)
+        run = self._fold_block
+        ckpt = torch.is_grad_enabled() and self.training
+        defer = ckpt and self.defer_encoder_backward
+        flex_only = (not torch.is_grad_enabled() and enc.compile and x_self.is_cuda and enc.flex
+                     and enc.flex_device and any(p.requires_grad for p in enc.parameters()))
+        n = x_self.shape[0]
+        parts, dest, corrections, blocks = [], [], [], []
+        for idx, valid in enc.layout(meta.crystal_id):
+            args = (x_self, x_ctx, x_crys, meta.crystal_id, idx, valid)
+            if flex_only:
+                with torch.enable_grad():
+                    out = torch.utils.checkpoint.checkpoint(run, *args, use_reentrant=False)
+            else:
+                out = (torch.utils.checkpoint.checkpoint(run, *args, use_reentrant=False)
+                       if ckpt else run(*args))
+            if defer or flex_only:
+                out = tuple(t.detach() for t in out)
+            if defer:
+                blocks.append((idx, valid))
+            parts.append(out[:-1])
+            corrections.append(out[-1].detach())
+            dest.append(torch.where(valid, idx, n).flatten())
+        if enc.refine_geometry:
+            enc.last_correction = torch.cat(corrections)
+        pos = scatter_positions(dest, n)
+        rows = [torch.cat(t).index_select(0, pos) for t in zip(*parts)]
+        del parts
+        if defer:
+            rows = [r.requires_grad_() for r in rows]
+            self._deferred = (run, meta, blocks, rows)
+        pred = ScalePrediction(**dict(zip(self._prediction_names(), rows)))
+        return self._anchor(pred, meta)
+
+    def encoder_backward(self) -> None:
+        """The encoder's share of a deferred backward pass (:meth:`_predict_fold`):
+        each block again, with autograd, back-propagated from the gradient its
+        outputs received; one block's activations at a time.  The batch's
+        predictions are spent by then, and released first (:meth:`clear`)."""
+        if self._deferred is None:
+            return
+        run, meta, blocks, rows = self._deferred
+        grads = [r.grad for r in rows]
+        del rows
+        self.clear()
+        x_self, x_ctx, x_crys = self.features.build(meta)
+        n = x_self.shape[0]
+        for idx, valid in blocks:
+            out = run(x_self, x_ctx, x_crys, meta.crystal_id, idx, valid)[:-1]
+            # each slot's gradient from its row; padding slots get none
+            at, live = idx.flatten().clamp(max=n - 1), valid.flatten()
+            pairs = [(o, g.index_select(0, at) * live.view(-1, *([1] * (g.dim() - 1))))
+                     for o, g in zip(out, grads) if g is not None]
+            if pairs:
+                torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
+
+    def _fold_block(self, x_self: Tensor, x_ctx: Tensor, x_crys: Tensor | None, group_id: Tensor,
+                    idx: Tensor, valid: Tensor) -> tuple[Tensor, ...]:
+        """Heads on every slot of one packed block (padding included), flattened, and
+        the block's geometry correction last."""
+        z, correction = self.encoder.encode(x_self, x_ctx, x_crys, group_id, idx, valid)
+        p = self.heads(z.flatten(0, 1))
+        return tuple(getattr(p, name) for name in self._prediction_names()) + (correction,)
 
     def predict_split(
         self, meta_self: ObsInfo, meta_ctx: ObsInfo
@@ -501,6 +630,7 @@ class AmortizedScale(ScaleModel):
     def clear(self) -> None:
         self._cached_obs_id = None
         self._cached_pred = None
+        self._deferred = None
         self.scatter.clear_prediction()
 
     def log_k(
