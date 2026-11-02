@@ -1031,6 +1031,8 @@ class AmortizedTrainer:
                     "basis": self.reciprocal_basis.definition(),
                     "coef": [c.cpu() for c in wilson],
                 }),
+                # the prior's pseudo-translation modulation as a function of hkl
+                "intensity_modulation": getattr(self, "intensity_modulation", None),
                 # outer-grid geometry, so a later merge integrates on the SAME grid
                 "posterior_grid": {
                     "k_coarse": self.cfg.posterior_k_coarse, "m_fine": self.cfg.posterior_m_fine,
@@ -1410,6 +1412,27 @@ class AmortizedTrainer:
             self.opt.add_param_group({"params": [t.enable_evidence_prior() for t in self.targets],
                                       "lr": self.cfg.lr * mult, "lr_mult": mult,
                                       "weight_decay": 0.0, "name": "wilson_surface"})
+
+    @torch.no_grad()
+    def set_intensity_modulation(self, modulation) -> None:
+        """Give every state's prior the pseudo-translation modulation of the mean intensity.
+
+        ``modulation`` (:class:`~torchsx.merging.priors.modulation.PhaseModulation`)
+        is evaluated on ``prep.hkl_valid`` with the symmetry factor and installed
+        as each target's fixed offset of ``log Sigma``; the smooth surface is
+        refitted under it (and the evidence parameter restarted there), after
+        :meth:`set_reciprocal_basis`.  The checkpoint records its definition.
+        """
+        hkl = self.prep.hkl_valid.long().cpu().numpy()
+        s2 = (1.0 / self.prep.d_spacing.double() ** 2).cpu().numpy()
+        log_mod = torch.as_tensor(modulation.log_prior_offset(hkl, s2), dtype=torch.float32)
+        for t in self.targets:
+            t.set_modulation(log_mod.to(t.wilson_log_mod.device))
+            if self.cfg.posterior_prior == "wilson" and t.has_basis:
+                t.fit_wilson_surface()
+                if t.wilson_coef_param is not None:
+                    t.wilson_coef_param.data.copy_(t.wilson_coef)
+        self.intensity_modulation = modulation.definition()
 
     def wilson_fit_info(self) -> dict:
         """Diagnostics of the Wilson surface on the first target (empty without a basis)."""

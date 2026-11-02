@@ -245,14 +245,11 @@ def _reflection_means(prep) -> tuple[np.ndarray, np.ndarray]:
         return np.where(cnt > 0, num / np.maximum(cnt, 1.0), np.nan), cnt
 
 
-def find_pseudo_translations(prep, spacegroup: str | None, *, n_shells: int = 20, **kw) -> list[dict]:
-    """Translations of the structure in the Patterson function of ``E2 - 1``.
-
-    ``E2`` is each reflection's plain mean over its symmetry factor and the mean
-    of that ratio in its resolution shell (equal-count shells in ``1/d^2``).
-    Keyword arguments go to :func:`find_translations`.  Every peak found is
-    returned; :data:`MIN_AMPLITUDE` decides which are used.
-    """
+def normalised_intensities(prep, spacegroup: str | None, *, n_shells: int = 20):
+    """``(hkl, s2, E2, seen)`` of the prepared reflections: ``E2`` is each
+    reflection's plain mean over its symmetry factor and the mean of that ratio
+    in its resolution shell (equal-count shells in ``s2 = 1/d^2``); 1 where a
+    reflection has no observation (``seen`` false)."""
     hkl = prep.hkl_valid.long().cpu().numpy()
     s2 = (1.0 / prep.d_spacing.double() ** 2).cpu().numpy()
     rotations = point_group_rotations(spacegroup or "P 1")
@@ -264,7 +261,17 @@ def find_pseudo_translations(prep, spacegroup: str | None, *, n_shells: int = 20
     shell = np.clip(np.searchsorted(edges, s2, side="right") - 1, 0, n_shells - 1)
     shell_mean = np.array([I[seen & (shell == i)].mean() if (seen & (shell == i)).any() else np.nan
                            for i in range(n_shells)])
-    E2 = np.where(seen, I / shell_mean[shell], 1.0)
+    return hkl, s2, np.where(seen, I / shell_mean[shell], 1.0), seen
+
+
+def find_pseudo_translations(prep, spacegroup: str | None, *, n_shells: int = 20, **kw) -> list[dict]:
+    """Translations of the structure in the Patterson function of ``E2 - 1``
+    (:func:`normalised_intensities`).  Keyword arguments go to
+    :func:`find_translations`.  Every peak found is returned;
+    :data:`MIN_AMPLITUDE` decides which are used.
+    """
+    hkl, _, E2, _ = normalised_intensities(prep, spacegroup, n_shells=n_shells)
+    rotations = point_group_rotations(spacegroup or "P 1")
     cell = prep.median_cell.double().cpu().numpy()
     return find_translations(hkl, cell, E2, rotations, **kw)
 

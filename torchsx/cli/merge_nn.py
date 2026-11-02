@@ -56,6 +56,7 @@ def main(argv: list[str] | None = None) -> None:
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     tr.set_reciprocal_basis(S["basis"])
     restore_wilson_surface(tr, prep, ckpt, names=bundle.split_names)
+    restore_intensity_modulation(tr, prep, ckpt)
     # Strict: a checkpoint from another version of the model fails here rather
     # than merging with some of its weights silently left out.
     try:
@@ -117,6 +118,23 @@ def restore_wilson_surface(tr, prep, ckpt, names=None) -> None:
         t.set_wilson_coef(c)
         if t.wilson_coef_param is not None:
             t.wilson_coef_param.data.copy_(c)
+
+
+def restore_intensity_modulation(tr, prep, ckpt) -> None:
+    """Install the checkpoint's prior modulation (:mod:`torchsx.merging.priors.modulation`),
+    evaluated on these reflections, on the trained surfaces; nothing when it has none."""
+    d = ckpt.get("intensity_modulation")
+    if d is None:
+        return
+    import torch
+
+    from torchsx.merging.priors.modulation import PhaseModulation
+    mod = PhaseModulation.from_definition(d)
+    log_mod = torch.as_tensor(mod.log_prior_offset(
+        prep.hkl_valid.long().cpu().numpy(), (1.0 / prep.d_spacing.double() ** 2).cpu().numpy()),
+        dtype=torch.float32)
+    for t in tr.targets:
+        t.set_modulation(log_mod.to(t.wilson_log_mod.device))
 
 
 def _export_crystals(tr, k: int):

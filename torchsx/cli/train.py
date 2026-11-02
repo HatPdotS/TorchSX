@@ -105,6 +105,10 @@ def _build_parser():
                         "instead.  Default: gauge.  The merge inherits the checkpoint")
     # Weight of the tether's penalty (nats^2 per observation, default 1).
     p.add_argument("--tether-weight", type=_positive, default=1.0, help=argparse.SUPPRESS)
+    # The Wilson prior's mean follows the structure's pseudo-translations: the symmetry factor
+    # and the modulation of the mean intensity by h.t, fitted to the data's plain means before
+    # training (torchsx.merging.priors.modulation); auto, or off (default).
+    p.add_argument("--structured-prior", choices=("off", "auto"), default="off", help=argparse.SUPPRESS)
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
@@ -202,12 +206,10 @@ def attach_heldout_stream(bundle, name: str = "heldout"):
     return ids
 
 
-def install_pseudo_translation(scale, prep, spacegroup) -> list[dict]:
-    """Find the data's pseudo-translations and, if any is strong enough, give the scale model
-    reflection-dependent profiles (:mod:`torchsx.merging.scale.pseudo_translation`)."""
-    from torchsx.merging.scale.pseudo_translation import (
-        PhaseBroad, PhaseWidth, find_pseudo_translations, select_translations,
-    )
+def find_used_translations(prep, spacegroup) -> tuple[list[dict], str]:
+    """The data's pseudo-translations (:mod:`torchsx.merging.scale.pseudo_translation`),
+    every Patterson peak reported; the ones strong enough to use, and why."""
+    from torchsx.merging.scale.pseudo_translation import find_pseudo_translations, select_translations
     peaks = find_pseudo_translations(prep, spacegroup)
     used, why = select_translations(peaks)
     for i, p in enumerate(peaks):
@@ -215,14 +217,33 @@ def install_pseudo_translation(scale, prep, spacegroup) -> list[dict]:
               f"amplitude {p['amplitude']:.3f} significance {p['significance']:.1f}"
               + ("" if p["harmonic_of"] is None else f" [harmonic {p['order']} of #{p['harmonic_of']}]")
               + (" (used)" if p in used else ""), flush=True)
+    return used, why
+
+
+def install_pseudo_translation(scale, prep, spacegroup, used, why) -> None:
+    """Give the scale model reflection-dependent profiles from the ``used`` translations."""
+    from torchsx.merging.scale.pseudo_translation import PhaseBroad, PhaseWidth
     if not used:
         print(f"pseudo-translation: {why}; one profile for every reflection", flush=True)
-        return used
+        return
     t = [p["t"] for p in used]
     scale.install_pseudo_translation(PhaseWidth.from_prep(prep, t, spacegroup),
                                      PhaseBroad.from_prep(prep, t, spacegroup))
     print(f"pseudo-translation: reflection profiles from {why}", flush=True)
-    return used
+
+
+def install_structured_prior(tr, prep, spacegroup, used) -> None:
+    """Give the Wilson prior the symmetry factor and the modulation of the mean intensity by the
+    ``used`` translations (:mod:`torchsx.merging.priors.modulation`)."""
+    from torchsx.merging.priors.modulation import PhaseModulation
+    mod = PhaseModulation.from_prep(prep, [p["t"] for p in used], spacegroup)
+    tr.set_intensity_modulation(mod)
+    for row in mod.summary():
+        print(f"structured prior: t {row['t']} amplitude {row['amplitude']} at d {row['d']} A", flush=True)
+    hkl = prep.hkl_valid.long().cpu().numpy()
+    g = np.exp(mod.log_factor(hkl, (1.0 / prep.d_spacing.double() ** 2).cpu().numpy()))
+    print(f"structured prior: modulation q01 {np.quantile(g, 0.01):.3f} median {np.median(g):.3f} "
+          f"q99 {np.quantile(g, 0.99):.3f} over {len(g):,} reflections", flush=True)
 
 
 def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=None):
@@ -302,8 +323,11 @@ def main(argv=None):
     bundle = P.load_prep(args)
     heldout_ids = attach_heldout_stream(bundle) if args.heldout_stream is not None else None
     prep, params, scale, obj, settings = P.build_stack(bundle, args)
+    used, why = ([], "")
+    if "auto" in (args.pseudo_translation, args.structured_prior):
+        used, why = find_used_translations(prep, bundle.spacegroup)
     if args.pseudo_translation == "auto":
-        install_pseudo_translation(scale, prep, bundle.spacegroup)
+        install_pseudo_translation(scale, prep, bundle.spacegroup, used, why)
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
         target_redundancy=args.redundancy, lr=1e-3,
@@ -324,6 +348,11 @@ def main(argv=None):
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     try:
         tr.set_reciprocal_basis(settings["basis"])
+        if args.structured_prior == "auto":
+            if used:
+                install_structured_prior(tr, prep, bundle.spacegroup, used)
+            else:
+                print(f"structured prior: {why}; the Wilson prior is unchanged", flush=True)
         tr.split_names = bundle.split_names
         config = asdict(cfg)
         if heldout_ids is not None:
