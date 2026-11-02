@@ -175,8 +175,8 @@ class ObsFeatureSpec(nn.Module):
                 f"{sorted(leaks)} may not be self features: routing an "
                 f"observation's own intensity to the scale head makes "
                 f"K_j = I_j / I0_h fit perfectly and mean nothing. "
-                f"Put them in context_features, where leave-one-out excludes "
-                f"the observation from its own pool."
+                f"Put them in context_features, which the encoder hides from "
+                f"the observation's own readout."
             )
         crystal_features = (
             tuple(crystal_features) if crystal_features is not None

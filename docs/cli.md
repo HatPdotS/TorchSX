@@ -39,7 +39,6 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--redundancy N` | 100 | Target observations per reflection in a batch. |
 | `--warmup N` | 25 | Learning-rate warm-up, in updates per state. |
 | `--lr-schedule` | `constant` | Learning rate after the warm-up: `constant`, or `cosine` decay to zero at the last update. |
-| `--peer-attention N` | 2 | Cross-attention layers from each observation onto the other observations of its crystal; 0 pools by mean only. |
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
 | `--outlier-frac F` | 0 | Initial weight of a detector-outlier component; 0 turns it off. |
 | `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
@@ -226,10 +225,13 @@ the setting from the checkpoint.
 
 Each observation's scale and scatter distribution are predicted from its own
 geometry and from the other observations of its crystal. The crystal's
-observations are split into two folds, and each observation attends to the
-other fold (`--peer-attention` layers). For every peer the network sees its
-intensity relative to the mean of its reflection over the whole input, and the
-log of that mean. The scatter distribution is a mixture of four Gaussians in
+observations are split into five folds, and the crystal is encoded once per
+fold with the measurements of that fold hidden: its observations attend to
+each other, the crystal's orientation and photon energy are corrected from
+them, and every hidden observation is read out from the encoding in which it
+is hidden. For every observation whose measurement it sees, the network reads
+its intensity relative to the mean of its reflection over the whole input, and
+the log of that mean. The scatter distribution is a mixture of four Gaussians in
 log scale, plus the miss component (`--miss-frac`). The detector term is
 Poisson counting on the spot and the background estimate.
 

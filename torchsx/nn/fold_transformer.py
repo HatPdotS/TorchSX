@@ -59,10 +59,8 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
-from torchsx.nn.deepsets import ResidualFF
-
-__all__ = ["AttentionBlock", "FoldTransformerEncoder", "fold_layout", "key_prefix_mask",
-           "scatter_positions"]
+__all__ = ["AttentionBlock", "FoldTransformerEncoder", "ResidualFF", "fold_layout",
+           "key_prefix_mask", "scatter_positions"]
 
 #: tiles, warps and pipeline stages of the flex attention kernels (``fwd_*`` /
 #: ``bwd_*`` keys of ``flex_attention``'s ``kernel_options``): the backward
@@ -88,8 +86,8 @@ def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 18,
     crystal's ``l``-th row and its fold is ``l % folds``.  One host sync per
     call.
 
-    Returns ``[(idx, valid)]`` as :func:`~torchsx.nn.deepsets.peer_layout`
-    does, each shaped ``(B, L // folds, folds)``: slot ``l`` of row ``b`` at
+    Returns ``[(idx, valid)]``, the rows of every slot and whether the slot
+    holds one, each shaped ``(B, L // folds, folds)``: slot ``l`` of row ``b`` at
     ``[b, l // folds, l % folds]``, the last index its fold (an empty row's
     ``idx`` repeats a row of the block).  The last dimension is marked static
     for ``torch.compile``, so every length in a compiled block is a multiple
@@ -197,6 +195,29 @@ def key_prefix_mask(n_keys: Tensor, q_len, kv_len, mask_mod=None, block: int = 1
             return kv < n_keys[b]
     return BlockMask((q_len, kv_len), kv_num, kv_idx, full_kv_num, full_kv_idx,
                      q_num, q_idx, full_q_num, full_q_idx, (block, block), mask_mod)
+
+
+class ResidualFF(nn.Module):
+    """Pre-norm residual feed-forward block: ``x + W2 act(W1 act(norm(x)))``.
+
+    The second projection is zero-initialised, so the block starts as the
+    identity.
+    """
+
+    def __init__(self, d_model: int, d_hidden: int | None = None, *,
+                 activation: type[nn.Module] = nn.SiLU) -> None:
+        super().__init__()
+        d_hidden = d_hidden if d_hidden is not None else 2 * d_model
+        self.norm = nn.RMSNorm(d_model)
+        self.act = activation()
+        self.fc1 = nn.Linear(d_model, d_hidden)
+        self.fc2 = nn.Linear(d_hidden, d_model)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.act(self.norm(x))
+        return x + self.fc2(self.act(self.fc1(h)))
 
 
 class AttentionBlock(nn.Module):
@@ -347,7 +368,7 @@ class FoldTransformerEncoder(nn.Module):
         self.n_self_features = int(n_self_features)
         self.n_context_features = int(n_context_features)
         self.n_crystal_features = int(n_crystal_features)
-        #: K, recorded under the same name as the Deep Sets fold count
+        #: K, the runs per crystal
         self.context_folds = int(folds)
         self.ctx_layers, self.query_layers = int(ctx_layers), int(query_layers)
         self.refine_geometry = bool(refine_geometry)

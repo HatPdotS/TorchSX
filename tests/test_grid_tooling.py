@@ -14,7 +14,7 @@ from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
 def _trainer(tmp_path, n_cond=2, **kw):
     prep, params, *_ = _synthetic(n_hkl=12, n_xtal=40, per=10, n_cond=n_cond)
-    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
+    scale = AmortizedScale.from_prep(prep, d_model=8, context_folds=2)
     return prep, AmortizedTrainer(prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
                                   config=TrainConfig(max_obs_per_batch=40, device="cpu", outdir=str(tmp_path),
                                                      posterior_k_coarse=5, posterior_m_fine=17,
@@ -91,6 +91,6 @@ def test_run_updates_stops_after_patience(tmp_path, monkeypatch):
 
 def test_width_flags_reach_the_encoder():
     from torchsx.cli import train
-    a = train._build_parser().parse_args(["x.stream", "-o", "run", "--d-model", "64", "--n-layers", "3",
+    a = train._build_parser().parse_args(["x.stream", "-o", "run", "--d-model", "64",
                                           "--eval-every", "50", "--patience", "3", "--heldout-stream", "h.stream"])
-    assert (a.d_model, a.n_layers, a.eval_every, a.patience, str(a.heldout_stream)) == (64, 3, 50, 3, "h.stream")
+    assert (a.d_model, a.eval_every, a.patience, str(a.heldout_stream)) == (64, 50, 3, "h.stream")
