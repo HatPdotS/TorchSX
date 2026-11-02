@@ -416,4 +416,4 @@ def test_cli_single_state_export_has_no_difference(tmp_path, capsys):
     (row,) = rows(pair / 'summary.tsv')
     assert (row['kind'], row['name']) == ('halves', 'merged') and float(row['cc_half']) > 0.8
     assert set(rows(pair / 'shells_halves.tsv')[0]) == {'name', 'shell', 'd_max', 'd_min', 'inv_d2', 'n', 'cc_half',
-                                                        'r_split'}
+                                                        'cc_half_flat', 'r_split'}
