@@ -10,8 +10,8 @@ common to the merges involved, after scaling, in equal-count resolution shells:
 * ``split_half_stats``: two independent halves of one dataset. Half B is
   scaled onto half A (one log scale plus six anisotropic terms on normalised
   hkl, sigma-weighted robust least squares on amplitudes), then CC1/2 and
-  R_split of the intensities, and the flat CC1/2: CC1/2 after each half is
-  divided by its own smooth global trend of <I>.
+  R_split of the intensities, and CC1/2 with each half's smooth trend of <I>
+  divided out.
 * ``halves_stats``: the same halves, scaled the same way, with CC and R on
   intensities and amplitudes, the sigma-normalised difference and the
   noise-to-signal ratio ``ln N/S``.
@@ -432,48 +432,30 @@ def _intensities(A: Merge, B: Merge, g):
     return A.F**2, (B.F * g) ** 2, 'F^2'
 
 
-TREND_DEGREE = 4
-TREND_MODEL = (f'<I>(h) = exp(c . [T_0..T_{TREND_DEGREE}(s2), invariant traceless s A s, centric, log epsilon]), '
-               'fitted to each half on its own scale; I / <I> has mean 1')
-
-
-def trend_design(hkl, cell, spacegroup, degree=TREND_DEGREE):
-    """Columns of the smooth global trend of ``log <I>``, the first constant.
-
-    The reciprocal basis of the torchsx Wilson prior (Chebyshev ``T_0 ..
-    T_degree`` in s2 and the point-group-invariant anisotropy tensors), a
-    centric indicator, and ``log epsilon``. Columns constant over ``hkl`` are
-    dropped.
-    """
+def trend_design(hkl, cell, spacegroup, degree=4):
+    """Columns of a smooth global trend of ``log <I>``: the torchsx Wilson prior's
+    reciprocal basis (Chebyshev ``T_0 .. T_degree`` in s2, the point-group-invariant
+    anisotropy tensors) and a centric indicator."""
     import torch
     from torchsx.merging.priors.reciprocal_basis import ReciprocalBasis
-    sg = _spacegroup(spacegroup)
     t = _tensor(hkl)
-    basis = ReciprocalBasis.from_hkl(t, torch.as_tensor(np.asarray(cell, dtype=np.float64)), str(spacegroup),
-                                     degree=degree)
-    centric = sg.is_centric(t.long()).cpu().numpy().astype(np.float64)
-    log_eps = np.log(sg.epsilon(t, friedel=False).cpu().double().numpy())
-    X = np.column_stack([basis.phi.double().cpu().numpy(), centric, log_eps])
-    return X[:, [0] + [j for j in range(1, X.shape[1]) if np.ptp(X[:, j]) > 1e-9]]
+    phi = ReciprocalBasis.from_hkl(t, torch.as_tensor(np.asarray(cell, dtype=np.float64)), str(spacegroup),
+                                   degree=degree).phi.double().numpy()
+    return np.column_stack([phi, _spacegroup(spacegroup).is_centric(t).cpu().numpy()])
 
 
 def fit_trend(X, I, n_iter=50):
-    """``exp(X @ c)``, the smooth mean of ``I``: the Wilson maximum-likelihood fit.
-
-    Solves ``sum_h X_h (I_h / exp(X_h c) - 1) = 0`` by Fisher scoring, so
-    negative measured intensities enter as they are. ``None`` when ``I`` has no
-    positive mean or the fit does not converge.
-    """
-    if X.shape[0] <= X.shape[1] or not I.mean() > 0:
-        return None
+    """``exp(X @ c)`` with ``sum_h X_h (I_h / exp(X_h c) - 1) = 0``, the Wilson
+    maximum-likelihood mean, by Fisher scoring; negative intensities enter as
+    they are. NaN when ``I`` has no positive mean or the fit does not converge."""
     c = np.zeros(X.shape[1])
-    c[0] = math.log(I.mean())
-    for _ in range(n_iter):
-        step = np.linalg.lstsq(X, I * np.exp(-np.clip(X @ c, -700, 700)) - 1.0, rcond=None)[0]
-        c += np.clip(step, -1.0, 1.0)
+    c[0] = math.log(I.mean()) if I.mean() > 0 else np.nan
+    for _ in range(n_iter if np.isfinite(c[0]) else 0):
+        step = np.linalg.lstsq(X, I * np.exp(-np.clip(X @ c, -700, 700)) - 1, rcond=None)[0]
+        c += np.clip(step, -1, 1)
         if np.abs(step).max() < 1e-9:
             return np.exp(X @ c)
-    return None
+    return np.full(len(I), np.nan)
 
 
 def split_half_stats(a: Merge, b: Merge, n_shells=20) -> dict:
@@ -484,26 +466,17 @@ def split_half_stats(a: Merge, b: Merge, n_shells=20) -> dict:
     sum|I_A + I_B|; intensities are the measured ones when both halves carry
     them, else F^2.
 
-    ``cc_half_flat`` is CC1/2 after each half, on its own scale, is divided by
-    its own smooth global trend of <I> (:func:`trend_design`,
-    :func:`fit_trend`). That division is also the scaling of the halves onto
-    each other: both come out with mean 1 everywhere, so the anisotropic
-    scale of B onto A does not enter. A trend the two halves share without
-    measuring it -- a Bayesian merge's anisotropic Wilson prior, which is all
-    a reflection without information returns -- varies across a shell and
-    correlates the halves there; divided out, such reflections carry no
-    correlation and the flat CC1/2 falls to zero where the data stop. The
-    trend of the signal goes too, so where the data are strong it lies
-    somewhat below CC1/2. A shared modulation outside the smooth basis (a
-    pseudo-translation's) remains.
+    ``cc_half_flat`` divides each half, on its own scale, by its own smooth
+    global trend of <I> first, which also scales both to mean 1. A Bayesian
+    merge returns its anisotropic prior where the data say nothing; both
+    halves share it, so CC1/2 turns back up at the weak end, while the flat
+    CC1/2 falls to zero. Where the data are strong it lies a little below
+    CC1/2, the signal's own trend being divided out too.
     """
     a, b, A, B, g, c = _common_scaled(a, b)
     IA, IB, intensities = _intensities(A, B, g)
     X = trend_design(A.hkl, A.cell, A.spacegroup)
-    IB_own = IB / g**2                     # B on its own scale: the trend is its scaling
-    tA, tB = fit_trend(X, IA), fit_trend(X, IB_own)
-    nan = np.full(len(A), np.nan)
-    EA, EB = (nan, nan) if tA is None or tB is None else (IA / tA, IB_own / tB)
+    EA, EB = IA / fit_trend(X, IA), IB / g**2 / fit_trend(X, IB / g**2)
 
     def stats(ix):
         return {'n': len(ix), 'cc_half': pearson(IA[ix], IB[ix]), 'cc_half_flat': pearson(EA[ix], EB[ix]),
@@ -514,7 +487,6 @@ def split_half_stats(a: Merge, b: Merge, n_shells=20) -> dict:
         'n_A': len(a), 'n_B': len(b), 'n_common': len(A), 'intensities': intensities,
         'amplitudes': [a.amplitudes, b.amplitudes],
         'scale': {'model': SCALE_MODEL, 'c': [float(v) for v in c], 'g_range': [float(g.min()), float(g.max())]},
-        'trend': {'model': TREND_MODEL, 'n_terms': X.shape[1], 'fitted': tA is not None and tB is not None},
         'overall': overall,
         'shells': shells,
         'headline': {'n_common': len(A), 'cc_half': overall['cc_half'], 'r_split': overall['r_split'],

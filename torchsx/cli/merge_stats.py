@@ -70,9 +70,8 @@ def discover(folder):
 
 def _build_parser():
     p = argparse.ArgumentParser(prog='torchsx.merge-stats', description=__doc__,
-        epilog='A dataset is one merge (summary statistics), two independent halves (CC1/2 and R_split; '
-               'flat CC1/2 divides each half by its own smooth global trend of <I> first, so a shared '
-               'anisotropic prior does not read as signal), '
+        epilog='A dataset is one merge (summary statistics), two independent halves (CC1/2, flat CC1/2 '
+               'with the smooth trend of <I> divided out, and R_split), '
                'or, for each state of a torchsx output directory, both. Every dataset other than the '
                'reference is also scored as a difference against it, when both have two halves; a run '
                'with one state has no differences. Inputs: MTZ, CrystFEL .hkl/.hkl1/.hkl2, mmCIF '

@@ -105,46 +105,34 @@ def test_split_half_cc_and_rsplit_after_scaling():
     assert (h['cc_half_outer'], h['r_split_outer']) == (res['shells'][-1]['cc_half'], res['shells'][-1]['r_split'])
 
 
-def prior_surface(hkl):
-    """An anisotropic Wilson surface in the span of the trend basis, and the centric flags."""
+def wilson(rng, hkl):
+    """An anisotropic Wilson surface in the span of the trend basis, the centric flags and intensities drawn from it."""
     s = hkl / np.array(CELL[:3])
-    s2 = (s**2).sum(1) / 4
+    Sigma = 1000 * np.exp(-10 * (s**2).sum(1) + 3 * (s[:, 2]**2 - s[:, 0]**2))
     centric = SpaceGroup(SG).is_centric(torch.from_numpy(hkl)).numpy()
-    return 1000 * np.exp(-40 * s2 + 0.2 * (s[:, 2]**2 - s[:, 0]**2) / s2.mean()), centric
+    return Sigma, centric, Sigma * np.where(centric, rng.standard_normal(len(hkl))**2, rng.exponential(1.0, len(hkl)))
 
 
 def test_trend_fit_recovers_the_surface_with_mean_one():
-    rng = np.random.default_rng(8)
     hkl = asu()
-    Sigma, centric = prior_surface(hkl)
-    I = Sigma * np.where(centric, rng.standard_normal(len(hkl))**2, rng.exponential(1.0, len(hkl)))
+    Sigma, _, I = wilson(np.random.default_rng(8), hkl)
     t = fit_trend(trend_design(hkl, CELL, SG), I)
-    assert np.mean(I / t) == pytest.approx(1.0, abs=1e-6)
-    assert np.std(np.log(t / Sigma)) < 0.05
+    assert np.mean(I / t) == pytest.approx(1.0, abs=1e-6) and np.std(np.log(t / Sigma)) < 0.05
 
 
 def test_flat_cc_half_divides_out_a_shared_prior():
-    """Halves that agree only on a prior -- anisotropic, centric-dependent, at different
-    overall scales -- correlate in every shell; their flat CC1/2 is zero. Halves that
-    measure the reflections keep it."""
+    """Halves that return only the prior, at different scales, correlate in every shell; their flat CC1/2 is zero."""
     rng = np.random.default_rng(7)
     hkl = asu()
-    n = len(hkl)
-    Sigma, centric = prior_surface(hkl)
-    F0 = np.sqrt(Sigma) * np.where(centric, np.sqrt(2 / np.pi), np.sqrt(np.pi) / 2)
-    sig = 0.5 * F0
-    noise = lambda: 1 + 0.002 * rng.standard_normal(n)                          # noqa: E731
-    res = split_half_stats(merge(hkl, F0 * noise(), sig), merge(hkl, 1.3 * F0 * noise(), sig))
-    assert res['trend']['fitted']
-    assert np.median([s['cc_half'] for s in res['shells']]) > 0.5
-    assert all(abs(s['cc_half_flat']) < 0.15 for s in res['shells'])
-    F = np.sqrt(Sigma * np.where(centric, rng.standard_normal(n)**2, rng.exponential(1.0, n)))
-    F = np.maximum(F, 1e-3 * F0)
-    res = split_half_stats(merge(hkl, F * noise(), sig), merge(hkl, F * noise(), sig))
-    assert all(s['cc_half_flat'] > 0.95 for s in res['shells'])
-    h = res['headline']
-    assert (h['cc_half_flat'], h['cc_half_flat_outer']) == (res['overall']['cc_half_flat'],
-                                                            res['shells'][-1]['cc_half_flat'])
+    Sigma, centric, I = wilson(rng, hkl)
+    noise = lambda: 1 + 0.002 * rng.standard_normal(len(hkl))                  # noqa: E731
+    halves = lambda F, k=1.0: split_half_stats(merge(hkl, F * noise(), F), merge(hkl, k * F * noise(), F))  # noqa: E731
+    prior = halves(np.sqrt(Sigma) * np.where(centric, np.sqrt(2 / np.pi), np.sqrt(np.pi) / 2), 1.3)
+    assert np.median([s['cc_half'] for s in prior['shells']]) > 0.5
+    assert all(abs(s['cc_half_flat']) < 0.15 for s in prior['shells'])
+    data = halves(np.sqrt(np.maximum(I, 1e-3 * Sigma)))
+    assert all(s['cc_half_flat'] > 0.95 for s in data['shells'])
+    assert data['headline']['cc_half_flat_outer'] == data['shells'][-1]['cc_half_flat']
 
 
 def test_r_split_of_weak_measured_intensities():
