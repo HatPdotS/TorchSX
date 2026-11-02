@@ -2,7 +2,8 @@
 
 :mod:`~torchsx.nn.obs_features` builds the per-observation features and
 enforces which of them the scale of an observation may see;
-:mod:`~torchsx.nn.deepsets` encodes each crystal's observations;
+:mod:`~torchsx.nn.fold_transformer` (the default) or :mod:`~torchsx.nn.deepsets`
+encodes each crystal's observations;
 :mod:`~torchsx.nn.heads` turns the embedding into ``log K`` and the scatter;
 :mod:`~torchsx.nn.objective` and :mod:`~torchsx.nn.posterior_target` give the
 marginal likelihood the network is trained on; :mod:`~torchsx.nn.train_amortized`
