@@ -731,19 +731,17 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 # ── model stack ────────────────────────────────────────────────────────
 
 
-#: The production configuration of a new run.  ``peer_attention=2``: two
-#: full-width cross-attention layers from each observation onto the other
-#: observations of its crystal.  The heads take their defaults from
+#: The production configuration of a new run.  The fold transformer:
+#: ``context_folds`` masked runs per crystal, ``ctx_layers`` self-attention and
+#: ``query_layers`` cross-attention blocks of ``n_heads`` heads, each run's
+#: geometry refined.  The heads take their defaults from
 #: :class:`~torchsx.nn.heads.ScaleHeads`.  A checkpoint's own record replaces
 #: these in a merge.
 DEFAULTS = dict(
-    d_model=128, n_layers=5, context_folds=2, obs_context_layers=2,
-    obs_self_layers=2, peer_attention=2, peer_heads=8, miss=0.03, outlier=0.0, inner_points=192,
+    d_model=128, context_folds=5, ctx_layers=2, query_layers=1, n_heads=8, refine_geometry=True,
+    miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_degree=4, gauge_anchor="basis",
-    # --encoder fold: K masked runs per crystal, context self-attention, per-reflection queries,
-    # each run's geometry refined
-    encoder="fold", fold_folds=5, ctx_layers=2, query_layers=1, refine_geometry=True,
     # the sum-of-spots tether's terms (torchsx.merging.tether); with "gauge" the scale pins
     # the scalar gauge only and the tether holds the smooth one
     tether=("gauge",),
@@ -900,26 +898,6 @@ def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
     return float(bvf) if any(corrected) else 0.0
 
 
-def _peer_dims(args):
-    """``--peer-dim``: None, one width, or a comma-separated width per layer (a tapered stack)."""
-    v = getattr(args, "peer_dim", None)
-    if v is None:
-        return None
-    dims = [int(x) for x in str(v).split(",") if x.strip()]
-    return dims if len(dims) > 1 else dims[0]
-
-
-def _peer_layers(args) -> int:
-    """``--peer-attention``, or the length of a per-layer ``--peer-dim`` list; they must agree."""
-    n = getattr(args, "peer_attention", None)
-    dims = _peer_dims(args)
-    if isinstance(dims, list):
-        if n is not None and int(n) != len(dims):
-            raise SystemExit(f"--peer-attention {n} but --peer-dim gives {len(dims)} widths")
-        return len(dims)
-    return DEFAULTS["peer_attention"] if n is None else int(n)
-
-
 def _refine_geometry(args) -> bool:
     """``--refine-geometry`` / ``--no-refine-geometry``; by default on."""
     v = getattr(args, "refine_geometry", None)
@@ -960,13 +938,14 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     from torchsx.merging.observations import DEFAULT_CRYSTAL_FEATURES, PROBIXI_CRYSTAL_FEATURES
     from torchsx.nn.obs_features import DISK_FEATURE, SELF_FEATURES
     if ck:
+        if rec(enc, "kind") != "fold":
+            raise SystemExit("checkpoint was written with another scale encoder; this version of "
+                             "torchsx has the fold transformer only. Retrain it.")
         kw = dict(
-            d_model=rec(enc, "d_model"), n_layers=rec(enc, "n_layers"),
-            context_folds=rec(enc, "context_folds"),
-            obs_context_layers=rec(enc, "obs_context_layers"),
-            obs_self_layers=rec(enc, "obs_self_layers"),
-            peer_attention_layers=rec(enc, "peer_attention_layers"),
-            peer_heads=rec(enc, "peer_heads"), peer_dim=rec(enc, "peer_dim") or None,
+            d_model=rec(enc, "d_model"),
+            **{k: int(rec(enc, k)) for k in ("context_folds", "ctx_layers", "query_layers",
+                                             "n_heads")},
+            refine_geometry=bool(rec(enc, "refine_geometry")),
             n_components=int(rec(scat, "n_components")),
             anchor_log_k=bool(rec(sc, "anchor_log_k")), anchor_stat=rec(sc, "anchor_stat"),
             self_features=tuple(rec(sc, "self_features")),
@@ -976,19 +955,14 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     else:
         recorded = bundle.recipe.get("disk_size") == "recorded"
         producer = ((bundle.recipe.get("measurement") or {}).get("source") or {}).get("producer")
+
+        def flag(name):
+            v = getattr(args, name, None)
+            return DEFAULTS[name] if v is None else int(v)
         kw = dict(
-            d_model=getattr(args, "d_model", None) or DEFAULTS["d_model"],
-            n_layers=getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
-            context_folds=(DEFAULTS["context_folds"] if getattr(args, "context_folds", None) is None
-                           else int(args.context_folds)),
-            obs_context_layers=DEFAULTS["obs_context_layers"],
-            obs_self_layers=DEFAULTS["obs_self_layers"],
-            peer_attention_layers=_peer_layers(args),
-            peer_dim=_peer_dims(args),
-            # heads are 8 wide (or at most DEFAULTS["peer_heads"] of them) at any attention width
-            peer_heads=(DEFAULTS["peer_heads"] if isinstance(_peer_dims(args), list) else
-                        min(DEFAULTS["peer_heads"],
-                            max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
+            d_model=flag("d_model"), context_folds=flag("context_folds"),
+            ctx_layers=flag("ctx_layers"), query_layers=flag("query_layers"),
+            n_heads=DEFAULTS["n_heads"], refine_geometry=_refine_geometry(args),
             anchor_stat="median" if "gauge" in tether_terms(args) else DEFAULTS["gauge_anchor"],
             self_features=SELF_FEATURES + ((DISK_FEATURE,) if recorded else ()),
             crystal_features=(DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
@@ -1000,26 +974,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     elif ck:
         phase_classes = None
     kw.update(phase_classes=phase_classes)
-    # encoder: the checkpoint's record (no kind = Deep Sets), else --encoder
-    encoder = ((rec(enc, "kind") or "deepsets") if ck
-               else (getattr(args, "encoder", None) or DEFAULTS["encoder"]))
-    if encoder == "fold":
-        if ck:
-            fold = {k: int(rec(enc, k)) for k in ("context_folds", "ctx_layers", "query_layers")}
-            fold["peer_heads"] = int(rec(enc, "n_heads"))
-            fold["refine_geometry"] = bool(rec(enc, "refine_geometry"))
-        else:
-            def flag(name, default):
-                v = getattr(args, name, None)
-                return default if v is None else int(v)
-            fold = dict(context_folds=flag("context_folds", DEFAULTS["fold_folds"]),
-                        ctx_layers=flag("ctx_layers", DEFAULTS["ctx_layers"]),
-                        query_layers=flag("query_layers", DEFAULTS["query_layers"]),
-                        refine_geometry=_refine_geometry(args),
-                        peer_heads=DEFAULTS["peer_heads"])
-        kw.update(encoder="fold", **fold)
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
-    scale.set_encoder_chunking(400)
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
     # the +c mean correction applies to the annulus estimate only

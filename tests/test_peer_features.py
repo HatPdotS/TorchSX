@@ -41,7 +41,7 @@ def test_context_carries_the_ratio_to_the_plain_mean():
 
 def test_training_leaves_the_features_where_the_data_put_them(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8, n_cond=2)
-    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
+    scale = AmortizedScale.from_prep(prep, d_model=8, context_folds=2)
     tr = AmortizedTrainer(
         prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,

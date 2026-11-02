@@ -70,18 +70,9 @@ def _build_parser():
                         "B alone is a per-panel gain correction)")
     # Research controls: they work, but --help does not list them.
     p.add_argument("--noise-lr-mult", type=float, default=30.0, help=argparse.SUPPRESS)
-    p.add_argument("--peer-attention", type=int, default=None,
-                   help="cross-attention layers from each observation onto the other observations "
-                        "of its crystal (default 2; 0 = mean pool only); the merge inherits the checkpoint")
-    # Width inside each peer-attention layer (default: the encoder width), or a
-    # comma-separated width per layer for a tapered stack, e.g. 128,128,32,32.
-    p.add_argument("--peer-dim", default=None, help=argparse.SUPPRESS)
-    # Crystal context pooling: K >= 2 folds (context from the other K-1 folds of the
-    # crystal, default 2), or 0 = leave-one-out; the merge inherits the checkpoint.
+    # Fold transformer: K >= 2 masked runs per crystal (default 5); the merge
+    # inherits the checkpoint, as for every setting of the network.
     p.add_argument("--context-folds", type=int, default=None, help=argparse.SUPPRESS)
-    # Scale encoder: fold (default), the masked-fold transformer (K = --context-folds
-    # runs per crystal, default 5), or deepsets; the merge inherits the checkpoint.
-    p.add_argument("--encoder", choices=("deepsets", "fold"), default=None, help=argparse.SUPPRESS)
     # Fold transformer depth: self-attention blocks over each run (default 2) and
     # cross-attention blocks from each masked observation onto its run (default 1).
     p.add_argument("--ctx-layers", type=int, default=None, help=argparse.SUPPRESS)
@@ -108,9 +99,8 @@ def _build_parser():
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
-    # Encoder width (default 128) and number of blocks (default 5).
+    # Encoder width (default 128).
     p.add_argument("--d-model", type=int, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--n-layers", type=int, default=None, help=argparse.SUPPRESS)
     # Held-out evaluation and checkpoint every this many updates per state.
     p.add_argument("--eval-every", type=int, default=100, help=argparse.SUPPRESS)
     # Stop after this many evaluations without a new held-out minimum (0 = never).
@@ -356,7 +346,7 @@ def main(argv=None):
         posterior_max_halfwidth=settings["max_halfwidth"],
         locate_windows=(8.0, 1.0, 0.125), posterior_prior=settings["prior"],
         wilson_degree=settings["wilson_degree"],
-        posterior_checkpoint_nodes=True, encoder_chunk_crystals=400,
+        posterior_checkpoint_nodes=True,
         stream_batches=True, heldout_frac=0.05,
         device=settings["device"], outdir=str(args.out), seed=args.seed,
         heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),

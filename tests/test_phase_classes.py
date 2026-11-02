@@ -62,7 +62,7 @@ def test_definition_round_trip():
 def test_features_read_the_reflections_cosines():
     prep = _toy_prep()
     pc = PhaseClasses.from_prep(prep, T, "P 2 2 2")
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, phase_classes=pc)
+    scale = AmortizedScale.from_prep(prep, d_model=16, phase_classes=pc)
     f = scale.features
     assert "phase_c0" in f.self_features and "phase_c1" in f.self_features
     assert "phase_c0" in f.context_features
@@ -70,7 +70,7 @@ def test_features_read_the_reflections_cosines():
     want = pc.cosines(prep.hkl_valid.long().numpy())[prep.obs_info.hkl_idx.numpy()]
     np.testing.assert_allclose(raw["phase_c0"].numpy(), want[:, 0], atol=1e-6)
     np.testing.assert_allclose(raw["phase_c1"].numpy(), want[:, 1], atol=1e-6)
-    plain = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
+    plain = AmortizedScale.from_prep(prep, d_model=16)
     assert not any(n.startswith("phase_c") for n in plain.features.self_features)
 
 

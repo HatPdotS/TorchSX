@@ -16,7 +16,7 @@ from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig, step_rever
 
 def _trainer(tmp_path, **cfg_kw):
     prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8)
-    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
+    scale = AmortizedScale.from_prep(prep, d_model=8, context_folds=2)
     return AmortizedTrainer(
         prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,

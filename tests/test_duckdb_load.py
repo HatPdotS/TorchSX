@@ -533,7 +533,7 @@ def test_probixi_features_reach_the_encoder(db_path):
     stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
     prep = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded"))
     scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2,
+        prep, d_model=16,
         self_features=SELF_FEATURES + (DISK_FEATURE,),
         crystal_features=DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES,
     )
@@ -544,7 +544,7 @@ def test_probixi_features_reach_the_encoder(db_path):
     assert x_crys.shape == (3, len(CRYSTAL_FEAT_COLUMNS))
     assert x_self[:, feats.self_features.index(DISK_FEATURE)].std() > 0
     # the default tiers are unchanged: no disk column, the twelve stream columns
-    plain = AmortizedScale.from_prep(prep, d_model=16, n_layers=2).features
+    plain = AmortizedScale.from_prep(prep, d_model=16).features
     assert DISK_FEATURE not in plain.self_features
     assert plain.crystal_features == DEFAULT_CRYSTAL_FEATURES
 

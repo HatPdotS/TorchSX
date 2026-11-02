@@ -284,7 +284,7 @@ def _trainer(tmp_path, anchor="median", **cfg_kw):
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
     prep, params, *_ = _synthetic(n_hkl=40, n_xtal=48, per=12, n_cond=2)
-    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2, anchor_stat=anchor)
+    scale = AmortizedScale.from_prep(prep, d_model=8, context_folds=2, anchor_stat=anchor)
     cfg = {"device": "cpu", "outdir": str(tmp_path), "heldout_frac": 0.25, "posterior_k_coarse": 9,
            "posterior_m_fine": 33, "tether": ("gauge",)}
     cfg.update(cfg_kw)
@@ -353,7 +353,7 @@ def _cli(monkeypatch):
     bundle = P.PrepBundle(prep, {'spacegroup': 'P 1', 'd_min': 0.9, 'gain': 1.0, 'radii': [7, 9, 11],
                                  'merge_friedel': True}, ['dark', 'light'], 0.1)
     monkeypatch.setattr(P, 'load_prep', lambda *a, **k: bundle)
-    for key, value in {"d_model": 16, "n_layers": 2, "inner_points": 32, "k_coarse": 15, "m_fine": 65}.items():
+    for key, value in {"d_model": 16, "inner_points": 32, "k_coarse": 15, "m_fine": 65}.items():
         monkeypatch.setitem(P.DEFAULTS, key, value)
     return P
 
