@@ -10,8 +10,9 @@ from torchref.io.mtz import write as write_mtz_frame
 from torchref.symmetry import SpaceGroup
 
 from torchsx.cli.merge_stats import discover, main
-from torchsx.merge_stats import (d_spacing, design, difference_stats, halves_stats, load_merge, merge_from_arrays,
-                                 possible_reflections, split_half_stats, summary_stats)
+from torchsx.merge_stats import (LOCAL_NEIGHBOURS, d_spacing, design, difference_stats, halves_stats, load_merge,
+                                 local_neighbours, merge_from_arrays, possible_reflections, resolution_shells,
+                                 split_half_stats, summary_stats)
 
 CELL = (40.0, 50.0, 60.0, 90.0, 90.0, 90.0)
 SG = 'P 21 21 21'
@@ -102,6 +103,61 @@ def test_split_half_cc_and_rsplit_after_scaling():
     assert [(s['cc_half'], s['r_split']) for s in res['shells']] == [(s['cc_I'], s['rsplit_I']) for s in full['shells']]
     h = res['headline']
     assert (h['cc_half_outer'], h['r_split_outer']) == (res['shells'][-1]['cc_half'], res['shells'][-1]['r_split'])
+
+
+def wilson(rng, hkl):
+    """An anisotropic Wilson surface, the centric flags and intensities drawn from it."""
+    s = hkl / np.array(CELL[:3])
+    Sigma = 1000 * np.exp(-10 * (s**2).sum(1) + 3 * (s[:, 2]**2 - s[:, 0]**2))
+    centric = SpaceGroup(SG).is_centric(torch.from_numpy(hkl)).numpy()
+    return Sigma, centric, Sigma * np.where(centric, rng.standard_normal(len(hkl))**2, rng.exponential(1.0, len(hkl)))
+
+
+def test_local_neighbours_share_the_fine_shell_and_leave_out_the_reflection():
+    hkl = asu()
+    m = merge(hkl, np.ones(len(hkl)), np.ones(len(hkl)))
+    near = local_neighbours(m)
+    assert near.shape == (len(m), LOCAL_NEIGHBOURS) and not (near == np.arange(len(m))[:, None]).any()
+    fine = np.empty(len(m), int)
+    for j, ix in enumerate(resolution_shells(m.d, min(80, len(m) // (2 * LOCAL_NEIGHBOURS)))):
+        fine[ix] = j
+    assert (fine[near] == fine[:, None]).all()
+
+
+def test_flat_cc_half_removes_a_shared_prior():
+    """Halves that return only the prior, at different scales and with independent 40 % intensity errors,
+    correlate in the outer shells; their flat CC1/2 is close to zero in every shell."""
+    rng = np.random.default_rng(7)
+    hkl = asu()
+    Sigma, centric, _ = wilson(rng, hkl)
+    F = np.sqrt(Sigma) * np.where(centric, np.sqrt(2 / np.pi), np.sqrt(np.pi) / 2)
+    noise = lambda: 1 + 0.2 * rng.standard_normal(len(hkl))                    # noqa: E731
+    res = split_half_stats(merge(hkl, F * noise(), 0.2 * F), merge(hkl, 1.3 * F * noise(), 0.26 * F))
+    assert all(s['cc_half'] > 0.5 for s in res['shells'][-5:])
+    assert all(abs(s['cc_half_flat']) < 0.15 for s in res['shells'])
+
+
+def test_flat_cc_half_of_shrunk_halves_follows_the_data():
+    """Measured halves, weak ones negative, each shrunk towards the shared prior by its signal fraction: CC1/2
+    rises at the weak end, the flat CC1/2 stays close to that of the unshrunk halves."""
+    rng = np.random.default_rng(9)
+    hkl = asu()
+    Sigma, _, J = wilson(rng, hkl)
+    sigma = 0.3 * Sigma + 30
+    w = Sigma**2 / (Sigma**2 + sigma**2)
+    obs = [J + sigma * rng.standard_normal(len(hkl)) for _ in 'AB']
+    assert np.mean(obs[0] < 0) > 0.1
+    one = np.ones(len(hkl))
+
+    def halves(IA, IB):
+        return split_half_stats(merge(hkl, one, one, I=IA, SIGI=sigma), merge(hkl, one, one, I=IB, SIGI=sigma))
+    raw = halves(*obs)
+    shrunk = halves(*(w * I + (1 - w) * Sigma for I in obs))
+    assert shrunk['shells'][-1]['cc_half'] > raw['shells'][-1]['cc_half'] + 0.2
+    for r, s in zip(raw['shells'], shrunk['shells']):
+        assert s['cc_half_flat'] == pytest.approx(r['cc_half_flat'], abs=0.1)
+    assert raw['headline']['cc_half_flat_outer'] == raw['shells'][-1]['cc_half_flat']
+    assert raw['overall']['cc_half_flat'] == pytest.approx(np.mean([s['cc_half_flat'] for s in raw['shells']]), abs=0.05)
 
 
 def test_r_split_of_weak_measured_intensities():
@@ -385,4 +441,4 @@ def test_cli_single_state_export_has_no_difference(tmp_path, capsys):
     (row,) = rows(pair / 'summary.tsv')
     assert (row['kind'], row['name']) == ('halves', 'merged') and float(row['cc_half']) > 0.8
     assert set(rows(pair / 'shells_halves.tsv')[0]) == {'name', 'shell', 'd_max', 'd_min', 'inv_d2', 'n', 'cc_half',
-                                                        'r_split'}
+                                                        'cc_half_flat', 'r_split'}

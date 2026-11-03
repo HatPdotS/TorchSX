@@ -70,7 +70,8 @@ def discover(folder):
 
 def _build_parser():
     p = argparse.ArgumentParser(prog='torchsx.merge-stats', description=__doc__,
-        epilog='A dataset is one merge (summary statistics), two independent halves (CC1/2 and R_split), '
+        epilog='A dataset is one merge (summary statistics), two independent halves (CC1/2, flat CC1/2 '
+               'on intensities standardised against their running mean and spread, and R_split), '
                'or, for each state of a torchsx output directory, both. Every dataset other than the '
                'reference is also scored as a difference against it, when both have two halves; a run '
                'with one state has no differences. Inputs: MTZ, CrystFEL .hkl/.hkl1/.hkl2, mmCIF '
@@ -223,7 +224,8 @@ def table(results):
                         f"multiplicity {_f(h['multiplicity'], '.1f')}  Wilson B {_f(h['wilson_B'], '.1f')}")
         else:
             rows.append(f"halves      {r['name']:<16} n {h['n_common']:>8d}  CC1/2 {_f(h['cc_half'], '.4f')}  "
-                        f"outer {_f(h['cc_half_outer'], '.4f')}  R_split {_f(h['r_split'], '.4f')}  "
+                        f"outer {_f(h['cc_half_outer'], '.4f')}  flat CC1/2 {_f(h['cc_half_flat'], '.4f')}  "
+                        f"outer {_f(h['cc_half_flat_outer'], '.4f')}  R_split {_f(h['r_split'], '.4f')}  "
                         f"outer {_f(h['r_split_outer'], '.4f')}")
     for r in results['differences']:
         h = r['headline']

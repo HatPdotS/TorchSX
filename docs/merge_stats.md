@@ -96,10 +96,33 @@ model is one log scale plus six anisotropic terms on hkl/max|hkl|. It is fitted 
 | Column | Definition |
 | --- | --- |
 | `cc_half` | CC<sub>1/2</sub>: Pearson CC of I_A and I_B |
+| `cc_half_flat` | flat CC<sub>1/2</sub>: Pearson CC of the two halves, each standardised against its running mean and spread (below) |
 | `r_split` | R<sub>split</sub> = √2 Σ\|I_A − I_B\| / Σ\|I_A + I_B\|; the magnitude of each pair, so negative measured intensities do not cancel positive ones |
 
-The headline adds both for the highest-resolution shell (`cc_half_outer`,
-`r_split_outer`); `stats.json` also records the scale coefficients.
+The headline adds them for the highest-resolution shell (`cc_half_outer`,
+`cc_half_flat_outer`, `r_split_outer`); `stats.json` also records the scale coefficients.
+
+**Flat CC1/2.** Where the data are weak, a Bayesian merge returns its prior: the
+expected intensity at that resolution and direction. Both halves share the prior, so
+CC1/2 there measures how well they agree on it, and it turns back up at the weak end.
+The flat CC1/2 takes every smooth trend out first:
+
+1. Each reflection's neighbours are the 32 reflections nearest to it in direction,
+   within its fine resolution shell. The fine shells are equal-count: 80 of them, or
+   fewer so that each holds at least 64 reflections.
+2. Directions cover the full sphere, with every point-group copy and Friedel mate of each
+   reflection. A neighbour counts once for each of its copies among the nearest, and a
+   reflection's own copies are never its neighbours.
+3. In each half, the neighbours' intensities give a running mean m and standard
+   deviation s, and the reflection enters as z = (I − m) / s. Both halves use the
+   same neighbours, each with its own intensities.
+
+The running mean follows any smooth trend the halves share: falloff, anisotropy, or a
+prior of whatever form a merging program uses. Standardising weights every region of
+reciprocal space equally and takes negative intensities as they are, so the overall
+flat CC1/2 is close to the mean over shells. Where the data are strong the flat CC1/2
+lies a little below CC1/2, because the local trend of the signal itself is taken out
+too.
 R_split has this one definition throughout torchsx: the training log, the
 `STEM.metrics.json` of an export and this command.
 
