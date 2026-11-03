@@ -10,9 +10,9 @@ from torchref.io.mtz import write as write_mtz_frame
 from torchref.symmetry import SpaceGroup
 
 from torchsx.cli.merge_stats import discover, main
-from torchsx.merge_stats import (d_spacing, design, difference_stats, fit_trend, halves_stats, load_merge,
-                                 merge_from_arrays, possible_reflections, split_half_stats, summary_stats,
-                                 trend_design)
+from torchsx.merge_stats import (LOCAL_NEIGHBOURS, d_spacing, design, difference_stats, halves_stats, load_merge,
+                                 local_neighbours, merge_from_arrays, possible_reflections, resolution_shells,
+                                 split_half_stats, summary_stats)
 
 CELL = (40.0, 50.0, 60.0, 90.0, 90.0, 90.0)
 SG = 'P 21 21 21'
@@ -106,33 +106,58 @@ def test_split_half_cc_and_rsplit_after_scaling():
 
 
 def wilson(rng, hkl):
-    """An anisotropic Wilson surface in the span of the trend basis, the centric flags and intensities drawn from it."""
+    """An anisotropic Wilson surface, the centric flags and intensities drawn from it."""
     s = hkl / np.array(CELL[:3])
     Sigma = 1000 * np.exp(-10 * (s**2).sum(1) + 3 * (s[:, 2]**2 - s[:, 0]**2))
     centric = SpaceGroup(SG).is_centric(torch.from_numpy(hkl)).numpy()
     return Sigma, centric, Sigma * np.where(centric, rng.standard_normal(len(hkl))**2, rng.exponential(1.0, len(hkl)))
 
 
-def test_trend_fit_recovers_the_surface_with_mean_one():
+def test_local_neighbours_share_the_fine_shell_and_leave_out_the_reflection():
     hkl = asu()
-    Sigma, _, I = wilson(np.random.default_rng(8), hkl)
-    t = fit_trend(trend_design(hkl, CELL, SG), I)
-    assert np.mean(I / t) == pytest.approx(1.0, abs=1e-6) and np.std(np.log(t / Sigma)) < 0.05
+    m = merge(hkl, np.ones(len(hkl)), np.ones(len(hkl)))
+    near = local_neighbours(m)
+    assert near.shape == (len(m), LOCAL_NEIGHBOURS) and not (near == np.arange(len(m))[:, None]).any()
+    fine = np.empty(len(m), int)
+    for j, ix in enumerate(resolution_shells(m.d, min(80, len(m) // (2 * LOCAL_NEIGHBOURS)))):
+        fine[ix] = j
+    assert (fine[near] == fine[:, None]).all()
 
 
-def test_flat_cc_half_divides_out_a_shared_prior():
-    """Halves that return only the prior, at different scales, correlate in every shell; their flat CC1/2 is zero."""
+def test_flat_cc_half_removes_a_shared_prior():
+    """Halves that return only the prior, at different scales and with independent 40 % intensity errors,
+    correlate in the outer shells; their flat CC1/2 is close to zero in every shell."""
     rng = np.random.default_rng(7)
     hkl = asu()
-    Sigma, centric, I = wilson(rng, hkl)
-    noise = lambda: 1 + 0.002 * rng.standard_normal(len(hkl))                  # noqa: E731
-    halves = lambda F, k=1.0: split_half_stats(merge(hkl, F * noise(), F), merge(hkl, k * F * noise(), F))  # noqa: E731
-    prior = halves(np.sqrt(Sigma) * np.where(centric, np.sqrt(2 / np.pi), np.sqrt(np.pi) / 2), 1.3)
-    assert np.median([s['cc_half'] for s in prior['shells']]) > 0.5
-    assert all(abs(s['cc_half_flat']) < 0.15 for s in prior['shells'])
-    data = halves(np.sqrt(np.maximum(I, 1e-3 * Sigma)))
-    assert all(s['cc_half_flat'] > 0.95 for s in data['shells'])
-    assert data['headline']['cc_half_flat_outer'] == data['shells'][-1]['cc_half_flat']
+    Sigma, centric, _ = wilson(rng, hkl)
+    F = np.sqrt(Sigma) * np.where(centric, np.sqrt(2 / np.pi), np.sqrt(np.pi) / 2)
+    noise = lambda: 1 + 0.2 * rng.standard_normal(len(hkl))                    # noqa: E731
+    res = split_half_stats(merge(hkl, F * noise(), 0.2 * F), merge(hkl, 1.3 * F * noise(), 0.26 * F))
+    assert all(s['cc_half'] > 0.5 for s in res['shells'][-5:])
+    assert all(abs(s['cc_half_flat']) < 0.15 for s in res['shells'])
+
+
+def test_flat_cc_half_of_shrunk_halves_follows_the_data():
+    """Measured halves, weak ones negative, each shrunk towards the shared prior by its signal fraction: CC1/2
+    rises at the weak end, the flat CC1/2 stays close to that of the unshrunk halves."""
+    rng = np.random.default_rng(9)
+    hkl = asu()
+    Sigma, _, J = wilson(rng, hkl)
+    sigma = 0.3 * Sigma + 30
+    w = Sigma**2 / (Sigma**2 + sigma**2)
+    obs = [J + sigma * rng.standard_normal(len(hkl)) for _ in 'AB']
+    assert np.mean(obs[0] < 0) > 0.1
+    one = np.ones(len(hkl))
+
+    def halves(IA, IB):
+        return split_half_stats(merge(hkl, one, one, I=IA, SIGI=sigma), merge(hkl, one, one, I=IB, SIGI=sigma))
+    raw = halves(*obs)
+    shrunk = halves(*(w * I + (1 - w) * Sigma for I in obs))
+    assert shrunk['shells'][-1]['cc_half'] > raw['shells'][-1]['cc_half'] + 0.2
+    for r, s in zip(raw['shells'], shrunk['shells']):
+        assert s['cc_half_flat'] == pytest.approx(r['cc_half_flat'], abs=0.1)
+    assert raw['headline']['cc_half_flat_outer'] == raw['shells'][-1]['cc_half_flat']
+    assert raw['overall']['cc_half_flat'] == pytest.approx(np.mean([s['cc_half_flat'] for s in raw['shells']]), abs=0.05)
 
 
 def test_r_split_of_weak_measured_intensities():
