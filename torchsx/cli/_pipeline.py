@@ -752,8 +752,9 @@ DEFAULTS = dict(
     # each run's geometry refined
     encoder="fold", fold_folds=5, ctx_layers=2, query_layers=1, refine_geometry=True,
     # the sum-of-spots tether's terms (torchsx.merging.tether); with "gauge" the scale pins
-    # the scalar gauge only and the tether holds the smooth one
-    tether=("gauge", "strength", "response"),
+    # the scalar gauge only and the tether holds the smooth one.  "strength" and "response"
+    # are available through --tether
+    tether=("gauge",),
 )
 
 

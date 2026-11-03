@@ -525,16 +525,17 @@ def _cli(monkeypatch):
 
 
 def test_tether_end_to_end(tmp_path, monkeypatch, small_groups):
-    """A default run holds every term: the record carries them, the checkpoint and run.json
-    the terms, the scale pins the scalar gauge only, every state's merge reports every
-    term, and torchsx.merge reproduces the readout from the checkpoint."""
+    """A run with every term: the record carries them, the checkpoint and run.json the
+    terms, the scale pins the scalar gauge only, every state's merge reports every term,
+    and torchsx.merge reproduces the readout from the checkpoint."""
     import numpy as np
 
     from torchsx.cli import merge_nn, train
 
     P = _cli(monkeypatch)
     run = tmp_path / 'run'
-    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '4', '--seed', '3'])
+    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '4', '--seed', '3',
+                '--tether', 'gauge,strength,response'])
     ck = torch.load(run / 'best.pt', weights_only=False)
     assert ck['scale']['anchor_stat'] == 'median'
     assert ck['scale']['tether'] == ['gauge', 'strength', 'response']
@@ -543,6 +544,7 @@ def test_tether_end_to_end(tmp_path, monkeypatch, small_groups):
     steps = [json.loads(line) for line in (run / 'metrics.jsonl').read_text().splitlines()]
     steps = [r for r in steps if r.get('phase') == 'train']
     assert len(steps) == 4 and all(math.isfinite(r['tether_gauge']) for r in steps)
+    assert all(math.isfinite(r['tether_strength']) and math.isfinite(r['tether_response']) for r in steps)
     metrics = json.loads((run / 'merged.metrics.json').read_text())
     assert set(metrics) == {'dark', 'light'}
     for rec in metrics.values():
@@ -568,6 +570,22 @@ def test_tether_end_to_end(tmp_path, monkeypatch, small_groups):
             assert np.isclose(a[k], b[k], rtol=1e-4, atol=1e-7)
         assert np.isclose(again[name]['tether']['response']['kappa'], metrics[name]['tether']['response']['kappa'],
                           rtol=1e-3, atol=1e-6)
+
+
+def test_a_default_run_holds_the_gauge_only(tmp_path, monkeypatch):
+    from torchsx.cli import train
+
+    _cli(monkeypatch)
+    run = tmp_path / 'run'
+    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '2'])
+    ck = torch.load(run / 'best.pt', weights_only=False)
+    assert ck['scale']['anchor_stat'] == 'median' and ck['scale']['tether'] == ['gauge']
+    steps = [json.loads(line) for line in (run / 'metrics.jsonl').read_text().splitlines()]
+    steps = [r for r in steps if r.get('phase') == 'train']
+    assert all(math.isfinite(r['tether_gauge']) and 'tether_response' not in r for r in steps)
+    # the readout reports every term all the same
+    metrics = json.loads((run / 'merged.metrics.json').read_text())
+    assert all({'gauge', 'strength', 'response'} <= set(rec['tether']) for rec in metrics.values())
 
 
 def test_tether_none_restores_the_basis_gauge(tmp_path, monkeypatch):

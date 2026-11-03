@@ -43,7 +43,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
 | `--outlier-frac F` | 0 | Initial weight of a detector-outlier component; 0 turns it off. |
 | `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
-| `--tether TERMS` | `gauge,strength,response` | Directions the likelihood leaves to the model, held at the raw counts; `none` turns it off (see [Sum-of-spots tether](#sum-of-spots-tether)). |
+| `--tether TERMS` | `gauge` | Directions the likelihood leaves to the model, held at the raw counts: any of `gauge`, `strength`, `response`, or `none` (see [Sum-of-spots tether](#sum-of-spots-tether)). |
 | `--pseudo-translation` | `off` | `auto`: reflection profiles that depend on the structure's translational pseudo-symmetry (see [Pseudo-translation](#pseudo-translation)). |
 | `--seed N` | 0 | Network initialization and batch sampling. |
 | `--device` | `cuda` if available | `cuda` or `cpu`. |
@@ -218,6 +218,11 @@ every term is where the counts put it.
 | `gauge` | The rocking-curve integral of the scale, its mean over a reflection's observations, is the same at every resolution and in every direction. The merged intensities keep the fall-off of the integrated intensities. |
 | `strength` | The mean scale of a reflection does not change with how bright the reflection is. |
 | `response` | The likelihood, evaluated at each reflection's sum of spots, does not move away from it differently for bright and dim reflections, so the merged amplitudes follow the counts' response to brightness. |
+
+A run holds `gauge` by default; `strength` and `response` are added with
+`--tether gauge,strength,response`. Unlike the gauge, along which the
+likelihood is exactly flat, these two directions are ones the likelihood
+prefers a little, so their weight trades the fit against the counts.
 
 A reflection's brightness is taken from the other half of the batch's crystals,
 so that it shares no noise with the observations it is compared with. Without

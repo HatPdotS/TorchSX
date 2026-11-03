@@ -607,7 +607,7 @@ def test_defaults_are_the_wilson_prior_and_the_tether(tmp_path):
     targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
     _p, _q, scale, _o, S = P.build_stack(bundle, targs, verbose=False)
     assert S["prior"] == "wilson" and S["basis"] is not None and scale.anchor_stat == "median"
-    assert P.tether_terms(targs) == ("gauge", "strength", "response")
+    assert P.tether_terms(targs) == ("gauge",)
     assert TrainConfig().posterior_prior == "wilson"
     off = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--tether", "none"])
     assert P.build_stack(bundle, off, verbose=False)[2].anchor_stat == "basis" and P.tether_terms(off) == ()

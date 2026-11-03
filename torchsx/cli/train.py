@@ -104,7 +104,7 @@ def _build_parser():
                         "integral of the scale is the same at every resolution), strength (the scale does not "
                         "know a reflection's brightness) and response (the likelihood keeps the counts' "
                         "response to brightness), or none, which pins the scale's smooth gauge by projection "
-                        "instead.  Default: all three.  The merge inherits the checkpoint")
+                        "instead.  Default: gauge.  The merge inherits the checkpoint")
     # Weight of the tether's penalty (nats^2 per observation, default 1).
     p.add_argument("--tether-weight", type=_positive, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--redundancy", type=_positive, default=100,
