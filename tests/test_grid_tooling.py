@@ -7,17 +7,18 @@ import torch
 from tests.test_amortized_training import _synthetic
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.scale import AmortizedScale
-from torchsx.nn.objective import MarginalNLL, wide_log_grid
+from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
+from torchsx.nn.objective import MarginalNLL
 from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
 
 def _trainer(tmp_path, n_cond=2, **kw):
     prep, params, *_ = _synthetic(n_hkl=12, n_xtal=40, per=10, n_cond=n_cond)
-    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, include_hkl=False, context_folds=2)
-    return prep, AmortizedTrainer(prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
+    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
+    return prep, AmortizedTrainer(prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
                                   config=TrainConfig(max_obs_per_batch=40, device="cpu", outdir=str(tmp_path),
                                                      posterior_k_coarse=5, posterior_m_fine=17,
-                                                     split_half_every=0, **kw))
+                                                     **kw))
 
 
 def test_explicit_heldout_crystals_are_scored_and_never_trained(tmp_path):

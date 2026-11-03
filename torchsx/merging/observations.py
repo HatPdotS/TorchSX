@@ -1,10 +1,7 @@
 """Observation preparation: stream → sorted tensors + initial estimates.
 
-Ported from ``torchsx.merging_clean.observations`` with imports redirected
-to the new ``torchsx.merging.hkl`` primitives.  ``ObsInfo`` lives
-here too (it is per-observation *metadata*, not a correction-specific
-construct — keeping it next to ``PreparedObs`` avoids a circular import
-path once ``ScaleModel`` subclasses need it).
+``ObsInfo`` lives here too: it is per-observation metadata, sorted like the
+``PreparedObs`` tensors it describes.
 """
 
 from __future__ import annotations
@@ -31,9 +28,8 @@ OBSERVATION_FILTER_VERSION = 2
 class ObsInfo:
     """Per-observation metadata, sorted identically to ``PreparedObs`` tensors.
 
-    ScaleModel subclasses index into this to compute their per-observation
-    log-correction without having to stash extra tensors.  Optional fields
-    stay ``None`` when the stream doesn't carry the corresponding channel.
+    The scale model reads its features from here.  Optional fields stay
+    ``None`` when the stream doesn't carry the corresponding channel.
 
     Kinetic-ensemble fields (``delay_bin_idx``, ``unique_timepoints``) are
     populated by :func:`prepare_observations` when the stream carries
@@ -56,8 +52,8 @@ class ObsInfo:
     ``obs_range=(s, e)`` is enough to index a per-observation side-channel; but
     crystal-batched training gathers **non-contiguous** subsets, where
     ``obs_range`` is meaningless.  Carrying ``obs_id`` lets any per-observation
-    cache — predicted scatter, ``FixedScale``, an EMA — be indexed correctly
-    under an arbitrary gather.
+    cache, such as the predicted scatter, be indexed correctly under an
+    arbitrary gather.
     """
 
     crystal_id: Tensor

@@ -7,7 +7,8 @@ import torch
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.scale import AmortizedScale
 from torchsx.nn.merge_target import plain_mean
-from torchsx.nn.objective import MarginalNLL, wide_log_grid
+from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
+from torchsx.nn.objective import MarginalNLL
 from torchsx.nn.obs_features import CONTEXT_ONLY_FEATURES, ObsFeatureSpec
 from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 from tests.test_amortized_scale import _toy_prep
@@ -42,9 +43,9 @@ def test_training_leaves_the_features_where_the_data_put_them(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8, n_cond=2)
     scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
     tr = AmortizedTrainer(
-        prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
+        prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
-                           posterior_k_coarse=5, posterior_m_fine=17, split_half_every=0),
+                           posterior_k_coarse=5, posterior_m_fine=17),
     )
     feats = scale.features
     before = {k: getattr(feats, k).clone() for k in ("_I_mean", "_mean", "_std")}

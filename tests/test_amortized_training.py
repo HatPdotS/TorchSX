@@ -22,11 +22,12 @@ from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.parameters import Parameters
-from torchsx.nn.objective import wide_log_grid
+from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.scale import AmortizedScale
 from torchsx.merging.scatter_shape import FreePerHKLShape
 from torchsx.nn.metrics import scale_metrics, spearman
 from torchsx.nn.objective import MarginalNLL
+from torchsx.cli.train import run_updates
 from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
 
@@ -95,15 +96,15 @@ def test_leave_one_out_context_recovers_a_hidden_per_crystal_scale(tmp_path):
     n_xtal = log_G.numel()
 
     scale = AmortizedScale.from_prep(
-        prep, d_model=64, n_layers=3, include_hkl=False
+        prep, d_model=64, n_layers=3
     )
-    obj = MarginalNLL(wide_log_grid(), Poisson())
-    # ~30 epochs to converge from zero-init.  The scale ramps up from 0 and
-    # OVERSHOOTS around epoch 10 (slope of predicted-on-true peaks near 1.6
+    obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
+    # ~30 updates to converge from zero-init.  The scale ramps up from 0 and
+    # OVERSHOOTS around update 10 (slope of predicted-on-true peaks near 1.6
     # before settling at ~0.94), so a short run measures the overshoot, not the
     # answer.  Same endpoint at lr 5e-4, just slower.
     cfg = TrainConfig(
-        max_obs_per_batch=6000, epochs=35, lr=3e-3, log_every=5, heldout_frac=0.1,
+        max_obs_per_batch=6000, lr=3e-3, log_every=5, heldout_frac=0.1,
         device="cpu", outdir=str(tmp_path),
     )
     trainer = AmortizedTrainer(prep, scale, obj, params, config=cfg)
@@ -115,7 +116,7 @@ def test_leave_one_out_context_recovers_a_hidden_per_crystal_scale(tmp_path):
         return torch.zeros(n_xtal).index_add_(0, cid.long(), lk) / per
 
     before = spearman(per_crystal_log_k(), log_G)
-    trainer.run()
+    run_updates(trainer, 35)
     after_pc = per_crystal_log_k()
     after = spearman(after_pc, log_G)
 
@@ -135,22 +136,6 @@ def test_leave_one_out_context_recovers_a_hidden_per_crystal_scale(tmp_path):
     # partiality" from "rediscovered G".
     m = scale_metrics(lk, prep.obs_info.crystal_id, n_xtal)
     assert m["between_frac"] > 0.8
-
-
-@pytest.mark.slow
-def test_hkl_permutation_stays_flat_when_hkl_is_not_a_feature(tmp_path):
-    """Control for the degeneracy monitor: with hkl excluded it must read 0."""
-    prep, params, *_ = _synthetic(n_hkl=40, n_xtal=60, per=30)
-    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, include_hkl=False)
-    obj = MarginalNLL(wide_log_grid(), Poisson())
-    trainer = AmortizedTrainer(
-        prep, scale, obj, params,
-        config=TrainConfig(max_obs_per_batch=3000, epochs=2, device="cpu",
-                           outdir=str(tmp_path)),
-    )
-    trainer.run()
-    rec = trainer.audit(trainer.index.rows(trainer.train_crystals[:32]))
-    assert rec["hkl_permutation_frac"] < 1e-6
 
 
 def test_crystals_are_never_split_across_batches():
@@ -243,20 +228,20 @@ def test_batches_are_condition_pure_and_complete():
 
 def _two_condition_trainer(tmp_path, **cfg_kw):
     prep, params, log_G, cid, per = _synthetic(n_hkl=40, n_xtal=120, per=40, n_cond=2)
-    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, include_hkl=False)
-    obj = MarginalNLL(wide_log_grid(), Poisson())
+    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2)
+    obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
     cfg = TrainConfig(
-        max_obs_per_batch=1000, epochs=1, lr=1e-3, log_every=1,
+        max_obs_per_batch=1000, lr=1e-3, log_every=1,
         heldout_frac=0.2, device="cpu", outdir=str(tmp_path),
         posterior_prior="wilson",
         posterior_k_coarse=9, posterior_m_fine=33, posterior_n_sigma=8.0,
-        split_half_every=0, **cfg_kw,
+        **cfg_kw,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     return tr, prep
 
 
-def test_heldout_and_merge_sets_come_from_the_first_condition(tmp_path):
+def test_heldout_comes_from_the_first_condition(tmp_path):
     tr, prep = _two_condition_trainer(tmp_path)
     cond = prep.obs_info.delay_bin_idx
     assert tr.n_conditions == 2 and len(tr.targets) == 2
@@ -266,8 +251,6 @@ def test_heldout_and_merge_sets_come_from_the_first_condition(tmp_path):
     # every crystal is either held out or trained on, exactly once
     allc = torch.cat([tr.heldout_crystals, tr.train_crystals]).sort().values
     assert torch.equal(allc, tr.index.nonempty)
-    for k, v in tr.merge_sets.items():
-        assert torch.all(cond[v] == 0), k
     # is_light follows the label without being passed in
     assert torch.equal(tr.is_light.cpu(), cond != 0)
     # pooled validation is refused with two conditions
@@ -299,8 +282,7 @@ def test_per_condition_targets_keep_the_difference(tmp_path):
     assert 0.85 < ratio[~shifted].median() < 1.15, ratio[~shifted].median()
 
     # (b) after training, each condition's merge keeps its own intensities
-    tr.cfg.epochs = 6
-    tr.run()
+    run_updates(tr, 30)
     merged = [tr.merge(condition=b)["I0"].cpu() for b in (0, 1)]
     r = merged[1] / merged[0]
     assert 1.3 < r[shifted].median() < 1.7, r[shifted].median()
@@ -322,15 +304,14 @@ def test_evaluation_changes_no_state(tmp_path, prior):
     """Scoring held-out data must not feed its intensities into later training."""
     prep, params, *_ = _synthetic(n_hkl=12, n_xtal=24, per=12, n_cond=2)
     scale = AmortizedScale.from_prep(
-        prep, d_model=8, n_layers=1, include_hkl=False, context_folds=2,
+        prep, d_model=8, n_layers=1, context_folds=2,
     )
     tr = AmortizedTrainer(
-        prep, scale, MarginalNLL(wide_log_grid(n_points=257), Poisson()), params,
+        prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(
             max_obs_per_batch=24, heldout_frac=0.25, device="cpu", outdir=str(tmp_path),
             posterior_prior=prior, posterior_k_coarse=5, posterior_m_fine=17,
-            split_half_every=0,
-        ),
+            ),
     )
 
     def state():
@@ -352,7 +333,6 @@ def test_evaluation_changes_no_state(tmp_path, prior):
             before = state()
             first = tr.evaluate(tr.heldout_crystals)
             second = tr.evaluate(tr.heldout_crystals)
-            tr._canonical_nll(tr.index.rows(tr.heldout_crystals))
             assert math.isfinite(first["nll_per_obs"])
             assert first["nll_per_obs"] == second["nll_per_obs"]
             for name, value in state().items():
@@ -431,12 +411,12 @@ def test_deferred_encoder_backward_is_the_one_pass_gradient(tmp_path):
     give every parameter the gradient of the single checkpointed pass."""
     prep, params, *_ = _synthetic(n_xtal=40, per=20)
     torch.manual_seed(0)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, include_hkl=False, peer_heads=4,
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, peer_heads=4,
                                      encoder="fold", context_folds=3, ctx_layers=2, query_layers=1)
     scale.encoder.tokens = 1 << 8                     # several blocks
-    cfg = TrainConfig(max_obs_per_batch=10 ** 6, epochs=1, lr=3e-3, heldout_frac=0.0,
+    cfg = TrainConfig(max_obs_per_batch=10 ** 6, lr=3e-3, heldout_frac=0.0,
                       device="cpu", outdir=str(tmp_path))
-    tr = AmortizedTrainer(prep, scale, MarginalNLL(wide_log_grid(), Poisson()), params, config=cfg)
+    tr = AmortizedTrainer(prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params, config=cfg)
     assert scale.defer_encoder_backward
     rows = tr.index.rows(tr.index.nonempty)
     grads = []
@@ -464,7 +444,7 @@ def test_fold_predictions_without_autograd_run_flex_and_match_the_masked_kernel(
     torch._dynamo.reset()
     prep, params, *_ = _synthetic(n_xtal=40, per=20)
     torch.manual_seed(0)
-    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, include_hkl=False, peer_heads=2,
+    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, peer_heads=2,
                                      encoder="fold", context_folds=3, ctx_layers=2, query_layers=1,
                                      anchor_stat="median").cuda()
     scale.encoder.tokens = 1 << 9                     # several blocks
@@ -479,6 +459,6 @@ def test_fold_predictions_without_autograd_run_flex_and_match_the_masked_kernel(
         with torch.no_grad():
             out[flex] = scale.predict(meta)
     assert not out[True].log_K.requires_grad and out[False].log_K.std() > 0
-    for name in ("log_K", "log_w", "beta"):
+    for name in ("log_K", "log_w", "log_e_s"):
         a, b = getattr(out[True], name), getattr(out[False], name)
         assert (a - b).norm() / b.norm() < 2e-2, name
