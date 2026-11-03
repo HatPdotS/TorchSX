@@ -554,9 +554,11 @@ def _trainer_from_stack(prep, params, scale, obj, S):
     return tr
 
 
-def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
-    """best.pt records the Wilson surface and the basis anchor; merge_nn rebuilds the
-    stack without flags, evaluates the same surface and reproduces the predictions."""
+@pytest.mark.parametrize("flags,anchor", [([], "median"), (["--tether", "none"], "basis")])
+def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path, flags, anchor):
+    """best.pt records the Wilson surface and the anchor (the scalar gauge with the
+    tether, the basis projection without it); merge_nn rebuilds the stack without
+    flags, evaluates the same surface and reproduces the predictions."""
     from torchsx.cli import _pipeline as P
     from torchsx.cli.merge_nn import _build_parser as merge_parser, restore_wilson_surface
     from torchsx.cli.train import _build_parser as train_parser
@@ -565,16 +567,16 @@ def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
     bundle = P.PrepBundle(prep, recipe, [], 0.1)
     targs = train_parser().parse_args(
-        ["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
+        ["x.sfx", "-o", str(tmp_path), "--device", "cpu", *flags])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
-    assert S["basis"] is not None and scale.anchor_stat == "basis" and S["basis"].degree == 4
+    assert S["basis"] is not None and scale.anchor_stat == anchor and S["basis"].degree == 4
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
     t = tr.targets[0]
     assert t.has_basis and t.wilson_coef.abs().sum() > 0 and t.wilson_coef_param is not None
     tr.data_recipe = dict(recipe)
     ck = torch.load(tr.save_best(tmp_path / "smooth.pt"), weights_only=False)
     assert ck["posterior_grid"]["wilson_degree"] == 4
-    assert ck["scale"]["anchor_stat"] == "basis"
+    assert ck["scale"]["anchor_stat"] == anchor
     assert set(ck["wilson_surface"]) == {"basis", "coef"}
     assert "gauge_phi" not in ck["state_dict"], "the basis rows are rebuilt, not stored"
 
@@ -582,7 +584,7 @@ def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
     margs = merge_parser().parse_args(
         ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
     p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
-    assert S2["wilson_degree"] == 4 and rebuilt.anchor_stat == "basis"
+    assert S2["wilson_degree"] == 4 and rebuilt.anchor_stat == anchor
     rebuilt.load_state_dict(ck["state_dict"])
     tr2 = _trainer_from_stack(p2, q2, rebuilt, o2, S2)
     restore_wilson_surface(tr2, p2, ck)
@@ -597,15 +599,18 @@ def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
                                    scale.predict(prep_.obs_info.gather(rows)).log_K)
 
 
-def test_defaults_are_the_wilson_prior_and_basis_anchor(tmp_path):
+def test_defaults_are_the_wilson_prior_and_the_tether(tmp_path):
     from torchsx.cli import _pipeline as P
     from torchsx.cli.train import _build_parser as train_parser
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
     targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
     _p, _q, scale, _o, S = P.build_stack(bundle, targs, verbose=False)
-    assert S["prior"] == "wilson" and S["basis"] is not None and scale.anchor_stat == "basis"
+    assert S["prior"] == "wilson" and S["basis"] is not None and scale.anchor_stat == "median"
+    assert P.tether_terms(targs) == ("gauge", "strength", "response")
     assert TrainConfig().posterior_prior == "wilson"
+    off = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--tether", "none"])
+    assert P.build_stack(bundle, off, verbose=False)[2].anchor_stat == "basis" and P.tether_terms(off) == ()
 
 
 @pytest.mark.parametrize("flags,kind,refine", [([], "fold", True), (["--no-refine-geometry"], "fold", False),

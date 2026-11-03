@@ -43,6 +43,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
 | `--outlier-frac F` | 0 | Initial weight of a detector-outlier component; 0 turns it off. |
 | `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
+| `--tether TERMS` | `gauge,strength,response` | Directions the likelihood leaves to the model, held at the raw counts; `none` turns it off (see [Sum-of-spots tether](#sum-of-spots-tether)). |
 | `--pseudo-translation` | `off` | `auto`: reflection profiles that depend on the structure's translational pseudo-symmetry (see [Pseudo-translation](#pseudo-translation)). |
 | `--seed N` | 0 | Network initialization and batch sampling. |
 | `--device` | `cuda` if available | `cuda` or `cpu`. |
@@ -197,6 +198,36 @@ for weak reflections, and its validation loss is not comparable with that of
 a Wilson run.
 
 `torchsx.merge` uses the prior of the checkpoint unless `--prior` is given.
+
+## Sum-of-spots tether
+
+The likelihood sees an observation through the product of its scale and the
+reflection's intensity, and through the scatter model. Some changes of these
+leave the fit unchanged, or nearly so: a smooth rescaling of every
+reflection's scale against its intensity exactly, and how much of a dim
+observation the scale explains and how much the scatter nearly. The network
+would pick a solution there for reasons unrelated to the data. The raw counts
+fix these directions: the sum of a reflection's spots, the background-subtracted
+counts of all its observations, depends on no model. The tether holds the
+model to it, as a term in the training loss computed from each batch alone.
+Unlike the intensity prior it does not weaken as the data grow; at its minimum
+every term is where the counts put it.
+
+| Term | Holds |
+|---|---|
+| `gauge` | The rocking-curve integral of the scale, its mean over a reflection's observations, is the same at every resolution and in every direction. The merged intensities keep the fall-off of the integrated intensities. |
+| `strength` | The mean scale of a reflection does not change with how bright the reflection is. |
+| `response` | The likelihood, evaluated at each reflection's sum of spots, does not move away from it differently for bright and dim reflections, so the merged amplitudes follow the counts' response to brightness. |
+
+A reflection's brightness is taken from the other half of the batch's crystals,
+so that it shares no noise with the observations it is compared with. Without
+`gauge` (`--tether none`), the smooth common mode of the log scale is
+projected out of every batch instead, which pins its geometric rather than its
+arithmetic mean.
+
+`merged.metrics.json` reports every term over each state's merged observations
+(`tether`), whichever terms the network was trained with. `torchsx.merge`
+takes the setting from the checkpoint.
 
 ## Model
 

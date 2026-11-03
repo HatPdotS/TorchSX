@@ -22,6 +22,14 @@ def _positive(value):
     return number
 
 
+def _tether_terms(value):
+    from torchsx.merging.tether import parse_terms
+    try:
+        return parse_terms(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r}: {exc}") from None
+
+
 def _steps(value):
     number = int(value)
     if number < 0:
@@ -90,6 +98,15 @@ def _build_parser():
                         "phase h.t; the merged intensity is the reflection's total.  Without a translation "
                         "above the threshold the model is unchanged.  off (default).  The merge inherits the "
                         "checkpoint")
+    p.add_argument("--tether", type=_tether_terms, default=None, metavar="TERMS",
+                   help="directions the likelihood leaves to the model, held at the raw counts, the sum of "
+                        "each reflection's spots: comma-separated terms out of gauge (the rocking-curve "
+                        "integral of the scale is the same at every resolution), strength (the scale does not "
+                        "know a reflection's brightness) and response (the likelihood keeps the counts' "
+                        "response to brightness), or none, which pins the scale's smooth gauge by projection "
+                        "instead.  Default: all three.  The merge inherits the checkpoint")
+    # Weight of the tether's penalty (nats^2 per observation, default 1).
+    p.add_argument("--tether-weight", type=_positive, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
@@ -244,7 +261,11 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=No
             probe.update(rec["sec"])
         if tr.step_i % 25 == 0 or sum(updates) == steps:
             print(f"update {tr.step_i}/{steps}: per-state {updates}, "
-                  f"nll/obs {rec['nll_per_obs']:.5f}", flush=True)
+                  f"nll/obs {rec['nll_per_obs']:.5f}"
+                  + (f", tether: gauge {rec['tether_gauge']:.4f} nats" if "tether_gauge" in rec else "")
+                  + (f", strength {rec['tether_strength']:+.4f}" if "tether_strength" in rec else "")
+                  + (f", response {rec['tether_response']:+.4f}" if "tether_response" in rec else ""),
+                  flush=True)
         if tr.step_i % evaluate_every == 0 or sum(updates) == steps:
             if has_validation:
                 result = tr.evaluate(tr.heldout_crystals)
@@ -302,6 +323,7 @@ def main(argv=None):
         device=settings["device"], outdir=str(args.out), seed=args.seed,
         heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),
         noise_lr_mult=args.noise_lr_mult,
+        tether=P.tether_terms(args), lam_tether=args.tether_weight,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     try:

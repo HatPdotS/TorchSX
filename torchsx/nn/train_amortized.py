@@ -297,6 +297,17 @@ class TrainConfig:
     lam_shape_prior: float = 0.0
     #: observations sampled per update to estimate the prior term
     shape_prior_sample: int = 2048
+    #: Terms of the sum-of-spots tether held in the training loss
+    #: (:mod:`torchsx.merging.tether`), any of ``"gauge"``, ``"strength"`` and
+    #: ``"response"``: directions the likelihood leaves to the model, held at
+    #: the raw counts.  ``"gauge"`` holds the smooth gauge of ``log K`` itself
+    #: and needs a scale that pins the scalar gauge only (``anchor_stat``
+    #: ``"median"`` or ``"mean"``).
+    tether: tuple = ()
+    #: Weight of the tether's penalty, in nats^2 per observation.  Its minimum
+    #: is where the data put every term at any positive weight; the weight sets
+    #: how stiffly the terms are held while the network trains.
+    lam_tether: float = 1.0
     log_every: int = 10
     heldout_frac: float = 0.05
     #: Condition (``ObsInfo.delay_bin_idx`` value) the held-out crystals and
@@ -410,6 +421,15 @@ class AmortizedTrainer:
             )
         if self.cfg.encoder_chunk_crystals:
             self.scale.set_encoder_chunking(self.cfg.encoder_chunk_crystals)
+        from torchsx.merging.tether import Tether
+
+        self.tether = Tether(self.cfg.tether)
+        self._tether_phi = None
+        if "gauge" in self.tether.names and getattr(self.scale, "anchor_stat", None) == "basis":
+            raise ValueError("the tether's gauge term holds the smooth gauge itself and needs a scale that "
+                             "pins the scalar gauge only (anchor_stat 'median' or 'mean'), not 'basis'")
+        if self.tether and not self.cfg.lam_tether > 0:
+            raise ValueError("the tether needs lam_tether > 0")
         if self._store is None:
             self.n_ph = (prep.I_obs + prep.bg).clamp(min=0)
             self.sigma = (
@@ -739,6 +759,72 @@ class AmortizedTrainer:
         )
         return tgt, post.log_Z
 
+    def _tether_batch(self, meta, log_K, n_ph, bg, sigma, n_crystals: int | None = None):
+        """The tether's view of a set of observations
+        (:class:`~torchsx.merging.tether.TetherBatch`): counts less the
+        likelihood's background mean, their counting variance, the scales."""
+        from torchsx.merging.tether import TetherBatch
+
+        if self._tether_phi is None:
+            raise RuntimeError("the tether needs a reciprocal basis: prep.median_cell or "
+                               "set_reciprocal_basis()")
+        shell = getattr(self, "_shell_dev", None)
+        if shell is None or shell.device != n_ph.device:
+            shell = self._shell_dev = self.shell_of_hkl.to(n_ph.device)
+        bvf = float(getattr(getattr(self.objective, "likelihood", None), "bg_var_factor", 0.0) or 0.0)
+        cid = meta.crystal_id
+        if n_crystals is None:
+            n_crystals = (int(meta.n_crystals) if getattr(meta, "n_crystals", None)
+                          else int(cid.max()) + 1)
+        return TetherBatch(n_ph - bg - _bg_mean_offset(self.objective),
+                           sigma.double() ** 2 + bvf * bg.double().clamp(min=0.0),
+                           log_K, meta.hkl_idx, cid, n_crystals, self._tether_phi, shell)
+
+    def _curves(self, pred, n_ph, bg, meta, target=None):
+        """The tether's :data:`~torchsx.merging.tether.Curves` for one batch: the
+        target's summed log-likelihood of each requested group at its nodes."""
+        tgt = self.target if target is None else target
+
+        def curves(requests):
+            return [tgt.accumulate(self.objective, self.scale.scatter, self.params, pred, n_ph, bg,
+                                   rows, meta, v, n_rows=n) for rows, n, v in requests]
+        return curves
+
+    @torch.no_grad()
+    def _tether_readout(self, seen_obs: list, batches, tgt) -> dict:
+        """Every tether term over the observations ``merge`` collected
+        (``(log K, reflection, crystal, n, bg, sigma)`` per batch, in batch
+        order); the response terms' curves are summed over a second pass of the
+        same batches."""
+        from torchsx.merging.tether import TERMS, Tether
+
+        dev = self.device
+        if seen_obs:
+            lk, h, cid, n_ph, bg, sigma = (torch.cat(c) for c in zip(*seen_obs))
+        else:
+            lk = n_ph = bg = sigma = torch.zeros(0, device=dev)
+            h = cid = torch.zeros(0, dtype=torch.int32, device=dev)
+        meta = type("Obs", (), {"hkl_idx": h.long(), "crystal_id": cid.long(), "n_crystals": self.index.n_crystals})
+        batch = self._tether_batch(meta, lk, n_ph, bg, sigma, n_crystals=self.index.n_crystals)
+        sizes = [int(c[0].numel()) for c in seen_obs]
+
+        def curves(requests):
+            out = [torch.zeros(n, 3, device=dev, dtype=torch.float64) for _, n, _ in requests]
+            start = 0
+            for (_, rows), m in zip(batches(), sizes):
+                meta_b, n_b, bg_b, _ = self._batch(rows.to(dev))
+                if not torch.equal(meta_b.hkl_idx.int(), h[start:start + m]):
+                    raise RuntimeError("the tether readout's second pass saw different batches")
+                pred = self.scale.prime(meta_b)
+                for S, (r, n, v) in zip(out, requests):
+                    S += tgt.accumulate(self.objective, self.scale.scatter, self.params, pred, n_b, bg_b,
+                                        r[start:start + m], meta_b, v, n_rows=n).double()
+                start += m
+                self.scale.clear()
+            return out
+
+        return Tether(TERMS).readout(batch, curves, d_spacing=self.prep.d_spacing)
+
     @torch.no_grad()
     def _canonical_nll(self, rows: Tensor) -> float:
         """Data NLL on this batch in eval mode and with no penalty.
@@ -774,6 +860,13 @@ class AmortizedTrainer:
         lam_s = self._lam_spread()
         if lam_s > 0:
             loss = loss + lam_s * pred.log_w.mean()
+        tether_rec = {}
+        if self.tether:
+            pen, tether_rec = self.tether.penalty(
+                self._tether_batch(meta, pred.log_K, n_ph, bg, sigma),
+                self._curves(pred, n_ph, bg, meta) if self.tether.response else None)
+            loss = loss + self.cfg.lam_tether * pen.to(loss.dtype)
+            pen = None
         shape_rec = {}
         if self.cfg.lam_shape_prior > 0:
             mix = pred.mix if pred.mix is not None else pack_single(pred.log_alpha, pred.beta, pred.log_alpha_hi)
@@ -859,6 +952,7 @@ class AmortizedTrainer:
             "n_floored": n_floored,
             "lam_spread": lam_s,
             **shape_rec,
+            **tether_rec,
             "lr": float(self.opt.param_groups[0]["lr"]),
             "sec": time.time() - t0,
             # time this update waited for its observations to be read from disk
@@ -1126,6 +1220,8 @@ class AmortizedTrainer:
                     "predict_shape": bool(getattr(self.scale.heads, "predict_shape", True)),
                     "anchor_log_k": bool(getattr(self.scale, "anchor_log_k", True)),
                     "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
+                    "tether": list(self.tether.names),
+                    "lam_tether": float(self.cfg.lam_tether),
                     "pseudo_translation": (
                         None if getattr(self.scale.features, "phase_broad", None) is None
                         else {"width": self.scale.features.phase_width.definition(),
@@ -1201,6 +1297,7 @@ class AmortizedTrainer:
         condition: int | None = None,
         estimator: str = "posterior",
         return_likelihood: bool = False,
+        tether_readout: bool = False,
     ) -> dict:
         """Merge a crystal set and return everything an MTZ needs.
 
@@ -1236,6 +1333,11 @@ class AmortizedTrainer:
 
         Returns a dict with ``F``/``F_sd`` (or ``I``/``I_sd``/``n_meas``),
         ``I0``, ``seen`` and the grid diagnostics ``edge_mass``, ``loc_sd``.
+        With ``tether_readout`` (posterior estimators, a reciprocal basis) it
+        also carries ``tether``: every term of the sum-of-spots tether over all
+        the merged observations (:meth:`~torchsx.merging.tether.Tether.readout`),
+        whichever terms the network was trained with; the response terms take
+        a second pass over the observations.
         """
         if estimator not in ("posterior", "flat", "ml", "pooled", "mean", "wls"):
             raise ValueError(f"unknown estimator {estimator!r}")
@@ -1415,8 +1517,10 @@ class AmortizedTrainer:
         # split.
         acc = torch.zeros(n_hkl, v_nodes.shape[1], device=dev)
         n_bad_acc = 0
+        readout = tether_readout and self._tether_phi is not None
+        seen_obs = []                     # what the tether's readout needs of every observation
         for _, rows in batches():
-            meta, n_ph, bg, _ = self._batch(rows.to(dev))
+            meta, n_ph, bg, sigma = self._batch(rows.to(dev))
             pred = self.scale.prime(meta)
             c = tgt.accumulate(
                 self.objective, self.scale.scatter, self.params, pred,
@@ -1427,7 +1531,12 @@ class AmortizedTrainer:
                 n_bad_acc += int(bad.any(1).sum())
                 c = c.masked_fill(bad, 0.0)
             acc = acc + c
+            if readout:
+                seen_obs.append((pred.log_K.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int(),
+                                 n_ph.float(), bg.float(), sigma.float()))
             self.scale.clear()
+        tether_rec = self._tether_readout(seen_obs, batches, tgt) if readout else None
+        del seen_obs
         _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
         log_c = self.scale.readout_log_factor(torch.arange(n_hkl, device=dev))
         if log_c is not None:
@@ -1470,6 +1579,8 @@ class AmortizedTrainer:
             "n_crystals": int(crystals.numel()),
             "condition": self._cond,
         }
+        if tether_rec is not None:
+            result["tether"] = tether_rec
         if return_likelihood:
             result['log_likelihood'] = tgt._interp(acc).detach().cpu()
             result['log_intensity_grid'] = v.detach().cpu()
@@ -1672,6 +1783,9 @@ class AmortizedTrainer:
         self.reciprocal_basis = basis
         for t in self.targets:
             t.set_basis(phi)
+        from torchsx.merging.tether import smooth_columns
+
+        self._tether_phi = smooth_columns(phi.detach().to(torch.float64))
         if hasattr(self.scale, "set_gauge_basis"):
             self.scale.set_gauge_basis(phi)
         if self.cfg.posterior_prior == "wilson":
