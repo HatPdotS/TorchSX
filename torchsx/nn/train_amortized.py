@@ -25,6 +25,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
+from torchsx.merging.likelihood.poisson import poisson_logpeak
 from torchsx.merging.observations import PreparedObs
 from torchsx.nn.merge_target import MergeTargetOut, unity_merge
 from torchsx.nn.metrics import (
@@ -570,7 +571,18 @@ class AmortizedTrainer:
             pred = self.scale.prime(meta)
             tgt, log_Z = self._posterior_step(pred, n_ph, bg, sigma, meta)
             # The marginal likelihood per reflection.  I0 appears nowhere.
-            nll = -log_Z[self.target.last_seen].sum()
+            # Scored against the saturated Poisson model: every observation's
+            # log p carries log p(n | lam = n) = n log n - n - log n!, about
+            # -1/2 log(2 pi n), which depends on the counts alone and is most of
+            # the value.  Taking it out leaves what the model pays beyond a
+            # perfect fit of each count.  It is a constant of the data, so the
+            # gradient and every comparison of models on the same observations
+            # are unchanged.
+            saturated = poisson_logpeak(n_ph.double()).sum()
+            nll = -log_Z[self.target.last_seen].sum() + saturated.to(log_Z.dtype)
+        #: ``-log p`` of the saturated model over this batch, the pedestal the
+        #: reported NLL leaves out
+        self.last_pedestal = -saturated
         return meta, pred, tgt, nll, n_ph, bg, sigma
 
     def _posterior_step(self, pred, n_ph, bg, sigma, meta):
@@ -631,6 +643,7 @@ class AmortizedTrainer:
 
         n_used = int(tgt.valid.sum())
         nll_data = float(nll.detach().item()) / max(n_used, 1)
+        pedestal = float(self.last_pedestal) / max(n_used, 1)
         loss = nll / max(n_used, 1)
         self.opt.zero_grad(set_to_none=True)
         if self.cfg.posterior_prior == "wilson" and self.targets[0].wilson_coef_param is None:
@@ -682,6 +695,10 @@ class AmortizedTrainer:
             # the same quantity ``evaluate()`` writes for the held-out set
             "nll_per_obs": nll_data,
             "nll_data": nll_data,
+            # Both are taken relative to the saturated Poisson model (see
+            # _forward); its own -log p per observation is this, so the full
+            # marginal NLL is nll_per_obs + nll_pedestal.
+            "nll_pedestal": pedestal,
             # Under ``loss="evidence"`` the numerator is a sum over
             # REFLECTIONS (-sum_h log Z_h) while the denominator counts
             # OBSERVATIONS, so "per obs" is only a scale convention -- and the
@@ -828,13 +845,14 @@ class AmortizedTrainer:
         merge rather than learning.
         """
         self.scale.eval()
-        tot, n_tot, n_hkl, recs = 0.0, 0, 0, []
+        tot, ped, n_tot, n_hkl, recs = 0.0, 0.0, 0, 0, []
         for sel, rows in self._batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         ):
             meta, pred, tgt, nll, *_ = self._forward(rows, grad=False)
             n_used = int(tgt.valid.sum())
             tot += float(nll.item())
+            ped += float(self.last_pedestal)
             n_tot += n_used
             n_hkl += getattr(self, "last_n_hkl", 0)
             recs.append(
@@ -844,6 +862,7 @@ class AmortizedTrainer:
         rec = {
             "step": self.step_i, "phase": phase,
             "nll_per_obs": tot / max(n_tot, 1),
+            "nll_pedestal": ped / max(n_tot, 1),
             # See step(): under loss="evidence" this is a reflection sum over an
             # observation count, so it is comparable along its own curve but not
             # against the training curve, which has a different multiplicity.
