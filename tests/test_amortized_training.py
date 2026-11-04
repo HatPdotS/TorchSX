@@ -341,6 +341,31 @@ def test_evaluation_changes_no_state(tmp_path, prior):
         tr.close()
 
 
+def test_reported_nll_is_relative_to_the_saturated_poisson(tmp_path):
+    """The reported NLL leaves out ``-log p(n | lam = n)``, a function of the
+    counts alone, and reports it as the pedestal.  What remains is non-negative
+    under the Poisson detection model: no evidence exceeds the likelihood of the
+    model that fits every count exactly."""
+    from scipy.stats import poisson
+
+    prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8)
+    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
+    tr = AmortizedTrainer(
+        prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
+        config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
+                           posterior_k_coarse=5, posterior_m_fine=17),
+    )
+    try:
+        rec = tr.evaluate(tr.heldout_crystals)
+        n = tr.n_ph[tr.index.rows(tr.heldout_crystals)].double().numpy()
+        assert rec["n_obs"] == n.size
+        assert math.isclose(rec["nll_pedestal"], -poisson.logpmf(n, n).sum() / n.size,
+                            rel_tol=1e-6)
+        assert rec["nll_per_obs"] >= 0.0
+    finally:
+        tr.close()
+
+
 def test_posterior_integrate_is_finite_for_flat_curves():
     """A flat curve at n_sigma=24 puts nodes ~96 nats above the centre.
 
