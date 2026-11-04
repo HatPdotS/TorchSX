@@ -100,10 +100,8 @@ def _build_parser():
                         "checkpoint")
     p.add_argument("--tether", type=_tether_terms, default=None, metavar="TERMS",
                    help="directions the likelihood leaves to the model, held at the raw counts, the sum of "
-                        "each reflection's spots: comma-separated terms out of gauge (the rocking-curve "
-                        "integral of the scale is the same at every resolution), strength (the scale does not "
-                        "know a reflection's brightness) and response (the likelihood keeps the counts' "
-                        "response to brightness), or none, which pins the scale's smooth gauge by projection "
+                        "each reflection's spots: gauge (the rocking-curve integral of the scale is the same "
+                        "at every resolution), or none, which pins the scale's smooth gauge by projection "
                         "instead.  Default: gauge.  The merge inherits the checkpoint")
     # Weight of the tether's penalty (nats^2 per observation, default 1).
     p.add_argument("--tether-weight", type=_positive, default=1.0, help=argparse.SUPPRESS)
@@ -262,9 +260,7 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=No
         if tr.step_i % 25 == 0 or sum(updates) == steps:
             print(f"update {tr.step_i}/{steps}: per-state {updates}, "
                   f"nll/obs {rec['nll_per_obs']:.5f}"
-                  + (f", tether: gauge {rec['tether_gauge']:.4f} nats" if "tether_gauge" in rec else "")
-                  + (f", strength {rec['tether_strength']:+.4f}" if "tether_strength" in rec else "")
-                  + (f", response {rec['tether_response']:+.4f}" if "tether_response" in rec else ""),
+                  + (f", tether gauge {rec['tether_gauge']:.4f} nats" if "tether_gauge" in rec else ""),
                   flush=True)
         if tr.step_i % evaluate_every == 0 or sum(updates) == steps:
             if has_validation:
@@ -310,7 +306,7 @@ def main(argv=None):
         install_pseudo_translation(scale, prep, bundle.spacegroup)
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
-        target_redundancy=args.redundancy, epochs=0, lr=1e-3,
+        target_redundancy=args.redundancy, lr=1e-3,
         warmup_steps=(25 if args.warmup is None else args.warmup) * n_states,
         lr_schedule=args.lr_schedule, total_steps=args.steps,
         grad_clip=20.0, log_every=25,
@@ -319,7 +315,7 @@ def main(argv=None):
         locate_windows=(8.0, 1.0, 0.125), posterior_prior=settings["prior"],
         wilson_degree=settings["wilson_degree"],
         posterior_checkpoint_nodes=True, encoder_chunk_crystals=400,
-        stream_batches=True, split_half_every=0, heldout_frac=0.05,
+        stream_batches=True, heldout_frac=0.05,
         device=settings["device"], outdir=str(args.out), seed=args.seed,
         heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),
         noise_lr_mult=args.noise_lr_mult,

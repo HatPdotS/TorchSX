@@ -1,53 +1,40 @@
 """Training loop for the amortised scale model.
 
-Batches are drawn over **crystals**, not observations, because the
-leave-one-out context pool needs a crystal's reflections to be complete: a
-truncated crystal gives a biased context.  The merge target is the opposite —
-it is an average, so a subsample of each reflection's observations is unbiased,
-and a batch of a few thousand crystals holds tens of observations per reflection.
+Batches are drawn as complete crystals, because the encoder reads each
+observation's context from the other observations of its crystal: a truncated
+crystal gives a biased context.  The batch is sized by observations per
+reflection (``target_redundancy``) rather than by crystal count, since how many
+observations of a reflection a batch holds is what constrains that reflection.
 
-That is why the batch is sized in *observations* rather than crystals: crystals
-carry a variable number (long tail), so a fixed crystal count makes
-memory jump around while a fixed observation budget keeps it flat.
-
-Each step is two passes:
-
-1. ``no_grad``: predict, then build the leave-one-out merge target from
-   **detached** ``K`` and ``w``.
-2. with grad: predict again, form ``log_mean = log I0^(-j) + log K``, and
-   evaluate the marginal NLL.
-
-Detaching the target is what makes the scheme well defined.  Leave-one-out
-blocks an observation from pulling its *own* target; detachment blocks the
-network from pulling the whole merge toward itself collectively.
-
-Adam only — no LBFGS anywhere, on the network or elsewhere.
+Each update is one forward pass.  The network predicts ``log K`` and the
+scatter of every observation; the posterior merge target
+(:mod:`torchsx.nn.posterior_target`) integrates each reflection's intensity out
+under the intensity prior and returns the per-reflection evidence ``log Z_h``.
+The loss is ``-sum_h log Z_h`` over the reflections in the batch, so no point
+estimate of the intensity enters it.  The network, the prior surface and the
+objective's own scalars are optimised with AdamW.
 """
 
 from __future__ import annotations
 
 import math
 import time
-import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from torch import Tensor
 
+from torchsx.merging.likelihood.poisson import poisson_logpeak
 from torchsx.merging.observations import PreparedObs
 from torchsx.nn.merge_target import MergeTargetOut, unity_merge
 from torchsx.nn.metrics import (
     MetricLogger,
-    _diagnostic_quantile,
     calibration_metrics,
     condition_auc,
     grad_norms,
-    hkl_permutation_sensitivity,
-    hkl_permutation_sensitivity_shape,
     scale_metrics,
 )
-from torchsx.nn.shape_prior import pack_single, shape_prior_kl
 
 __all__ = ["CrystalIndex", "TrainConfig", "AmortizedTrainer"]
 
@@ -191,10 +178,6 @@ def lr_factor(step: int, *, warmup: int, total: int, schedule: str = "constant",
 
 @dataclass
 class TrainConfig:
-    #: Warn when the hkl-permutation sensitivity exceeds this.  A scale that
-    #: depends on hkl is degenerate with I0 and can manufacture a difference
-    #: peak.
-    hkl_permutation_warn: float = 0.02
     max_obs_per_batch: int = 1_500_000
     #: Size the batch by the in-batch REDUNDANCY it buys, not by an observation
     #: count.  The in-batch merge target for a reflection is built from roughly
@@ -206,12 +189,7 @@ class TrainConfig:
     #: objective.  When set, ``max_obs_per_batch`` is derived as
     #: ``target_redundancy * n_hkl`` and the configured value is ignored.
     target_redundancy: float | None = None
-    epochs: int = 10
     lr: float = 1e-3
-    #: Learning-rate multiplier for the mixture head's parameters.  The head
-    #: reads the full embedding like the other heads; a large multiplier drives
-    #: the lower widths to extreme alpha within a few hundred updates.
-    mixture_lr_mult: float = 1.0
     #: Learning-rate multiplier for the pseudo-translation profile coefficients
     #: (``PhaseWidth``, ``PhaseBroad``): a handful of scalars that must travel
     #: O(1) in log width and log fraction, where Adam at the network's rate
@@ -244,19 +222,6 @@ class TrainConfig:
     #: coupled to gradient history rather than being a clean prior.
     weight_decay: float = 0.0
     grad_clip: float = 1.0
-    #: Penalty on the predicted scatter width, ``lam_spread * mean(log w)``.
-    #: The GenGauss normaliser already contains -log(alpha), so no explicit
-    #: penalty on w is needed *at the likelihood optimum*; that says nothing
-    #: about which optimum you reach.  The model can settle into a wide-scatter
-    #: minimum where the width absorbs nearly all per-observation variation,
-    #: and there is then almost no gradient pressure left to
-    #: refine K per observation.  This penalty is a tool for escaping that
-    #: basin, not a claim about the statistics -- so it is annealed away and
-    #: the final w is judged on calibration (var_z), not on this term.
-    lam_spread: float = 0.0
-    #: Halflife of the spread penalty in steps; ``0`` disables the ramp and
-    #: holds ``lam_spread`` constant for the whole run.
-    lam_spread_halflife_steps: int = 400
     #: Recompute each outer quadrature node in backward instead of keeping all
     #: ``k_coarse`` node graphs alive at once.  Trades ~2x compute in
     #: ``accumulate`` for a large drop in retained activations.  Only worth it
@@ -287,22 +252,11 @@ class TrainConfig:
     wilson_degree: int = 4
     #: Outer grid half-width cap in nats (see PosteriorMergeTarget.max_halfwidth).
     posterior_max_halfwidth: float = 12.0
-    #: Hierarchical prior on each observation's scatter density
-    #: (:mod:`torchsx.nn.shape_prior`): ``lam_shape_prior`` pseudo-observations
-    #: per observation drawn from the batch's population density, i.e.
-    #: ``lam * mean_j KL(p_bar || p_j)`` added to the per-observation loss.
-    #: Weak observations, whose likelihood barely depends on their scatter
-    #: shape, take the population shape; strong ones keep what their data say.
-    #: Constant over the run (it is a prior, not an escape schedule).
-    lam_shape_prior: float = 0.0
-    #: observations sampled per update to estimate the prior term
-    shape_prior_sample: int = 2048
     #: Terms of the sum-of-spots tether held in the training loss
-    #: (:mod:`torchsx.merging.tether`), any of ``"gauge"``, ``"strength"`` and
-    #: ``"response"``: directions the likelihood leaves to the model, held at
-    #: the raw counts.  ``"gauge"`` holds the smooth gauge of ``log K`` itself
-    #: and needs a scale that pins the scalar gauge only (``anchor_stat``
-    #: ``"median"`` or ``"mean"``).
+    #: (:mod:`torchsx.merging.tether`): directions the likelihood leaves to the
+    #: model, held at the raw counts.  ``"gauge"`` holds the smooth gauge of
+    #: ``log K`` itself and needs a scale that pins the scalar gauge only
+    #: (``anchor_stat`` ``"median"`` or ``"mean"``).
     tether: tuple = ()
     #: Weight of the tether's penalty, in nats^2 per observation.  Its minimum
     #: is where the data put every term at any positive weight; the weight sets
@@ -323,20 +277,9 @@ class TrainConfig:
     #: scored, never trained on, and the export leaves them out
     #: (``external_heldout``).  None: a random ``heldout_frac`` of that condition.
     heldout_crystal_ids: object = None
-    #: Crystals scored from the TRAINING set under the same conditions as the
-    #: held-out set (no spread penalty).  Without this the logged train and
-    #: heldout numbers differ in the penalty, so their gap is bookkeeping
-    #: rather than generalisation — and that gap is precisely the diagnostic
-    #: for whether capacity binds.
-    train_eval_crystals: int = 3500
-    #: Keep the parameters that scored best on held-out.  A long run can peak
-    #: before its end and then degrade as the spread penalty anneals and the
-    #: model over-commits to within-crystal structure -- the endpoint need not
-    #: be the model we want.
+    #: Keep the parameters that scored best on held-out: a long run can peak
+    #: before its end, so the endpoint need not be the model we want.
     keep_best: bool = True
-    #: Run the split-half merge every N epochs (0 disables).  Costs one
-    #: no-grad pass over the whole dataset.
-    split_half_every: int = 20
     #: Scan half-widths for the merge's locating passes, one full data pass
     #: each.  A single wide round mis-centres the grid by about half a nat
     #: whatever the multiplicity (see ``merge``); shrinking the window squares
@@ -346,7 +289,6 @@ class TrainConfig:
     outdir: str = "."
     device: str = "cuda"
     shell_bins: int = 10
-    extra: dict = field(default_factory=dict)
 
 
 class AmortizedTrainer:
@@ -499,12 +441,9 @@ class AmortizedTrainer:
             ref_train = perm[n_held:]
         self.train_crystals = torch.cat([ref_train, other])
 
-        decay, no_decay, mixture, profile = [], [], [], []
+        decay, no_decay, profile = [], [], []
         for name, prm in self.scale.named_parameters():
             if not prm.requires_grad:
-                continue
-            if name.startswith("heads.mixture.") and self.cfg.mixture_lr_mult != 1.0:
-                mixture.append(prm)
                 continue
             if name.startswith(("features.phase_width.", "features.phase_broad.")):
                 profile.append(prm)
@@ -518,55 +457,10 @@ class AmortizedTrainer:
         for prm in self.objective.parameters():
             if prm.requires_grad:
                 (noise if id(prm) in noise_ids else no_decay).append(prm)
-        # Merge-quality quartets, at MATCHED crystal count.  Merge statistics
-        # depend strongly on multiplicity, so comparing a full train merge
-        # against a validation merge a twentieth its size would measure the
-        # count, not the model.  Both sets are subsampled to the same size and
-        # each is split in half, giving CC1/2 within seen crystals and within
-        # unseen crystals on equal footing.
-        n_match = min(ref_train.numel(), self.heldout_crystals.numel())
-        n_match -= n_match % 2
-        gq = torch.Generator().manual_seed(self.cfg.seed + 991)
-        tr_sub = ref_train[
-            torch.randperm(ref_train.numel(), generator=gq)[:n_match]
-        ]
-        va_sub = self.heldout_crystals[
-            torch.randperm(self.heldout_crystals.numel(), generator=gq)[:n_match]
-        ]
-        h = n_match // 2
-        self.merge_sets = {
-            "train_A": tr_sub[:h], "train_B": tr_sub[h:],
-            "val_A": va_sub[:h], "val_B": va_sub[h:],
-        }
-        self.n_merge_crystals = n_match
-
-        # FULL-dataset split-half, for an absolute CC1/2 comparable to other
-        # programs' full-data split-half figures.
-        # The matched train/val sets above answer a different question and are
-        # much shallower: each half carries an order of magnitude fewer
-        # observations per reflection than the full merge, and
-        # merge statistics depend strongly on multiplicity -- so those numbers
-        # are NOT comparable to the literature and only their train-vs-val
-        # difference is meaningful.
-        allc = ref_pool[torch.randperm(ref_pool.numel(), generator=gq)]
-        half = allc.numel() // 2
-        self.merge_sets["full_A"] = allc[:half]
-        self.merge_sets["full_B"] = allc[half:]
-        # A second, independent split of the same data: comparing the two gives
-        # the scatter of the statistic itself, so we know which differences
-        # between runs are real.
-        allc2 = ref_pool[torch.randperm(ref_pool.numel(), generator=gq)]
-        self.merge_sets["rep_A"] = allc2[:half]
-        self.merge_sets["rep_B"] = allc2[half:]
-
         groups = [
             {"params": decay, "weight_decay": self.cfg.weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ]
-        if mixture:
-            groups.append({"params": mixture, "weight_decay": 0.0,
-                           "lr": self.cfg.lr * self.cfg.mixture_lr_mult,
-                           "lr_mult": float(self.cfg.mixture_lr_mult)})
         if noise:
             groups.append({"params": noise, "weight_decay": 0.0,
                            "lr": self.cfg.lr * self.cfg.noise_lr_mult,
@@ -628,22 +522,6 @@ class AmortizedTrainer:
         """Merge target of the condition currently in flight."""
         return self.targets[self._cond]
 
-    # ── schedule ───────────────────────────────────────────────────────
-
-    def _lam_spread(self) -> float:
-        if self.cfg.lam_spread <= 0:
-            return 0.0
-        hl = self.cfg.lam_spread_halflife_steps
-        if hl <= 0:
-            # No ramp: hold the penalty constant.  A decaying penalty makes the
-            # optimised loss non-comparable across a run for a reason that has
-            # nothing to do with the model -- and a strong decaying penalty can
-            # drive the per-shell CC1/2 non-monotone in resolution, which is
-            # not physically possible.  A weak constant penalty is a prior, not a
-            # schedule, and is what the shrinkage is meant to be.
-            return self.cfg.lam_spread
-        return self.cfg.lam_spread * (0.5 ** (self.step_i / hl))
-
     # ── one step ───────────────────────────────────────────────────────
 
     def _batch(self, rows: Tensor):
@@ -698,6 +576,17 @@ class AmortizedTrainer:
                 self.prefetch(nxt[1])
             yield cur
 
+    def _tether_batch(self, meta, log_K):
+        """The tether's view of a batch (:class:`~torchsx.merging.tether.TetherBatch`)."""
+        from torchsx.merging.tether import TetherBatch
+
+        if self._tether_phi is None:
+            raise RuntimeError("the tether needs a reciprocal basis: prep.median_cell or "
+                               "set_reciprocal_basis()")
+        cid = meta.crystal_id
+        n_crystals = int(meta.n_crystals) if getattr(meta, "n_crystals", None) else int(cid.max()) + 1
+        return TetherBatch(log_K, meta.hkl_idx, cid, n_crystals, self._tether_phi)
+
     def _forward(self, rows: Tensor, *, grad: bool):
         meta, n_ph, bg, sigma = self._batch(rows)
 
@@ -712,7 +601,18 @@ class AmortizedTrainer:
             pred = self.scale.prime(meta)
             tgt, log_Z = self._posterior_step(pred, n_ph, bg, sigma, meta)
             # The marginal likelihood per reflection.  I0 appears nowhere.
-            nll = -log_Z[self.target.last_seen].sum()
+            # Scored against the saturated Poisson model: every observation's
+            # log p carries log p(n | lam = n) = n log n - n - log n!, about
+            # -1/2 log(2 pi n), which depends on the counts alone and is most of
+            # the value.  Taking it out leaves what the model pays beyond a
+            # perfect fit of each count.  It is a constant of the data, so the
+            # gradient and every comparison of models on the same observations
+            # are unchanged.
+            saturated = poisson_logpeak(n_ph.double()).sum()
+            nll = -log_Z[self.target.last_seen].sum() + saturated.to(log_Z.dtype)
+        #: ``-log p`` of the saturated model over this batch, the pedestal the
+        #: reported NLL leaves out
+        self.last_pedestal = -saturated
         return meta, pred, tgt, nll, n_ph, bg, sigma
 
     def _posterior_step(self, pred, n_ph, bg, sigma, meta):
@@ -759,89 +659,6 @@ class AmortizedTrainer:
         )
         return tgt, post.log_Z
 
-    def _tether_batch(self, meta, log_K, n_ph, bg, sigma, n_crystals: int | None = None):
-        """The tether's view of a set of observations
-        (:class:`~torchsx.merging.tether.TetherBatch`): counts less the
-        likelihood's background mean, their counting variance, the scales."""
-        from torchsx.merging.tether import TetherBatch
-
-        if self._tether_phi is None:
-            raise RuntimeError("the tether needs a reciprocal basis: prep.median_cell or "
-                               "set_reciprocal_basis()")
-        shell = getattr(self, "_shell_dev", None)
-        if shell is None or shell.device != n_ph.device:
-            shell = self._shell_dev = self.shell_of_hkl.to(n_ph.device)
-        bvf = float(getattr(getattr(self.objective, "likelihood", None), "bg_var_factor", 0.0) or 0.0)
-        cid = meta.crystal_id
-        if n_crystals is None:
-            n_crystals = (int(meta.n_crystals) if getattr(meta, "n_crystals", None)
-                          else int(cid.max()) + 1)
-        return TetherBatch(n_ph - bg - _bg_mean_offset(self.objective),
-                           sigma.double() ** 2 + bvf * bg.double().clamp(min=0.0),
-                           log_K, meta.hkl_idx, cid, n_crystals, self._tether_phi, shell)
-
-    def _curves(self, pred, n_ph, bg, meta, target=None):
-        """The tether's :data:`~torchsx.merging.tether.Curves` for one batch: the
-        target's summed log-likelihood of each requested group at its nodes."""
-        tgt = self.target if target is None else target
-
-        def curves(requests):
-            return [tgt.accumulate(self.objective, self.scale.scatter, self.params, pred, n_ph, bg,
-                                   rows, meta, v, n_rows=n) for rows, n, v in requests]
-        return curves
-
-    @torch.no_grad()
-    def _tether_readout(self, seen_obs: list, batches, tgt) -> dict:
-        """Every tether term over the observations ``merge`` collected
-        (``(log K, reflection, crystal, n, bg, sigma)`` per batch, in batch
-        order); the response terms' curves are summed over a second pass of the
-        same batches."""
-        from torchsx.merging.tether import TERMS, Tether
-
-        dev = self.device
-        if seen_obs:
-            lk, h, cid, n_ph, bg, sigma = (torch.cat(c) for c in zip(*seen_obs))
-        else:
-            lk = n_ph = bg = sigma = torch.zeros(0, device=dev)
-            h = cid = torch.zeros(0, dtype=torch.int32, device=dev)
-        meta = type("Obs", (), {"hkl_idx": h.long(), "crystal_id": cid.long(), "n_crystals": self.index.n_crystals})
-        batch = self._tether_batch(meta, lk, n_ph, bg, sigma, n_crystals=self.index.n_crystals)
-        sizes = [int(c[0].numel()) for c in seen_obs]
-
-        def curves(requests):
-            out = [torch.zeros(n, 3, device=dev, dtype=torch.float64) for _, n, _ in requests]
-            start = 0
-            for (_, rows), m in zip(batches(), sizes):
-                meta_b, n_b, bg_b, _ = self._batch(rows.to(dev))
-                if not torch.equal(meta_b.hkl_idx.int(), h[start:start + m]):
-                    raise RuntimeError("the tether readout's second pass saw different batches")
-                pred = self.scale.prime(meta_b)
-                for S, (r, n, v) in zip(out, requests):
-                    S += tgt.accumulate(self.objective, self.scale.scatter, self.params, pred, n_b, bg_b,
-                                        r[start:start + m], meta_b, v, n_rows=n).double()
-                start += m
-                self.scale.clear()
-            return out
-
-        return Tether(TERMS).readout(batch, curves, d_spacing=self.prep.d_spacing)
-
-    @torch.no_grad()
-    def _canonical_nll(self, rows: Tensor) -> float:
-        """Data NLL on this batch in eval mode and with no penalty.
-
-        The optimised loss moves for reasons that have nothing to do with the
-        model getting better while ``lam_spread`` anneals, so the training
-        curve is not comparable across a run.  This is the same batch scored
-        under conditions that never change.
-        """
-        self.scale.eval()
-        try:
-            _, _, tgt, nll, *_ = self._forward(rows, grad=False)
-        finally:
-            self.scale.train()
-        self.scale.clear()
-        return float(nll.item()) / max(int(tgt.valid.sum()), 1)
-
     def step(self, rows: Tensor) -> dict:
         self.scale.train()
         if self.cfg.warmup_steps > 0 or self.cfg.lr_schedule != "constant":
@@ -855,25 +672,14 @@ class AmortizedTrainer:
         io_wait = (self._store.store.wait_s - io0) if self._store is not None else 0.0
 
         n_used = int(tgt.valid.sum())
-        nll_data = float(nll.detach().item()) / max(n_used, 1)   # no penalty
+        nll_data = float(nll.detach().item()) / max(n_used, 1)
+        pedestal = float(self.last_pedestal) / max(n_used, 1)
         loss = nll / max(n_used, 1)
-        lam_s = self._lam_spread()
-        if lam_s > 0:
-            loss = loss + lam_s * pred.log_w.mean()
         tether_rec = {}
         if self.tether:
-            pen, tether_rec = self.tether.penalty(
-                self._tether_batch(meta, pred.log_K, n_ph, bg, sigma),
-                self._curves(pred, n_ph, bg, meta) if self.tether.response else None)
+            pen, tether_rec = self.tether.penalty(self._tether_batch(meta, pred.log_K))
             loss = loss + self.cfg.lam_tether * pen.to(loss.dtype)
             pen = None
-        shape_rec = {}
-        if self.cfg.lam_shape_prior > 0:
-            mix = pred.mix if pred.mix is not None else pack_single(pred.log_alpha, pred.beta, pred.log_alpha_hi)
-            kl, sd_bar, out_bar = shape_prior_kl(mix, pred.log_e_s, n_sample=self.cfg.shape_prior_sample)
-            loss = loss + self.cfg.lam_shape_prior * kl
-            shape_rec = {"shape_prior_kl": float(kl.detach()), "shape_prior_sd_bar": sd_bar,
-                         "shape_prior_off_grid": out_bar}
         self.opt.zero_grad(set_to_none=True)
         if self.cfg.posterior_prior == "wilson" and self.targets[0].wilson_coef_param is None:
             raise RuntimeError("the Wilson surface is trained with the network and needs a "
@@ -881,12 +687,11 @@ class AmortizedTrainer:
         loss.backward()
         # everything the record needs from the batch's forward tensors, then the
         # tensors themselves are released before the encoder's backward pass
-        loss_total, loss_finite = float(loss.item()), bool(torch.isfinite(loss.detach()))
+        loss_finite = bool(torch.isfinite(loss.detach()))
         n_crystals, n_floored = int(meta.crystal_id.unique().numel()), tgt.n_floored
         diag = (self._diagnostics(meta, pred, tgt, rows)
                 if self.step_i % self.cfg.log_every == 0 else {})
-        mix = kl = None
-        del meta, pred, tgt, nll, n_ph, bg, sigma, loss, mix, kl
+        del meta, pred, tgt, nll, n_ph, bg, sigma, loss
         if hasattr(self.scale, "encoder_backward"):
             self.scale.encoder_backward()
         gn = grad_norms(self.scale)
@@ -922,15 +727,13 @@ class AmortizedTrainer:
         rec = {
             "step": self.step_i,
             "phase": "train",
-            # What the optimiser actually minimised (penalty included).
-            "loss_total": loss_total,
-            # ``nll_per_obs`` is the DATA term in both train and held-out
-            # records, the penalty-free objective ``evaluate()`` writes under
-            # the same key.  ``loss_total`` includes the spread penalty
-            # (negative, since log w < 0), which can fall while the data term
-            # rises and would otherwise look like training progress.
+            # the same quantity ``evaluate()`` writes for the held-out set
             "nll_per_obs": nll_data,
             "nll_data": nll_data,
+            # Both are taken relative to the saturated Poisson model (see
+            # _forward); its own -log p per observation is this, so the full
+            # marginal NLL is nll_per_obs + nll_pedestal.
+            "nll_pedestal": pedestal,
             # Under ``loss="evidence"`` the numerator is a sum over
             # REFLECTIONS (-sum_h log Z_h) while the denominator counts
             # OBSERVATIONS, so "per obs" is only a scale convention -- and the
@@ -950,19 +753,14 @@ class AmortizedTrainer:
             "n_crystals": n_crystals,
             "n_used": n_used,
             "n_floored": n_floored,
-            "lam_spread": lam_s,
-            **shape_rec,
-            **tether_rec,
             "lr": float(self.opt.param_groups[0]["lr"]),
             "sec": time.time() - t0,
             # time this update waited for its observations to be read from disk
             "io_wait": io_wait,
             **gn,
+            **tether_rec,
         }
         if self.step_i % self.cfg.log_every == 0:
-            # No-penalty score on this same batch: the only training number
-            # that is comparable across the whole run.
-            rec["nll_canonical"] = self._canonical_nll(rows)
             rec.update(diag)
         self.step_i += 1
         self.logger.log(rec)
@@ -981,8 +779,6 @@ class AmortizedTrainer:
             # which is invisible in the total.
             "median_w": float(pred.log_w.exp().median().item()),
             "mean_log_w": float(pred.log_w.mean().item()),
-            "median_beta": float(pred.beta.median().item()),
-            "mean_log_alpha": float(pred.log_alpha.mean().item()),
             # F. is the width head doing anything?
             "var_frac_scatter": float(tgt.var_frac_scatter.median().item()),
             # The in-batch merge needs within-batch agreement: with n_hkl
@@ -1012,14 +808,6 @@ class AmortizedTrainer:
             # detached gradient is wrong, not merely unnecessary.
             out["posterior_edge_mass_med"] = float(em.median().item())
             out["posterior_edge_mass_max"] = float(em.max().item())
-        gm = getattr(self.objective, "last_grid_mass", None)
-        if gm is not None:
-            # Share of the scatter density actually inside the quadrature grid.
-            # Near 1 => the truncation correction is immaterial; well below 1
-            # => the scatter is wider than the grid can represent and the
-            # likelihood is only a density because we divided this out.
-            out["grid_mass_median"] = float(gm.median().item())
-            out["grid_mass_p01"] = float(_diagnostic_quantile(gm, 0.01).item())
         _m_, _n_, _b_, _s_ = self._batch(rows)
         ios = (_n_ - _b_) / _s_
         shell = self.shell_of_hkl.to(meta.hkl_idx.device)[meta.hkl_idx]
@@ -1038,32 +826,24 @@ class AmortizedTrainer:
             if int((dec == d).sum()) > 8 else float("nan")
             for d in range(10)
         ]
-        out["median_beta_by_isigma_decile"] = [
-            float(pred.beta[dec == d].median().item())
-            if int((dec == d).sum()) > 8 else float("nan")
-            for d in range(10)
-        ]
         out["var_frac_scatter_by_isigma_decile"] = [
             float(tgt.var_frac_scatter[dec == d].median().item())
             if int((dec == d).sum()) > 8 else float("nan")
             for d in range(10)
         ]
-        if pred.mix is not None:
-            from torchsx.merging.scatter.mixture import split_mix
-            from torchsx.merging.scatter.mixture import N_BLOCKS
-            K = pred.mix.shape[1] // N_BLOCKS
-            log_pi, offset, la_lo, la_hi, lb = split_mix(pred.mix.detach(), K)
-            out["mix_weight_median"] = [float(v) for v in log_pi.exp().median(dim=0).values]
-            out["mix_offset_median"] = [float(v) for v in offset.median(dim=0).values]
-            out["mix_alpha_lo_median"] = [float(v) for v in la_lo.exp().median(dim=0).values]
-            out["mix_alpha_hi_median"] = [float(v) for v in la_hi.exp().median(dim=0).values]
-            out["mix_beta_median"] = [float(v) for v in lb.exp().median(dim=0).values]
-            out["mix_log_e_s_median"] = float(pred.log_e_s.median().item())
-            out["mix_weight_median_by_isigma_decile"] = [
-                [float(v) for v in log_pi[dec == d].exp().median(dim=0).values]
-                if int((dec == d).sum()) > 8 else [float("nan")] * K
-                for d in range(10)
-            ]
+        from torchsx.merging.scatter.mixture import split_mix
+        K = self.scale.heads.n_components
+        log_pi, offset, la_lo, la_hi, _ = split_mix(pred.mix.detach(), K)
+        out["mix_weight_median"] = [float(v) for v in log_pi.exp().median(dim=0).values]
+        out["mix_offset_median"] = [float(v) for v in offset.median(dim=0).values]
+        out["mix_alpha_lo_median"] = [float(v) for v in la_lo.exp().median(dim=0).values]
+        out["mix_alpha_hi_median"] = [float(v) for v in la_hi.exp().median(dim=0).values]
+        out["mix_log_e_s_median"] = float(pred.log_e_s.median().item())
+        out["mix_weight_median_by_isigma_decile"] = [
+            [float(v) for v in log_pi[dec == d].exp().median(dim=0).values]
+            if int((dec == d).sum()) > 8 else [float("nan")] * K
+            for d in range(10)
+        ]
         out.update(scale_metrics(
             pred.log_K, meta.crystal_id, meta.n_crystals,
             features={
@@ -1101,13 +881,14 @@ class AmortizedTrainer:
         merge rather than learning.
         """
         self.scale.eval()
-        tot, n_tot, n_hkl, recs = 0.0, 0, 0, []
+        tot, ped, n_tot, n_hkl, recs = 0.0, 0.0, 0, 0, []
         for sel, rows in self._batches(
             self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
         ):
             meta, pred, tgt, nll, *_ = self._forward(rows, grad=False)
             n_used = int(tgt.valid.sum())
             tot += float(nll.item())
+            ped += float(self.last_pedestal)
             n_tot += n_used
             n_hkl += getattr(self, "last_n_hkl", 0)
             recs.append(
@@ -1117,6 +898,7 @@ class AmortizedTrainer:
         rec = {
             "step": self.step_i, "phase": phase,
             "nll_per_obs": tot / max(n_tot, 1),
+            "nll_pedestal": ped / max(n_tot, 1),
             # See step(): under loss="evidence" this is a reflection sum over an
             # observation count, so it is comparable along its own curve but not
             # against the training curve, which has a different multiplicity.
@@ -1212,12 +994,9 @@ class AmortizedTrainer:
                 "scale": {
                     "d_model": getattr(self.scale.encoder, "d_model", None),
                     "n_layers": getattr(self.scale.encoder, "n_layers", None),
-                    "include_hkl": bool(getattr(self.scale.features, "include_hkl", False)),
                     "self_features": list(getattr(self.scale.features, "self_features", ())),
                     "context_features": list(getattr(self.scale.features, "context_features", ())),
                     "crystal_features": list(getattr(self.scale.features, "crystal_features", ())),
-                    "predict_width": bool(getattr(self.scale.heads, "predict_width", True)),
-                    "predict_shape": bool(getattr(self.scale.heads, "predict_shape", True)),
                     "anchor_log_k": bool(getattr(self.scale, "anchor_log_k", True)),
                     "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
                     "tether": list(self.tether.names),
@@ -1231,11 +1010,7 @@ class AmortizedTrainer:
                 # scatter family and miss component, so a merge rebuilds the
                 # SAME likelihood the network was fitted under
                 "scatter": {
-                    "predict_skew": bool(getattr(self.scale.heads, "predict_skew", False)),
-                    "family": getattr(self.scale.heads, "scatter_family", "gengauss"),
-                    "n_components": int(getattr(self.scale.heads, "n_components", 1)),
-                    "component_shape": (self.scale.heads.mixture.shape
-                                        if getattr(self.scale.heads, "scatter_family", "gengauss") == "mixture" else None),
+                    "n_components": int(self.scale.heads.n_components),
                     "miss_logit": (None if getattr(self.objective, "miss_logit", None) is None
                                    else float((getattr(self, "_best_obj_state", None) or {}).get(
                                        "miss_logit", self.objective.miss_logit.detach()))),
@@ -1336,8 +1111,7 @@ class AmortizedTrainer:
         With ``tether_readout`` (posterior estimators, a reciprocal basis) it
         also carries ``tether``: every term of the sum-of-spots tether over all
         the merged observations (:meth:`~torchsx.merging.tether.Tether.readout`),
-        whichever terms the network was trained with; the response terms take
-        a second pass over the observations.
+        whichever terms the network was trained with.
         """
         if estimator not in ("posterior", "flat", "ml", "pooled", "mean", "wls"):
             raise ValueError(f"unknown estimator {estimator!r}")
@@ -1518,9 +1292,9 @@ class AmortizedTrainer:
         acc = torch.zeros(n_hkl, v_nodes.shape[1], device=dev)
         n_bad_acc = 0
         readout = tether_readout and self._tether_phi is not None
-        seen_obs = []                     # what the tether's readout needs of every observation
+        seen_obs = []                     # (log K, reflection, crystal) of every observation
         for _, rows in batches():
-            meta, n_ph, bg, sigma = self._batch(rows.to(dev))
+            meta, n_ph, bg, _ = self._batch(rows.to(dev))
             pred = self.scale.prime(meta)
             c = tgt.accumulate(
                 self.objective, self.scale.scatter, self.params, pred,
@@ -1532,11 +1306,22 @@ class AmortizedTrainer:
                 c = c.masked_fill(bad, 0.0)
             acc = acc + c
             if readout:
-                seen_obs.append((pred.log_K.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int(),
-                                 n_ph.float(), bg.float(), sigma.float()))
+                seen_obs.append((pred.log_K.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int()))
             self.scale.clear()
-        tether_rec = self._tether_readout(seen_obs, batches, tgt) if readout else None
-        del seen_obs
+        tether_rec = None
+        if readout:
+            from torchsx.merging.tether import TERMS, Tether, TetherBatch
+
+            if seen_obs:
+                lk, h, cid = (torch.cat(c) for c in zip(*seen_obs))
+            else:
+                lk = torch.zeros(0, device=dev)
+                h = cid = torch.zeros(0, dtype=torch.int32, device=dev)
+            del seen_obs
+            tether_rec = Tether(TERMS).readout(
+                TetherBatch(lk, h, cid, self.index.n_crystals, self._tether_phi),
+                d_spacing=self.prep.d_spacing)
+            del lk, h, cid
         _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
         log_c = self.scale.readout_log_factor(torch.arange(n_hkl, device=dev))
         if log_c is not None:
@@ -1587,176 +1372,6 @@ class AmortizedTrainer:
             result['wilson_sigma'] = tgt.wilson_sigma.detach().cpu().clone()
             result['centric'] = tgt.is_centric.detach().cpu().clone()
         return result
-
-    @torch.no_grad()
-    def _merge_set(self, crystals: Tensor) -> tuple[Tensor, Tensor]:
-        """Merge one crystal set with the current network.
-
-        Deliberately **no separate estimator**: whatever the training objective
-        merges with is what gets scored.  Otherwise CC1/2 measures a different
-        quantity from the one being minimised, and improving the loss need not
-        improve the metric.
-
-        That means accumulating the same coarse log-likelihood curve the loss
-        uses (additive over observations, hence over batches) and integrating
-        once.
-        """
-        n_hkl = self.prep.n_valid
-        if self.n_conditions > 1:
-            # A merge is a same-condition quantity; pin the target BEFORE
-            # reading it, since the last training batch may have been the
-            # other condition.
-            cb = self.condition[crystals.cpu()].unique()
-            if cb.numel() != 1:
-                raise ValueError(
-                    f"_merge_set: crystals span conditions {cb.tolist()}; "
-                    "merge one condition at a time"
-                )
-            self._cond = int(cb[0])
-        tgt = self.target
-        # Locate the peak on THIS crystal subset first.  A closed-form width
-        # here would collapse the merge onto the shared grid centre (per-shell
-        # CC1/2 a spurious 1).
-        start = tgt.start_centre()
-        scan = tgt.scan_grid(start)
-        acc_s = torch.zeros(n_hkl, scan.shape[1], device=self.device)
-        for _, r in self._batches(
-            self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
-        ):
-            r = r.to(self.device)
-            m, _n, _b, _ = self._batch(r)
-            pr = self.scale.prime(m)
-            acc_s = acc_s + tgt.accumulate(
-                self.objective, self.scale.scatter, self.params, pr,
-                _n, _b, m.hkl_idx, m, scan,
-            )
-            self.scale.clear()
-        c, sd = tgt.peak_from_scan(acc_s, start)
-        v_nodes = c[:, None] + sd[:, None] * tgt.u_coarse[None, :]
-        tgt._loc = (c, sd)
-        acc = torch.zeros(n_hkl, v_nodes.shape[1], device=self.device)
-        for _, rows in self._batches(
-            self.cfg.max_obs_per_batch, crystals=crystals, shuffle=False
-        ):
-            rows = rows.to(self.device)
-            meta, _nph, _bg, _sig = self._batch(rows)
-            pred = self.scale.prime(meta)
-            acc = acc + tgt.accumulate(
-                self.objective, self.scale.scatter, self.params, pred,
-                _nph, _bg, meta.hkl_idx, meta, v_nodes,
-            )
-            self.scale.clear()
-        _, I0, *_ = tgt.integrate(acc)
-        seen = (acc.abs().sum(1) > 0).float()
-        # (value, weight) so the caller's ratio form works unchanged
-        return I0 * seen, seen
-
-    @torch.no_grad()
-    def split_half_metrics(self, *, n_shells: int = 10, log: bool = True) -> dict:
-        """CC1/2 and R_split on TRAIN and VALIDATION crystals, matched in count.
-
-        Four merges of equal size: ``train_A/train_B`` and ``val_A/val_B``.
-        ``cc_half_train`` is merge quality on crystals the network has trained
-        on; ``cc_half_val`` is the same statistic on crystals it has never
-        seen, at identical multiplicity.  The gap between them is the
-        generalisation of the *scale model* — a per-crystal G has no such gap
-        by construction, because it is refit for every crystal.
-
-        Computed on **intensities**, not amplitudes, so the numbers are not
-        directly comparable to an amplitude CC1/2.  The baseline that
-        counts is the same-data, same-protocol unity merge.
-        """
-        from torchsx.merging.hkl.stats import (
-            MatchedHalves, cc_half, cc_star, r_split, shell_stats,
-        )
-
-        was_training = self.scale.training
-        self.scale.eval()
-        merged = {k: self._merge_set(v) for k, v in self.merge_sets.items()}
-        # CC1/2 on INTENSITIES, not amplitudes.  ``I.clamp(min=0).sqrt()``
-        # sends every negative merged intensity to exactly 0, and identical
-        # values in both halves read to Pearson as perfect agreement.
-        # Intensities are the honest choice: negatives are real measurements
-        # and must be allowed to disagree.
-
-        def _pair(a: str, b: str) -> tuple[MatchedHalves, Tensor]:
-            (na, da), (nb, db) = merged[a], merged[b]
-            ok = (da > 0) & (db > 0)
-            Ia = torch.where(da > 0, na / da.clamp(min=1e-30), torch.zeros_like(na))
-            Ib = torch.where(db > 0, nb / db.clamp(min=1e-30), torch.zeros_like(nb))
-            return MatchedHalves(
-                F1=Ia[ok].cpu(), F2=Ib[ok].cpu(),
-                # per-reflection and host-resident under stream_batches, so
-                # index with a host mask rather than the device one
-                d_spacing=self.prep.d_spacing[ok.cpu()].cpu(),
-                hkl=self.prep.hkl_valid[ok.cpu()].cpu(),
-            ), ok
-
-        rec = {
-            "step": self.step_i, "phase": "split_half",
-            "n_merge_crystals": int(self.n_merge_crystals),
-        }
-        for tag, (a, b) in {
-            "train": ("train_A", "train_B"),
-            "val": ("val_A", "val_B"),
-            "full": ("full_A", "full_B"),
-            "rep": ("rep_A", "rep_B"),
-        }.items():
-            m, ok = _pair(a, b)
-            cc = cc_half(m)
-            rec[f"cc_half_{tag}"] = cc
-            rec[f"cc_star_{tag}"] = cc_star(cc)
-            rec[f"r_split_{tag}"] = r_split(m)
-            rec[f"n_matched_{tag}"] = int(ok.sum())
-            if tag in ("val", "full"):
-                sh = shell_stats(m, n_shells=n_shells)
-                # Per tag, not shared.  Shells are quantiles of d over the
-                # MATCHED reflections and ``ok`` differs between the pairings,
-                # so a single ``shell_d_min`` key was whichever tag ran last
-                # (``full``) while ``shell_cc_half_val`` was still printed
-                # against it -- the val shells carried the full-merge
-                # boundaries.
-                rec[f"shell_d_min_{tag}"] = [x.d_min for x in sh]
-                rec[f"shell_cc_half_{tag}"] = [x.cc_half for x in sh]
-                if tag == "full":
-                    rec["shell_d_min"] = rec["shell_d_min_full"]  # back-compat
-        rec["cc_half_gap"] = rec["cc_half_train"] - rec["cc_half_val"]
-        # |full - rep| is two independent splits of identical data, so it is a
-        # direct read on the statistic's own scatter -- the floor below which
-        # differences between runs mean nothing.
-        rec["cc_half_split_scatter"] = abs(rec["cc_half_full"] - rec["cc_half_rep"])
-        if log:
-            self.logger.log(rec)
-        if was_training:
-            self.scale.train()
-        return rec
-
-    @torch.no_grad()
-    def audit(self, rows: Tensor) -> dict:
-        """Per-epoch leakage battery.  Run before trusting any headline number."""
-        self.scale.eval()
-        meta, _, _, _ = self._batch(rows)
-        rec = {
-            "step": self.step_i,
-            "phase": "audit",
-            # D. a scale that depends on hkl is degenerate with I0 and is the
-            # one channel that can manufacture a difference peak.
-            "hkl_permutation_frac": hkl_permutation_sensitivity(self.scale, meta),
-            # the same test on the predicted width and mixture shape
-            "hkl_permutation_frac_shape": hkl_permutation_sensitivity_shape(self.scale, meta),
-        }
-        frac = max(rec["hkl_permutation_frac"], rec["hkl_permutation_frac_shape"])
-        if frac == frac and frac > self.cfg.hkl_permutation_warn:
-            warnings.warn(
-                f"hkl-permutation sensitivity {frac:.3f} exceeds "
-                f"{self.cfg.hkl_permutation_warn}: the scale is becoming a "
-                f"function of hkl, which is degenerate with I0 and is the one "
-                f"channel that can manufacture a difference peak. Drop hkl from "
-                f"the features before any light/dark work.",
-                RuntimeWarning, stacklevel=2,
-            )
-        self.logger.log(rec)
-        return rec
 
     # ── driver ─────────────────────────────────────────────────────────
 
@@ -1810,40 +1425,8 @@ class AmortizedTrainer:
             info[f"wilson_aniso_{i}"] = float(coef[b.degree + 1 + i])
         return info
 
-    def run(self) -> None:
-        for epoch in range(self.cfg.epochs):
-            for _, rows in self._batches(
-                self.cfg.max_obs_per_batch,
-                generator=self.gen,
-                crystals=self.train_crystals,
-            ):
-                self.step(rows.to(self.device))
-            if self.heldout_crystals.numel():
-                self.evaluate(self.heldout_crystals)
-            if self.cfg.train_eval_crystals > 0:
-                self.evaluate(
-                    self.train_crystals[: self.cfg.train_eval_crystals],
-                    phase="train_eval",
-                )
-            probe = self.index.rows(self.train_crystals[:256])
-            self.audit(probe.to(self.device))
-            self.save_best()
-            if (
-                self.cfg.split_half_every > 0
-                and (epoch + 1) % self.cfg.split_half_every == 0
-            ):
-                sh = self.split_half_metrics()
-                print(
-                    f"    [merge] ep {epoch}  "
-                    f"train CC1/2={sh['cc_half_train']:.4f} Rsplit={sh['r_split_train']:.4f} | "
-                    f"val CC1/2={sh['cc_half_val']:.4f} Rsplit={sh['r_split_val']:.4f} | "
-                    f"gap={sh['cc_half_gap']:+.4f}  ({sh['n_merge_crystals']:,} xtals each)",
-                    flush=True,
-                )
-
     def close(self) -> None:
-        """Close the metric sink.  ``run()`` deliberately does not — callers
-        routinely keep auditing and evaluating after training finishes."""
+        """Close the metric sink."""
         self.logger.close()
 
 

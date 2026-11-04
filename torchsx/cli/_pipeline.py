@@ -675,12 +675,6 @@ def tether_summary(rec: dict) -> str:
         parts.append(f"gauge RMS {g['rms']:.4f} nats"
                      + (" (by shell, low to high resolution: "
                         + " ".join(f"{s['mean']:+.3f}" for s in g["by_shell"]) + ")" if g.get("by_shell") else ""))
-    s = rec.get("strength")
-    if s:
-        parts.append(f"strength slope of K {s['value']:+.4f}")
-    r = rec.get("response")
-    if r and r.get("kappa") is not None:
-        parts.append(f"response slope {r['kappa']:+.4f} over {r['n_groups']:,} groups")
     return f"sum-of-spots tether over {rec['n_obs']:,} observations: " + "; ".join(parts)
 
 
@@ -737,23 +731,21 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 # ── model stack ────────────────────────────────────────────────────────
 
 
-#: The production configuration of a new run.  ``skew``: two-width scatter.
-#: ``peer_attention=2``: two full-width cross-attention layers from each
-#: observation onto the other observations of its crystal.  A checkpoint's own
-#: record overrides these in a merge.
+#: The production configuration of a new run.  ``peer_attention=2``: two
+#: full-width cross-attention layers from each observation onto the other
+#: observations of its crystal.  The heads take their defaults from
+#: :class:`~torchsx.nn.heads.ScaleHeads`.  A checkpoint's own record replaces
+#: these in a merge.
 DEFAULTS = dict(
-    d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
-    beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
-    obs_self_layers=2, peer_attention=2, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
+    d_model=128, n_layers=5, context_folds=2, obs_context_layers=2,
+    obs_self_layers=2, peer_attention=2, peer_heads=8, miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_degree=4, gauge_anchor="basis",
-    scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
     # --encoder fold: K masked runs per crystal, context self-attention, per-reflection queries,
     # each run's geometry refined
     encoder="fold", fold_folds=5, ctx_layers=2, query_layers=1, refine_geometry=True,
     # the sum-of-spots tether's terms (torchsx.merging.tether); with "gauge" the scale pins
-    # the scalar gauge only and the tether holds the smooth one.  "strength" and "response"
-    # are available through --tether
+    # the scalar gauge only and the tether holds the smooth one
     tether=("gauge",),
 )
 
@@ -946,77 +938,67 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     ck = ckpt or {}
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     prep = bundle.prep  # Host residency bounds device memory independently of dataset size.
-    # The predicted scatter families carry every per-observation shape parameter;
+    # The predicted scatter carries every per-observation shape parameter;
     # there are no per-HKL parameters to fit, so the objective's ``params`` slot
     # is empty.
     params = None
 
-    enc = dict(ck.get("encoder") or {})
-    sc = dict(ck.get("scale") or {})
-    scat = dict(ck.get("scatter") or {})
-    skew = bool(scat.get("predict_skew", DEFAULTS["skew"]) if scat
-                else DEFAULTS["skew"])
-    w_init = sc.get("w_init", DEFAULTS["w_init"])
-    # scatter family: the checkpoint's own family wins over the defaults (a
-    # checkpoint written before the key existed is the single family)
-    scatter_family = scat.get("family", "gengauss") if ck else DEFAULTS["scatter_family"]
-    n_components = int(scat.get("n_components") or DEFAULTS["scatter_components"])
-    scatter_shape = str(scat.get("component_shape") or ("shared" if ck else DEFAULTS["scatter_shape"]))
-    beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
-    # feature tiers: a checkpoint's record wins, else what the prepared data carries
+    # A checkpoint's record decides the model; a new run takes DEFAULTS and the flags.
+    enc = ck.get("encoder") or {}
+    sc = ck.get("scale") or {}
+    scat = ck.get("scatter") or {}
+
+    def rec(section: dict, key: str):
+        if key not in section:
+            raise SystemExit(f"checkpoint does not record {key!r}; it was written by another "
+                             "version of torchsx. Retrain it.")
+        return section[key]
+
     from torchsx.merging.observations import DEFAULT_CRYSTAL_FEATURES, PROBIXI_CRYSTAL_FEATURES
     from torchsx.nn.obs_features import DISK_FEATURE, SELF_FEATURES
-    context_features = None
     if ck:
-        self_features = tuple(sc["self_features"]) if sc.get("self_features") else None
-        context_features = tuple(sc["context_features"]) if sc.get("context_features") else None
-        crystal_features = tuple(sc["crystal_features"]) if sc.get("crystal_features") else None
+        kw = dict(
+            d_model=rec(enc, "d_model"), n_layers=rec(enc, "n_layers"),
+            context_folds=rec(enc, "context_folds"),
+            obs_context_layers=rec(enc, "obs_context_layers"),
+            obs_self_layers=rec(enc, "obs_self_layers"),
+            peer_attention_layers=rec(enc, "peer_attention_layers"),
+            peer_heads=rec(enc, "peer_heads"), peer_dim=rec(enc, "peer_dim") or None,
+            n_components=int(rec(scat, "n_components")),
+            anchor_log_k=bool(rec(sc, "anchor_log_k")), anchor_stat=rec(sc, "anchor_stat"),
+            self_features=tuple(rec(sc, "self_features")),
+            context_features=tuple(rec(sc, "context_features")),
+            crystal_features=tuple(rec(sc, "crystal_features")),
+        )
     else:
         recorded = bundle.recipe.get("disk_size") == "recorded"
-        self_features = SELF_FEATURES + ((DISK_FEATURE,) if recorded else ())
         producer = ((bundle.recipe.get("measurement") or {}).get("source") or {}).get("producer")
-        crystal_features = (DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
-                            if producer == "probixi" else None)
-    # encoder: a checkpoint's record wins (no kind = Deep Sets), else --encoder
-    encoder = (enc.get("kind") or "deepsets") if ck else (getattr(args, "encoder", None) or DEFAULTS["encoder"])
-    kw = dict(
-        d_model=enc.get("d_model") or sc.get("d_model") or getattr(args, "d_model", None) or DEFAULTS["d_model"],
-        n_layers=enc.get("n_layers") or sc.get("n_layers") or getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
-        include_hkl=bool(sc.get("include_hkl", DEFAULTS["include_hkl"])),
-        predict_shape=bool(sc.get("predict_shape", DEFAULTS["predict_shape"])),
-        beta_init=beta_init, w_init=w_init,
-        context_folds=enc.get("context_folds", DEFAULTS["context_folds"] if getattr(args, "context_folds", None) is None
-                              else int(args.context_folds)),
-        obs_context_layers=enc.get("obs_context_layers", DEFAULTS["obs_context_layers"]),
-        obs_self_layers=enc.get("obs_self_layers", DEFAULTS["obs_self_layers"]),
-        # a checkpoint's own record wins; a checkpoint written before the key
-        # existed has no attention blocks
-        peer_attention_layers=(enc.get("peer_attention_layers") or 0) if ck else _peer_layers(args),
-        # heads are 8 wide (or at most DEFAULTS["peer_heads"] of them) at any attention width
-        peer_dim=(enc.get("peer_dim") or None) if ck else _peer_dims(args),
-        peer_heads=(enc.get("peer_heads") or DEFAULTS["peer_heads"]) if ck else
-                   (DEFAULTS["peer_heads"] if isinstance(_peer_dims(args), list) else
-                    min(DEFAULTS["peer_heads"], max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
-        scatter_family=scatter_family, n_components=n_components,
-        component_shape=scatter_shape,
-    )
-    # A checkpoint's own head geometry wins over the defaults: rebuilding it
-    # with different heads would fail the state_dict load, or load a subset.
-    kw.update(
-        predict_width=bool(sc.get("predict_width", True)),
-        anchor_log_k=bool(sc.get("anchor_log_k", True)),
-        anchor_stat=sc.get("anchor_stat",
-                            "median" if ck else
-                            ("median" if "gauge" in tether_terms(args) else DEFAULTS["gauge_anchor"])),
-        predict_skew=bool(skew),
-        self_features=self_features, context_features=context_features,
-        crystal_features=crystal_features,
-    )
+        kw = dict(
+            d_model=getattr(args, "d_model", None) or DEFAULTS["d_model"],
+            n_layers=getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
+            context_folds=(DEFAULTS["context_folds"] if getattr(args, "context_folds", None) is None
+                           else int(args.context_folds)),
+            obs_context_layers=DEFAULTS["obs_context_layers"],
+            obs_self_layers=DEFAULTS["obs_self_layers"],
+            peer_attention_layers=_peer_layers(args),
+            peer_dim=_peer_dims(args),
+            # heads are 8 wide (or at most DEFAULTS["peer_heads"] of them) at any attention width
+            peer_heads=(DEFAULTS["peer_heads"] if isinstance(_peer_dims(args), list) else
+                        min(DEFAULTS["peer_heads"],
+                            max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
+            anchor_stat="median" if "gauge" in tether_terms(args) else DEFAULTS["gauge_anchor"],
+            self_features=SELF_FEATURES + ((DISK_FEATURE,) if recorded else ()),
+            crystal_features=(DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
+                              if producer == "probixi" else None),
+        )
+    # encoder: the checkpoint's record (no kind = Deep Sets), else --encoder
+    encoder = ((rec(enc, "kind") or "deepsets") if ck
+               else (getattr(args, "encoder", None) or DEFAULTS["encoder"]))
     if encoder == "fold":
         if ck:
-            fold = {k: int(enc[k]) for k in ("context_folds", "ctx_layers", "query_layers")}
-            fold["peer_heads"] = int(enc["n_heads"])
-            fold["refine_geometry"] = bool(enc.get("refine_geometry", False))
+            fold = {k: int(rec(enc, k)) for k in ("context_folds", "ctx_layers", "query_layers")}
+            fold["peer_heads"] = int(rec(enc, "n_heads"))
+            fold["refine_geometry"] = bool(rec(enc, "refine_geometry"))
         else:
             def flag(name, default):
                 v = getattr(args, name, None)
@@ -1049,14 +1031,13 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
                          "support SplitLogGrid checkpoints only")
     if ck:
-        # a checkpoint decides: its miss logit is restored below, None means off
-        miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
-                else (0.5 if scat.get("miss_logit") is not None else 0.0))
+        # the checkpoint's miss logit is restored below; None means off
+        miss = 0.5 if rec(scat, "miss_logit") is not None else 0.0
     else:
         miss = (getattr(args, "miss_frac", None) if getattr(args, "miss_frac", None) is not None
                 else DEFAULTS["miss"])
     if ck:
-        outlier = 0.5 if scat.get("outlier_logit") is not None else 0.0
+        outlier = 0.5 if rec(scat, "outlier_logit") is not None else 0.0
     else:
         outlier = (getattr(args, "outlier_frac", None) if getattr(args, "outlier_frac", None) is not None
                    else DEFAULTS["outlier"])
@@ -1141,9 +1122,9 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         prior=prior,
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
-        skew=bool(skew), miss=float(miss), outlier=float(outlier), detector_noise=noise_mode or "off",
+        miss=float(miss), outlier=float(outlier), detector_noise=noise_mode or "off",
         wilson_degree=wilson_degree, basis=basis,
-        scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
+        scatter_components=int(scale.heads.n_components),
     )
     if verbose:
         print(f"intensity prior: {prior}"
@@ -1154,8 +1135,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                   "the missed-spot component prevents an unbounded flat posterior. "
                   "Check edge mass and integration-range sensitivity.", flush=True)
         print(f"stack: amortised scale, "
-              f"{'two-width' if skew else 'symmetric'} "
-              f"{f'{n_components}-component {scatter_shape}-shape mixture ' if scatter_family == 'mixture' else ''}scatter, "
+              f"{scale.heads.n_components}-component Gaussian mixture scatter, "
               f"miss {miss:.3f}, " + (f"outlier {outlier:.4f}, " if outlier else "")
               + f"SplitLogGrid({n_points}), "
               f"outer {settings['k_coarse']}/{settings['m_fine']} "

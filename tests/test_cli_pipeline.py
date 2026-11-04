@@ -23,30 +23,22 @@ from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.scale import AmortizedScale
-from torchsx.nn.heads import ScaleHeads
 from torchsx.nn.objective import MarginalNLL
 from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
 from tests.test_amortized_training import _synthetic
 
 
-def _stack(prep, params, tmp_path, *, skew=True, n_cond=1):
-    kw = dict(d_model=32, n_layers=2, include_hkl=False, predict_shape=False,
-              beta_init=1.0, w_init=1.65, predict_skew=skew)
-    scale = AmortizedScale.from_prep(prep, **kw)
+def _stack(prep, params, tmp_path, *, n_cond=1):
+    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
     cfg = TrainConfig(
-        max_obs_per_batch=6000, epochs=0, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
+        max_obs_per_batch=6000, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
         posterior_prior="wilson",
         posterior_k_coarse=15, posterior_m_fine=65, posterior_n_sigma=8.0,
         device="cpu", outdir=str(tmp_path),
     )
     return scale, obj, AmortizedTrainer(prep, scale, obj, params, config=cfg)
-
-
-def test_default_heads_are_unchanged():
-    h = ScaleHeads(8)
-    assert h(torch.zeros(3, 8)).log_alpha_hi is None
 
 
 # ── merge() ────────────────────────────────────────────────────────────
@@ -86,10 +78,9 @@ def _inline_merge(tr, scale, obj, params, prep):
     return F, F_sd, I0, edge
 
 
-@pytest.mark.parametrize("skew", [False, True])
-def test_merge_matches_the_inline_bench_loop(tmp_path, skew):
+def test_merge_matches_the_inline_bench_loop(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
-    scale, obj, tr = _stack(prep, params, tmp_path, skew=skew)
+    scale, obj, tr = _stack(prep, params, tmp_path)
     scale.eval()
     # One locating window, because that is what the inline loop does.  The
     # shipped default refines over three (see
@@ -170,16 +161,15 @@ def test_merge_refuses_to_pool_splits_and_honours_one(tmp_path):
 
 def test_checkpoint_carries_the_recipe(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
-    scale, _obj, tr = _stack(prep, params, tmp_path, skew=True)
+    scale, _obj, tr = _stack(prep, params, tmp_path)
     tr.data_recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0,
                       "radii": [7.0, 9.0, 11.0]}
     tr.split_names = ["dark"]
     ck = torch.load(tr.save_best(tmp_path / "best.pt"), weights_only=False)
     assert ck["data"]["radii"] == [7.0, 9.0, 11.0]
     assert ck["likelihood"]["bg_var_factor"] == pytest.approx(0.1)
-    assert ck["scatter"]["predict_skew"]
+    assert ck["scatter"]["n_components"] == scale.heads.n_components == 4
     assert ck["quadrature"] == {"kind": "SplitLogGrid", "n_points": 64}
-    assert ck["scale"]["predict_shape"] is False
     for tier in ("self_features", "context_features", "crystal_features"):
         assert ck["scale"][tier] == list(getattr(scale.features, tier)), tier
     assert ck["splits"] == ["dark"]
@@ -546,7 +536,7 @@ def test_merge_survives_a_non_finite_batch(tmp_path):
 
 def _trainer_from_stack(prep, params, scale, obj, S):
     cfg = TrainConfig(
-        epochs=0, posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
+        posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
         posterior_k_coarse=9, posterior_m_fine=33, device="cpu", heldout_frac=0.1,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
@@ -557,8 +547,8 @@ def _trainer_from_stack(prep, params, scale, obj, S):
 @pytest.mark.parametrize("flags,anchor", [([], "median"), (["--tether", "none"], "basis")])
 def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path, flags, anchor):
     """best.pt records the Wilson surface and the anchor (the scalar gauge with the
-    tether, the basis projection without it); merge_nn rebuilds the stack without
-    flags, evaluates the same surface and reproduces the predictions."""
+    tether's gauge term, the basis projection without it); merge_nn rebuilds the stack
+    without flags, evaluates the same surface and reproduces the predictions."""
     from torchsx.cli import _pipeline as P
     from torchsx.cli.merge_nn import _build_parser as merge_parser, restore_wilson_surface
     from torchsx.cli.train import _build_parser as train_parser

@@ -3,7 +3,7 @@
 The model an observation's intensity is drawn from, in the order the code
 composes it::
 
-    ScaleModel x ScatterModel -> Quadrature -> DetectionLikelihood
+    AmortizedScale x ScatterModel -> Quadrature -> DetectionLikelihood
 
 Each layer is an ``nn.Module`` behind a narrow abstract base.  The latent
 per-reflection intensity is integrated out by the quadrature rather than

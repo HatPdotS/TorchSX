@@ -6,12 +6,15 @@ Two tiers, and the split is load-bearing:
 ``self`` features
     What the scale head sees for the observation it is scaling.  Smooth
     diffraction geometry only.  An observation's own intensity is **forbidden**
-    here — with it, ``K_j = I_j / I0_h`` fits perfectly and means nothing.
+    here — with it, ``K_j = I_j / I0_h`` fits perfectly and means nothing.  So
+    are its Miller indices: a scale that depends on the reflection's identity
+    is degenerate with ``I0`` (``K(h) I0(h)``), and it is the one channel that
+    can manufacture a difference peak.
 
 ``context`` features
-    What goes into the pooled branch.  May include intensity and σ, because
-    :func:`~torchsx.nn.pooling.leave_one_out_mean` removes observation ``j``
-    from its own context before it is used.
+    What the observation's peers contribute.  May include intensity and σ,
+    because the encoder keeps every observation's own measurement out of its
+    own embedding.
 
     The peers are not a fallback for missing geometry — they are a **better
     measurement than ``j``'s own geometry can be**.  Reflection ``j``'s
@@ -86,13 +89,12 @@ SELF_FEATURES: tuple[str, ...] = (
     "crystal_res",     # per-crystal diffraction limit (crystal quality)
     "fs", "ss",        # detector position (absorption, geometry)
     "panel",           # detector panel
-    "h", "k", "l",     # Miller indices — see the permutation monitor
 )
 
 #: Recorded disk pixel count; constant, hence dropped, under nominal disks.
 DISK_FEATURE: str = "disk_pix"
 
-#: Measurement channels, legitimate ONLY in the leave-one-out pooled branch.
+#: Measurement channels: context only, never features of the observation being scaled.
 CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
     "signed_log_I",    # sign(I)·log1p(|I|) — keeps the negatives
     "log_sigma",
@@ -128,8 +130,7 @@ CONDITION_FEATURES: frozenset[str] = frozenset(
 class ObsFeatureSpec(nn.Module):
     """Builds ``(x_self, x_ctx)`` from an ``ObsInfo`` slice or gather.
 
-    Raw per-observation channels (``I``, ``bg``, ``sigma``) and the Miller table
-    are held as buffers and addressed by ``meta.obs_id``, so this works
+    Raw per-observation channels (``I``, ``bg``, ``sigma``) are held as buffers and addressed by ``meta.obs_id``, so this works
     identically under a contiguous ``ObsInfo.slice`` and an arbitrary
     crystal-batched ``ObsInfo.gather``.
 
@@ -144,13 +145,9 @@ class ObsFeatureSpec(nn.Module):
         *,
         self_features: tuple[str, ...] = SELF_FEATURES,
         context_features: tuple[str, ...] | None = None,
-        include_hkl: bool = True,
         crystal_features: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__()
-        #: Recorded so a checkpoint can say which feature set it was fitted
-        #: under; the flag itself is consumed a few lines below.
-        self.include_hkl = bool(include_hkl)
         #: Optional reflection-dependent profile (installed by
         #: :meth:`~torchsx.merging.scale.AmortizedScale.install_pseudo_translation`):
         #: the Ewald offset is read in units of the reflection's own core width,
@@ -161,11 +158,6 @@ class ObsFeatureSpec(nn.Module):
 
         if context_features is None:
             context_features = tuple(self_features) + CONTEXT_ONLY_FEATURES
-        if not include_hkl:
-            self_features = tuple(f for f in self_features if f not in ("h", "k", "l"))
-            context_features = tuple(
-                f for f in context_features if f not in ("h", "k", "l")
-            )
 
         leaks = FORBIDDEN_IN_SELF.intersection(self_features)
         if leaks:
@@ -233,7 +225,6 @@ class ObsFeatureSpec(nn.Module):
         self.register_buffer("_I", I, persistent=False)
         self.register_buffer("_bg", bg, persistent=False)
         self.register_buffer("_sigma", sigma.clamp(min=1e-6), persistent=False)
-        self.register_buffer("_hkl", prep.hkl_valid.float(), persistent=False)
         self.has_supplied_sigma = (oi.has_sigma if self._store is not None
                                    else oi.sigma is not None)
         # The per-reflection context channels are fixed by the data alone and
@@ -404,8 +395,6 @@ class ObsFeatureSpec(nn.Module):
                     meta.panel_id.float() if meta.panel_id is not None
                     else torch.zeros_like(meta.s_sq)
                 )
-            elif k in ("h", "k", "l"):
-                out[k] = self._hkl[meta.hkl_idx, "hkl".index(k)]
             elif k == "signed_log_I":
                 out[k] = torch.sign(I) * torch.log1p(I.abs())
             elif k == "log_sigma":

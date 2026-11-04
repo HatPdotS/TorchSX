@@ -440,7 +440,6 @@ class PosteriorMergeTarget(nn.Module):
     def accumulate(
         self, objective, scatter, params, pred,
         n_ph: Tensor, bg: Tensor, hkl_id: Tensor, meta, v_nodes: Tensor,
-        n_rows: int | None = None,
     ) -> Tensor:
         """Coarse log-likelihood curve summed over observations: ``(n_hkl, K)``.
 
@@ -451,12 +450,7 @@ class PosteriorMergeTarget(nn.Module):
         a merge over an arbitrary crystal subset reuse this directly instead of
         reimplementing an estimator.  Accumulate ``S`` across batches, then call
         :meth:`integrate` once.
-
-        ``n_rows`` sums into that many rows instead of one per reflection:
-        ``hkl_id`` and ``v_nodes`` then index groups of observations, such as a
-        reflection's observations from each half of the crystals.
         """
-        rows = self.n_hkl if n_rows is None else int(n_rows)
         base = pred.log_K - pred.log_e_s
         # Learned detector noise: per-panel (A, B, C), gathered once per batch and
         # grad mode by the objective (the node loop below reads the same terms).
@@ -472,7 +466,7 @@ class PosteriorMergeTarget(nn.Module):
             olog = getattr(objective, "outlier_logit", None)
             return posterior_node_sums(
                 base, scatter.mixture_obs(meta), objective.miss_logit, v_nodes, hkl_id,
-                n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=rows, outlier_logit=olog,
+                n_ph, p, q.n_points, sig_b2=sig_b2, n_hkl=self.n_hkl, outlier_logit=olog,
                 log_out=objective.log_outlier(n_ph, bg) if olog is not None else None,
                 noise=noise,
             )
@@ -531,7 +525,7 @@ class PosteriorMergeTarget(nn.Module):
                     base.contiguous(), n_ph, bg, la, lb, hkl_id, v_nodes,
                     q.log_S_grid, q._trap_log_w(q.log_S_grid, q.n_points),
                 )
-                out = base.new_zeros(rows, v_nodes.shape[1])
+                out = base.new_zeros(self.n_hkl, v_nodes.shape[1])
                 return out.index_add(0, hkl_id, lp)
 
         cols = []
@@ -558,7 +552,7 @@ class PosteriorMergeTarget(nn.Module):
             else:
                 v_c = v_nodes[:, c].index_select(0, hkl_id)
                 f = objective.log_prob(scatter, params, v_c + base, n_ph, bg, meta)
-            cols.append(group_sum(f, hkl_id, rows))
+            cols.append(group_sum(f, hkl_id, self.n_hkl))
         return torch.stack(cols, dim=1)
 
     def integrate(
