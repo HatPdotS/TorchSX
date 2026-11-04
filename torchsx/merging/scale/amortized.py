@@ -129,15 +129,18 @@ class AmortizedScale(nn.Module):
         ctx_layers: int = 2,
         query_layers: int = 1,
         refine_geometry: bool = False,
+        phase_classes=None,
     ) -> "AmortizedScale":
         """``encoder="fold"`` builds :class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`
         with ``context_folds`` folds, ``ctx_layers`` / ``query_layers`` blocks,
         ``refine_geometry`` and ``peer_heads`` heads; the Deep Sets arguments are
-        then unused."""
+        then unused.  ``phase_classes``
+        (:class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses`) adds the
+        reflections' phase cosines to the self features."""
         # None keeps each tier's default; a checkpoint passes its recorded tiers
         features = ObsFeatureSpec(
             prep, context_features=context_features,
-            crystal_features=crystal_features,
+            crystal_features=crystal_features, phase_classes=phase_classes,
             **({} if self_features is None else {"self_features": tuple(self_features)}),
         )
         if encoder not in ("deepsets", "fold"):

@@ -109,6 +109,11 @@ def _build_parser():
     # and the modulation of the mean intensity by h.t, fitted to the data's plain means before
     # training (torchsx.merging.priors.modulation); auto, or off (default).
     p.add_argument("--structured-prior", choices=("off", "auto"), default="off", help=argparse.SUPPRESS)
+    # The scale model reads each reflection's pseudo-translation phase cosines, and the tether's
+    # phase term holds the rocking-curve integral of every class of them at the sum of its spots
+    # (torchsx.merging.scale.pseudo_translation.PhaseClasses); auto, or off (default).  Needs the
+    # tether.
+    p.add_argument("--phase-classes", choices=("off", "auto"), default="off", help=argparse.SUPPRESS)
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
@@ -232,6 +237,21 @@ def install_pseudo_translation(scale, prep, spacegroup, used, why) -> None:
     print(f"pseudo-translation: reflection profiles from {why}", flush=True)
 
 
+def install_phase_classes(prep, spacegroup, used, why):
+    """The pseudo-translation classes of the ``used`` translations
+    (:class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses`), or None without any."""
+    from torchsx.merging.scale.pseudo_translation import PhaseClasses
+    if not used:
+        print(f"phase classes: {why}; no phase features", flush=True)
+        return None
+    classes = PhaseClasses.from_prep(prep, [p["t"] for p in used], spacegroup)
+    cells = np.bincount(classes.cells(prep.hkl_valid.long().cpu().numpy()), minlength=classes.n_cells)
+    print(f"phase classes: features phase_c0..{classes.n_translations - 1} from {why}; tether phase term "
+          f"over {classes.n_cells} cells x T0..T{classes.degree} in resolution "
+          f"(reflections per cell {int(cells.min())}..{int(cells.max())})", flush=True)
+    return classes
+
+
 def install_structured_prior(tr, prep, spacegroup, used) -> None:
     """Give the Wilson prior the symmetry factor and the modulation of the mean intensity by the
     ``used`` translations (:mod:`torchsx.merging.priors.modulation`)."""
@@ -322,10 +342,17 @@ def main(argv=None):
         args.split = list(args.split) + [f"heldout={args.heldout_stream}"]
     bundle = P.load_prep(args)
     heldout_ids = attach_heldout_stream(bundle) if args.heldout_stream is not None else None
-    prep, params, scale, obj, settings = P.build_stack(bundle, args)
     used, why = ([], "")
-    if "auto" in (args.pseudo_translation, args.structured_prior):
-        used, why = find_used_translations(prep, bundle.spacegroup)
+    if "auto" in (args.pseudo_translation, args.structured_prior, args.phase_classes):
+        used, why = find_used_translations(bundle.prep, bundle.spacegroup)
+    classes, tether = None, P.tether_terms(args)
+    if args.phase_classes == "auto":
+        if not tether:
+            raise SystemExit("--phase-classes needs the tether: its phase term holds the classes' brightness")
+        classes = install_phase_classes(bundle.prep, bundle.spacegroup, used, why)
+        if classes is not None:
+            tether = tuple(tether) + ("phase",)
+    prep, params, scale, obj, settings = P.build_stack(bundle, args, phase_classes=classes)
     if args.pseudo_translation == "auto":
         install_pseudo_translation(scale, prep, bundle.spacegroup, used, why)
     n_states = max(1, len(bundle.split_names))
@@ -343,11 +370,13 @@ def main(argv=None):
         device=settings["device"], outdir=str(args.out), seed=args.seed,
         heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),
         noise_lr_mult=args.noise_lr_mult,
-        tether=P.tether_terms(args), lam_tether=args.tether_weight,
+        tether=tether, lam_tether=args.tether_weight,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     try:
         tr.set_reciprocal_basis(settings["basis"])
+        if classes is not None:
+            tr.set_phase_classes(classes)
         if args.structured_prior == "auto":
             if used:
                 install_structured_prior(tr, prep, bundle.spacegroup, used)

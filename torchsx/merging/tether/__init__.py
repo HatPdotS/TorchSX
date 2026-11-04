@@ -17,7 +17,8 @@ every term is where the counts put it.  Each direction is a term
 (:mod:`~torchsx.merging.tether.terms`): the arithmetic mean of ``K`` carries no
 trend along the term's columns (:mod:`~torchsx.merging.tether.kmean`).  The
 smooth reciprocal basis is the gauge term, which pins the rocking-curve integral
-at every resolution and in every direction.  The quantities the terms share are
+at every resolution and in every direction; the pseudo-translation classes are
+the phase term, which pins it in every family of reflections.  The quantities the terms share are
 built once per batch (:class:`~torchsx.merging.tether.batch.TetherBatch`).
 """
 
@@ -30,12 +31,13 @@ from torchsx.merging.tether.kmean import (
     smooth_columns,
     step_mean_square,
 )
-from torchsx.merging.tether.terms import TERMS, KMeanTerm, SmoothGauge
+from torchsx.merging.tether.terms import TERMS, KMeanTerm, PhaseGauge, SmoothGauge
 from torchsx.merging.tether.tether import Tether, parse_terms
 
 __all__ = [
     "TERMS",
     "KMeanTerm",
+    "PhaseGauge",
     "SmoothGauge",
     "Tether",
     "TetherBatch",

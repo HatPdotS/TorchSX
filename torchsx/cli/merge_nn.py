@@ -57,6 +57,9 @@ def main(argv: list[str] | None = None) -> None:
     tr.set_reciprocal_basis(S["basis"])
     restore_wilson_surface(tr, prep, ckpt, names=bundle.split_names)
     restore_intensity_modulation(tr, prep, ckpt)
+    if (ckpt.get("scale") or {}).get("phase_classes"):
+        from torchsx.merging.scale.pseudo_translation import PhaseClasses
+        tr.set_phase_classes(PhaseClasses.from_definition(ckpt["scale"]["phase_classes"]))
     # Strict: a checkpoint from another version of the model fails here rather
     # than merging with some of its weights silently left out.
     try:

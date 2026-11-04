@@ -146,6 +146,7 @@ class ObsFeatureSpec(nn.Module):
         self_features: tuple[str, ...] = SELF_FEATURES,
         context_features: tuple[str, ...] | None = None,
         crystal_features: tuple[str, ...] | None = None,
+        phase_classes=None,
     ) -> None:
         super().__init__()
         #: Optional reflection-dependent profile (installed by
@@ -155,6 +156,22 @@ class ObsFeatureSpec(nn.Module):
         self.phase_width = None
         self.phase_broad = None
         self._extra_log_width = None
+        #: Optional pseudo-translation classes
+        #: (:class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses`): each
+        #: observation reads its reflection's phase cosines as the self features
+        #: ``phase_c0 ..``.  A factor of ``h`` they open between scale and
+        #: intensity is held by the tether's ``phase`` term.
+        self.phase_classes = phase_classes
+        phase_names = (tuple(f"phase_c{j}" for j in range(phase_classes.n_translations))
+                       if phase_classes is not None else ())
+        self_features = tuple(self_features) + tuple(f for f in phase_names if f not in self_features)
+        if context_features is not None:
+            context_features = tuple(context_features) + tuple(
+                f for f in phase_names if f not in context_features)
+        stray = [f for f in tuple(self_features) + tuple(context_features or ())
+                 if f.startswith("phase_c") and f not in phase_names]
+        if stray:
+            raise ValueError(f"{stray} need the pseudo-translation classes they were trained with")
 
         if context_features is None:
             context_features = tuple(self_features) + CONTEXT_ONLY_FEATURES
@@ -225,6 +242,10 @@ class ObsFeatureSpec(nn.Module):
         self.register_buffer("_I", I, persistent=False)
         self.register_buffer("_bg", bg, persistent=False)
         self.register_buffer("_sigma", sigma.clamp(min=1e-6), persistent=False)
+        self.register_buffer(
+            "_phase", torch.as_tensor(phase_classes.cosines(prep.hkl_valid.long().cpu().numpy()),
+                                      dtype=torch.float32)
+            if phase_classes is not None else torch.zeros(prep.hkl_valid.shape[0], 0), persistent=False)
         self.has_supplied_sigma = (oi.has_sigma if self._store is not None
                                    else oi.sigma is not None)
         # The per-reflection context channels are fixed by the data alone and
@@ -395,6 +416,8 @@ class ObsFeatureSpec(nn.Module):
                     meta.panel_id.float() if meta.panel_id is not None
                     else torch.zeros_like(meta.s_sq)
                 )
+            elif k.startswith("phase_c"):
+                out[k] = self._phase.to(meta.hkl_idx.device)[meta.hkl_idx, int(k[len("phase_c"):])]
             elif k == "signed_log_I":
                 out[k] = torch.sign(I) * torch.log1p(I.abs())
             elif k == "log_sigma":

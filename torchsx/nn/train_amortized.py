@@ -367,6 +367,7 @@ class AmortizedTrainer:
 
         self.tether = Tether(self.cfg.tether)
         self._tether_phi = None
+        self._tether_phase = None
         if "gauge" in self.tether.names and getattr(self.scale, "anchor_stat", None) == "basis":
             raise ValueError("the tether's gauge term holds the smooth gauge itself and needs a scale that "
                              "pins the scalar gauge only (anchor_stat 'median' or 'mean'), not 'basis'")
@@ -585,7 +586,7 @@ class AmortizedTrainer:
                                "set_reciprocal_basis()")
         cid = meta.crystal_id
         n_crystals = int(meta.n_crystals) if getattr(meta, "n_crystals", None) else int(cid.max()) + 1
-        return TetherBatch(log_K, meta.hkl_idx, cid, n_crystals, self._tether_phi)
+        return TetherBatch(log_K, meta.hkl_idx, cid, n_crystals, self._tether_phi, phase=self._tether_phase)
 
     def _forward(self, rows: Tensor, *, grad: bool):
         meta, n_ph, bg, sigma = self._batch(rows)
@@ -1001,6 +1002,8 @@ class AmortizedTrainer:
                     "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
                     "tether": list(self.tether.names),
                     "lam_tether": float(self.cfg.lam_tether),
+                    "phase_classes": (None if getattr(self.scale.features, "phase_classes", None) is None
+                                      else self.scale.features.phase_classes.definition()),
                     "pseudo_translation": (
                         None if getattr(self.scale.features, "phase_broad", None) is None
                         else {"width": self.scale.features.phase_width.definition(),
@@ -1321,7 +1324,7 @@ class AmortizedTrainer:
                 h = cid = torch.zeros(0, dtype=torch.int32, device=dev)
             del seen_obs
             tether_rec = Tether(TERMS).readout(
-                TetherBatch(lk, h, cid, self.index.n_crystals, self._tether_phi),
+                TetherBatch(lk, h, cid, self.index.n_crystals, self._tether_phi, phase=self._tether_phase),
                 d_spacing=self.prep.d_spacing)
             del lk, h, cid
         _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
@@ -1412,6 +1415,16 @@ class AmortizedTrainer:
             self.opt.add_param_group({"params": [t.enable_evidence_prior() for t in self.targets],
                                       "lr": self.cfg.lr * mult, "lr_mult": mult,
                                       "weight_decay": 0.0, "name": "wilson_surface"})
+
+    @torch.no_grad()
+    def set_phase_classes(self, classes) -> None:
+        """Give the tether the pseudo-translation classes' columns
+        (:meth:`~torchsx.merging.scale.pseudo_translation.PhaseClasses.columns`) on
+        ``prep.hkl_valid``, for its ``phase`` term."""
+        hkl = self.prep.hkl_valid.long().cpu().numpy()
+        s2 = (1.0 / self.prep.d_spacing.double() ** 2).cpu().numpy()
+        self._tether_phase = torch.as_tensor(classes.columns(hkl, s2), dtype=torch.float64,
+                                             device=self.device)
 
     @torch.no_grad()
     def set_intensity_modulation(self, modulation) -> None:

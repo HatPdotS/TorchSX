@@ -50,8 +50,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-__all__ = ["DOMINANCE", "MIN_AMPLITUDE", "PhaseBroad", "PhaseWidth", "find_pseudo_translations",
-           "find_translations", "select_translations"]
+__all__ = ["DOMINANCE", "MIN_AMPLITUDE", "PhaseBroad", "PhaseClasses", "PhaseWidth",
+           "find_pseudo_translations", "find_translations", "select_translations"]
 
 #: Translations whose modulation amplitude is below this are not used.
 MIN_AMPLITUDE: float = 0.1
@@ -296,6 +296,97 @@ def select_translations(peaks: list[dict]) -> tuple[list[dict], str]:
                     f"small structure)")
     used = [peaks[first]] + [p for p in peaks if p["harmonic_of"] == first and p["amplitude"] >= MIN_AMPLITUDE]
     return used, f"{len(used)} translation(s): one dominant translation and its harmonics"
+
+
+# ── classes ────────────────────────────────────────────────────────────────
+
+class PhaseClasses:
+    """The phase cosines ``c_j(h)`` of the used translations, as features and as classes.
+
+    :meth:`cosines` are the scale model's phase features: each observation
+    reads its reflection's ``c_j``, so the network can give the families of
+    reflections their own profiles.  A factor of ``h`` is degenerate between
+    the scale and the intensity, and the features open it along every function
+    of ``c``; :meth:`columns` close it again from the counts.  The reflections
+    fall into cells of equal-count bins of every ``c_j`` (``edges``, fitted on
+    the training reflections), and each cell carries the Chebyshev polynomials
+    ``T_0 .. T_degree`` of ``s2 = 1/d^2`` mapped onto ``[-1, 1]`` by
+    ``s2_range``.  The tether holds the arithmetic mean of ``K`` free of a
+    trend along these columns (:class:`~torchsx.merging.tether.terms.PhaseGauge`),
+    so in every cell and at every resolution it is the sum of the spots: the
+    features shape a family's profile, the counts set its brightness.
+    """
+
+    #: cells over all translations together; the bins per translation follow
+    N_CELLS = 16
+
+    def __init__(self, translations, spacegroup: str | None, edges, s2_range, degree: int = 2):
+        self.translations = np.asarray(translations, dtype=np.float64).reshape(-1, 3)
+        self.spacegroup = spacegroup
+        self.edges = [np.asarray(e, dtype=np.float64) for e in edges]
+        self.s2_range = (float(s2_range[0]), float(s2_range[1]))
+        self.degree = int(degree)
+
+    @classmethod
+    def fit(cls, hkl, s2, translations, spacegroup: str | None, *, degree: int = 2) -> "PhaseClasses":
+        """Bin edges (interior quantiles of each ``c_j``) and the resolution range from the reflections."""
+        t = np.asarray(translations, dtype=np.float64).reshape(-1, 3)
+        s2 = np.asarray(s2, dtype=np.float64)
+        out = cls(t, spacegroup, [np.zeros(0)] * len(t), (s2.min(), s2.max()), degree)
+        if len(t):
+            n_bins = max(2, round(cls.N_CELLS ** (1.0 / len(t))))
+            C = out.cosines(hkl)
+            out.edges = [np.quantile(C[:, j], np.linspace(0, 1, n_bins + 1)[1:-1]) for j in range(len(t))]
+        return out
+
+    @classmethod
+    def from_prep(cls, prep, translations, spacegroup: str | None, **kw) -> "PhaseClasses":
+        hkl = prep.hkl_valid.long().cpu().numpy()
+        return cls.fit(hkl, (1.0 / prep.d_spacing.double() ** 2).cpu().numpy(), translations, spacegroup, **kw)
+
+    @property
+    def n_translations(self) -> int:
+        return len(self.translations)
+
+    def cosines(self, hkl) -> np.ndarray:
+        """``c_j(h)`` for every translation, ``(N, P)``."""
+        hkl = np.asarray(hkl, dtype=np.int64)
+        rotations = point_group_rotations(self.spacegroup or "P 1")
+        return (np.stack([phase_cos(hkl, t, rotations) for t in self.translations], axis=1)
+                if len(self.translations) else np.zeros((len(hkl), 0)))
+
+    def cells(self, hkl) -> np.ndarray:
+        """Each reflection's cell, ``0 .. n_cells - 1``."""
+        C = self.cosines(hkl)
+        cell = np.zeros(len(C), dtype=np.int64)
+        for j, e in enumerate(self.edges):
+            cell = cell * (len(e) + 1) + np.searchsorted(e, C[:, j], side="right")
+        return cell
+
+    @property
+    def n_cells(self) -> int:
+        return int(np.prod([len(e) + 1 for e in self.edges])) if self.edges else 1
+
+    def columns(self, hkl, s2) -> np.ndarray:
+        """``(N, n_cells (degree + 1))``: each cell's indicator times ``T_0 .. T_degree`` of the resolution."""
+        s2 = np.asarray(s2, dtype=np.float64)
+        lo, hi = self.s2_range
+        x = np.clip(2.0 * (s2 - lo) / max(hi - lo, 1e-12) - 1.0, -1.0, 1.0)
+        T = np.polynomial.chebyshev.chebvander(x, self.degree)
+        out = np.zeros((len(s2), self.n_cells * (self.degree + 1)))
+        cell = self.cells(hkl)
+        for k in range(self.degree + 1):
+            out[np.arange(len(s2)), cell * (self.degree + 1) + k] = T[:, k]
+        return out
+
+    def definition(self) -> dict:
+        return {"translations": self.translations.tolist(), "spacegroup": self.spacegroup,
+                "edges": [e.tolist() for e in self.edges], "s2_range": list(self.s2_range),
+                "degree": self.degree}
+
+    @classmethod
+    def from_definition(cls, d: dict) -> "PhaseClasses":
+        return cls(d["translations"], d.get("spacegroup"), d["edges"], d["s2_range"], d.get("degree", 2))
 
 
 # ── profile ────────────────────────────────────────────────────────────────

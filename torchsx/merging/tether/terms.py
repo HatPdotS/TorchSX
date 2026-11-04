@@ -22,7 +22,7 @@ from torch import Tensor
 
 from torchsx.merging.tether.batch import TetherBatch
 
-__all__ = ["TERMS", "KMeanTerm", "SmoothGauge"]
+__all__ = ["TERMS", "KMeanTerm", "PhaseGauge", "SmoothGauge"]
 
 
 class KMeanTerm:
@@ -90,5 +90,22 @@ class SmoothGauge(KMeanTerm):
         return out
 
 
+class PhaseGauge(SmoothGauge):
+    """The rocking-curve integral of ``K`` is the same in every pseudo-translation class
+    at every resolution: the class columns of
+    :class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses` as columns.
+
+    A scale model that reads the reflections' phase features can make a whole
+    family of reflections brighter or dimmer, exactly against its intensity;
+    this term holds every family at its sum of spots.  Without classes it has
+    no columns.
+    """
+
+    name = "phase"
+
+    def columns(self, batch: TetherBatch) -> Tensor:
+        return batch.phase
+
+
 #: Every term, by name.  The order is the order of their columns.
-TERMS = {t.name: t for t in (SmoothGauge(),)}
+TERMS = {t.name: t for t in (SmoothGauge(), PhaseGauge())}

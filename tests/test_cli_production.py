@@ -15,7 +15,7 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file, python_parser
 
 
-@pytest.mark.parametrize('module,count', [(train,40), (merge_nn,14)])
+@pytest.mark.parametrize('module,count', [(train,41), (merge_nn,14)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
@@ -32,7 +32,7 @@ def test_research_options_parse_but_stay_out_of_help():
     hidden = {'--noise-lr-mult': '10', '--peer-dim': '64', '--context-folds': '0', '--d-model': '64',
               '--n-layers': '3', '--eval-every': '50', '--patience': '2', '--heldout-stream': 'h.stream',
               '--encoder': 'fold', '--ctx-layers': '4', '--query-layers': '0', '--tether-weight': '2',
-              '--structured-prior': 'auto'}
+              '--structured-prior': 'auto', '--phase-classes': 'auto'}
     flags = ['--refine-geometry']
     text = parser.format_help()
     assert not [o for o in hidden if o in text]
@@ -44,7 +44,7 @@ def test_research_options_parse_but_stay_out_of_help():
     assert a.tether_weight == 2.0 and a.tether is None
     assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'gauge']).tether == ('gauge',)
     assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'none']).tether == ()
-    assert a.structured_prior == 'auto'
+    assert a.structured_prior == 'auto' and a.phase_classes == 'auto'
     assert parser.parse_args(['x.stream', '-o', 'run']).structured_prior == 'off'
     assert parser.parse_args(['x.stream', '-o', 'run', '--no-refine-geometry']).refine_geometry is False
     assert parser.parse_args(['x.stream', '-o', 'run']).steps == 400
