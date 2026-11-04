@@ -41,7 +41,6 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--lr-schedule` | `constant` | Learning rate after the warm-up: `constant`, or `cosine` decay to zero at the last update. |
 | `--average-last N` | 5 | When the last N updates per state oscillate, validate, checkpoint and merge the mean of the network after each of them; 0 uses the last update alone. |
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
-| `--outlier-frac F` | 0 | Initial weight of a detector-outlier component; 0 turns it off. |
 | `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
 | `--tether TERMS` | `gauge` | Directions the likelihood leaves to the model, held at the raw counts; `none` turns it off (see [Sum-of-spots tether](#sum-of-spots-tether)). |
 | `--pseudo-translation` | `auto` | Finds translational pseudo-symmetry in the data and, with a dominant translation, handles its classes of reflections; `off` skips the search (see [Pseudo-translation](#pseudo-translation)). |
