@@ -4,9 +4,10 @@
 #                   platform (Python >= 3.10) plus an sdist
 #   torchsx         the pure-Python package; depends on torchsx-native
 #
-# torchsx-native is uploaded first, with skip-existing, so a torchsx-only
-# release leaves the published native version in place. check_release.py
-# refuses a release whose native build changed without a version bump.
+# torchsx-native is uploaded first, and only when its version is not yet on the
+# index, so a torchsx-only release leaves the published native version in
+# place. check_release.py refuses a release whose native build changed without
+# a version bump.
 #
 # One-time setup:
 #   - On PyPI and on TestPyPI, add a trusted publisher for BOTH projects
@@ -218,11 +219,30 @@ jobs:
           merge-multiple: true
           path: dist/
 
+      # A rebuilt wheel can carry its platform tags in a different order, so
+      # skip-existing alone would add new files to the published version, which
+      # PyPI refuses for releases older than 14 days.
+      - name: Check the index
+        id: index
+        env:
+          INDEX: ${{ (github.event_name == 'release' || inputs.target == 'pypi') && 'https://pypi.org/pypi' || 'https://test.pypi.org/pypi' }}
+        run: |
+          sdist=$(ls dist/torchsx_native-*.tar.gz)
+          version=${sdist#dist/torchsx_native-}
+          version=${version%.tar.gz}
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$INDEX/torchsx-native/$version/json")
+          case $code in
+            200) echo "torchsx-native $version is already on the index"; echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::$INDEX/torchsx-native/$version/json returned HTTP $code"; exit 1 ;;
+          esac
+
       - name: Publish
+        if: steps.index.outputs.exists == 'false'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: ${{ (github.event_name == 'release' || inputs.target == 'pypi') && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
-          # An unchanged torchsx-native version is already on the index.
+          # A re-run after a partial upload of a new version.
           skip-existing: true
 
   publish-torchsx:
