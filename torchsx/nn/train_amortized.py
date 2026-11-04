@@ -228,10 +228,6 @@ class TrainConfig:
     #: share of device memory and does not shrink with the batch, so it is pure
     #: overhead; the transfer is milliseconds against a multi-second
     #: step.  Off by default: it is a loss on a data set that already fits.
-    #: Crystals per encoder chunk (0 = the whole batch at once).  The encoder
-    #: is separable across crystals -- only ``leave_one_out_mean`` couples rows,
-    #: and only within a crystal -- so this is exact, not an approximation.
-    encoder_chunk_crystals: int = 0
     stream_batches: bool = False
     posterior_checkpoint_nodes: bool = False
     posterior_k_coarse: int = 31
@@ -356,8 +352,6 @@ class AmortizedTrainer:
                 f" obs/reflection",
                 flush=True,
             )
-        if self.cfg.encoder_chunk_crystals:
-            self.scale.set_encoder_chunking(self.cfg.encoder_chunk_crystals)
         from torchsx.merging.tether import Tether
 
         self.tether = Tether(self.cfg.tether)
@@ -962,11 +956,8 @@ class AmortizedTrainer:
                 # so a later merge builds the SAME forward, not the default one
                 "encoder": {
                     k: getattr(self.scale.encoder, k, None)
-                    for k in ("kind", "context_folds", "obs_context_layers",
-                              "obs_self_layers", "d_model", "n_layers",
-                              "n_crystal_features", "peer_attention_layers",
-                              "peer_heads", "peer_dim", "ctx_layers",
-                              "query_layers", "refine_geometry", "n_heads")
+                    for k in ("kind", "context_folds", "d_model", "n_crystal_features",
+                              "ctx_layers", "query_layers", "refine_geometry", "n_heads")
                 },
                 # everything a merge must not have to guess: the likelihood it
                 # was fitted under, the data recipe, and the scale geometry.  A
@@ -982,7 +973,6 @@ class AmortizedTrainer:
                 "data": dict(self.data_recipe or {}),
                 "scale": {
                     "d_model": getattr(self.scale.encoder, "d_model", None),
-                    "n_layers": getattr(self.scale.encoder, "n_layers", None),
                     "self_features": list(getattr(self.scale.features, "self_features", ())),
                     "context_features": list(getattr(self.scale.features, "context_features", ())),
                     "crystal_features": list(getattr(self.scale.features, "crystal_features", ())),

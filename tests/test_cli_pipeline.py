@@ -30,7 +30,7 @@ from tests.test_amortized_training import _synthetic
 
 
 def _stack(prep, params, tmp_path, *, n_cond=1):
-    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2)
+    scale = AmortizedScale.from_prep(prep, d_model=32)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
     cfg = TrainConfig(
         max_obs_per_batch=6000, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
@@ -603,9 +603,8 @@ def test_defaults_are_the_wilson_prior_and_the_tether(tmp_path):
     assert P.build_stack(bundle, off, verbose=False)[2].anchor_stat == "basis" and P.tether_terms(off) == ()
 
 
-@pytest.mark.parametrize("flags,kind,refine", [([], "fold", True), (["--no-refine-geometry"], "fold", False),
-                                              (["--encoder", "deepsets"], "deepsets", None)])
-def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path, flags, kind, refine):
+@pytest.mark.parametrize("flags,refine", [([], True), (["--no-refine-geometry"], False)])
+def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path, flags, refine):
     from torchsx.cli import _pipeline as P
     from torchsx.cli.train import _build_parser as train_parser
     from torchsx.nn.fold_transformer import FoldTransformerEncoder
@@ -613,10 +612,9 @@ def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path,
     bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
     targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", *flags])
     enc = P.build_stack(bundle, targs, verbose=False)[2].encoder
-    assert isinstance(enc, FoldTransformerEncoder) == (kind == "fold")
-    if kind == "fold":
-        assert (enc.context_folds, len(enc.ctx_blocks), len(enc.query_blocks)) == (5, 2, 1)
-        assert enc.refine_geometry == refine
+    assert isinstance(enc, FoldTransformerEncoder)
+    assert (enc.context_folds, len(enc.ctx_blocks), len(enc.query_blocks)) == (5, 2, 1)
+    assert enc.refine_geometry == refine
 
 
 # ── detector noise under the gain policy ───────────────────────────────

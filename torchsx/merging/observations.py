@@ -181,7 +181,7 @@ class ObsInfo:
 
 #: Columns of ``ObsInfo.crystal_feat``, in order.  One row per crystal; every
 #: column is metadata (no intensity), so the scale encoder may read it for a
-#: crystal without any leave-one-out.  A column the stream does not carry is
+#: crystal without hiding any of it.  A column the stream does not carry is
 #: emitted as zeros, which the feature standardisation then treats as constant.
 CRYSTAL_FEAT_COLUMNS: tuple[str, ...] = (
     "cell_a", "cell_b", "cell_c", "cell_alpha", "cell_beta", "cell_gamma",

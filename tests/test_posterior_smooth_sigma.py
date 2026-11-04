@@ -88,7 +88,7 @@ def test_trainer_installs_basis_on_targets_and_replaces_the_default():
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
     prep, params, _, _, _ = _synthetic(n_hkl=60, n_xtal=60, per=30, seed=3)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=1)
+    scale = AmortizedScale.from_prep(prep, d_model=16)
     obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
     cfg = TrainConfig(posterior_prior="wilson", device="cpu", heldout_frac=0.1)
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
