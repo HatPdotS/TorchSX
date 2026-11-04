@@ -17,6 +17,7 @@ from torchsx.merging.hkl.noise import PoissonNoiseModel
 from torchsx.merging.observations import prepare_observations
 from torchsx.merging.store import RECORD, ObservationStore, PreparedStore
 from torchsx.nn.merge_target import plain_mean, unity_merge
+from tests import python_parser
 
 OBS_FIELDS = ("crystal_id", "s_sq", "hkl_idx", "panel_id", "fs", "ss", "peak", "background",
               "ewald_offset", "sigma", "q_dir", "beam_energy", "crystal_res", "n_pix")
@@ -90,13 +91,10 @@ def streams(tmp_path, sample_geometry):
             for s in range(2)]
 
 
-@pytest.fixture(params=[False, True], ids=["python", "native"])
+@pytest.fixture(params=["python", "native"])
 def parser(request, monkeypatch):
-    if request.param:
-        if _native.load() is None:
-            pytest.skip("native parser unavailable")
-    else:
-        monkeypatch.setattr(_native, "load", lambda: None)
+    if request.param == "python":
+        monkeypatch.setattr(_native, "load", lambda: python_parser)
 
 
 def _reference(paths, *, spacegroup, merge_friedel, d_min, gain, extra=None):

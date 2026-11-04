@@ -1,7 +1,4 @@
-"""Byte-level chunk indexing and pass-1 counting.
-
-Leaf module: no torchsx imports. The native-vs-python index dispatcher keeps
-its ``from torchsx.io import _native`` function-local (load timing).
+"""Byte-level chunk indexing and pass-1 counting, in pure Python.
 
 A chunk marker (``----- Begin chunk -----`` / ``----- End chunk -----``) always
 ends a reflection table, also when ``End of reflections`` is missing, so a
@@ -11,7 +8,6 @@ same rule; that is what makes its threaded scan match the serial one.
 
 from __future__ import annotations
 
-import numpy as np
 
 B_BEGIN_CHUNK = b"----- Begin chunk -----"
 B_END_CHUNK = b"----- End chunk -----"
@@ -162,25 +158,3 @@ def _index_chunks_until(
 
     return selected
 
-
-def _index_chunks_native_or_python(
-    path: str,
-    n_workers: int = 1,
-    max_crystals: int | None = None,
-) -> np.ndarray:
-    """Per-chunk ``(start, end, n_crys, n_obs)`` rows as an ``(n, 4)`` int64 array.
-
-    Uses the native indexer when available (GIL released, ``n_workers``
-    threads). ``max_crystals`` selects early-exit head mode, which is serial
-    and may return no rows; a full index of a file without chunks raises.
-    """
-    from torchsx.io import _native
-
-    native_mod = _native.load()
-    if native_mod is not None:
-        rows = native_mod.index_chunks(path, max(1, int(n_workers)), max_crystals)
-    else:
-        rows = np.asarray(_index_chunks_until(path, max_crystals), dtype=np.int64).reshape(-1, 4)
-    if max_crystals is None and len(rows) == 0:
-        raise ValueError(f"No chunks found in {path}")
-    return rows

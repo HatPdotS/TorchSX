@@ -19,29 +19,27 @@ def write_stream_reconstruct(
 ):
     """Generate a valid CrystFEL stream from tensors.
 
-    Dispatches to the native writer (``torchsx_native``) when it is installed;
-    falls back to the pure-Python writer otherwise.
+    Uses the native writer (``torchsx_native``), except for a core that holds
+    the raw peak search (a ``peak`` level, e.g. from build_stream): the native
+    writer's argument list is fixed and carries no peak arrays, so the
+    pure-Python writer, which emits the "Peaks from peak search" section,
+    writes it.
 
     Parameters
     ----------
     core : SFXStreamCore
     path : output .stream file path
     original_stream : if provided, copy geometry/unit cell sections verbatim
-    n_threads : ≥1. Native-only: images are formatted on this many threads in
-        batches and written in order, so memory stays bounded whatever the
-        output size. Ignored by the Python fallback.
+    n_threads : ≥1. Images are formatted on this many threads in batches and
+        written in order, so memory stays bounded whatever the output size.
+        Not used for a core with a ``peak`` level.
     """
-    from torchsx.io import _native
-
-    mod = _native.load()
-    # The native writer's argument list is fixed and carries no peak arrays, so a
-    # core that holds the raw peak search (a ``peak`` level, e.g. from build_stream)
-    # is written via the Python writer, which emits the "Peaks from peak search"
-    # section. Peak-less streams (parsed/merged) keep the fast native path.
-    if mod is None or "peak" in getattr(core, "levels", {}):
+    if "peak" in getattr(core, "levels", {}):
         return _write_stream_reconstruct_python(core, path, original_stream)
 
-    return _write_stream_reconstruct_native(core, path, original_stream, mod, n_threads)
+    from torchsx.io import _native
+
+    return _write_stream_reconstruct_native(core, path, original_stream, _native.load(), n_threads)
 
 
 def _build_header_blob(core: SFXStreamCore, original_stream: str | Path | None) -> str:

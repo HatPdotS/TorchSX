@@ -47,7 +47,7 @@ from torchsx.measurement import MEASUREMENT_KEY, MeasurementSpec
 _NM_INV_PER_A_INV = 10.0
 
 #: ``resolution`` fallback (Å) when a frame has no diffraction limit, matching
-#: the stream parser's sentinel in ``io/_parse/records.py``.
+#: the stream parser's sentinel.
 _NO_RESOLUTION = 999.0
 #: newest probixi database schema this reader understands
 SUPPORTED_DB_SCHEMA = 1

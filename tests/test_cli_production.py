@@ -12,7 +12,7 @@ import torch
 from torchsx.cli import _pipeline as P, train, merge_nn
 from tests.test_amortized_training import _synthetic
 from tests.test_cli_pipeline import _stack, _DataArgs
-from tests.test_measurement_sources import stream_file, python_parser
+from tests.test_measurement_sources import stream_file
 
 
 @pytest.mark.parametrize('module,count', [(train,35), (merge_nn,14)])
@@ -71,7 +71,7 @@ def test_invalid_or_removed_options_fail_before_loading(module,option,value,caps
         assert 'none' in error and 'wilson' in error
 
 
-def test_custom_split_matches_source_images(stream_file,python_parser,tmp_path):
+def test_custom_split_matches_source_images(stream_file,tmp_path):
     labels = tmp_path/'custom.split'
     labels.write_text('/raw/a.h5 //5 dark\n/raw/b.h5 //8 light\n')
     args = _DataArgs(stream=[stream_file],split_file=labels,int_radius=None,gain='trust_input')
@@ -80,7 +80,7 @@ def test_custom_split_matches_source_images(stream_file,python_parser,tmp_path):
     assert set(bundle.prep.obs_info.delay_bin_idx.tolist()) == {0,1}
 
 
-def test_cache_moves_with_inputs_and_rejects_changed_content(stream_file,python_parser,tmp_path,monkeypatch):
+def test_cache_moves_with_inputs_and_rejects_changed_content(stream_file,tmp_path,monkeypatch):
     cache=tmp_path/'prepared'
     args=_DataArgs(stream=[stream_file],int_radius=None,gain=None,cache_prep=cache)
     built=P.load_prep(args,verbose=False)

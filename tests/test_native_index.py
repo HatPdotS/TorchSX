@@ -1,7 +1,7 @@
 """Invariants for the native chunk indexer.
 
 ``torchsx_native.index_chunks`` must return exactly what the pure-Python
-``_index_chunks`` / ``_index_chunks_until`` return, whatever the thread count.
+``_index_chunks`` / ``_index_chunks_until`` (``tests/python_parser``) return, whatever the thread count.
 Chunk markers end reflection tables in both, which is what keeps the threaded
 scan equal to the serial one even for truncated tables.
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from torchsx.io import _native
-from torchsx.io._parser import _find_first_chunk_offset, _index_chunks, _index_chunks_until
+from tests.python_parser.indexing import _find_first_chunk_offset, _index_chunks, _index_chunks_until
 
 
 def _rows(arr) -> list[tuple[int, int, int, int]]:
@@ -22,10 +22,7 @@ def _rows(arr) -> list[tuple[int, int, int, int]]:
 
 @pytest.fixture(scope="module")
 def native():
-    mod = _native.load()
-    if mod is None:
-        pytest.skip("native module not installed")
-    return mod
+    return _native.load()
 
 
 @pytest.mark.slow

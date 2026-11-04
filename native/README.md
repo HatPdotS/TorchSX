@@ -17,12 +17,12 @@ output does not depend on the thread count.
 
 ## Behaviour
 
-- On well-formed streams the parse is bit-identical to the pure-Python parser
-  (`torchsx/io/_parse/records.py`). Both follow the same rules, and
+- On well-formed streams the parse is bit-identical to the pure-Python
+  reference parser (`tests/python_parser/`). Both follow the same rules, and
   `tests/test_native_parse.py` compares them.
 - Malformed content never raises. It is excluded at the smallest unit that
   keeps the rest valid, and `report` counts it by reason, with the byte offset
-  of the first occurrence. `records.py` lists the rules.
+  of the first occurrence. `torchsx/io/_parser.py` lists the rules.
 - Python's `str.split()`, `str.strip()`, `int()` and `float()` are reproduced,
   including PEP 515 underscores and `inf`/`nan`. Unicode decimal digits other
   than ASCII, which Python's `int()` also accepts, are not numbers here.

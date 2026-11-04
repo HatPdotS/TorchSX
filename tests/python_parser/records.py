@@ -1,46 +1,14 @@
 """Pass-2 record parsing: line streaming, array allocation, direct writes.
 
-Leaf module (numpy + torch only). This is the pure-Python twin of the native
-parser (``native/src/parse.rs``): same state machine, same rules for malformed
-input, same report. Keep the two in step; ``tests/test_native_parse.py``
-checks they agree.
-
-Malformed content is excluded at the smallest unit that keeps the rest valid,
-and each exclusion is counted by reason (see :data:`REASONS`):
-
-- a reflection line with fewer than ten fields, a non-numeric field or an hkl
-  outside int16 is dropped;
-- a crystal whose cell line has fewer than six numbers, whose reciprocal
-  vector line has no ``=`` or fewer than three numbers, or that is cut off
-  (chunk marker or end of input before ``End of reflections``) is dropped with
-  its reflections;
-- a non-numeric value of a key that is read keeps the default; a ``det_shift``
-  line that does not parse is ignored;
-- an ``Image filename:`` line with nothing after it, and a chunk without one,
-  are skipped.
-
-A chunk marker (``----- Begin chunk -----`` / ``----- End chunk -----``) ends
-whatever image or crystal is open, so no chunk can swallow the next one, and
-``--- Begin crystal`` starts a crystal even where a peak section was expected.
+The pure-Python twin of the native parser (``native/src/parse.rs``): same state
+machine, same rules for malformed input (listed in ``torchsx/io/_parser.py``),
+same report. ``tests/test_native_parse.py`` checks they agree.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch
-
-REASONS = (
-    "reflection_short",
-    "reflection_value",
-    "reflection_hkl_range",
-    "crystal_cell",
-    "crystal_vector",
-    "crystal_truncated",
-    "image_truncated",
-    "chunk_no_image",
-    "key_value",
-    "det_shift",
-)
 
 _BEGIN_CHUNK = "----- Begin chunk -----"
 _END_CHUNK = "----- End chunk -----"

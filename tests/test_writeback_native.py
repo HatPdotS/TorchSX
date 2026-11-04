@@ -32,10 +32,7 @@ from torchsx.stream import SFXStream
 
 @pytest.fixture(scope="module")
 def native():
-    mod = _native.load()
-    if mod is None:
-        pytest.skip("native module not installed")
-    return mod
+    return _native.load()
 
 
 @pytest.fixture(scope="module")
