@@ -4,7 +4,7 @@
 
 Nothing is backwards compatible with 0.1.0: retrain, and rebuild prepared caches.
 
-- Fold transformer scale encoder with per-run geometry correction (#9, #16)
+- Fold transformer scale encoder with per-crystal geometry correction (#9, #16)
 - Sum-of-spots tether: merged intensities follow the sum of the spots at every resolution (#12)
 - Pseudo-translation search on by default: structured Wilson prior and phase classes for tNCS and lattice translocation defects (#14)
 - Mean of the last updates when training oscillates (`--average-last`, #15)
