@@ -5,10 +5,10 @@ import pytest
 import torch
 
 from torchsx.merging.likelihood import Poisson
-from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid, eager_only
 from torchsx.merging.quadrature.split_log_grid import SplitLogGrid, HAVE_TRITON
 from torchsx.merging.scatter.gengauss import (
-    GenGaussLogScatter, gengauss_log_cdf_from_obs, log_alpha_from_log_width,
+    GenGaussLogScatter, gengauss_log_cdf_from_obs, gengauss_log_prob_from_obs,
+    log_alpha_from_log_width,
 )
 
 CUDA = torch.cuda.is_available()
@@ -42,20 +42,32 @@ def _batch(device, seed=0, M=4096):
     return t(n_ph), t(bg), t(la), t(lb), t(mu)
 
 
+def _uniform(n_ph, bg, la, lb, mu, lik, *, n, half):
+    """The integrand on ``n`` uniform trapezoid nodes over ``log S`` in [-half, half].
+
+    Shared by every observation and eager throughout; the likelihood enters
+    through ``log_prob_given_signal``.
+    """
+    log_S = torch.linspace(-half, half, n, dtype=mu.dtype, device=mu.device)
+    eps = log_S[None, :] - mu[:, None]
+    log_scatter = gengauss_log_prob_from_obs(eps, la, lb)
+    log_lik = lik.log_prob_given_signal(n_ph, log_S.exp()[None, :].expand_as(eps), bg)
+    log_w = torch.full((n,), math.log(2 * half / (n - 1)), dtype=mu.dtype, device=mu.device)
+    log_w[[0, -1]] -= math.log(2.0)
+    return torch.logsumexp(log_scatter + log_lik + log_w, dim=1)
+
+
 def _reference(n_ph, bg, la, lb, mu, lik, n=80001, half=45.0, chunk=256):
-    """Dense uniform fixed grid, eager, float64 -- the same integrand, brute force.
+    """Dense uniform grid, eager, float64 -- the same integrand, brute force.
 
     float64 because the eager Poisson forms ``n log lam - lam - log n!`` and
     loses ~0.2 nats at n = 2e5 in float32.  Chunked to bound the (M, K) tensors.
     """
-    q = FixedLogGrid(S_min=math.exp(-half), S_max=math.exp(half), n_points=n).to(n_ph.device).double()
     out = []
-    with eager_only():
-        for i in range(0, n_ph.numel(), chunk):
-            sl = slice(i, i + chunk)
-            out.append(q.marginalize_signal(
-                _scatter(la[sl].double(), lb[sl].double()), lik, mu[sl].double(),
-                n_ph[sl].double(), bg[sl].double(), None, None))
+    for i in range(0, n_ph.numel(), chunk):
+        sl = slice(i, i + chunk)
+        out.append(_uniform(n_ph[sl].double(), bg[sl].double(), la[sl].double(), lb[sl].double(),
+                            mu[sl].double(), lik, n=n, half=half))
     return torch.cat(out).to(mu.dtype)
 
 
@@ -93,13 +105,13 @@ def test_split_eager_matches_dense_reference(bvf):
     assert float(d.max()) < 1e-2, (float(d.max()), int(d.argmax()))
 
 
-def test_split_gradients_no_worse_than_production_grid():
+def test_split_gradients_no_worse_than_a_uniform_grid():
     """Per-observation gradients against the float64 dense reference.
 
     The GenGauss slope changes sign at eps = 0, and for beta near 1 that is a
     kink; the trapezoid rule's error on d log p / d log_mean is then FIRST order
-    in the node spacing, for the production FixedLogGrid (h = 0.051) as much as
-    for this one.  So the bar is the production grid's own error, not zero.
+    in the node spacing, for a shared uniform grid (h = 0.051) as much as for
+    this one.  So the bar is that grid's own error, not zero.
     """
     n_ph, bg, la, lb, mu = _batch("cpu", seed=1, M=1024)
     lik = Poisson(bg_var_factor=1.1641)
@@ -115,9 +127,7 @@ def test_split_gradients_no_worse_than_production_grid():
     _, g_ref = grads(lambda m, a, b: _reference(n_ph, bg, a, b, m, lik))
     qs = SplitLogGrid(n_points=192)
     _, g_split = grads(lambda m, a, b: qs.marginalize_signal(_scatter(a, b), lik, m, n_ph, bg, None, None))
-    qf = FixedLogGrid(S_min=math.exp(-34.5), S_max=math.exp(34.5), n_points=1355)
-    with eager_only():
-        _, g_fixed = grads(lambda m, a, b: qf.marginalize_signal(_scatter(a, b), lik, m, n_ph, bg, None, None))
+    _, g_fixed = grads(lambda m, a, b: _uniform(n_ph, bg, a, b, m, lik, n=1355, half=34.5))
     for name, gs, gf, gr in zip(("mu", "log_alpha", "log_beta"), g_split, g_fixed, g_ref):
         es = (gs - gr).abs()
         ef = (gf - gr).abs()
@@ -162,7 +172,7 @@ def test_split_triton_matches_eager(bvf):
     sc = _scatter(la, lb)
 
     def run(eager):
-        os.environ["TORCHSX_FIXEDLOGGRID_NO_TRITON"] = "1" if eager else ""
+        os.environ["TORCHSX_NO_TRITON"] = "1" if eager else ""
         import importlib
         import torchsx.merging.quadrature.split_log_grid as slg
         slg._DISABLE_TRITON = eager
@@ -187,26 +197,3 @@ def test_split_triton_matches_eager(bvf):
     assert float(d.max()) < 3e-2, float(d.max())
     for ge, gt in zip(g_e, g_t):
         assert float((ge - gt).abs().max()) < 2e-2 * float(ge.abs().max().clamp(min=1e-6)) + 1e-3
-
-
-@pytest.mark.skipif(not (CUDA and HAVE_TRITON), reason="needs CUDA + triton")
-def test_split_triton_speed_vs_fixed():
-    """Not an assertion on speed; prints the ratio for the record."""
-    import time
-    M = 1_000_000
-    g = torch.Generator().manual_seed(3)
-    bg = (torch.rand(M, generator=g) * 4 + 3).exp().cuda()
-    n_ph = torch.poisson(bg * 1.1).cuda()
-    la = torch.full((M,), math.log(1.0), device="cuda")
-    lb = torch.full((M,), math.log(1.225), device="cuda")
-    mu = (n_ph - bg).clamp(min=1).log()
-    lik = Poisson(bg_var_factor=1.1641)
-    qs = SplitLogGrid(n_points=192)
-    qf = FixedLogGrid(S_min=math.exp(-34.5), S_max=math.exp(34.5), n_points=1355).cuda()
-    for q in (qs, qf):
-        ts = []
-        for i in range(4):
-            torch.cuda.synchronize(); t0 = time.time()
-            q.marginalize_signal(_scatter(la, lb), lik, mu, n_ph, bg, None, None)
-            torch.cuda.synchronize(); ts.append(time.time() - t0)
-        print(f"{type(q).__name__}: {1e3 * sorted(ts[1:])[1]:.1f} ms")

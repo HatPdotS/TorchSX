@@ -46,25 +46,6 @@ class Quadrature(nn.Module):
         ]
         return torch.logsumexp(torch.stack(terms, dim=0), dim=0)
 
-    def _reject_unmodelled_bg(
-        self, likelihood: DetectionLikelihood, *, variance: bool = False,
-    ) -> None:
-        """Refuse a detection background this quadrature does not implement.
-
-        For the handful of quadratures that reimplement the plain-Poisson
-        integrand instead of calling ``log_prob_given_signal``: silently
-        computing the uncorrected quantity is the failure mode that a merge
-        would never surface, so they say so instead.
-        """
-        if float(getattr(likelihood, "bg_mean_offset", 0.0) or 0.0):
-            raise NotImplementedError(
-                f"{type(self).__name__} hardcodes the plain-Poisson integrand "
-                "and would silently ignore the likelihood's bg_mean_offset")
-        if variance and float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0):
-            raise NotImplementedError(
-                f"{type(self).__name__} hardcodes the plain-Poisson integrand "
-                "and would silently ignore the likelihood's bg_var_factor")
-
     def log_miss(
         self, likelihood: DetectionLikelihood, n_ph: Tensor, bg: Tensor,
     ) -> Tensor:                   # (n_obs,)

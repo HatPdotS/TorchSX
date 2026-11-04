@@ -45,7 +45,3 @@ dev = ["pytest>=6.0", "black>=21.5", "isort>=5.9"]
 
 [tool.setuptools.packages.find]
 include = ["torchsx*"]
-
-[tool.setuptools.package-data]
-# The Triton kernel's per-GPU launch configurations.
-"torchsx.merging.quadrature" = ["_fixed_log_grid_tuning.json"]

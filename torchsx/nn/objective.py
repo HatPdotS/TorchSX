@@ -22,25 +22,7 @@ from torch import Tensor
 from torchsx.merging.likelihood.poisson import poisson_log_prob_at_zero_signal
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 
-__all__ = ["MarginalNLL", "wide_log_grid"]
-
-
-def wide_log_grid(n_points: int = 2001):
-    """A :class:`~torchsx.merging.quadrature.fixed_log_grid.FixedLogGrid` wide
-    enough that the scatter never falls off it.
-
-    The grid spans ``log S`` in [-34.5, 34.5], which holds +-5 sigma for scatter
-    widths up to ``w ~ 5`` — beyond anything physical, since ``w = 5`` already
-    means the scale varies by a factor of ``e^5 = 148``.  A narrower window
-    truncates the GenGauss tail for ``alpha`` above ~2.5, and a truncated
-    marginal is no longer a density.
-
-    At ``n_points=2001`` the node spacing is 0.034.  Cost is close to flat in
-    the node count, so the default is set by resolution rather than by budget.
-    """
-    from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
-    import math as _m
-    return FixedLogGrid(S_min=_m.exp(-34.5), S_max=_m.exp(34.5), n_points=n_points)
+__all__ = ["MarginalNLL"]
 
 
 class MarginalNLL(nn.Module):

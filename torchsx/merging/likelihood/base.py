@@ -30,10 +30,10 @@ class DetectionLikelihood(nn.Module):
         estimate's own variance, or ``None`` when it is not modelled.  Identity
         and ``None`` by default, so a likelihood that does neither is untouched.
 
-        This is **one** call returning both on purpose.  The two fast
-        quadratures (``SplitLogGrid``, ``FixedLogGrid``) and their Triton
-        kernels reimplement the Poisson core instead of calling
-        :meth:`log_prob_given_signal`, so they have to ask for this mapping —
+        This is **one** call returning both on purpose.  The fast quadrature
+        (``SplitLogGrid``) and its Triton kernels reimplement the Poisson core
+        instead of calling :meth:`log_prob_given_signal`, so they have to ask
+        for this mapping —
         and with two separate accessors the plausible-looking
         ``bg_variance(model_bg(bg))`` silently computes the variance at the
         shifted background.  Returning the pair makes that unrepresentable.
