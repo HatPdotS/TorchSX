@@ -414,20 +414,9 @@ class PreparedObs:
     # Per-observation metadata for scale corrections
     obs_info: ObsInfo
 
-    # External partiality (sorted), or None
-    partiality: Tensor | None
-
     # French–Wilson prior inputs (per valid HKL)
     shell_id_fw: Tensor
     is_centric: Tensor
-
-    # Per-observation likelihood weight (sorted), or None.
-    # Multiplies ``log p`` per observation in the data NLL; the default
-    # ``None`` recovers the unweighted ``-Σ log p`` sum (bit-for-bit).
-    # Was used by the time-binned merge to apply a Gaussian-over-crystal-rank
-    # weighting; that module is gone, but the hook is kept for any weighting
-    # scheme (the ``timepoint`` metadata it keyed off still exists).
-    obs_weights: Tensor | None = None
 
     def to(self, device) -> "PreparedObs":
         return PreparedObs(
@@ -441,10 +430,8 @@ class PreparedObs:
             obs_counts=self.obs_counts.to(device),
             n_obs_total=self.n_obs_total,
             obs_info=self.obs_info.to(device),
-            partiality=None if self.partiality is None else self.partiality.to(device),
             shell_id_fw=self.shell_id_fw.to(device),
             is_centric=self.is_centric.to(device),
-            obs_weights=None if self.obs_weights is None else self.obs_weights.to(device),
         )
 
 
@@ -566,20 +553,10 @@ def prepare_observations(
     stream,
     config: MergeConfig,
     *,
-    partiality: Tensor | None = None,
     poisson_noise: PoissonNoiseModel | None = None,
-    crystal_weights: Tensor | None = None,
     resolved_measurement: ResolvedMeasurement | None = None,
 ) -> PreparedObs:
-    """Stream → PreparedObs (CPU).  Call ``.to(device)`` afterwards.
-
-    ``crystal_weights`` is an optional ``(n_crystals,)`` float tensor that
-    will be broadcast to per-observation weights via
-    ``crystal_weights[obs_info.crystal_id]`` and stored on
-    :attr:`PreparedObs.obs_weights`.  Multiplies ``log p`` per
-    observation in the data NLL.  Default ``None`` → no weighting,
-    bit-for-bit identical to the unweighted pipeline.
-    """
+    """Stream → PreparedObs (CPU).  Call ``.to(device)`` afterwards."""
     from torchref.base.reciprocal.hkl import get_d_spacing
     from torchsx.measurement import resolve_measurement, validate_measurement
 
@@ -619,10 +596,8 @@ def prepare_observations(
         raise ValueError("No valid observations remain after measurement filtering")
     if n_rejected:
         # Subset all observation columns together, retaining parent IDs/tables
-        # so crystal weights, split labels and timepoints keep their alignment.
+        # so split labels and timepoints keep their alignment.
         core = core.select_cascade({"obs": valid})
-        if partiality is not None:
-            partiality = partiality[valid]
     core_I = core.I
     core_background = core.background
 
@@ -767,25 +742,6 @@ def prepare_observations(
 
     _lap("obs_info gathers")
 
-    # ── External partiality (sorted to match) ──
-    partiality_sorted = None
-    if partiality is not None:
-        partiality_sorted = partiality[keep_all][sort_all]
-
-    # ── Per-observation weights (broadcast from per-crystal, then sorted) ──
-    obs_weights_sorted = None
-    if crystal_weights is not None:
-        if crystal_weights.ndim != 1 or crystal_weights.shape[0] != n_crystals:
-            raise ValueError(
-                f"crystal_weights must be 1-D with length n_crystals={n_crystals}, "
-                f"got shape {tuple(crystal_weights.shape)}"
-            )
-        # Broadcast per-crystal weight to all (pre-filter) observations via
-        # the stream's crystal_id, then apply the same keep/sort permutation
-        # used above to align with ``I_obs`` / ``hkl_id`` / ``obs_info``.
-        per_obs_w = crystal_weights[core.crystal_id.long()].to(torch.float32)
-        obs_weights_sorted = per_obs_w[keep_all][sort_all]
-
     return PreparedObs(
         hkl_valid=hkl_valid,
         d_spacing=d_valid,
@@ -797,8 +753,6 @@ def prepare_observations(
         obs_counts=obs_counts,
         n_obs_total=n_obs_total,
         obs_info=obs_info,
-        partiality=partiality_sorted,
         shell_id_fw=shell_id_fw,
         is_centric=is_centric,
-        obs_weights=obs_weights_sorted,
     )

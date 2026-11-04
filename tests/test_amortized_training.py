@@ -76,7 +76,7 @@ def _synthetic(n_hkl=60, n_xtal=150, per=40, seed=0, n_cond=1, shift=1.5):
         I_obs=I, hkl_id=hkl, bg=bg,
         obs_counts=torch.bincount(hkl, minlength=n_hkl),
         n_obs_total=hkl.numel(),
-        obs_info=oi, partiality=None,
+        obs_info=oi,
         shell_id_fw=torch.arange(n_hkl) % 4,
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
     )

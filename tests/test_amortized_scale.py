@@ -67,7 +67,6 @@ def _toy_prep(n_crystals: int = 12, obs_per_crystal: int = 9, n_hkl: int = 20):
         obs_counts=torch.bincount(hkl_id, minlength=n_hkl),
         n_obs_total=n,
         obs_info=obs_info,
-        partiality=None,
         shell_id_fw=torch.arange(n_hkl) % 4,
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
     )
