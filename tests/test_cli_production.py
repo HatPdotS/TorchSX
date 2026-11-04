@@ -15,7 +15,7 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file, python_parser
 
 
-@pytest.mark.parametrize('module,count', [(train,37), (merge_nn,14)])
+@pytest.mark.parametrize('module,count', [(train,39), (merge_nn,14)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
@@ -31,7 +31,7 @@ def test_research_options_parse_but_stay_out_of_help():
     parser = train._build_parser()
     hidden = {'--noise-lr-mult': '10', '--peer-dim': '64', '--context-folds': '0', '--d-model': '64',
               '--n-layers': '3', '--eval-every': '50', '--patience': '2', '--heldout-stream': 'h.stream',
-              '--encoder': 'fold', '--ctx-layers': '4', '--query-layers': '0'}
+              '--encoder': 'fold', '--ctx-layers': '4', '--query-layers': '0', '--tether-weight': '2'}
     flags = ['--refine-geometry']
     text = parser.format_help()
     assert not [o for o in hidden if o in text]
@@ -40,11 +40,15 @@ def test_research_options_parse_but_stay_out_of_help():
     assert (a.noise_lr_mult, a.peer_dim, a.context_folds, a.d_model, a.n_layers, a.eval_every, a.patience,
             a.heldout_stream) == (10.0, '64', 0, 64, 3, 50, 2, Path('h.stream'))
     assert (a.encoder, a.ctx_layers, a.query_layers, a.refine_geometry) == ('fold', 4, 0, True)
+    assert a.tether_weight == 2.0 and a.tether is None
+    assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'gauge']).tether == ('gauge',)
+    assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'none']).tether == ()
     assert parser.parse_args(['x.stream', '-o', 'run', '--no-refine-geometry']).refine_geometry is False
     assert parser.parse_args(['x.stream', '-o', 'run']).steps == 400
 
 
-@pytest.mark.parametrize('option,value', [('--miss-frac', '1'), ('--outlier-frac', '-0.1'), ('--noise-terms', 'C')])
+@pytest.mark.parametrize('option,value', [('--miss-frac', '1'), ('--outlier-frac', '-0.1'), ('--noise-terms', 'C'),
+                                          ('--tether', 'gauge,wobble'), ('--tether-weight', '0')])
 def test_out_of_range_training_options_fail_at_parsing(option, value, capsys):
     with pytest.raises(SystemExit):
         train._build_parser().parse_args(['x.stream', '-o', 'run', option, value])

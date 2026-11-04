@@ -43,6 +43,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
 | `--outlier-frac F` | 0 | Initial weight of a detector-outlier component; 0 turns it off. |
 | `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
+| `--tether TERMS` | `gauge` | Directions the likelihood leaves to the model, held at the raw counts; `none` turns it off (see [Sum-of-spots tether](#sum-of-spots-tether)). |
 | `--pseudo-translation` | `off` | `auto`: reflection profiles that depend on the structure's translational pseudo-symmetry (see [Pseudo-translation](#pseudo-translation)). |
 | `--seed N` | 0 | Network initialization and batch sampling. |
 | `--device` | `cuda` if available | `cuda` or `cpu`. |
@@ -197,6 +198,29 @@ for weak reflections, and its validation loss is not comparable with that of
 a Wilson run.
 
 `torchsx.merge` uses the prior of the checkpoint unless `--prior` is given.
+
+## Sum-of-spots tether
+
+The likelihood sees an observation through the product of its scale and the
+reflection's intensity, so a smooth rescaling of every reflection's scale
+against its intensity leaves the fit unchanged. Something has to fix it. The
+raw counts do: the observations of a reflection in still images sample the
+rocking curve evenly, so the mean of their scales is the rocking-curve integral,
+the sum of the reflection's spots, which depends on no model. The tether holds
+the model to it, as a term in the training loss computed from each batch alone.
+Unlike the intensity prior it does not weaken as the data grow; at its minimum
+every term is where the counts put it.
+
+| Term | Holds |
+|---|---|
+| `gauge` | The rocking-curve integral of the scale is the same at every resolution and in every direction. The merged intensities keep the fall-off of the integrated intensities. |
+
+With `--tether none` the smooth common mode of the log scale is projected out of
+every batch instead, which pins its geometric rather than its arithmetic mean.
+
+`merged.metrics.json` reports every term over each state's merged observations
+(`tether`), whichever terms the network was trained with. `torchsx.merge` takes
+the setting from the checkpoint.
 
 ## Model
 

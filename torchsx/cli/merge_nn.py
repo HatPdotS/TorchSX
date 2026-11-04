@@ -194,7 +194,8 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
         sets = [(0, _export_crystals(tr, k) if getattr(tr, "external_heldout", None) is not None else None)]
         h1, h2 = _split_halves(tr, k, args.seed + 1000000007)
         sets += [(1, h1), (2, h2)]
-        merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior")
+        merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior",
+                                 tether_readout=half == 0)
                   for half, crystals in sets}
         post = merges[0]
         label = names[k] if k < len(names) else str(k)
@@ -217,6 +218,10 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
                             merge_friedel=merge_friedel,
                             verbose=verbose and half == 0)
         rec = {"split": label, "products": ["posterior"], "prior": post["prior"]}
+        tether = post.get("tether")
+        if tether and tether.get("n_obs"):
+            rec["tether"] = tether
+            print("  " + P.tether_summary(tether), flush=True)
         stats = _split_half_stats(merges[1], merges[2], d, rank=merges[0]["I0"])
         if stats is not None:
             rec["split_half_posterior"] = stats

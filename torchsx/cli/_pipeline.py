@@ -667,6 +667,17 @@ def _bijvoet_columns(hkl: np.ndarray, cols: dict,
     return rows, out
 
 
+def tether_summary(rec: dict) -> str:
+    """One line of a merge's tether readout (:meth:`~torchsx.merging.tether.Tether.readout`)."""
+    parts = []
+    g = rec.get("gauge")
+    if g:
+        parts.append(f"gauge RMS {g['rms']:.4f} nats"
+                     + (" (by shell, low to high resolution: "
+                        + " ".join(f"{s['mean']:+.3f}" for s in g["by_shell"]) + ")" if g.get("by_shell") else ""))
+    return f"sum-of-spots tether over {rec['n_obs']:,} observations: " + "; ".join(parts)
+
+
 def report_merge(res: dict, *, verbose: bool = True) -> None:
     """The diagnostics that have actually caught bugs in this pipeline."""
     if not verbose:
@@ -733,7 +744,16 @@ DEFAULTS = dict(
     # --encoder fold: K masked runs per crystal, context self-attention, per-reflection queries,
     # each run's geometry refined
     encoder="fold", fold_folds=5, ctx_layers=2, query_layers=1, refine_geometry=True,
+    # the sum-of-spots tether's terms (torchsx.merging.tether); with "gauge" the scale pins
+    # the scalar gauge only and the tether holds the smooth one
+    tether=("gauge",),
 )
+
+
+def tether_terms(args) -> tuple:
+    """The tether's terms of a new run: ``--tether``, else the default."""
+    terms = getattr(args, "tether", None)
+    return tuple(DEFAULTS["tether"] if terms is None else terms)
 
 
 def configure_torch() -> None:
@@ -966,7 +986,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             peer_heads=(DEFAULTS["peer_heads"] if isinstance(_peer_dims(args), list) else
                         min(DEFAULTS["peer_heads"],
                             max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
-            anchor_stat=DEFAULTS["gauge_anchor"],
+            anchor_stat="median" if "gauge" in tether_terms(args) else DEFAULTS["gauge_anchor"],
             self_features=SELF_FEATURES + ((DISK_FEATURE,) if recorded else ()),
             crystal_features=(DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
                               if producer == "probixi" else None),
