@@ -14,9 +14,7 @@ import pytest
 import torch
 
 from torchsx.merging.observations import ObsInfo, PreparedObs
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scale import AmortizedScale
-from torchsx.merging.scatter_shape import FreePerHKLShape
 from torchsx.nn.obs_features import ObsFeatureSpec
 
 
@@ -69,19 +67,8 @@ def _toy_prep(n_crystals: int = 12, obs_per_crystal: int = 9, n_hkl: int = 20):
         obs_counts=torch.bincount(hkl_id, minlength=n_hkl),
         n_obs_total=n,
         obs_info=obs_info,
-        partiality=None,
         shell_id_fw=torch.arange(n_hkl) % 4,
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
-    )
-
-
-def _params(prep) -> Parameters:
-    n = prep.n_valid
-    return Parameters(
-        log_I0_init=torch.full((n,), math.log(30.0)),
-        scatter_shape=FreePerHKLShape(
-            torch.full((n,), 1.65).log(), torch.full((n,), 2.0).log()
-        ),
     )
 
 
@@ -120,28 +107,19 @@ def test_features_are_normalised_against_the_full_dataset():
 
 def test_init_gives_unity_scale_and_seeded_scatter():
     """Zero-init heads -> K == 1, so the first merge is a unity merge."""
+    from torchsx.merging.scatter.mixture import split_mix
     prep = _toy_prep()
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
+    scale = AmortizedScale.from_prep(prep, d_model=16)
     pred = scale.predict(prep.obs_info)
     assert torch.allclose(pred.log_K, torch.zeros_like(pred.log_K), atol=1e-6)
-    assert torch.allclose(pred.log_w.exp(), torch.full_like(pred.log_w, 1.65), atol=1e-5)
-    assert torch.allclose(pred.beta, torch.full_like(pred.beta, 2.0), atol=1e-5)
-    # beta = 2 is Gaussian-in-log, so alpha = w*sqrt(2)
-    torch.testing.assert_close(
-        pred.log_alpha.exp(),
-        torch.full_like(pred.log_alpha, 1.65 * math.sqrt(2)),
-        rtol=1e-4, atol=1e-4,
-    )
-
-
-def test_ablation_switches_hold_width_and_shape_fixed():
-    prep = _toy_prep()
-    scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2, predict_width=False, predict_shape=False
-    )
-    names = {n for n, _ in scale.heads.named_parameters()}
-    assert "head_log_w.weight" not in names and "head_beta.weight" not in names
-    assert {"global_log_w", "global_beta_raw"} <= names
+    log_pi, offset, la_lo, la_hi, log_beta = split_mix(pred.mix, scale.heads.n_components)
+    # Gaussian components (beta = 2, so alpha = w * sqrt(2)); component 0 is
+    # centred, at width w_init, and carries the most weight
+    assert torch.equal(log_beta, torch.full_like(log_beta, math.log(2.0)))
+    for la in (la_lo[:, 0], la_hi[:, 0]):
+        torch.testing.assert_close(la.exp(), torch.full_like(la, 1.65 * math.sqrt(2)), rtol=1e-4, atol=1e-4)
+    assert torch.equal(offset[:, 0], torch.zeros_like(offset[:, 0]))
+    assert bool((log_pi.argmax(dim=1) == 0).all())
 
 
 # ── the leakage guarantee, at model level ──────────────────────────────
@@ -159,7 +137,7 @@ def test_own_intensity_does_not_move_own_log_k():
     torch.manual_seed(1)
 
     scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2, anchor_log_k=False
+        prep, d_model=16, anchor_log_k=False
     )
     for p in scale.parameters():          # break the zero-init so log_K varies
         if p.dim() > 1:
@@ -179,7 +157,7 @@ def test_own_intensity_does_not_move_own_log_k():
 def test_anchor_change_is_a_uniform_shift():
     prep = _toy_prep()
     torch.manual_seed(1)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_log_k=True)
+    scale = AmortizedScale.from_prep(prep, d_model=16, anchor_log_k=True)
     for p in scale.parameters():
         if p.dim() > 1:
             torch.nn.init.normal_(p, std=0.3)
@@ -213,7 +191,7 @@ def test_median_anchor_is_not_hijacked_by_runaway_outliers():
     n = prep.n_obs_total
     for stat, tol in (("median", 0.05), ("mean", None)):
         scale = AmortizedScale.from_prep(
-            prep, d_model=16, n_layers=2, anchor_stat=stat
+            prep, d_model=16, anchor_stat=stat
         )
         clean = scale.predict(prep.obs_info).log_K.clone()
         # inject a runaway on 1.5 % of observations via the head bias path
@@ -233,7 +211,7 @@ def test_median_anchor_is_not_hijacked_by_runaway_outliers():
 
 def test_anchor_pins_the_gauge():
     prep = _toy_prep()
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
+    scale = AmortizedScale.from_prep(prep, d_model=16)
     torch.nn.init.constant_(scale.heads.head_log_K.bias, 3.7)
     assert scale.predict(prep.obs_info).log_K.abs().max() < 1e-5
 
@@ -244,13 +222,12 @@ def test_anchor_pins_the_gauge():
 def test_marginal_nll_backward_reaches_the_network():
     """prime() -> quadrature marginal -> backward, gradients on encoder+heads."""
     from torchsx.merging.likelihood import Poisson
-    from torchsx.nn.objective import wide_log_grid
+    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
     from torchsx.merging.config import MergeConfig
 
     prep = _toy_prep()
-    params = _params(prep)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    quad = wide_log_grid()
+    scale = AmortizedScale.from_prep(prep, d_model=16)
+    quad = SplitLogGrid(n_points=96)
     lik = Poisson()
 
     # Heads are zero-initialised, so at step 0 the encoder correctly receives
@@ -258,16 +235,16 @@ def test_marginal_nll_backward_reaches_the_network():
     # weights first (they do get gradient, asserted below).  Perturb them here
     # so this test exercises the full graph rather than that first step.
     torch.manual_seed(3)
-    for h in ("head_log_K", "head_log_w", "head_beta"):
+    for h in ("head_log_K", "head_log_w", "mixture"):
         torch.nn.init.normal_(getattr(scale.heads, h).weight, std=0.1)
 
     meta = prep.obs_info
     pred = scale.prime(meta)
     n_ph = (prep.I_obs + prep.bg).clamp(min=0)
-    log_mean = params.log_I0[meta.hkl_idx] + pred.log_K
+    log_mean = math.log(30.0) + pred.log_K
 
-    log_p = quad.marginalize_signal(
-        scale.scatter, lik, log_mean, n_ph, prep.bg, params, meta,
+    log_p = quad.marginalize_mixture(
+        scale.scatter, lik, log_mean, n_ph, prep.bg, None, meta,
         obs_range=(0, prep.n_obs_total),
     )
     assert torch.isfinite(log_p).all()
@@ -277,27 +254,26 @@ def test_marginal_nll_backward_reaches_the_network():
     assert any("encoder" in n for n in got), "no gradient reached the encoder"
     assert any("head_log_K" in n for n in got), "no gradient reached the log K head"
     assert any("head_log_w" in n for n in got), "no gradient reached the width head"
-    assert any("head_beta" in n for n in got), "no gradient reached the shape head"
+    assert any("heads.mixture" in n for n in got), "no gradient reached the mixture head"
 
 
 def test_zero_init_still_bootstraps_the_heads():
     """At exact zero-init the encoder gets no gradient (dL/dz = W = 0), but the
     head weights do — which is how training starts moving at all."""
     from torchsx.merging.likelihood import Poisson
-    from torchsx.nn.objective import wide_log_grid
+    from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
     from torchsx.merging.config import MergeConfig
 
     prep = _toy_prep()
-    params = _params(prep)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    quad = wide_log_grid()
+    scale = AmortizedScale.from_prep(prep, d_model=16)
+    quad = SplitLogGrid(n_points=96)
 
     meta = prep.obs_info
     pred = scale.prime(meta)
-    log_mean = params.log_I0[meta.hkl_idx] + pred.log_K
-    log_p = quad.marginalize_signal(
+    log_mean = math.log(30.0) + pred.log_K
+    log_p = quad.marginalize_mixture(
         scale.scatter, Poisson(), log_mean,
-        (prep.I_obs + prep.bg).clamp(min=0), prep.bg, params, meta,
+        (prep.I_obs + prep.bg).clamp(min=0), prep.bg, None, meta,
         obs_range=(0, prep.n_obs_total),
     )
     (-log_p.sum()).backward()
@@ -306,31 +282,24 @@ def test_zero_init_still_bootstraps_the_heads():
 
 
 def test_scatter_hook_is_what_the_quadrature_reads():
-    """The predicted (alpha, beta) must actually reach the density."""
+    """The predicted mixture must actually reach the density."""
     prep = _toy_prep()
-    params = _params(prep)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
+    scale = AmortizedScale.from_prep(prep, d_model=16)
     meta = prep.obs_info
     pred = scale.prime(meta)
-
-    la, lb = scale.scatter.log_alpha_beta_obs(params, meta)
-    torch.testing.assert_close(la, pred.log_alpha)
-    torch.testing.assert_close(lb, torch.log(pred.beta))
-
+    torch.testing.assert_close(scale.scatter.mixture_obs(meta), pred.mix)
     # ...and under an arbitrary gather it still resolves by obs_id.
     idx = torch.tensor([31, 4, 77, 12])
-    la_g, _ = scale.scatter.log_alpha_beta_obs(params, meta.gather(idx))
-    torch.testing.assert_close(la_g, pred.log_alpha[idx])
+    torch.testing.assert_close(scale.scatter.mixture_obs(meta.gather(idx)), pred.mix[idx])
 
 
 def test_stale_prediction_raises_rather_than_silently_resolving():
     prep = _toy_prep()
-    params = _params(prep)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
+    scale = AmortizedScale.from_prep(prep, d_model=16)
     meta = prep.obs_info
     scale.prime(meta.gather(torch.arange(10)))
     with pytest.raises(KeyError, match="outside the installed prediction"):
-        scale.scatter.log_alpha_beta_obs(params, meta)
+        scale.scatter.log_alpha_beta_obs(None, meta)
 
 
 def test_calibration_metrics_survive_non_finite_entries():
@@ -380,7 +349,7 @@ def test_obs_scale_is_context_only():
 
 def test_the_reference_reaches_the_prediction():
     prep = _toy_prep()
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_log_k=False)
+    scale = AmortizedScale.from_prep(prep, d_model=16, anchor_log_k=False)
     torch.manual_seed(4)
     for p in scale.parameters():
         if p.dim() > 1:
@@ -408,7 +377,7 @@ def test_constant_features_are_zeroed_not_standardised():
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        spec = ObsFeatureSpec(prep, include_hkl=False)
+        spec = ObsFeatureSpec(prep)
     assert any("carry no information" in str(c.message) for c in caught)
 
     x_self, x_ctx, _ = spec.build(prep.obs_info)
@@ -423,77 +392,15 @@ def test_varying_features_are_still_standardised():
     from torchsx.nn.obs_features import ObsFeatureSpec
 
     prep = _toy_prep()
-    spec = ObsFeatureSpec(prep, include_hkl=False)
+    spec = ObsFeatureSpec(prep)
     x_self, _, _ = spec.build(prep.obs_info)
     i = spec.self_features.index("s_sq")
     assert x_self[:, i].std() > 0.5
 
 
-def test_encoder_chunking_is_exact_in_value_and_gradient():
-    """Crystal-chunked prediction must equal the one-shot pass, bit-for-bit-ish.
-
-    The chunking exists to move the checkpoint boundary from the block to the
-    chunk: measured on 1.67 M observations the encoder held 14.0 GB, all of it
-    16 interior ``(M, d_model)`` tensors, when only three ``(M,)`` outputs ever
-    leave.  That trade is only legitimate if it changes nothing, and the one
-    thing that could is ``leave_one_out_mean``: it pools within a crystal, so a
-    chunk edge inside a crystal would give that crystal a context built from
-    part of itself -- and would still run.
-    """
-    torch.manual_seed(0)
-    prep = _toy_prep()
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    # non-trivial weights: zero-init heads would hide any discrepancy
-    for prm in scale.parameters():
-        if prm.dim() >= 1:
-            torch.nn.init.normal_(prm, std=0.05)
-    scale.train()
-    # PreparedObs is hkl-sorted; the trainer feeds crystal-grouped rows, and
-    # chunking requires that ordering, so reproduce it here.
-    order = torch.argsort(prep.obs_info.crystal_id, stable=True)
-    meta = prep.obs_info.gather(order)
-
-    def run(chunk):
-        scale.set_encoder_chunking(chunk)
-        scale.zero_grad(set_to_none=True)
-        pred = scale.predict(meta)
-        loss = (pred.log_K.square().sum() + pred.log_w.sum()
-                + pred.beta.sum() + pred.log_alpha.sum())
-        loss.backward()
-        g = torch.cat([p.grad.flatten() for p in scale.parameters()
-                       if p.grad is not None])
-        return pred.log_K.detach().clone(), pred.log_w.detach().clone(), g
-
-    k0, w0, g0 = run(0)
-    for chunk in (1, 2):
-        k1, w1, g1 = run(chunk)
-        torch.testing.assert_close(k1, k0, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(w1, w0, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(g1, g0, rtol=1e-4, atol=1e-6)
-
-
-def test_encoder_chunks_never_split_a_crystal():
-    """The chunk bounds must land on crystal boundaries."""
-    cid = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2, 2, 3])
-    for per_chunk in (1, 2, 3, 10):
-        spans = AmortizedScale._crystal_chunks(cid, per_chunk)
-        assert spans[0][0] == 0 and spans[-1][1] == cid.numel()
-        for a, b in spans:
-            assert a < b
-            # a boundary may only sit where the crystal id changes
-            if a > 0:
-                assert cid[a] != cid[a - 1]
-            if b < cid.numel():
-                assert cid[b] != cid[b - 1]
-        # and they must tile the range with no gaps
-        assert [a for a, _ in spans[1:]] == [b for _, b in spans[:-1]]
-
-
 # ── fold-pooled (crystal-shared) context and the crystal-level head ─────
 
 from torchsx.merging.observations import CRYSTAL_FEAT_COLUMNS, _crystal_feature_table  # noqa: E402
-from torchsx.nn.deepsets import DeepSetsEncoder  # noqa: E402
-from torchsx.nn.pooling import fold_ids  # noqa: E402
 
 
 def _toy_prep_with_crystal_feat(**kw):
@@ -512,74 +419,11 @@ def _randomise(scale, std=0.3):
             torch.nn.init.normal_(p, std=std)
 
 
-def test_fold_mode_own_fold_cannot_move_own_log_k():
-    """Bit-exact: perturbing I_j changes nothing in j's fold, something in the
-    other fold of j's crystal, nothing in any other crystal."""
-    prep = _toy_prep_with_crystal_feat()
-    torch.manual_seed(1)
-    scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2, anchor_log_k=False, context_folds=2,
-    )
-    _randomise(scale)
-    meta = prep.obs_info
-    base = scale.predict(meta).log_K.detach().clone()
-    j = 7
-    scale.features._I[j] += 500.0
-    moved = scale.predict(meta).log_K.detach()
-
-    fold = fold_ids(meta.crystal_id, meta.n_crystals, 2)
-    same_c = meta.crystal_id == meta.crystal_id[j]
-    own = same_c & (fold == fold[j])
-    other = same_c & (fold != fold[j])
-    assert torch.equal(moved[own], base[own]), "own fold saw its own intensity"
-    assert (moved[other] - base[other]).abs().max() > 1e-4, "pool is inert"
-    assert torch.equal(moved[~same_c], base[~same_c])
-
-
-def test_fold_mode_zero_init_gives_unity_scale():
-    prep = _toy_prep_with_crystal_feat()
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, context_folds=2)
-    pred = scale.predict(prep.obs_info)
-    assert torch.allclose(pred.log_K, torch.zeros_like(pred.log_K), atol=1e-6)
-
-
-def test_legacy_path_is_bit_identical_with_crystal_head_present():
-    """context_folds=0 with the (zero-init) crystal head equals the old encoder."""
-    prep = _toy_prep_with_crystal_feat()
-    torch.manual_seed(2)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_log_k=False)
-    _randomise(scale)
-    torch.nn.init.zeros_(scale.encoder.input_crystal.weight)   # as constructed
-    enc = scale.encoder
-    assert enc.context_folds == 0 and enc.obs_context_layers == 2 and enc.obs_self_layers == 2
-    x_self, x_ctx, x_crys = scale.features.build(prep.obs_info)
-    with torch.no_grad():
-        z_new = enc(x_self, x_ctx, prep.obs_info.crystal_id, prep.obs_info.n_crystals, x_crys=x_crys)
-        # the pre-change forward, written out
-        h = enc.input_context(x_ctx)
-        for blk in enc.context_blocks:
-            h = blk(h)
-        from torchsx.nn.pooling import leave_one_out_mean
-        ctx, _ = leave_one_out_mean(h, prep.obs_info.crystal_id, prep.obs_info.n_crystals)
-        z_old = enc.input_self(x_self) + ctx
-        for blk in enc.self_blocks:
-            z_old = blk(z_old)
-    assert torch.equal(z_new, z_old)
-
-
-def test_old_checkpoint_without_crystal_head_loads():
-    prep = _toy_prep_with_crystal_feat()
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    sd = {k: v for k, v in scale.state_dict().items() if "input_crystal" not in k}
-    scale.load_state_dict(sd)          # strict, as to_mtz / restore_best do
-    assert (scale.encoder.input_crystal.weight == 0).all()
-
-
 def test_crystal_head_moves_only_its_crystal():
     prep = _toy_prep_with_crystal_feat()
     torch.manual_seed(4)
     scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2, anchor_log_k=False, context_folds=2,
+        prep, d_model=16, anchor_log_k=False, context_folds=2,
     )
     _randomise(scale)
     torch.nn.init.normal_(scale.encoder.input_crystal.weight, std=0.3)
@@ -600,69 +444,6 @@ def test_crystal_feature_tier_rejects_condition_fields():
     prep = _toy_prep_with_crystal_feat()
     with pytest.raises(KeyError):
         ObsFeatureSpec(prep, crystal_features=("cell_a", "delay"))
-
-
-def test_fold_predictions_do_not_depend_on_row_grouping():
-    """hkl-sorted vs crystal-grouped input give the same log_K per obs_id."""
-    prep = _toy_prep_with_crystal_feat()
-    torch.manual_seed(6)
-    scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2, anchor_log_k=False, context_folds=2,
-    )
-    _randomise(scale)
-    meta = prep.obs_info
-    order = torch.argsort(meta.crystal_id, stable=True)
-    a = scale.predict(meta).log_K.detach()
-    b = scale.predict(meta.gather(order)).log_K.detach()
-    torch.testing.assert_close(b, a[order], rtol=1e-5, atol=1e-6)
-
-
-@pytest.mark.parametrize("split", [(1, 1), (2, 2), (0, 2)])
-def test_fold_chunking_is_exact_in_value_and_gradient(split):
-    torch.manual_seed(0)
-    prep = _toy_prep_with_crystal_feat()
-    scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2, context_folds=2,
-        obs_context_layers=split[0], obs_self_layers=split[1],
-    )
-    for prm in scale.parameters():
-        if prm.dim() >= 1:
-            torch.nn.init.normal_(prm, std=0.05)
-    scale.train()
-    order = torch.argsort(prep.obs_info.crystal_id, stable=True)
-    meta = prep.obs_info.gather(order)
-
-    def run(chunk):
-        scale.set_encoder_chunking(chunk)
-        scale.zero_grad(set_to_none=True)
-        pred = scale.predict(meta)
-        loss = (pred.log_K.square().sum() + pred.log_w.sum()
-                + pred.beta.sum() + pred.log_alpha.sum())
-        loss.backward()
-        g = torch.cat([p.grad.flatten() for p in scale.parameters()
-                       if p.grad is not None])
-        return pred.log_K.detach().clone(), g
-
-    k0, g0 = run(0)
-    for chunk in (1, 3):
-        k1, g1 = run(chunk)
-        torch.testing.assert_close(k1, k0, rtol=1e-5, atol=1e-6)
-        # float32 sums in a different order: gradients agree to rounding
-        torch.testing.assert_close(g1, g0, rtol=1e-4, atol=1e-5)
-
-
-def test_fold_mode_depth_split_moves_blocks_to_the_table():
-    """Per-observation blocks still see (n, D); the rest run on (G*K, D)."""
-    enc = DeepSetsEncoder(4, 6, d_model=8, n_layers=3, context_folds=2,
-                          obs_context_layers=1, obs_self_layers=1)
-    seen = []
-    for blk in list(enc.context_blocks) + list(enc.self_blocks):
-        blk.register_forward_hook(lambda m, i, o: seen.append(o.shape[0]))
-    n, G = 40, 5
-    gid = torch.arange(n) % G
-    enc(torch.randn(n, 4), torch.randn(n, 6), gid, G)
-    # context: 1 per-obs (n) + 2 table (G*K); self: 2 table + 1 per-obs
-    assert seen == [n, G * 2, G * 2, G * 2, G * 2, n]
 
 
 def test_crystal_feature_table_column_order_and_missing_columns():
@@ -687,20 +468,6 @@ def test_crystal_feature_table_column_order_and_missing_columns():
     assert (t[:, 9:] == 0).all()
 
 
-def test_state_dict_refuses_a_different_encoder_architecture():
-    """Same parameter names in every mode, so this has to be explicit."""
-    prep = _toy_prep_with_crystal_feat()
-    fold = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, context_folds=2)
-    loo = AmortizedScale.from_prep(prep, d_model=16, n_layers=2)
-    with pytest.raises(RuntimeError, match="architecture mismatch"):
-        loo.load_state_dict(fold.state_dict())
-    with pytest.raises(RuntimeError, match="architecture mismatch"):
-        fold.load_state_dict(loo.state_dict())
-    # pre-arch checkpoints were leave-one-out at full depth: they still load there
-    sd = {k: v for k, v in loo.state_dict().items() if not k.endswith("_arch")}
-    loo.load_state_dict(sd)
-
-
 # ── basis gauge anchor ─────────────────────────────────────────────────
 
 
@@ -710,7 +477,7 @@ def _basis_scale(prep, degree=2):
     basis = ReciprocalBasis.from_hkl(prep.hkl_valid.long(), prep.median_cell, "P 1",
                                      degree=degree, aniso=False)
     torch.manual_seed(3)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_stat="basis")
+    scale = AmortizedScale.from_prep(prep, d_model=16, anchor_stat="basis")
     for p in scale.parameters():
         if p.dim() > 1:
             torch.nn.init.normal_(p, std=0.3)
@@ -720,7 +487,7 @@ def _basis_scale(prep, degree=2):
 
 def test_basis_anchor_requires_a_basis():
     prep = _toy_prep()
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, anchor_stat="basis")
+    scale = AmortizedScale.from_prep(prep, d_model=16, anchor_stat="basis")
     with pytest.raises(RuntimeError):
         scale.predict(prep.obs_info)
 
@@ -733,10 +500,8 @@ def test_basis_anchor_removes_a_planted_common_mode_exactly():
     phi_b = basis.phi[meta.hkl_idx]
     c = torch.tensor([0.7, -2.0, 1.3])
     from torchsx.nn.heads import ScalePrediction
-    planted = ScalePrediction(
-        log_K=pred.log_K + phi_b @ c, log_w=pred.log_w, beta=pred.beta,
-        log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
-    )
+    planted = ScalePrediction(log_K=pred.log_K + phi_b @ c, log_w=pred.log_w,
+                              log_e_s=pred.log_e_s, mix=pred.mix)
     # The toy crystals each see a few reflections only, so the two-way fit separates
     # crystal effects from the smooth term approximately; on a full-coverage batch
     # (next test) it is exact.
@@ -771,7 +536,7 @@ def test_basis_anchor_is_exact_on_full_coverage_and_keeps_crystal_scales():
     raw = torch.randn(meta.hkl_idx.numel()) * 0.3
     zeros = torch.zeros_like(raw)
     def pred_of(x):
-        return ScalePrediction(log_K=x, log_w=zeros, beta=zeros + 1, log_alpha=zeros, log_e_s=zeros, log_alpha_hi=zeros)
+        return ScalePrediction(log_K=x, log_w=zeros, log_e_s=zeros, mix=zeros[:, None])
     ref = scale._anchor(pred_of(raw), meta).log_K
     # (a) a planted common mode phi @ c is removed exactly
     c = torch.tensor([0.7, -2.0, 1.3])
@@ -807,8 +572,7 @@ def test_basis_anchor_keeps_per_crystal_differences():
     from torchsx.nn.heads import ScalePrediction
     pred = scale.predict(meta)
     shifted = scale._anchor(ScalePrediction(
-        log_K=pred.log_K + offsets, log_w=pred.log_w, beta=pred.beta,
-        log_alpha=pred.log_alpha, log_e_s=pred.log_e_s, log_alpha_hi=pred.log_alpha_hi,
+        log_K=pred.log_K + offsets, log_w=pred.log_w, log_e_s=pred.log_e_s, mix=pred.mix,
     ), meta).log_K
     # Two observations of the same reflection share a basis row, so their
     # difference is untouched by the projection: it changes by the crystal offsets alone.
@@ -822,18 +586,6 @@ def test_basis_anchor_keeps_per_crystal_differences():
         torch.testing.assert_close(shifted[i] - shifted[j], expected, rtol=0, atol=1e-5)
 
 
-def test_basis_anchor_is_chunk_invariant():
-    prep = _toy_prep()
-    scale, _ = _basis_scale(prep)
-    # Chunking needs crystal-grouped observations, as CrystalIndex.rows() delivers them.
-    rows = prep.obs_info.crystal_id.argsort(stable=True)
-    meta = prep.obs_info.gather(rows)
-    whole = scale.predict(meta).log_K.detach().clone()
-    scale.set_encoder_chunking(3)
-    chunked = scale.predict(meta).log_K.detach()
-    torch.testing.assert_close(chunked, whole, rtol=0, atol=1e-5)
-
-
 def test_basis_anchor_gradient_ignores_the_common_mode():
     """The projection stays in the graph: a loss on the anchored log K has zero
     gradient with respect to a common-mode shift of the raw predictions."""
@@ -845,10 +597,8 @@ def test_basis_anchor_gradient_ignores_the_common_mode():
     torch.manual_seed(13)
     raw = torch.randn(meta.hkl_idx.numel()) * 0.3
     zeros = torch.zeros_like(raw)
-    planted = ScalePrediction(
-        log_K=raw + basis.phi[meta.hkl_idx] @ c, log_w=zeros, beta=zeros + 1,
-        log_alpha=zeros, log_e_s=zeros, log_alpha_hi=zeros,
-    )
+    planted = ScalePrediction(log_K=raw + basis.phi[meta.hkl_idx] @ c, log_w=zeros,
+                              log_e_s=zeros, mix=zeros[:, None])
     loss = (scale._anchor(planted, meta).log_K ** 2).sum()
     loss.backward()
     assert c.grad.abs().max() < 1e-4

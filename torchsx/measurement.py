@@ -89,8 +89,6 @@ def parse_radii(value) -> tuple[float, float, float]:
 def parse_gain(value) -> str | float:
     if value is None:
         return "auto"
-    if str(value) == "stream":  # Older recipes used this name for trust_input.
-        return "trust_input"
     if str(value) in ("trust_input", "auto", "calibrate"):
         return str(value)
     error = (f"Invalid --gain {value!r}. Expected 'auto' (default), 'trust_input', "
@@ -199,10 +197,10 @@ def resolve_measurement(spec: MeasurementSpec | None, *, radii=None, gain=None,
 
 
 def legacy_stream_gain(core) -> float:
-    """Retain the old direct-reader/explicit legacy-recipe behavior visibly.
+    """Gain of an input without a measurement specification, with a warning.
 
-    The new CLI resolver never selects this path implicitly for missing metadata.
-    Probixi keeps its previous preparation behavior until its adapter is added.
+    The geometry's ``adu_per_eV`` times the mean beam energy.  The CLI resolver
+    never selects this path implicitly for missing metadata.
     """
     import warnings
     warnings.warn("Legacy input has no measurement specification; using the historical "

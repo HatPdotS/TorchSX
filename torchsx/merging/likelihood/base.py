@@ -7,23 +7,14 @@ from abc import abstractmethod
 import torch.nn as nn
 from torch import Tensor
 
-from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
-
 
 class DetectionLikelihood(nn.Module):
-    """``p(n | signal, bg)`` and (optionally) a bg-mixture wrapper.
+    """``p(n | signal, bg)``.
 
-    Two hooks:
-
-    * ``log_prob_given_signal(n, S, bg)`` — per-grid-point log likelihood.
-      The Quadrature calls this inside the signal integral.
-    * ``combine_with_marginal(n, bg, log_p_sig_marginal, params, meta)`` —
-      post-marginal combining (e.g. mixing in a bg hypothesis).  Default
-      implementation just returns the signal marginal unchanged.
-
-    Plus :meth:`detection_params`, describing how the *stored* ``bg`` — an
-    annulus-derived ESTIMATE, not a measurement — enters the detection model.
+    :meth:`log_prob_given_signal` is the per-grid-point log likelihood the
+    Quadrature calls inside the signal integral; :meth:`detection_params`
+    describes how the *stored* ``bg`` — an annulus-derived ESTIMATE, not a
+    measurement — enters the detection model.
     """
 
     @abstractmethod
@@ -39,10 +30,10 @@ class DetectionLikelihood(nn.Module):
         estimate's own variance, or ``None`` when it is not modelled.  Identity
         and ``None`` by default, so a likelihood that does neither is untouched.
 
-        This is **one** call returning both on purpose.  The two fast
-        quadratures (``SplitLogGrid``, ``FixedLogGrid``) and their Triton
-        kernels reimplement the Poisson core instead of calling
-        :meth:`log_prob_given_signal`, so they have to ask for this mapping —
+        This is **one** call returning both on purpose.  The fast quadrature
+        (``SplitLogGrid``) and its Triton kernels reimplement the Poisson core
+        instead of calling :meth:`log_prob_given_signal`, so they have to ask
+        for this mapping —
         and with two separate accessors the plausible-looking
         ``bg_variance(model_bg(bg))`` silently computes the variance at the
         shifted background.  Returning the pair makes that unrepresentable.
@@ -52,13 +43,3 @@ class DetectionLikelihood(nn.Module):
         deliberately keep the raw value and must NOT route through this.
         """
         return bg, None
-
-    def combine_with_marginal(
-        self,
-        n: Tensor,
-        bg: Tensor,
-        log_p_sig_marginal: Tensor,     # (M,)
-        params: Parameters,
-        meta: ObsInfo,
-    ) -> Tensor:                         # (M,)
-        return log_p_sig_marginal

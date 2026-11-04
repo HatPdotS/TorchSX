@@ -1,10 +1,7 @@
 """Observation preparation: stream → sorted tensors + initial estimates.
 
-Ported from ``torchsx.merging_clean.observations`` with imports redirected
-to the new ``torchsx.merging.hkl`` primitives.  ``ObsInfo`` lives
-here too (it is per-observation *metadata*, not a correction-specific
-construct — keeping it next to ``PreparedObs`` avoids a circular import
-path once ``ScaleModel`` subclasses need it).
+``ObsInfo`` lives here too: it is per-observation metadata, sorted like the
+``PreparedObs`` tensors it describes.
 """
 
 from __future__ import annotations
@@ -31,9 +28,8 @@ OBSERVATION_FILTER_VERSION = 2
 class ObsInfo:
     """Per-observation metadata, sorted identically to ``PreparedObs`` tensors.
 
-    ScaleModel subclasses index into this to compute their per-observation
-    log-correction without having to stash extra tensors.  Optional fields
-    stay ``None`` when the stream doesn't carry the corresponding channel.
+    The scale model reads its features from here.  Optional fields stay
+    ``None`` when the stream doesn't carry the corresponding channel.
 
     Kinetic-ensemble fields (``delay_bin_idx``, ``unique_timepoints``) are
     populated by :func:`prepare_observations` when the stream carries
@@ -56,8 +52,8 @@ class ObsInfo:
     ``obs_range=(s, e)`` is enough to index a per-observation side-channel; but
     crystal-batched training gathers **non-contiguous** subsets, where
     ``obs_range`` is meaningless.  Carrying ``obs_id`` lets any per-observation
-    cache — predicted scatter, ``FixedScale``, an EMA — be indexed correctly
-    under an arbitrary gather.
+    cache, such as the predicted scatter, be indexed correctly under an
+    arbitrary gather.
     """
 
     crystal_id: Tensor
@@ -185,7 +181,7 @@ class ObsInfo:
 
 #: Columns of ``ObsInfo.crystal_feat``, in order.  One row per crystal; every
 #: column is metadata (no intensity), so the scale encoder may read it for a
-#: crystal without any leave-one-out.  A column the stream does not carry is
+#: crystal without hiding any of it.  A column the stream does not carry is
 #: emitted as zeros, which the feature standardisation then treats as constant.
 CRYSTAL_FEAT_COLUMNS: tuple[str, ...] = (
     "cell_a", "cell_b", "cell_c", "cell_alpha", "cell_beta", "cell_gamma",
@@ -418,20 +414,9 @@ class PreparedObs:
     # Per-observation metadata for scale corrections
     obs_info: ObsInfo
 
-    # External partiality (sorted), or None
-    partiality: Tensor | None
-
     # French–Wilson prior inputs (per valid HKL)
     shell_id_fw: Tensor
     is_centric: Tensor
-
-    # Per-observation likelihood weight (sorted), or None.
-    # Multiplies ``log p`` per observation in the data NLL; the default
-    # ``None`` recovers the unweighted ``-Σ log p`` sum (bit-for-bit).
-    # Was used by the time-binned merge to apply a Gaussian-over-crystal-rank
-    # weighting; that module is gone, but the hook is kept for any weighting
-    # scheme (the ``timepoint`` metadata it keyed off still exists).
-    obs_weights: Tensor | None = None
 
     def to(self, device) -> "PreparedObs":
         return PreparedObs(
@@ -445,10 +430,8 @@ class PreparedObs:
             obs_counts=self.obs_counts.to(device),
             n_obs_total=self.n_obs_total,
             obs_info=self.obs_info.to(device),
-            partiality=None if self.partiality is None else self.partiality.to(device),
             shell_id_fw=self.shell_id_fw.to(device),
             is_centric=self.is_centric.to(device),
-            obs_weights=None if self.obs_weights is None else self.obs_weights.to(device),
         )
 
 
@@ -570,20 +553,10 @@ def prepare_observations(
     stream,
     config: MergeConfig,
     *,
-    partiality: Tensor | None = None,
     poisson_noise: PoissonNoiseModel | None = None,
-    crystal_weights: Tensor | None = None,
     resolved_measurement: ResolvedMeasurement | None = None,
 ) -> PreparedObs:
-    """Stream → PreparedObs (CPU).  Call ``.to(device)`` afterwards.
-
-    ``crystal_weights`` is an optional ``(n_crystals,)`` float tensor that
-    will be broadcast to per-observation weights via
-    ``crystal_weights[obs_info.crystal_id]`` and stored on
-    :attr:`PreparedObs.obs_weights`.  Multiplies ``log p`` per
-    observation in the data NLL.  Default ``None`` → no weighting,
-    bit-for-bit identical to the unweighted pipeline.
-    """
+    """Stream → PreparedObs (CPU).  Call ``.to(device)`` afterwards."""
     from torchref.base.reciprocal.hkl import get_d_spacing
     from torchsx.measurement import resolve_measurement, validate_measurement
 
@@ -623,10 +596,8 @@ def prepare_observations(
         raise ValueError("No valid observations remain after measurement filtering")
     if n_rejected:
         # Subset all observation columns together, retaining parent IDs/tables
-        # so crystal weights, split labels and timepoints keep their alignment.
+        # so split labels and timepoints keep their alignment.
         core = core.select_cascade({"obs": valid})
-        if partiality is not None:
-            partiality = partiality[valid]
     core_I = core.I
     core_background = core.background
 
@@ -771,25 +742,6 @@ def prepare_observations(
 
     _lap("obs_info gathers")
 
-    # ── External partiality (sorted to match) ──
-    partiality_sorted = None
-    if partiality is not None:
-        partiality_sorted = partiality[keep_all][sort_all]
-
-    # ── Per-observation weights (broadcast from per-crystal, then sorted) ──
-    obs_weights_sorted = None
-    if crystal_weights is not None:
-        if crystal_weights.ndim != 1 or crystal_weights.shape[0] != n_crystals:
-            raise ValueError(
-                f"crystal_weights must be 1-D with length n_crystals={n_crystals}, "
-                f"got shape {tuple(crystal_weights.shape)}"
-            )
-        # Broadcast per-crystal weight to all (pre-filter) observations via
-        # the stream's crystal_id, then apply the same keep/sort permutation
-        # used above to align with ``I_obs`` / ``hkl_id`` / ``obs_info``.
-        per_obs_w = crystal_weights[core.crystal_id.long()].to(torch.float32)
-        obs_weights_sorted = per_obs_w[keep_all][sort_all]
-
     return PreparedObs(
         hkl_valid=hkl_valid,
         d_spacing=d_valid,
@@ -801,8 +753,6 @@ def prepare_observations(
         obs_counts=obs_counts,
         n_obs_total=n_obs_total,
         obs_info=obs_info,
-        partiality=partiality_sorted,
         shell_id_fw=shell_id_fw,
         is_centric=is_centric,
-        obs_weights=obs_weights_sorted,
     )

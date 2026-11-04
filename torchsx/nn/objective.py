@@ -1,35 +1,14 @@
-"""Training objectives for the amortised scale model.
+"""Training objective of the amortised scale model.
 
-Two implementations behind one seam.
+:class:`MarginalNLL` is the marginal likelihood of each observation, with the
+multiplicative scatter integrated out of the detection likelihood::
 
-:class:`MarginalNLL` — **primary**.  The proper marginal likelihood,
-integrating the multiplicative scatter out of the detection likelihood::
+    log p_j = log INT p_det(n_j | S, bg_j) . p_scatter(log S - log_mean_j) d log S
 
-    log p_j = log INT p_det(n_j | S, bg_j) . GenGauss(log S - log_mean_j; a_j, b_j) d log S
-
-evaluated by the existing quadrature.  On CUDA this dispatches to the Triton
-kernel, which takes **per-observation** ``log_alpha_obs`` / ``log_beta_obs``,
-never materialises the ``(M, K)`` integrand (it saves four aux statistics,
-~5 floats per observation) and returns analytic gradients for both.  So the
-marginal is the *cheap* option here — the quadrature costs tens of MB per
-million observations against several GB of network activations — and it is what makes
-``beta`` identifiable, which a Gaussian closed form cannot be.
-
-:class:`AgreementNLL` — reference.  Moment-matched Gaussian overlap between the
-observations of a reflection, in closed form, no grid::
-
-    -0.5 * sum_j (y_j - ybar)^2 / tau_j^2      agreement (chi^2)
-    -0.5 * sum_j log tau_j^2                   no false precision
-    -0.5 * log sum_j (1/tau_j^2)               Cox-Reid correction
-
-Grid-free and exactly differentiable, so it is a fast dev loop and a
-cross-check: at ``beta = 2`` and high counts the two must agree.  Its third
-term is worth understanding even though the primary objective does not use it —
-there is one nuisance parameter per reflection (thousands, growing with the ASU),
-so this is the Neyman-Scott incidental-parameter problem, and profiling I0 out
-by maximisation biases exactly the quantity we intend to judge the model by,
-the scatter width.  In :class:`MarginalNLL` leave-one-out plays that role:
-every observation is scored against a target it did not contribute to.
+evaluated by the quadrature stack.  On CUDA the quadrature dispatches to Triton
+kernels that take the per-observation scatter parameters, never materialise the
+``(M, K)`` integrand and return analytic gradients, so the marginal costs tens
+of MB per million observations against several GB of network activations.
 """
 
 from __future__ import annotations
@@ -42,93 +21,8 @@ from torch import Tensor
 
 from torchsx.merging.likelihood.poisson import poisson_log_prob_at_zero_signal
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
-from torchsx.nn.pooling import group_sum
 
-__all__ = [
-    "MarginalNLL", "AgreementNLL", "gengauss_grid_log_mass", "wide_log_grid",
-]
-
-_LOG_2PI = math.log(2.0 * math.pi)
-
-
-def wide_log_grid(n_points: int = 2001):
-    """A :class:`~torchsx.merging.quadrature.fixed_log_grid.FixedLogGrid` wide
-    enough that the scatter never falls off it.
-
-    The grid spans ``log S`` in [-34.5, 34.5], which holds +-5 sigma for scatter
-    widths up to ``w ~ 5`` — beyond anything physical, since ``w = 5`` already
-    means the scale varies by a factor of ``e^5 = 148``.  A narrower window
-    truncates the GenGauss tail for ``alpha`` above ~2.5, and a truncated
-    marginal is no longer a density.
-
-    At ``n_points=2001`` the node spacing is 0.034.  Cost is close to flat in
-    the node count, so the default is set by resolution rather than by budget.
-    """
-    from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
-    import math as _m
-    return FixedLogGrid(S_min=_m.exp(-34.5), S_max=_m.exp(34.5), n_points=n_points)
-
-
-def gengauss_grid_log_mass(
-    log_mean: Tensor, log_alpha: Tensor, beta: Tensor, lo: float, hi: float
-) -> Tensor:
-    r"""``log`` of the GenGauss mass lying inside ``[lo, hi]`` in ``log S``.
-
-    The quadrature integrates the scatter over a **finite** grid, so whatever
-    mass falls off the ends is silently discarded and the "likelihood" stops
-    being a density.  On the default fixed grid (``log S`` in [-6.9, 13.8]):
-    ``Sum_n p(n)`` is 1.000 at ``w = 0.2`` but 0.941 at ``w = 1.65``, 0.586 at
-    ``w = 6.75`` and 0.390 at ``w = 12``.  At ``w = 6.75, beta = 3.5`` the
-    density is near-uniform across ``2*alpha = 22.8``, wider than the whole
-    grid.
-
-    **Use this as a diagnostic, not as a correction.**  Dividing ``p`` by this
-    mass looks like it restores a density — ``p(n | S in grid)`` — but the
-    conditioning event *moves with the parameters*, so it is not a valid
-    likelihood across them.  Worse, it is unbounded in the wrong direction:
-    ``log p - log mass`` goes to ``+inf`` as the mass goes to zero, so the
-    width head is *rewarded* for growing the scatter past the grid: in
-    training it drives the loss to 0 and NaNs the network within an epoch.
-
-    The honest reading of a mass below 1 is "the model is putting probability
-    where we are not integrating", and the fix is a wider grid (see
-    ``WIDE_LOG_GRID``), not a correction factor.  The GenGauss CDF is closed form:
-
-    .. math::
-        F(t) = \tfrac12 + \tfrac12 \,\mathrm{sign}(t)\, P(1/\beta, |t|^\beta)
-
-    with ``P`` the regularised lower incomplete gamma, so this costs two
-    ``gammainc`` calls and no extra grid work.  Validated against dense
-    numerical integration of the density over the grid: agreement to ~1e-6
-    relative for w in {1, 1.65, 6.75, 12} x beta in {1, 2, 3.5}.
-
-    **Gradient caveat.**  ``torch.special.gammainc`` implements no derivative
-    with respect to its shape argument, so ``beta`` is detached *in that slot
-    only*.  Gradients still flow through ``alpha`` (via ``t``) and through
-    ``beta`` in the exponent of ``|t|^beta``.  The omitted path is ``beta``'s
-    effect on the tail shape of the normaliser, which is second order next to
-    the width dependence that this term exists to penalise.  Monitor
-    ``grid_mass_median``: while it stays near 1 the whole correction — and
-    therefore the approximation — is immaterial.
-    """
-    alpha = log_alpha.exp().clamp(min=1e-8)
-    inv_b = (1.0 / beta).detach()          # gammainc has no d/d(shape)
-
-    def _cdf(bound: float) -> Tensor:
-        t = (bound - log_mean) / alpha
-        # |t|**beta overflows float32 whenever alpha is small -- t reaches ~1e9
-        # and beta up to 4 takes it past 3.4e38, producing inf and then NaN
-        # gradients.  That is exactly the regime where the scatter sits well
-        # inside the grid and the correction is a no-op, so the NaNs were
-        # arriving where the term does nothing.  Clamp in the exponent:
-        # P(a, x) is 1.0 to float32 precision for x beyond ~1e2, so capping
-        # x at e**20 is numerically identical and cannot overflow.
-        log_t = t.abs().clamp(min=1e-30).log()
-        x = (beta * log_t).clamp(max=20.0).exp()
-        return 0.5 + 0.5 * torch.sign(t) * torch.special.gammainc(inv_b, x)
-
-    mass = (_cdf(hi) - _cdf(lo)).clamp(min=1e-12)
-    return mass.log()
+__all__ = ["MarginalNLL"]
 
 
 class MarginalNLL(nn.Module):
@@ -137,8 +31,7 @@ class MarginalNLL(nn.Module):
     Parameters
     ----------
     quadrature
-        Any :class:`~torchsx.merging.quadrature.base.Quadrature`.  Use
-        ``FixedLogGrid`` on CUDA to get the Triton fast path.
+        Any :class:`~torchsx.merging.quadrature.base.Quadrature`.
     likelihood
         Detection likelihood; ``Poisson`` for counts.
     chunk_size
@@ -155,7 +48,7 @@ class MarginalNLL(nn.Module):
 
     def __init__(
         self, quadrature, likelihood, *,
-        chunk_size: int | None = None, renormalize: bool = False,
+        chunk_size: int | None = None,
         checkpoint_chunks: bool = True, miss_frac: float = 0.0,
         outlier_frac: float = 0.0, outlier_scale: float = 3.0,
         detector_noise=None,
@@ -165,8 +58,6 @@ class MarginalNLL(nn.Module):
         self.likelihood = likelihood
         self.chunk_size = chunk_size
         self.checkpoint_chunks = bool(checkpoint_chunks)
-        self.renormalize = bool(renormalize)
-        self.last_grid_mass: Tensor | None = None
         #: Miss component.  A predicted reflection that recorded no signal at
         #: all -- masked pixels, a mis-prediction, a spot that never formed --
         #: is not a partial observation, but the scatter has to stretch its
@@ -270,24 +161,6 @@ class MarginalNLL(nn.Module):
             lp = torch.logaddexp(log_1r + lp, log_r + lo)
         return lp
 
-    def _grid_bounds(self) -> tuple[float, float] | None:
-        g = getattr(self.quadrature, "log_S_grid", None)
-        if g is None:
-            return None
-        return float(g[0].item()), float(g[-1].item())
-
-    def _renorm(self, log_p: Tensor, scatter, params, meta, log_mean: Tensor) -> Tensor:
-        """Divide out the scatter mass that fell off the grid."""
-        bounds = self._grid_bounds()
-        if bounds is None:
-            return log_p
-        log_alpha, log_beta = scatter.log_alpha_beta_obs(params, meta)
-        log_mass = gengauss_grid_log_mass(
-            log_mean, log_alpha, log_beta.exp(), *bounds
-        )
-        self.last_grid_mass = log_mass.detach().exp()
-        return log_p - log_mass
-
     def _marginal(self, scatter, params, log_mean, n_ph, bg, meta, obs_range, noise=None) -> Tensor:
         """``log p(n | log_mean)`` with the scatter integrated out.
 
@@ -301,10 +174,9 @@ class MarginalNLL(nn.Module):
                 scatter, self.likelihood, log_mean, n_ph, bg, params, meta,
                 obs_range=obs_range, **kw,
             )
-        lp = self.quadrature.marginalize_signal(
+        return self.quadrature.marginalize_signal(
             scatter, self.likelihood, log_mean, n_ph, bg, params, meta, obs_range=obs_range, **kw,
         )
-        return self._renorm(lp, scatter, params, meta, log_mean) if self.renormalize else lp
 
     def log_prob(
         self, scatter, params, log_mean: Tensor, n_ph: Tensor, bg: Tensor, meta
@@ -343,38 +215,3 @@ class MarginalNLL(nn.Module):
         if mask is not None:
             lp = lp[mask]
         return -lp.sum()
-
-
-class AgreementNLL(nn.Module):
-    """Closed-form moment-matched agreement between a reflection's observations.
-
-    Grid-free reference objective; see the module docstring.  ``beta`` is not
-    identifiable here — a Gaussian overlap has no shape parameter, so
-    ``(w, beta)`` collapse to one effective variance.  That is the price of the
-    closed form and the reason it is not the primary objective.
-    """
-
-    def __init__(self, n_hkl: int, *, cox_reid: bool = True) -> None:
-        super().__init__()
-        self.n_hkl = int(n_hkl)
-        self.cox_reid = bool(cox_reid)
-
-    def forward(
-        self,
-        y: Tensor,          # (n,) per-observation estimate of I0
-        tau2: Tensor,       # (n,) its variance
-        ybar: Tensor,       # (n,) leave-one-out target
-        hkl_id: Tensor,     # (n,)
-        *, mask: Tensor | None = None,
-    ) -> Tensor:
-        w = 1.0 / tau2.clamp(min=1e-12)
-        resid2 = (y - ybar) ** 2
-        per_obs = 0.5 * (resid2 * w + tau2.clamp(min=1e-12).log() + _LOG_2PI)
-        if mask is not None:
-            per_obs = per_obs * mask
-            w = w * mask
-        nll = per_obs.sum()
-        if self.cox_reid:
-            fisher = group_sum(w, hkl_id, self.n_hkl)
-            nll = nll + 0.5 * fisher.clamp(min=1e-12).log()[fisher > 0].sum()
-        return nll

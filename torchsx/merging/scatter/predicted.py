@@ -20,7 +20,6 @@ import torch
 from torch import Tensor
 
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scatter.gengauss import GenGaussLogScatter
 
 
@@ -47,6 +46,7 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
     def __init__(self, *, strict: bool = True) -> None:
         super().__init__()
         self.strict = bool(strict)
+        self._obs_id: Tensor | None = None
         self._sorted_ids: Tensor | None = None
         self._sort_perm: Tensor | None = None
         self._log_alpha: Tensor | None = None
@@ -65,15 +65,15 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
                 f"shape mismatch: obs_id={tuple(obs_id.shape)} "
                 f"log_alpha={tuple(log_alpha.shape)} log_beta={tuple(log_beta.shape)}"
             )
-        sorted_ids, perm = torch.sort(obs_id)
-        self._sorted_ids = sorted_ids
-        self._sort_perm = perm
+        # sorted for lookups on first use (_positions)
+        self._obs_id = obs_id
+        self._sorted_ids = self._sort_perm = None
         self._log_alpha = log_alpha
         self._log_beta = log_beta
         self._log_alpha_hi = log_alpha_hi
 
     def clear_prediction(self) -> None:
-        self._sorted_ids = self._sort_perm = None
+        self._obs_id = self._sorted_ids = self._sort_perm = None
         self._log_alpha = self._log_beta = self._log_alpha_hi = None
 
     @property
@@ -81,8 +81,13 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
         return self._log_alpha is not None
 
     def _positions(self, obs_id: Tensor) -> Tensor:
-        """Map ``obs_id`` to rows of the installed prediction."""
-        assert self._sorted_ids is not None and self._sort_perm is not None
+        """Map ``obs_id`` to rows of the installed prediction (in order when ``obs_id``
+        is the installed tensor itself)."""
+        assert self._obs_id is not None
+        if obs_id is self._obs_id:
+            return torch.arange(obs_id.numel(), device=obs_id.device)
+        if self._sorted_ids is None:
+            self._sorted_ids, self._sort_perm = torch.sort(self._obs_id)
         loc = torch.searchsorted(self._sorted_ids, obs_id)
         loc = loc.clamp(max=self._sorted_ids.numel() - 1)
         found = self._sorted_ids[loc] == obs_id
@@ -98,7 +103,7 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
     # ── the seam ───────────────────────────────────────────────────────
 
     def log_alpha_beta_obs(
-        self, params: Parameters, meta: ObsInfo
+        self, params: None, meta: ObsInfo
     ) -> tuple[Tensor, Tensor]:
         if self._log_alpha is None:
             raise RuntimeError(
@@ -113,7 +118,7 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
         pos = self._positions(meta.obs_id)
         return self._log_alpha[pos], self._log_beta[pos]
 
-    def log_alpha_hi_obs(self, params: Parameters, meta: ObsInfo) -> Tensor | None:
+    def log_alpha_hi_obs(self, params: None, meta: ObsInfo) -> Tensor | None:
         if self._log_alpha_hi is None:
             return None
         return self._log_alpha_hi[self._positions(meta.obs_id)]

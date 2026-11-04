@@ -23,30 +23,22 @@ from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.scale import AmortizedScale
-from torchsx.nn.heads import ScaleHeads
 from torchsx.nn.objective import MarginalNLL
 from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
 from tests.test_amortized_training import _synthetic
 
 
-def _stack(prep, params, tmp_path, *, skew=True, n_cond=1):
-    kw = dict(d_model=32, n_layers=2, include_hkl=False, predict_shape=False,
-              beta_init=1.0, w_init=1.65, predict_skew=skew)
-    scale = AmortizedScale.from_prep(prep, **kw)
+def _stack(prep, params, tmp_path, *, n_cond=1):
+    scale = AmortizedScale.from_prep(prep, d_model=32)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
     cfg = TrainConfig(
-        max_obs_per_batch=6000, epochs=0, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
+        max_obs_per_batch=6000, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
         posterior_prior="wilson",
         posterior_k_coarse=15, posterior_m_fine=65, posterior_n_sigma=8.0,
         device="cpu", outdir=str(tmp_path),
     )
     return scale, obj, AmortizedTrainer(prep, scale, obj, params, config=cfg)
-
-
-def test_default_heads_are_unchanged():
-    h = ScaleHeads(8)
-    assert h(torch.zeros(3, 8)).log_alpha_hi is None
 
 
 # ── merge() ────────────────────────────────────────────────────────────
@@ -86,10 +78,9 @@ def _inline_merge(tr, scale, obj, params, prep):
     return F, F_sd, I0, edge
 
 
-@pytest.mark.parametrize("skew", [False, True])
-def test_merge_matches_the_inline_bench_loop(tmp_path, skew):
+def test_merge_matches_the_inline_bench_loop(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
-    scale, obj, tr = _stack(prep, params, tmp_path, skew=skew)
+    scale, obj, tr = _stack(prep, params, tmp_path)
     scale.eval()
     # One locating window, because that is what the inline loop does.  The
     # shipped default refines over three (see
@@ -170,16 +161,15 @@ def test_merge_refuses_to_pool_splits_and_honours_one(tmp_path):
 
 def test_checkpoint_carries_the_recipe(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
-    scale, _obj, tr = _stack(prep, params, tmp_path, skew=True)
+    scale, _obj, tr = _stack(prep, params, tmp_path)
     tr.data_recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0,
                       "radii": [7.0, 9.0, 11.0]}
     tr.split_names = ["dark"]
     ck = torch.load(tr.save_best(tmp_path / "best.pt"), weights_only=False)
     assert ck["data"]["radii"] == [7.0, 9.0, 11.0]
     assert ck["likelihood"]["bg_var_factor"] == pytest.approx(0.1)
-    assert ck["scatter"]["predict_skew"]
+    assert ck["scatter"]["n_components"] == scale.heads.n_components == 4
     assert ck["quadrature"] == {"kind": "SplitLogGrid", "n_points": 64}
-    assert ck["scale"]["predict_shape"] is False
     for tier in ("self_features", "context_features", "crystal_features"):
         assert ck["scale"][tier] == list(getattr(scale.features, tier)), tier
     assert ck["splits"] == ["dark"]
@@ -192,7 +182,6 @@ def test_checkpoint_carries_the_recipe(tmp_path):
 
 class _FreeArgs:
     def __init__(self, **kw):
-        self.no_free = False
         self.free_from = None
         self.free_frac = 0.05
         self.free_seed = 20260902
@@ -217,7 +206,6 @@ def test_free_flags_are_reproducible_and_copied(tmp_path):
     c = P.work_mask(hkl, _FreeArgs(free_seed=1), verbose=False)
     assert (a == b).all() and not (a == c).all()
     assert abs((~a).mean() - 0.05) < 0.01
-    assert P.work_mask(hkl, _FreeArgs(no_free=True), verbose=False) is None
 
     # a set taken from a file is copied, and absent reflections go to WORK
     src = {tuple(int(v) for v in k): 0 for k in P.canonical_hkl(hkl[:50])}
@@ -308,30 +296,6 @@ def test_anomalous_products_unstack_onto_asu_rows(tmp_path):
     assert mtz.nreflections == n_asu
     flag = np.array(mtz.column_with_label("R-free-flags"), dtype=int)
     assert set(np.unique(flag)) <= {0, 1}          # one flag per ASU row, not per mate
-
-    out_i = tmp_path / "anom_i.mtz"
-    counts = torch.arange(n) % 5 + 1
-    P.write_intensity_mtz(out_i, signed, val, val * 0.1, cell=cell, spacegroup=sg,
-                          keep=keep, n_meas=counts, merge_friedel=False, verbose=False)
-    mtz_i = gemmi.read_mtz_file(str(out_i))
-    labels_i = [c.label for c in mtz_i.columns]
-    assert {"I-obs(+)", "SIGI-obs(+)", "I-obs(-)", "SIGI-obs(-)",
-            "N(+)", "N(-)"} <= set(labels_i)
-    assert {c.type for c in mtz_i.columns if c.label.startswith("N(")} == {"I"}
-    assert mtz_i.nreflections == n_asu
-    asu = gemmi.ReciprocalAsu(gemmi.SpaceGroup(sg))
-    written = np.array(mtz_i, dtype=float)[:, :3].astype(int)
-    assert all(asu.is_in(row.tolist()) for row in written)
-    # Every measurement is filed under exactly one branch, none invented.
-    n_plus = np.array(mtz_i.column_with_label("N(+)"))
-    n_minus = np.array(mtz_i.column_with_label("N(-)"))
-    assert (n_plus + n_minus).sum() == counts.sum()
-
-    out_m = tmp_path / "merged_i.mtz"
-    P.write_intensity_mtz(out_m, np.abs(signed), val, val * 0.1, cell=cell,
-                          spacegroup=sg, keep=keep, n_meas=counts, verbose=False)
-    mtz_m = gemmi.read_mtz_file(str(out_m))
-    assert next(c.type for c in mtz_m.columns if c.label == "N") == "I"
 
 
 def test_radii_and_gain_parsing():
@@ -546,7 +510,7 @@ def test_merge_survives_a_non_finite_batch(tmp_path):
 
 def _trainer_from_stack(prep, params, scale, obj, S):
     cfg = TrainConfig(
-        epochs=0, posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
+        posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
         posterior_k_coarse=9, posterior_m_fine=33, device="cpu", heldout_frac=0.1,
     )
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
@@ -554,9 +518,11 @@ def _trainer_from_stack(prep, params, scale, obj, S):
     return tr
 
 
-def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
-    """best.pt records the Wilson surface and the basis anchor; merge_nn rebuilds the
-    stack without flags, evaluates the same surface and reproduces the predictions."""
+@pytest.mark.parametrize("flags,anchor", [([], "median"), (["--tether", "none"], "basis")])
+def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path, flags, anchor):
+    """best.pt records the Wilson surface and the anchor (the scalar gauge with the
+    tether's gauge term, the basis projection without it); merge_nn rebuilds the stack
+    without flags, evaluates the same surface and reproduces the predictions."""
     from torchsx.cli import _pipeline as P
     from torchsx.cli.merge_nn import _build_parser as merge_parser, restore_wilson_surface
     from torchsx.cli.train import _build_parser as train_parser
@@ -565,16 +531,16 @@ def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
     recipe = {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}
     bundle = P.PrepBundle(prep, recipe, [], 0.1)
     targs = train_parser().parse_args(
-        ["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
+        ["x.sfx", "-o", str(tmp_path), "--device", "cpu", *flags])
     prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
-    assert S["basis"] is not None and scale.anchor_stat == "basis" and S["basis"].degree == 4
+    assert S["basis"] is not None and scale.anchor_stat == anchor and S["basis"].degree == 4
     tr = _trainer_from_stack(prep_, params_, scale, obj, S)
     t = tr.targets[0]
     assert t.has_basis and t.wilson_coef.abs().sum() > 0 and t.wilson_coef_param is not None
     tr.data_recipe = dict(recipe)
     ck = torch.load(tr.save_best(tmp_path / "smooth.pt"), weights_only=False)
     assert ck["posterior_grid"]["wilson_degree"] == 4
-    assert ck["scale"]["anchor_stat"] == "basis"
+    assert ck["scale"]["anchor_stat"] == anchor
     assert set(ck["wilson_surface"]) == {"basis", "coef"}
     assert "gauge_phi" not in ck["state_dict"], "the basis rows are rebuilt, not stored"
 
@@ -582,7 +548,7 @@ def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
     margs = merge_parser().parse_args(
         ["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
     p2, q2, rebuilt, o2, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
-    assert S2["wilson_degree"] == 4 and rebuilt.anchor_stat == "basis"
+    assert S2["wilson_degree"] == 4 and rebuilt.anchor_stat == anchor
     rebuilt.load_state_dict(ck["state_dict"])
     tr2 = _trainer_from_stack(p2, q2, rebuilt, o2, S2)
     restore_wilson_surface(tr2, p2, ck)
@@ -597,15 +563,32 @@ def test_checkpoint_round_trip_rebuilds_the_same_model(tmp_path):
                                    scale.predict(prep_.obs_info.gather(rows)).log_K)
 
 
-def test_defaults_are_the_wilson_prior_and_basis_anchor(tmp_path):
+def test_defaults_are_the_wilson_prior_and_the_tether(tmp_path):
     from torchsx.cli import _pipeline as P
     from torchsx.cli.train import _build_parser as train_parser
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
     bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
     targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu"])
     _p, _q, scale, _o, S = P.build_stack(bundle, targs, verbose=False)
-    assert S["prior"] == "wilson" and S["basis"] is not None and scale.anchor_stat == "basis"
+    assert S["prior"] == "wilson" and S["basis"] is not None and scale.anchor_stat == "median"
+    assert P.tether_terms(targs) == ("gauge",)
     assert TrainConfig().posterior_prior == "wilson"
+    off = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", "--tether", "none"])
+    assert P.build_stack(bundle, off, verbose=False)[2].anchor_stat == "basis" and P.tether_terms(off) == ()
+
+
+@pytest.mark.parametrize("flags,refine", [([], True), (["--no-refine-geometry"], False)])
+def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path, flags, refine):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser as train_parser
+    from torchsx.nn.fold_transformer import FoldTransformerEncoder
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", *flags])
+    enc = P.build_stack(bundle, targs, verbose=False)[2].encoder
+    assert isinstance(enc, FoldTransformerEncoder)
+    assert (enc.context_folds, len(enc.ctx_blocks), len(enc.query_blocks)) == (5, 2, 1)
+    assert enc.refine_geometry == refine
 
 
 # ── detector noise under the gain policy ───────────────────────────────

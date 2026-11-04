@@ -30,7 +30,6 @@ import torch.nn as nn
 from torch import Tensor
 
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scatter.base import ScatterModel
 from torchsx.merging.scatter.gengauss import (
     gengauss_log_prob_from_obs,
@@ -171,6 +170,7 @@ class PredictedMixtureScatter(ScatterModel):
         self.views = nn.ModuleList(
             [PredictedGenGaussScatter(strict=strict) for _ in range(self.n_components)]
         )
+        self._obs_id: Tensor | None = None
         self._sorted_ids: Tensor | None = None
         self._sort_perm: Tensor | None = None
         self._log_pi: Tensor | None = None
@@ -190,15 +190,16 @@ class PredictedMixtureScatter(ScatterModel):
         self._mix = mix
         for k, view in enumerate(self.views):
             view.set_prediction(obs_id, la_lo[:, k], log_beta[:, k], la_hi[:, k])
-        sorted_ids, perm = torch.sort(obs_id)
-        self._sorted_ids, self._sort_perm = sorted_ids, perm
+        # sorted for lookups on first use (_positions)
+        self._obs_id = obs_id
+        self._sorted_ids = self._sort_perm = None
         self._log_pi, self._offset = log_pi, offset
         self._log_alpha_lo, self._log_alpha_hi, self._log_beta = la_lo, la_hi, log_beta
 
     def clear_prediction(self) -> None:
         for view in self.views:
             view.clear_prediction()
-        self._sorted_ids = self._sort_perm = None
+        self._obs_id = self._sorted_ids = self._sort_perm = None
         self._log_pi = self._offset = None
         self._log_alpha_lo = self._log_alpha_hi = self._log_beta = None
         self._mix = None
@@ -208,11 +209,15 @@ class PredictedMixtureScatter(ScatterModel):
         return self._log_pi is not None
 
     def _positions(self, obs_id: Tensor) -> Tensor:
-        if self._sorted_ids is None or self._sort_perm is None:
+        if self._obs_id is None:
             raise RuntimeError(
                 "PredictedMixtureScatter has no prediction installed; call "
                 "set_prediction(obs_id, mix) first."
             )
+        if obs_id is self._obs_id:
+            return torch.arange(obs_id.numel(), device=obs_id.device)
+        if self._sorted_ids is None:
+            self._sorted_ids, self._sort_perm = torch.sort(self._obs_id)
         loc = torch.searchsorted(self._sorted_ids, obs_id)
         loc = loc.clamp(max=self._sorted_ids.numel() - 1)
         found = self._sorted_ids[loc] == obs_id
@@ -235,9 +240,12 @@ class PredictedMixtureScatter(ScatterModel):
         ]
 
     def mixture_obs(self, meta: ObsInfo) -> Tensor:
-        """Gather all five parameter blocks with one observation lookup."""
+        """Gather all five parameter blocks with one observation lookup (the installed
+        table itself for the installed batch)."""
         if meta.obs_id is None:
             raise ValueError("PredictedMixtureScatter needs ObsInfo.obs_id to address its prediction")
+        if meta.obs_id is self._obs_id:
+            return self._mix
         pos = self._positions(meta.obs_id)
         return self._mix.index_select(0, pos)
 
@@ -248,15 +256,15 @@ class PredictedMixtureScatter(ScatterModel):
         k = self._log_pi[pos].argmax(dim=1)
         return pos, k
 
-    def log_alpha_beta_obs(self, params: Parameters, meta: ObsInfo) -> tuple[Tensor, Tensor]:
+    def log_alpha_beta_obs(self, params: None, meta: ObsInfo) -> tuple[Tensor, Tensor]:
         pos, k = self._dominant(meta)
         return self._log_alpha_lo[pos, k], self._log_beta[pos, k]
 
-    def log_alpha_hi_obs(self, params: Parameters, meta: ObsInfo) -> Tensor | None:
+    def log_alpha_hi_obs(self, params: None, meta: ObsInfo) -> Tensor | None:
         pos, k = self._dominant(meta)
         return self._log_alpha_hi[pos, k]
 
-    def log_prob(self, eps: Tensor, params: Parameters, meta: ObsInfo) -> Tensor:
+    def log_prob(self, eps: Tensor, params: None, meta: ObsInfo) -> Tensor:
         """Mixture log-density at ``eps`` ``(M, K_grid)`` for the observations in ``meta``."""
         pos = self._positions(meta.obs_id)
         terms = []

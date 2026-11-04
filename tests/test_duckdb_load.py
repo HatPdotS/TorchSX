@@ -533,7 +533,7 @@ def test_probixi_features_reach_the_encoder(db_path):
     stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
     prep = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded"))
     scale = AmortizedScale.from_prep(
-        prep, d_model=16, n_layers=2,
+        prep, d_model=16,
         self_features=SELF_FEATURES + (DISK_FEATURE,),
         crystal_features=DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES,
     )
@@ -544,7 +544,7 @@ def test_probixi_features_reach_the_encoder(db_path):
     assert x_crys.shape == (3, len(CRYSTAL_FEAT_COLUMNS))
     assert x_self[:, feats.self_features.index(DISK_FEATURE)].std() > 0
     # the default tiers are unchanged: no disk column, the twelve stream columns
-    plain = AmortizedScale.from_prep(prep, d_model=16, n_layers=2).features
+    plain = AmortizedScale.from_prep(prep, d_model=16).features
     assert DISK_FEATURE not in plain.self_features
     assert plain.crystal_features == DEFAULT_CRYSTAL_FEATURES
 
@@ -571,15 +571,22 @@ def test_cli_switches_on_what_the_database_records(db_path, tmp_path):
     assert sorted(oi.n_pix.tolist()) == [6, 7, 9, 9, 9, 9, 9]
     # Var[bg] / bg in photons from the recorded columns: 4 / (GAIN * 40)
     assert bundle.bg_var_factor == pytest.approx(4.0 / (GAIN * 40.0))
-    _, _, scale, obj, _ = P.build_stack(bundle, args, verbose=False)
+    host, params, scale, obj, S = P.build_stack(bundle, args, verbose=False)
     assert DISK_FEATURE in scale.features.self_features
     assert set(PROBIXI_CRYSTAL_FEATURES) <= set(scale.features.crystal_features)
     assert obj.likelihood.bg_var_factor == pytest.approx(4.0 / (GAIN * 40.0))
     assert obj.likelihood.bg_mean_offset == 0.0
     # a merge rebuilds the tiers its checkpoint recorded, not the defaults
+    from tests.test_cli_pipeline import _trainer_from_stack
+    tr = _trainer_from_stack(host, params, scale, obj, S)
+    try:
+        ck = torch.load(tr.save_best(tmp_path / "model.pt"), weights_only=False)
+    finally:
+        tr.close()
     tiers = {k: list(getattr(scale.features, k))
              for k in ("self_features", "context_features", "crystal_features")}
-    _, _, again, _, _ = P.build_stack(bundle, args, ckpt={"scale": tiers}, verbose=False)
+    assert {k: ck["scale"][k] for k in tiers} == tiers
+    _, _, again, _, _ = P.build_stack(bundle, args, ckpt=ck, verbose=False)
     assert {k: list(getattr(again.features, k)) for k in tiers} == tiers
     prep.close()
 

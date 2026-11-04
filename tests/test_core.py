@@ -1,9 +1,9 @@
-"""Tests for _SFXStreamCore."""
+"""Tests for SFXStreamCore."""
 
 import pytest
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 
 
 def test_core_dimensions(sample_core):
@@ -15,7 +15,7 @@ def test_core_dimensions(sample_core):
 def test_core_validation_crystal_id_range():
     """crystal_id out of range should raise."""
     with pytest.raises(AssertionError, match="crystal_id max"):
-        _SFXStreamCore(
+        SFXStreamCore(
             hkl=torch.tensor([[1, 0, 0]], dtype=torch.int16),
             I=torch.tensor([1.0]),
             sigma=torch.tensor([1.0]),
@@ -51,7 +51,7 @@ def test_core_to_device(sample_core):
 def test_core_obs_length_mismatch():
     """Mismatched observation tensor lengths should raise."""
     with pytest.raises(AssertionError):
-        _SFXStreamCore(
+        SFXStreamCore(
             hkl=torch.tensor([[1, 0, 0], [0, 1, 0]], dtype=torch.int16),
             I=torch.tensor([1.0]),  # wrong length
             sigma=torch.tensor([1.0, 2.0]),

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import pickle
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -86,7 +87,6 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
                         "columns. Default: the checkpoint recipe, then merge.")
 
 
-# Preserve these import names for callers while keeping one resolver.
 from torchsx.measurement import (parse_gain, parse_radii, GAIN_POLICY_VERSION,
                                  DEFAULT_GAIN_TOLERANCE)
 
@@ -190,19 +190,15 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     cache = args.cache_prep
     if cache is None and getattr(args, "out", None) is not None:
         run = args.ckpt.parent if getattr(args, "ckpt", None) else args.out
-        # a run prepared before the on-disk store keeps its blob
-        cache = run / "prepared.pt" if (run / "prepared.pt").is_file() else run / "prepared"
-    blob = stored = None
-    if cache is not None and cache.is_file():
-        blob = torch.load(cache, weights_only=False)
-    elif cache is not None and (cache / "meta.json").is_file():
+        cache = run / "prepared"
+    stored = None
+    if cache is not None and (cache / "meta.json").is_file():
         stored = json.loads((cache / "meta.json").read_text())
-        blob = {"signature": stored.get("signature"), "recipe": stored.get("recipe")}
     elif cache is not None and cache.exists():
         raise SystemExit(f"--cache {cache} exists but is not a prepared cache; "
                          "remove it or point --cache somewhere else.")
-    if blob is not None:
-        if (blob.get("signature") or {}).get("observation_filter_version") != OBSERVATION_FILTER_VERSION:
+    if stored is not None:
+        if (stored.get("signature") or {}).get("observation_filter_version") != OBSERVATION_FILTER_VERSION:
             raise SystemExit(
                 f"Prepared cache {cache} uses an incompatible observation filter. "
                 "Rebuild it from the source using a new --cache path; "
@@ -266,12 +262,12 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     except (OSError, ValueError) as exc:
         raise SystemExit(f"Cannot resolve input measurement: {exc}") from exc
 
-    if blob is not None:
-        got = blob.get("signature")
+    if stored is not None:
+        got = stored.get("signature")
         comparable_got = _comparable_prep_signature(got, {})
         comparable_signature = _comparable_prep_signature(signature, {})
         if isinstance(signature.get("gain"), (float, int)):
-            comparable_got = _comparable_prep_signature(got, blob["recipe"])
+            comparable_got = _comparable_prep_signature(got, stored.get("recipe"))
         if comparable_got != comparable_signature:
             differ = sorted(
                 k for k in set(comparable_signature) | set(comparable_got)
@@ -280,15 +276,10 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                 f"--cache {cache} was built with different settings "
                 f"({', '.join(differ) if differ else 'no signature recorded'}); "
                 f"delete it or point --cache somewhere else.")
-        if stored is not None:
-            from torchsx.merging.store import PreparedStore
-            prep = PreparedStore(cache)
-            bundle = PrepBundle(prep, stored["recipe"], stored.get("split_names", []),
-                                stored["bg_var_factor"])
-        else:
-            prep = blob["prep"]
-            bundle = PrepBundle(prep, blob["recipe"], blob.get("split_names", []),
-                                blob["bg_var_factor"])
+        from torchsx.merging.store import PreparedStore
+        prep = PreparedStore(cache)
+        bundle = PrepBundle(prep, stored["recipe"], stored.get("split_names", []),
+                            stored["bg_var_factor"])
         if verbose:
             print(f"prep from cache {cache} "
                   f"({prep.n_valid:,} reflections, {prep.n_obs_total:,} obs, "
@@ -395,11 +386,6 @@ def _recipe(args, d, splits, d_min, spacegroup, merge_friedel, gain, radii, nois
     return recipe
 
 
-# a custom-split file names events //N; a database records the integer
-def _event_key(event) -> str:
-    return event if isinstance(event, str) else f"//{int(event)}"
-
-
 def _split_labels(args, builder, *, verbose: bool = True):
     """``(labels, names, extra)``: the split of every prepared crystal, the split
     names, and the masks over the surviving crystals that are prepared once
@@ -416,16 +402,12 @@ def _split_labels(args, builder, *, verbose: bool = True):
             # CrystFEL custom-split file: "filename event dataset", the unit
             # being a frame, not a crystal. All crystals of a frame belong
             # to each of its named splits.
-            lookup = {}
-            for raw in open(args.split_file):
-                line = raw.split("#", 1)[0].split()
-                if not line:
-                    continue
-                if len(line) < 3:
-                    raise SystemExit(
-                        f"{args.split_file}: expected 'filename event dataset', "
-                        f"got {raw.rstrip()!r}")
-                lookup.setdefault((line[0], line[1]), set()).add(line[2])
+            from torchsx.io.times import event_key, load_split_labels
+
+            try:
+                lookup = load_split_labels(args.split_file)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from None
             names = sorted({name for bins in lookup.values() for name in bins})
             index = {n: i for i, n in enumerate(names)}
             fnames, evts = builder.surviving_filenames, builder.surviving_events
@@ -434,7 +416,7 @@ def _split_labels(args, builder, *, verbose: bool = True):
                     "the stream carries no image filename/event metadata, so a "
                     "custom-split file cannot be matched to it; re-parse from "
                     "the .stream, or pass a .pt label tensor")
-            memberships = [sorted(index[name] for name in lookup.get((f, _event_key(e)), ()))
+            memberships = [sorted(index[name] for name in lookup.get((f, event_key(e)), ()))
                            for f, e in zip(fnames, evts)]
             image_id = builder.surviving_image_id
             per_image = torch.tensor([bins[0] if bins else -1 for bins in memberships],
@@ -447,7 +429,7 @@ def _split_labels(args, builder, *, verbose: bool = True):
                       f"unmatched", flush=True)
             # The trainer consumes one label per crystal. Add another copy
             # of the frame's crystals/observations for each extra membership.
-            # Sets above prevent duplicate rows from double-counting a bin.
+            # A repeated row is one membership, so no bin counts a crystal twice.
             label_parts = [labels]
             for slot in range(1, max(map(len, memberships), default=0)):
                 more = torch.tensor([bins[slot] if len(bins) > slot else -1
@@ -484,7 +466,7 @@ def _split_labels(args, builder, *, verbose: bool = True):
 
 
 def add_free_args(p: argparse.ArgumentParser) -> None:
-    p.set_defaults(free_frac=0.05, free_seed=20260902, no_free=False)
+    p.set_defaults(free_frac=0.05, free_seed=20260902)
     p.add_argument("--seed", type=int, default=None, help="random seed (default 0; merge reuses the run seed)")
     p.add_argument("--free-from", type=Path, default=None,
                    help="take the free set from an existing .mtz (FreeR_flag / "
@@ -506,7 +488,7 @@ def canonical_hkl(hkl: np.ndarray) -> np.ndarray:
     return h
 
 
-def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | None:
+def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray:
     """``True = working set, False = free`` (CCP4's 0 = free convention).
 
     Reflections absent from a shared free set go to the WORKING set: inventing
@@ -515,8 +497,6 @@ def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | No
     """
     import torch
 
-    if args.no_free:
-        return None
     n = len(hkl)
     if args.free_from is not None:
         if str(args.free_from).endswith(".pkl"):
@@ -560,7 +540,7 @@ def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | No
 
 
 def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
-              work: np.ndarray | None, keep: np.ndarray, merge_friedel: bool = True,
+              work: np.ndarray, keep: np.ndarray, merge_friedel: bool = True,
               verbose: bool = True) -> None:
     """Write F/SIGF (+ free flags) and prove no intensity column landed.
 
@@ -580,7 +560,7 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
         F_sigma=F_sd.detach().cpu()[kt].float().clamp(min=1e-6),
         cell=Cell(list(cell)),
         spacegroup=SpaceGroup(spacegroup),
-        rfree_flags=(None if work is None else torch.from_numpy(work[keep])),
+        rfree_flags=torch.from_numpy(work[keep]),
         friedel_merged=merge_friedel,
     )
     # Deliberately NOT setting data.I / data.I_sigma -- see the module docstring.
@@ -600,46 +580,6 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
             fr = np.array(mtz.column_with_label(free_label), dtype=int)
             print(f"  readback free {100 * (fr == 0).mean():.2f} % "
                   f"({int((fr == 0).sum()):,} of {len(fr):,})", flush=True)
-
-
-def write_intensity_mtz(path: Path, hkl: np.ndarray, I, I_sd, *, cell, spacegroup: str,
-                        keep: np.ndarray, n_meas=None, merge_friedel: bool = True,
-                        verbose: bool = True) -> None:
-    """Write merged intensities as ``I-obs`` / ``SIGI-obs`` (no free flags).
-
-    For the moment estimators, whose product is an intensity; French-Wilson
-    happens downstream.  ``n_meas`` goes out as ``N``, aimless's spelling for the
-    multiplicity.  With ``merge_friedel=False`` the signed indices are pivoted
-    onto ``I-obs(+)``/``I-obs(-)``/``N(+)``/``N(-)``, since a negative ASU index
-    in the file is not what a reader takes for a Bijvoet mate.
-    """
-    import pandas as pd
-    from torchref.io.mtz import write
-
-    def _np(t, dtype=np.float64):
-        return np.asarray(t.detach().cpu().numpy() if hasattr(t, "detach") else t,
-                          dtype=dtype)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    I, I_sd = _np(I), _np(I_sd)
-    keep = np.asarray(keep, dtype=bool) & np.isfinite(I) & np.isfinite(I_sd) & (I_sd > 0)
-
-    cols = {"I-obs": I[keep], "SIGI-obs": I_sd[keep]}
-    if n_meas is not None:
-        cols["N"] = _np(n_meas, np.int32)[keep]
-    if merge_friedel:
-        rows = hkl[keep]
-    else:
-        rows, cols = _bijvoet_columns(hkl[keep], cols, spacegroup)
-        # A mate nobody measured has no intensity, but its multiplicity is 0.
-        for name in ("N(+)", "N(-)"):
-            if name in cols:
-                cols[name] = np.nan_to_num(cols[name]).astype(np.int32)
-    df = pd.DataFrame({"H": rows[:, 0], "K": rows[:, 1], "L": rows[:, 2], **cols})
-    write(df, [float(c) for c in cell], spacegroup, str(path))
-    if verbose:
-        print(f"wrote {path}\n  reflections {len(df):,}  "
-              f"columns {list(df.columns)}", flush=True)
 
 
 def _bijvoet_columns(hkl: np.ndarray, cols: dict,
@@ -664,6 +604,17 @@ def _bijvoet_columns(hkl: np.ndarray, cols: dict,
             col = out.setdefault(f"{name}{suffix}", np.full(len(rows), np.nan))
             col[inverse[sel]] = values[sel]
     return rows, out
+
+
+def tether_summary(rec: dict) -> str:
+    """One line of a merge's tether readout (:meth:`~torchsx.merging.tether.Tether.readout`)."""
+    parts = []
+    g = rec.get("gauge")
+    if g:
+        parts.append(f"gauge RMS {g['rms']:.4f} nats"
+                     + (" (by shell, low to high resolution: "
+                        + " ".join(f"{s['mean']:+.3f}" for s in g["by_shell"]) + ")" if g.get("by_shell") else ""))
+    return f"sum-of-spots tether over {rec['n_obs']:,} observations: " + "; ".join(parts)
 
 
 def report_merge(res: dict, *, verbose: bool = True) -> None:
@@ -719,18 +670,132 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
 # ── model stack ────────────────────────────────────────────────────────
 
 
-#: The production configuration of a new run.  ``skew``: two-width scatter.
-#: ``peer_attention=2``: two full-width cross-attention layers from each
-#: observation onto the other observations of its crystal.  A checkpoint's own
-#: record overrides these in a merge.
+#: The production configuration of a new run.  The fold transformer:
+#: ``context_folds`` masked runs per crystal, ``ctx_layers`` self-attention and
+#: ``query_layers`` cross-attention blocks of ``n_heads`` heads, each run's
+#: geometry refined.  The heads take their defaults from
+#: :class:`~torchsx.nn.heads.ScaleHeads`.  A checkpoint's own record replaces
+#: these in a merge.
 DEFAULTS = dict(
-    d_model=128, n_layers=5, include_hkl=False, predict_shape=False,
-    beta_init=1.0, w_init=1.65, context_folds=2, obs_context_layers=2,
-    obs_self_layers=2, peer_attention=2, peer_heads=8, skew=True, miss=0.03, outlier=0.0, inner_points=192,
+    d_model=128, context_folds=5, ctx_layers=2, query_layers=1, n_heads=8, refine_geometry=True,
+    miss=0.03, outlier=0.0, inner_points=192,
     k_coarse=63, m_fine=257, n_sigma=24.0, max_halfwidth=12.0,
     wilson_degree=4, gauge_anchor="basis",
-    scatter_family="mixture", scatter_components=4, scatter_shape="gaussian",
+    # the sum-of-spots tether's terms (torchsx.merging.tether); with "gauge" the scale pins
+    # the scalar gauge only and the tether holds the smooth one
+    tether=("gauge",),
 )
+
+
+def tether_terms(args) -> tuple:
+    """The tether's terms of a new run: ``--tether``, else the default."""
+    terms = getattr(args, "tether", None)
+    return tuple(DEFAULTS["tether"] if terms is None else terms)
+
+
+def configure_torch() -> None:
+    """Torch settings shared by training and the merge, before CUDA is first used.
+
+    TF32 for the encoder's float32 matmuls (the likelihood and posterior
+    integrals are elementwise and Triton code, which this does not touch), and
+    CUDA memory in expandable segments unless ``PYTORCH_ALLOC_CONF`` (or the
+    older ``PYTORCH_CUDA_ALLOC_CONF``) says otherwise: the packed encoder blocks
+    change size every batch, and fixed segments sized to earlier blocks fill
+    the cache with pieces the next block cannot use.
+    """
+    import torch
+
+    torch.set_float32_matmul_precision("high")
+    if "PYTORCH_ALLOC_CONF" not in os.environ and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        name = ("PYTORCH_ALLOC_CONF" if torch.torch_version.TorchVersion(torch.__version__) >= "2.9"
+                else "PYTORCH_CUDA_ALLOC_CONF")
+        os.environ[name] = "expandable_segments:True"
+        if torch.cuda.is_initialized():
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+
+
+class ResourceProbe:
+    """Wall time and GPU memory of a run, phase by phase.
+
+    :meth:`begin` ends the running phase and starts the next; :meth:`end` ends
+    the last.  A phase records its seconds and, on CUDA, the caching
+    allocator's peak allocated and reserved memory and the most device memory
+    seen in use, sampled at every update and at the phase's ends.  Device
+    memory is what ``nvidia-smi`` shows for the whole GPU: the reserved cache,
+    the CUDA context and any other process on the same device.  :meth:`update`
+    records an update's wall seconds; the first includes compilation.  The
+    probe never initialises CUDA itself: a phase that starts before the first
+    CUDA call counts from that call.
+    """
+
+    def __init__(self, device):
+        import torch
+
+        self._torch = torch
+        self.cuda = str(device or "").startswith("cuda") and torch.cuda.is_available()
+        self.phases: dict[str, dict] = {}
+        self.update_s: list[float] = []
+        self._name = None
+
+    def _live(self) -> bool:
+        return self.cuda and self._torch.cuda.is_initialized()
+
+    def _sample(self) -> None:
+        if self._live():
+            free, total = self._torch.cuda.mem_get_info()
+            self._device_used = max(self._device_used, (total - free) / 2**30)
+
+    def begin(self, name: str) -> None:
+        self.end()
+        if self._live():
+            self._torch.cuda.synchronize()
+            self._torch.cuda.reset_peak_memory_stats()
+        self._name, self._t0, self._device_used = name, time.time(), 0.0
+        self._sample()
+
+    def end(self) -> None:
+        if self._name is None:
+            return
+        rec = {}
+        if self._live():
+            self._torch.cuda.synchronize()
+            self._sample()
+            cuda = self._torch.cuda
+            rec = dict(gpu_peak_allocated_gib=cuda.max_memory_allocated() / 2**30,
+                       gpu_peak_reserved_gib=cuda.max_memory_reserved() / 2**30,
+                       gpu_device_used_gib=self._device_used)
+        self.phases[self._name] = dict(seconds=time.time() - self._t0, **rec)
+        self._name = None
+
+    def update(self, seconds: float) -> None:
+        self.update_s.append(float(seconds))
+        self._sample()
+
+    def summary(self) -> dict:
+        out = dict(phases=dict(self.phases))
+        if self.cuda:
+            out["gpu"] = self._torch.cuda.get_device_name()
+        if self.update_s:
+            s = sorted(self.update_s[1:]) or self.update_s
+            out["updates"] = dict(
+                n=len(self.update_s), first_s=self.update_s[0], median_s=s[len(s) // 2],
+                p90_s=s[int(0.9 * (len(s) - 1))], max_s=s[-1], total_s=sum(self.update_s))
+        return out
+
+    def report(self) -> str:
+        lines = []
+        for name, r in self.phases.items():
+            line = f"{name}: {r['seconds']:.0f} s"
+            if "gpu_peak_allocated_gib" in r:
+                line += (f", GPU peak {r['gpu_peak_allocated_gib']:.2f} GiB allocated, "
+                         f"{r['gpu_peak_reserved_gib']:.2f} reserved, "
+                         f"{r['gpu_device_used_gib']:.2f} in use on the device")
+            lines.append(line)
+        u = self.summary().get("updates")
+        if u:
+            lines.append(f"updates: {u['n']}, median {u['median_s']:.2f} s, p90 {u['p90_s']:.2f} s, "
+                         f"max {u['max_s']:.1f} s, first {u['first_s']:.0f} s")
+        return "\n".join(lines)
 
 
 def add_model_args(p: argparse.ArgumentParser) -> None:
@@ -742,14 +807,12 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
                         "checkpoint unless set")
 
 
-# Checkpoint ``kind`` markers for the corrected detection stack.  The first of
-# each pair is what this package writes; the second is an earlier wrapper
-# (``annulus_mean_only_v1``) whose checkpoints predate the parameter.
-_BG_MEAN_QUAD_KINDS = ("SplitLogGrid+bgmean", "AnnulusMeanOnlySplitLogGridV1")
-_BG_MEAN_LIK_KINDS = ("Poisson+bgmean", "AnnulusMeanOnlyPoissonV1")
+# Checkpoint ``kind`` markers for the corrected detection stack.
+_BG_MEAN_QUAD_KIND = "SplitLogGrid+bgmean"
+_BG_MEAN_LIK_KIND = "Poisson+bgmean"
 
 
-def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
+def bg_mean_offset_from_ckpt(ck: dict) -> float:
     """The background-mean offset a checkpoint was trained with.
 
     Both ``kind`` markers have to agree: a checkpoint carrying one alone is a
@@ -759,42 +822,30 @@ def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
     """
     qkind = (ck.get("quadrature") or {}).get("kind")
     lkind = (ck.get("likelihood") or {}).get("kind")
-    corrected = (qkind in _BG_MEAN_QUAD_KINDS, lkind in _BG_MEAN_LIK_KINDS)
+    corrected = (qkind == _BG_MEAN_QUAD_KIND, lkind == _BG_MEAN_LIK_KIND)
     if any(corrected) and not all(corrected):
         raise SystemExit(
             f"checkpoint markers disagree: quadrature {qkind!r} vs likelihood "
             f"{lkind!r}; one says the background mean was corrected and the "
             "other does not")
     stored = (ck.get("likelihood") or {}).get("bg_mean_offset")
-    if stored is not None:
-        return float(stored)
-    # The earlier wrapper recorded no offset; it always used c itself.
-    return float(bvf) if any(corrected) else 0.0
+    if any(corrected) and stored is None:
+        raise SystemExit("checkpoint marks a corrected background mean but records no bg_mean_offset")
+    return float(stored or 0.0)
 
 
-def _peer_dims(args):
-    """``--peer-dim``: None, one width, or a comma-separated width per layer (a tapered stack)."""
-    v = getattr(args, "peer_dim", None)
-    if v is None:
-        return None
-    dims = [int(x) for x in str(v).split(",") if x.strip()]
-    return dims if len(dims) > 1 else dims[0]
-
-
-def _peer_layers(args) -> int:
-    """``--peer-attention``, or the length of a per-layer ``--peer-dim`` list; they must agree."""
-    n = getattr(args, "peer_attention", None)
-    dims = _peer_dims(args)
-    if isinstance(dims, list):
-        if n is not None and int(n) != len(dims):
-            raise SystemExit(f"--peer-attention {n} but --peer-dim gives {len(dims)} widths")
-        return len(dims)
-    return DEFAULTS["peer_attention"] if n is None else int(n)
+def _refine_geometry(args) -> bool:
+    """``--refine-geometry`` / ``--no-refine-geometry``; by default on."""
+    v = getattr(args, "refine_geometry", None)
+    return DEFAULTS["refine_geometry"] if v is None else bool(v)
 
 
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
-                verbose: bool = True):
-    """Build the production model, preserving recorded checkpoint geometry."""
+                verbose: bool = True, phase_classes=None):
+    """Build the production model, preserving recorded checkpoint geometry.
+
+    ``phase_classes`` gives a new model the pseudo-translation classes' phase
+    features; a checkpoint restores its own."""
     import torch
     from torchsx.merging.likelihood import Poisson
     from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
@@ -804,80 +855,66 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     ck = ckpt or {}
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     prep = bundle.prep  # Host residency bounds device memory independently of dataset size.
-    # The predicted scatter families carry every per-observation shape parameter;
+    # The predicted scatter carries every per-observation shape parameter;
     # there are no per-HKL parameters to fit, so the objective's ``params`` slot
     # is empty.
     params = None
 
-    enc = dict(ck.get("encoder") or {})
-    sc = dict(ck.get("scale") or {})
-    scat = dict(ck.get("scatter") or {})
-    skew = bool(scat.get("predict_skew", DEFAULTS["skew"]) if scat
-                else DEFAULTS["skew"])
-    w_init = sc.get("w_init", DEFAULTS["w_init"])
-    # scatter family: the checkpoint's own family wins over the defaults (a
-    # checkpoint written before the key existed is the single family)
-    scatter_family = scat.get("family", "gengauss") if ck else DEFAULTS["scatter_family"]
-    n_components = int(scat.get("n_components") or DEFAULTS["scatter_components"])
-    scatter_shape = str(scat.get("component_shape") or ("shared" if ck else DEFAULTS["scatter_shape"]))
-    beta_init = sc.get("beta_init", DEFAULTS["beta_init"])
-    # feature tiers: a checkpoint's record wins, else what the prepared data carries
+    # A checkpoint's record decides the model; a new run takes DEFAULTS and the flags.
+    enc = ck.get("encoder") or {}
+    sc = ck.get("scale") or {}
+    scat = ck.get("scatter") or {}
+
+    def rec(section: dict, key: str):
+        if key not in section:
+            raise SystemExit(f"checkpoint does not record {key!r}; it was written by another "
+                             "version of torchsx. Retrain it.")
+        return section[key]
+
     from torchsx.merging.observations import DEFAULT_CRYSTAL_FEATURES, PROBIXI_CRYSTAL_FEATURES
     from torchsx.nn.obs_features import DISK_FEATURE, SELF_FEATURES
-    context_features = None
     if ck:
-        self_features = tuple(sc["self_features"]) if sc.get("self_features") else None
-        context_features = tuple(sc["context_features"]) if sc.get("context_features") else None
-        crystal_features = tuple(sc["crystal_features"]) if sc.get("crystal_features") else None
+        if rec(enc, "kind") != "fold":
+            raise SystemExit("checkpoint was written with another scale encoder; this version of "
+                             "torchsx has the fold transformer only. Retrain it.")
+        kw = dict(
+            d_model=rec(enc, "d_model"),
+            **{k: int(rec(enc, k)) for k in ("context_folds", "ctx_layers", "query_layers",
+                                             "n_heads")},
+            refine_geometry=bool(rec(enc, "refine_geometry")),
+            n_components=int(rec(scat, "n_components")),
+            anchor_log_k=bool(rec(sc, "anchor_log_k")), anchor_stat=rec(sc, "anchor_stat"),
+            self_features=tuple(rec(sc, "self_features")),
+            context_features=tuple(rec(sc, "context_features")),
+            crystal_features=tuple(rec(sc, "crystal_features")),
+        )
     else:
         recorded = bundle.recipe.get("disk_size") == "recorded"
-        self_features = SELF_FEATURES + ((DISK_FEATURE,) if recorded else ())
         producer = ((bundle.recipe.get("measurement") or {}).get("source") or {}).get("producer")
-        crystal_features = (DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
-                            if producer == "probixi" else None)
-    kw = dict(
-        d_model=enc.get("d_model") or sc.get("d_model") or getattr(args, "d_model", None) or DEFAULTS["d_model"],
-        n_layers=enc.get("n_layers") or sc.get("n_layers") or getattr(args, "n_layers", None) or DEFAULTS["n_layers"],
-        include_hkl=bool(sc.get("include_hkl", DEFAULTS["include_hkl"])),
-        predict_shape=bool(sc.get("predict_shape", DEFAULTS["predict_shape"])),
-        beta_init=beta_init, w_init=w_init,
-        context_folds=enc.get("context_folds", DEFAULTS["context_folds"] if getattr(args, "context_folds", None) is None
-                              else int(args.context_folds)),
-        obs_context_layers=enc.get("obs_context_layers", DEFAULTS["obs_context_layers"]),
-        obs_self_layers=enc.get("obs_self_layers", DEFAULTS["obs_self_layers"]),
-        # a checkpoint's own record wins; a checkpoint written before the key
-        # existed has no attention blocks
-        peer_attention_layers=(enc.get("peer_attention_layers") or 0) if ck else _peer_layers(args),
-        # heads are 8 wide (or at most DEFAULTS["peer_heads"] of them) at any attention width
-        peer_dim=(enc.get("peer_dim") or None) if ck else _peer_dims(args),
-        peer_heads=(enc.get("peer_heads") or DEFAULTS["peer_heads"]) if ck else
-                   (DEFAULTS["peer_heads"] if isinstance(_peer_dims(args), list) else
-                    min(DEFAULTS["peer_heads"], max(1, int(_peer_dims(args) or DEFAULTS["d_model"]) // 8))),
-        scatter_family=scatter_family, n_components=n_components,
-        component_shape=scatter_shape,
-    )
-    # A checkpoint's own head geometry wins over the defaults: rebuilding it
-    # with different heads would fail the state_dict load, or load a subset.
-    kw.update(
-        predict_width=bool(sc.get("predict_width", True)),
-        anchor_log_k=bool(sc.get("anchor_log_k", True)),
-        anchor_stat=sc.get("anchor_stat",
-                            "median" if ck else DEFAULTS["gauge_anchor"]),
-        predict_skew=bool(skew),
-        self_features=self_features, context_features=context_features,
-        crystal_features=crystal_features,
-    )
+
+        def flag(name):
+            v = getattr(args, name, None)
+            return DEFAULTS[name] if v is None else int(v)
+        kw = dict(
+            d_model=flag("d_model"), context_folds=flag("context_folds"),
+            ctx_layers=flag("ctx_layers"), query_layers=flag("query_layers"),
+            n_heads=DEFAULTS["n_heads"], refine_geometry=_refine_geometry(args),
+            anchor_stat="median" if "gauge" in tether_terms(args) else DEFAULTS["gauge_anchor"],
+            self_features=SELF_FEATURES + ((DISK_FEATURE,) if recorded else ()),
+            crystal_features=(DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
+                              if producer == "probixi" else None),
+        )
+    if ck and sc.get("phase_classes"):
+        from torchsx.merging.scale.pseudo_translation import PhaseClasses
+        phase_classes = PhaseClasses.from_definition(sc["phase_classes"])
+    elif ck:
+        phase_classes = None
+    kw.update(phase_classes=phase_classes)
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
-    scale.set_encoder_chunking(400)
-    if sc.get("pseudo_translation"):
-        from torchsx.merging.scale.pseudo_translation import PhaseBroad, PhaseWidth
-        pt = sc["pseudo_translation"]
-        scale.install_pseudo_translation(PhaseWidth.from_definition(pt["width"], prep),
-                                         PhaseBroad.from_definition(pt["broad"], prep))
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
     # the +c mean correction applies to the annulus estimate only
-    bg_mean_offset = (bg_mean_offset_from_ckpt(ck, bvf) if ck
+    bg_mean_offset = (bg_mean_offset_from_ckpt(ck) if ck
                       else 0.0 if bundle.recipe.get("background") == "model" else float(bvf))
     if bg_mean_offset and float(bvf) <= 0.0:
         raise SystemExit(
@@ -885,18 +922,17 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             "background variance coefficient in the measurement/checkpoint recipe")
     quad = dict(ck.get("quadrature") or {})
     n_points = quad.get("n_points") or DEFAULTS["inner_points"]
-    if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS):
+    if quad and quad.get("kind") not in (None, "SplitLogGrid", _BG_MEAN_QUAD_KIND):
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
                          "support SplitLogGrid checkpoints only")
     if ck:
-        # a checkpoint decides: its miss logit is restored below, None means off
-        miss = (DEFAULTS["miss"] if scat.get("miss_logit") is None and not scat
-                else (0.5 if scat.get("miss_logit") is not None else 0.0))
+        # the checkpoint's miss logit is restored below; None means off
+        miss = 0.5 if rec(scat, "miss_logit") is not None else 0.0
     else:
         miss = (getattr(args, "miss_frac", None) if getattr(args, "miss_frac", None) is not None
                 else DEFAULTS["miss"])
     if ck:
-        outlier = 0.5 if scat.get("outlier_logit") is not None else 0.0
+        outlier = 0.5 if rec(scat, "outlier_logit") is not None else 0.0
     else:
         outlier = (getattr(args, "outlier_frac", None) if getattr(args, "outlier_frac", None) is not None
                    else DEFAULTS["outlier"])
@@ -959,11 +995,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     prior = getattr(args, "prior", None)
     if prior is None:
         prior = str(grid.get("prior", "wilson"))
-    if prior == "flat_I0":  # Historical checkpoint spelling.
-        prior = "none"
-    if prior not in ("none", "wilson", "flat_log"):
-        raise ValueError(f"Invalid checkpoint prior {prior!r}; expected 'none' or 'wilson' "
-                         "(legacy 'flat_I0' and 'flat_log' are also readable)")
+    if prior not in ("none", "wilson"):
+        raise ValueError(f"Invalid checkpoint prior {prior!r}; expected 'none' or 'wilson'")
     wilson_degree = int(grid.get("wilson_degree", DEFAULTS["wilson_degree"]))
     # One smooth reciprocal-space basis for the prior's Sigma(h) and the scale's
     # gauge pin, built from the prepared reflections, the median cell and the
@@ -981,9 +1014,9 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         prior=prior,
         bg_var_factor=float(bvf),
         bg_mean_offset=float(bg_mean_offset), inner_points=int(n_points),
-        skew=bool(skew), miss=float(miss), outlier=float(outlier), detector_noise=noise_mode or "off",
+        miss=float(miss), outlier=float(outlier), detector_noise=noise_mode or "off",
         wilson_degree=wilson_degree, basis=basis,
-        scatter_family=scatter_family, scatter_components=int(n_components), scatter_shape=scatter_shape,
+        scatter_components=int(scale.heads.n_components),
     )
     if verbose:
         print(f"intensity prior: {prior}"
@@ -994,8 +1027,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
                   "the missed-spot component prevents an unbounded flat posterior. "
                   "Check edge mass and integration-range sensitivity.", flush=True)
         print(f"stack: amortised scale, "
-              f"{'two-width' if skew else 'symmetric'} "
-              f"{f'{n_components}-component {scatter_shape}-shape mixture ' if scatter_family == 'mixture' else ''}scatter, "
+              f"{scale.heads.n_components}-component Gaussian mixture scatter, "
               f"miss {miss:.3f}, " + (f"outlier {outlier:.4f}, " if outlier else "")
               + f"SplitLogGrid({n_points}), "
               f"outer {settings['k_coarse']}/{settings['m_fine']} "

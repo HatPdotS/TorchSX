@@ -1,7 +1,7 @@
 """The native parser and writer against their pure-Python twins.
 
 - Parse: on well-formed and malformed streams, ``torchsx_native.parse_chunks``
-  and the Python parser return bit-identical columns, the same filenames and
+  and the Python parser (``tests/python_parser``) return bit-identical columns, the same filenames and
   events and the same exclusion report, whatever the thread count.
 - Write: ``torchsx_native.write_stream`` is byte-identical to the Python writer,
   including on values that stress number formatting (exact ties, ±0, ±inf,
@@ -19,32 +19,25 @@ import numpy as np
 import pytest
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 from torchsx.geometry import Geometry
 from torchsx.io import _native
 from torchsx.io._metadata import StreamMetadata
-from torchsx.io._parser import (
-    _find_first_chunk_offset,
-    _index_chunks_until,
-    _parse_byte_range,
-    _parse_chunks_python,
-    _parse_stream,
-)
+from torchsx.io._parser import _parse_stream
 from torchsx.io._writeback import (
     _write_stream_reconstruct_native,
     _write_stream_reconstruct_python,
 )
 from torchsx.stream import SFXStream
+from tests import python_parser
+from tests.python_parser.indexing import _find_first_chunk_offset
 
 BEGIN = "----- Begin chunk -----\n"
 
 
 @pytest.fixture(scope="module")
 def native():
-    mod = _native.load()
-    if mod is None:
-        pytest.skip("native module not installed")
-    return mod
+    return _native.load()
 
 
 @pytest.fixture
@@ -65,19 +58,17 @@ def _parse_all(native, path: Path, n_threads=(1, 2, 4)):
     """Parse ``path`` every way; assert all agree; return one result."""
     path = str(path)
     geometry = Geometry.from_stream(path)
-    rows = np.asarray(_index_chunks_until(path, None), dtype=np.int64).reshape(-1, 4)
+    rows = python_parser.index_chunks(path)
     assert _same(native.index_chunks(path, 1), rows)
 
-    tensors, filenames, events, report = _parse_chunks_python(path, rows, geometry.panel_name_to_id)
-    py = {k: t.numpy() for k, t in tensors.items()}
-    report = {k: tuple(v) for k, v in report.items()}
+    py, filenames, events, report = python_parser.parse_chunks(path, rows, geometry.panel_names)
 
     if len(rows):
-        full, f_fn, f_ev, f_rep = _parse_byte_range(
-            path, _find_first_chunk_offset(path), Path(path).stat().st_size, geometry.panel_name_to_id
+        full, f_fn, f_ev, f_rep = python_parser.parse_byte_range(
+            path, _find_first_chunk_offset(path), Path(path).stat().st_size, geometry.panel_names
         )
-        assert all(_same(full[k].numpy(), py[k]) for k in py)
-        assert (f_fn, f_ev, {k: tuple(v) for k, v in f_rep.items()}) == (filenames, events, report)
+        assert all(_same(full[k], py[k]) for k in py)
+        assert (f_fn, f_ev, f_rep) == (filenames, events, report)
 
     for n in n_threads:
         cols, n_fn, n_ev, n_rep = native.parse_chunks(path, rows, geometry.panel_names, n)
@@ -272,7 +263,7 @@ def _core_bytes(core) -> dict[str, bytes]:
 def test_real_stream_modes_match_python(mode, real_stream, native, monkeypatch):
     kwargs = {"max_crystals": 3000, "sequential": mode == "head", "seed": 7}
     fast = [_parse_stream(str(real_stream), n_workers=n, **kwargs) for n in (1, 4)]
-    monkeypatch.setattr(_native, "load", lambda: None)
+    monkeypatch.setattr(_native, "load", lambda: python_parser)
     slow = _parse_stream(str(real_stream), **kwargs)
     for core in fast:
         assert _core_bytes(core) == _core_bytes(slow)
@@ -310,7 +301,7 @@ def test_writer_formatting_sweep(native, sample_geometry, tmp_path):
     rng = np.random.default_rng(3)
     hkl = rng.integers(-32768, 32768, (n_obs, 3)).astype(np.int16)
     hkl[:4] = [[-32768, 32767, 0], [0, 0, 0], [-5, 5, -1], [1, -1, 100]]
-    core = _SFXStreamCore(
+    core = SFXStreamCore(
         hkl=torch.from_numpy(hkl),
         I=f(1, n_obs), sigma=f(2, n_obs), background=f(3, n_obs), peak=f(4, n_obs),
         fs=f(5, n_obs), ss=f(6, n_obs),
@@ -357,15 +348,11 @@ def test_loader_refuses_other_protocol(monkeypatch):
     fake.PROTOCOL = _native.PROTOCOL + 1
     fake.__file__ = "/stale/torchsx_native.so"
     monkeypatch.setitem(sys.modules, "torchsx_native", fake)
-    monkeypatch.delenv("TORCHSX_NO_NATIVE_PARSER", raising=False)
     with pytest.raises(ImportError, match="protocol"):
         _native._import()
 
 
-def test_loader_missing_module_warns(monkeypatch):
+def test_loader_requires_the_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "torchsx_native", None)
-    monkeypatch.delenv("TORCHSX_NO_NATIVE_PARSER", raising=False)
-    with pytest.warns(UserWarning, match="not installed"):
-        assert _native._import() is None
-    monkeypatch.setenv("TORCHSX_NO_NATIVE_PARSER", "1")
-    assert _native._import() is None
+    with pytest.raises(ImportError, match="torchsx-native"):
+        _native._import()

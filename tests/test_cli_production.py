@@ -12,10 +12,10 @@ import torch
 from torchsx.cli import _pipeline as P, train, merge_nn
 from tests.test_amortized_training import _synthetic
 from tests.test_cli_pipeline import _stack, _DataArgs
-from tests.test_measurement_sources import stream_file, python_parser
+from tests.test_measurement_sources import stream_file
 
 
-@pytest.mark.parametrize('module,count', [(train,33), (merge_nn,14)])
+@pytest.mark.parametrize('module,count', [(train,35), (merge_nn,14)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
@@ -29,17 +29,27 @@ def test_public_options_and_split_inputs(module, count):
 
 def test_research_options_parse_but_stay_out_of_help():
     parser = train._build_parser()
-    hidden = {'--noise-lr-mult': '10', '--peer-dim': '64', '--context-folds': '0', '--d-model': '64',
-              '--n-layers': '3', '--eval-every': '50', '--patience': '2', '--heldout-stream': 'h.stream'}
+    hidden = {'--noise-lr-mult': '10', '--context-folds': '3', '--d-model': '64',
+              '--eval-every': '50', '--heldout-stream': 'h.stream', '--outlier-frac': '0.01',
+              '--ctx-layers': '4', '--query-layers': '0', '--tether-weight': '2'}
+    flags = ['--refine-geometry']
     text = parser.format_help()
     assert not [o for o in hidden if o in text]
-    a = parser.parse_args(['x.stream', '-o', 'run', *(t for o, v in hidden.items() for t in (o, v))])
-    assert (a.noise_lr_mult, a.peer_dim, a.context_folds, a.d_model, a.n_layers, a.eval_every, a.patience,
-            a.heldout_stream) == (10.0, '64', 0, 64, 3, 50, 2, Path('h.stream'))
+    assert not [o for o in flags if o in text]
+    a = parser.parse_args(['x.stream', '-o', 'run', *(t for o, v in hidden.items() for t in (o, v)), *flags])
+    assert (a.noise_lr_mult, a.context_folds, a.d_model, a.eval_every, a.heldout_stream,
+            a.outlier_frac) == (10.0, 3, 64, 50, Path('h.stream'), 0.01)
+    assert (a.ctx_layers, a.query_layers, a.refine_geometry) == (4, 0, True)
+    assert a.tether_weight == 2.0 and a.tether is None
+    assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'gauge']).tether == ('gauge',)
+    assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'none']).tether == ()
+    assert parser.parse_args(['x.stream', '-o', 'run']).pseudo_translation == 'auto'
+    assert parser.parse_args(['x.stream', '-o', 'run', '--no-refine-geometry']).refine_geometry is False
     assert parser.parse_args(['x.stream', '-o', 'run']).steps == 400
 
 
-@pytest.mark.parametrize('option,value', [('--miss-frac', '1'), ('--outlier-frac', '-0.1'), ('--noise-terms', 'C')])
+@pytest.mark.parametrize('option,value', [('--miss-frac', '1'), ('--outlier-frac', '-0.1'), ('--noise-terms', 'C'),
+                                          ('--tether', 'gauge,wobble'), ('--tether-weight', '0')])
 def test_out_of_range_training_options_fail_at_parsing(option, value, capsys):
     with pytest.raises(SystemExit):
         train._build_parser().parse_args(['x.stream', '-o', 'run', option, value])
@@ -61,7 +71,7 @@ def test_invalid_or_removed_options_fail_before_loading(module,option,value,caps
         assert 'none' in error and 'wilson' in error
 
 
-def test_custom_split_matches_source_images(stream_file,python_parser,tmp_path):
+def test_custom_split_matches_source_images(stream_file,tmp_path):
     labels = tmp_path/'custom.split'
     labels.write_text('/raw/a.h5 //5 dark\n/raw/b.h5 //8 light\n')
     args = _DataArgs(stream=[stream_file],split_file=labels,int_radius=None,gain='trust_input')
@@ -70,7 +80,7 @@ def test_custom_split_matches_source_images(stream_file,python_parser,tmp_path):
     assert set(bundle.prep.obs_info.delay_bin_idx.tolist()) == {0,1}
 
 
-def test_cache_moves_with_inputs_and_rejects_changed_content(stream_file,python_parser,tmp_path,monkeypatch):
+def test_cache_moves_with_inputs_and_rejects_changed_content(stream_file,tmp_path,monkeypatch):
     cache=tmp_path/'prepared'
     args=_DataArgs(stream=[stream_file],int_radius=None,gain=None,cache_prep=cache)
     built=P.load_prep(args,verbose=False)
@@ -92,7 +102,7 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
     args=train._build_parser().parse_args(['x.stream','-o',str(tmp_path),'--device','cpu'])
     host,_,scale,obj,S=P.build_stack(bundle,args,verbose=False)
     assert host is prep
-    assert (scale.heads.scatter_family,scale.heads.n_components,scale.heads.mixture.shape)==('mixture',4,'gaussian')
+    assert scale.heads.n_components==4
     assert obj.likelihood.bg_mean_offset==0.125
     assert S['prior']=='wilson'
     oldscale,oldobj,tr=_stack(prep,params,tmp_path)
@@ -100,7 +110,6 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
         ck=torch.load(tr.save_best(),weights_only=False)
         _,_,rebuilt,oldlik,_=P.build_stack(bundle,args,ckpt=ck,verbose=False)
         rebuilt.load_state_dict(ck['state_dict'])
-        assert rebuilt.heads.scatter_family=='gengauss'
         assert oldlik.likelihood.bg_mean_offset==0.0
     finally:
         tr.close()
@@ -108,7 +117,6 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
 
 @pytest.mark.parametrize('saved,requested,expected', [
     ('none',None,'none'), ('wilson','none','none'), ('none','wilson','wilson'),
-    ('flat_I0',None,'none'), ('flat_log',None,'flat_log'),
 ])
 def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,requested,expected):
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10)
@@ -117,8 +125,21 @@ def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,reque
     if requested is not None:
         argv+=['--prior',requested]
     args=merge_nn._build_parser().parse_args(argv)
-    _,_,_,_,settings=P.build_stack(bundle,args,ckpt={'posterior_grid':{'prior':saved}},verbose=False)
+    ck=_production_checkpoint(bundle,tmp_path)
+    ck['posterior_grid']={'prior':saved}
+    _,_,_,_,settings=P.build_stack(bundle,args,ckpt=ck,verbose=False)
     assert settings['prior']==expected
+
+
+def _production_checkpoint(bundle,tmp_path):
+    """A checkpoint of the default model, written by the trainer."""
+    from tests.test_cli_pipeline import _trainer_from_stack
+    targs=train._build_parser().parse_args(['x.stream','-o',str(tmp_path),'--device','cpu'])
+    tr=_trainer_from_stack(*P.build_stack(bundle,targs,verbose=False))
+    try:
+        return torch.load(tr.save_best(tmp_path/'model.pt'),weights_only=False)
+    finally:
+        tr.close()
 
 
 def test_batches_are_balanced_and_allow_small_states():
@@ -164,15 +185,19 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10,n_cond=2)
     bundle=P.PrepBundle(prep,{'spacegroup':'P 1','d_min':0.9,'gain':1.0,'radii':[7,9,11],'merge_friedel':merge_friedel},['dark','light'],0.1)
     monkeypatch.setattr(P,'load_prep',lambda *a,**k: bundle)
-    for key,value in dict(d_model=16,n_layers=2,inner_points=32,k_coarse=15,m_fine=65).items():
+    for key,value in dict(d_model=16,inner_points=32,k_coarse=15,m_fine=65).items():
         monkeypatch.setitem(P.DEFAULTS,key,value)
     run=tmp_path/'run'
     train.main(['x.stream','-o',str(run),'--device','cpu','--steps','4','--seed','17',
                 '--prior',prior])
     summary=json.loads((run/'training_summary.json').read_text())
     assert summary['updates_per_state']==[2,2]
+    res=summary['resources']
+    assert list(res['phases'])==['prepare','train','readout']
+    assert all(p['seconds']>=0 and 'gpu_peak_allocated_gib' not in p for p in res['phases'].values())
+    assert res['updates']['n']==4 and res['updates']['median_s']<=res['updates']['max_s']
     ck=torch.load(run/'best.pt',weights_only=False)
-    assert ck['scatter']['family']=='mixture' and ck['scatter']['n_components']==4
+    assert ck['scatter']['n_components']==4
     assert ck['likelihood']['bg_mean_offset']==0.1
     assert ck['data']['training']['config']['seed']==17
     assert (ck['wilson_surface'] is not None and len(ck['wilson_surface']['coef'])==2)
@@ -190,6 +215,7 @@ def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,p
     monkeypatch.setattr(P,'write_mtz',capture)
     merge_nn.main([str(run/'best.pt'),'x.stream','-o',str(tmp_path/'again.mtz'),'--device','cpu'])
     assert all(r['prior']==prior for r in json.loads((tmp_path/'again.metrics.json').read_text()).values())
+    assert list(json.loads((tmp_path/'again.resources.json').read_text())['phases'])==['prepare','readout']
     assert len(exported)==6
     import gemmi
     for path,F,sd,keep in exported:

@@ -83,14 +83,12 @@ def test_fixed_gaussian_contract_and_packed_addressing():
         sc.mixture_obs(Meta(ids))
 
 
-@pytest.mark.parametrize("shape,fixed", [("gaussian", True), ("partiality", True),
-                                        ("shared", False), ("free", False)])
-def test_scale_selects_fusion_only_for_fixed_gaussian_heads(shape, fixed):
+def test_scale_uses_the_fused_gaussian_scatter():
     from torchsx.nn.heads import ScaleHeads
     from torchsx.merging.scale import AmortizedScale
-    heads = ScaleHeads(16, scatter_family="mixture", n_components=4, component_shape=shape)
+    heads = ScaleHeads(16, n_components=4)
     scale = AmortizedScale(torch.nn.Identity(), torch.nn.Identity(), heads, n_crystals=2)
-    assert scale.scatter.fixed_gaussian is fixed
+    assert scale.scatter.fixed_gaussian and scale.scatter.n_components == 4
     prediction = heads(torch.randn(7, 16))
     scale.scatter.set_prediction(torch.arange(7), prediction.mix)
 
@@ -176,8 +174,7 @@ def test_gaussian_network_gradients_through_checkpointed_posterior(monkeypatch):
     from torchsx.nn.posterior_target import PosteriorMergeTarget
     torch.manual_seed(17)
     n, h = 120, 12
-    heads = ScaleHeads(16, scatter_family="mixture", n_components=4,
-                       component_shape="gaussian", predict_skew=True).cuda()
+    heads = ScaleHeads(16, n_components=4).cuda()
     scale = AmortizedScale(torch.nn.Identity(), torch.nn.Identity(), heads, n_crystals=2)
     pred = heads(torch.randn(n, 16, device="cuda"))
     ids = torch.arange(n, device="cuda")

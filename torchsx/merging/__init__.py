@@ -3,7 +3,7 @@
 The model an observation's intensity is drawn from, in the order the code
 composes it::
 
-    ScaleModel x ScatterModel -> Quadrature -> DetectionLikelihood
+    AmortizedScale x ScatterModel -> Quadrature -> DetectionLikelihood
 
 Each layer is an ``nn.Module`` behind a narrow abstract base.  The latent
 per-reflection intensity is integrated out by the quadrature rather than
@@ -19,12 +19,10 @@ everything else is built on.
 
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.observations import ObsInfo, PreparedObs, prepare_observations
-from torchsx.merging.parameters import Parameters
 
 __all__ = [
     "MergeConfig",
     "ObsInfo",
-    "Parameters",
     "PreparedObs",
     "prepare_observations",
 ]

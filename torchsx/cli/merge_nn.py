@@ -23,7 +23,8 @@ def _build_parser():
     P.add_free_args(p)
     p.add_argument("-o", "--out", type=Path, required=True,
                    help="output MTZ, e.g. merged.mtz; with several states one file per state, "
-                        "merged_STATE.mtz, each with its _half1/_half2 companions")
+                        "merged_STATE.mtz, each with its _half1/_half2 companions; time and GPU "
+                        "memory by phase go to merged.resources.json")
     return p
 
 
@@ -31,11 +32,11 @@ def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
     import torch
 
-    # TF32 for the encoder's float32 matmuls; the likelihood and posterior
-    # integrals are elementwise and Triton code, which this does not touch.
-    torch.set_float32_matmul_precision("high")
+    P.configure_torch()
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
 
+    probe = P.ResourceProbe(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    probe.begin("prepare")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     print(f"checkpoint {args.ckpt} (step {ckpt.get('best_step')}, "
           f"heldout {ckpt.get('best_heldout')})", flush=True)
@@ -45,10 +46,9 @@ def main(argv: list[str] | None = None) -> None:
     prep, params, scale, obj, S = P.build_stack(bundle, args, ckpt=ckpt)
 
     cfg = TrainConfig(
-        max_obs_per_batch=P.READOUT_MAX_OBS, epochs=0,
-        posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
+        max_obs_per_batch=P.READOUT_MAX_OBS, posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
         posterior_n_sigma=S["n_sigma"], posterior_max_halfwidth=S["max_halfwidth"],
-        stream_batches=True, encoder_chunk_crystals=400,
+        stream_batches=True,
         locate_windows=(8.0, 1.0, 0.125),
         posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
         heldout_frac=0.05, device=S["device"], outdir=str(args.out.parent),
@@ -56,17 +56,16 @@ def main(argv: list[str] | None = None) -> None:
     tr = AmortizedTrainer(prep, scale, obj, params, config=cfg)
     tr.set_reciprocal_basis(S["basis"])
     restore_wilson_surface(tr, prep, ckpt, names=bundle.split_names)
-    # Checkpoints written before the data buffers were made non-persistent
-    # carry the training set's own _I/_bg/_sigma, whose length is that data
-    # set's observation count; drop them rather than refuse to merge a
-    # different set.  Everything the model actually needs must be present.
-    want = scale.state_dict()
-    have = {k: v for k, v in ckpt["state_dict"].items() if k in want}
-    missing = [k for k in want if k not in have]
-    if missing:
-        raise SystemExit(f"checkpoint is missing {len(missing)} parameters, "
-                         f"first {missing[:3]}")
-    scale.load_state_dict(have)
+    restore_intensity_modulation(tr, prep, ckpt)
+    if (ckpt.get("scale") or {}).get("phase_classes"):
+        from torchsx.merging.scale.pseudo_translation import PhaseClasses
+        tr.set_phase_classes(PhaseClasses.from_definition(ckpt["scale"]["phase_classes"]))
+    # Strict: a checkpoint from another version of the model fails here rather
+    # than merging with some of its weights silently left out.
+    try:
+        scale.load_state_dict(ckpt["state_dict"])
+    except RuntimeError as exc:
+        raise SystemExit(f"checkpoint does not match this version's model; retrain it.\n{exc}")
     # The network weights, the fitted feature standardisation and the Wilson
     # surface come from the checkpoint; everything per reflection is formed
     # from the supplied data, as in training.
@@ -75,11 +74,16 @@ def main(argv: list[str] | None = None) -> None:
     names = bundle.split_names or [""]
     if tr.n_conditions != max(len(names), 1) and tr.n_conditions > 1:
         names = [str(i) for i in range(tr.n_conditions)]
+    out = args.out
     try:
+        probe.begin("readout")
         merge_products(tr, prep, args, names, list(range(tr.n_conditions)),
                        spacegroup=bundle.spacegroup, merge_friedel=bundle.merge_friedel)
+        probe.end()
+        out.with_suffix(".resources.json").write_text(json.dumps(probe.summary(), indent=2) + "\n")
     finally:
         tr.close()
+    print(probe.report(), flush=True)
 
 
 def restore_wilson_surface(tr, prep, ckpt, names=None) -> None:
@@ -117,6 +121,23 @@ def restore_wilson_surface(tr, prep, ckpt, names=None) -> None:
         t.set_wilson_coef(c)
         if t.wilson_coef_param is not None:
             t.wilson_coef_param.data.copy_(c)
+
+
+def restore_intensity_modulation(tr, prep, ckpt) -> None:
+    """Install the checkpoint's prior modulation (:mod:`torchsx.merging.priors.modulation`),
+    evaluated on these reflections, on the trained surfaces; nothing when it has none."""
+    d = ckpt.get("intensity_modulation")
+    if d is None:
+        return
+    import torch
+
+    from torchsx.merging.priors.modulation import PhaseModulation
+    mod = PhaseModulation.from_definition(d)
+    log_mod = torch.as_tensor(mod.log_prior_offset(
+        prep.hkl_valid.long().cpu().numpy(), (1.0 / prep.d_spacing.double() ** 2).cpu().numpy()),
+        dtype=torch.float32)
+    for t in tr.targets:
+        t.set_modulation(log_mod.to(t.wilson_log_mod.device))
 
 
 def _export_crystals(tr, k: int):
@@ -194,7 +215,8 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
         sets = [(0, _export_crystals(tr, k) if getattr(tr, "external_heldout", None) is not None else None)]
         h1, h2 = _split_halves(tr, k, args.seed + 1000000007)
         sets += [(1, h1), (2, h2)]
-        merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior")
+        merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior",
+                                 tether_readout=half == 0)
                   for half, crystals in sets}
         post = merges[0]
         label = names[k] if k < len(names) else str(k)
@@ -217,6 +239,10 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
                             merge_friedel=merge_friedel,
                             verbose=verbose and half == 0)
         rec = {"split": label, "products": ["posterior"], "prior": post["prior"]}
+        tether = post.get("tether")
+        if tether and tether.get("n_obs"):
+            rec["tether"] = tether
+            print("  " + P.tether_summary(tether), flush=True)
         stats = _split_half_stats(merges[1], merges[2], d, rank=merges[0]["I0"])
         if stats is not None:
             rec["split_half_posterior"] = stats

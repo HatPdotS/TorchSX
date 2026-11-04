@@ -10,15 +10,12 @@ I/O for serial crystallography data. Three formats, three jobs: DuckDB and
 | `sources.py` | `SourceInput`, explicit dispatch and header-only measurement inspection |
 | `_crystfel.py` | Interpret recorded CrystFEL commands and gain declarations |
 | `_duckdb.py` | Read a probixi DuckDB run into a stream core (the key/unit mapping is documented there) |
-| `_parser.py` | Parse CrystFEL `.stream` files into stacked tensors — a facade over `_parse/` |
-| `_parse/` | The pure-Python parser and the driver: `indexing` (byte scanning) and `records` (per-record parse) are leaves, `workers` (serial range parse) builds on both, `orchestrator` drives index → select → parse for either implementation |
-| `_native.py` | Loads `torchsx_native`, the Rust index/parse/write module built from `native/`; `None` means the pure-Python fallback |
+| `_parser.py` | Parse CrystFEL `.stream` files into stacked tensors: index → select chunks → parse, with the native module; lists the rules for malformed content |
+| `_native.py` | Loads `torchsx_native`, the Rust index/parse/write module built from `native/` (a dependency); a missing or stale build raises |
 | `_safetensors.py` | Save/load `.sfx` (safetensors + JSON sidecar), columnar v2 |
 | `_metadata.py` | `StreamMetadata` — per-level metadata with tensor round-trip |
 | `_writeback.py` | Write refined data back to `.stream` |
 | `times.py` | Timepoint assignment and split labels |
-| `_excise.py` | Extract pixel patches (ROIs) around reflections from HDF5 |
-| `_roi_store.py` | `ROIStore` — memory-mapped patch storage in safetensors |
 
 ## Key functions
 
@@ -45,7 +42,7 @@ stream = SFXStream.load("data.sfx")
   `metadata["crystal"]["frame_id"]` for write-back.
 - `.sfx` = safetensors binary + `.sfx.json` sidecar carrying the column schema
   and join registry, Friedel state, and the versioned measurement record under
-  `metadata["_torchsx_measurement"]["record"]`. Legacy files have no spec.
+  `metadata["_torchsx_measurement"]["record"]`, when the source recorded one.
 - Adapters describe stored values; `prepare_observations` converts them once.
   `resolve_measurement` applies explicit > checkpoint > source precedence.
   The supported run has one ring recipe; effective masked apertures are unknown.
@@ -53,10 +50,11 @@ stream = SFXStream.load("data.sfx")
   existing tensor transforms preserve them without special filtering code.
   Per-image `source_file`, `filename` and `event` identify source observations.
 - A probixi `.duckdb` dispatches to `_duckdb.py` (`SFXStream.read` and the
-  CLIs take it like a stream); DIALS stays a reserved kind.
+  CLIs take it like a stream).
 - Imports are lazy (`__getattr__`) so heavy or optional modules (duckdb, h5py,
   the native module) are not loaded until used.
 - Malformed stream content is excluded, not fatal: a bad reflection line, a
   crystal with a broken or cut-off header or table, or a chunk without an
   image is skipped, and one warning per parse counts the exclusions by reason
-  (`_parse/records.py` lists the rules; both implementations follow them).
+  (`_parser.py` lists the rules; the pure-Python reference parser in
+  `tests/python_parser/` follows them too).

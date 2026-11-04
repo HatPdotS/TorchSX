@@ -8,7 +8,6 @@ import torch
 from torch import Tensor
 
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scatter.base import ScatterModel
 
 
@@ -125,7 +124,7 @@ def gengauss_log_prob_from_obs(
 ) -> Tensor:                  # (M, K)
     """GenGauss log-density evaluated from per-observation (log α, log β).
 
-    Bypasses the (Parameters, ObsInfo) indirection so callers that need
+    Takes the per-observation values directly, so callers that need
     elementwise gradient gating on (α, β) — e.g. the bg-gate weak/strong
     split — can pass `torch.where(mask, x, x.detach())` directly.
 
@@ -161,14 +160,14 @@ class GenGaussLogScatter(ScatterModel):
             = -(|\\epsilon|/\\alpha)^{\\beta} + \\log\\beta - \\log 2\\alpha
               - \\log\\Gamma(1/\\beta)
 
-    α_h, β_h are per-HKL and live on ``Parameters`` as ``log_alpha``,
-    ``log_beta`` (log-parameterised for positivity).
+    Subclasses supply the per-observation α, β (log-parameterised for
+    positivity) through :meth:`log_alpha_beta_obs`.
     """
 
     def log_prob(
         self,
         eps: Tensor,              # (M, K)
-        params: Parameters,
+        params: None,
         meta: ObsInfo,
     ) -> Tensor:
         log_alpha_obs, log_beta_obs = self.log_alpha_beta_obs(params, meta)

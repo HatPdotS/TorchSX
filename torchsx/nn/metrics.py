@@ -13,7 +13,7 @@ F. Optimisation health.
 The one that decides the project is ``between_frac`` in group C.  A per-crystal
 G model puts 100 % of its ``log K`` variance between crystals.  The entire
 premise of amortising is that the *within*-crystal part — partiality — is real
-and predictable from a leave-one-out context.  If ``within`` stays near zero the
+and predictable from a context without the observation.  If ``within`` stays near zero the
 network has merely rediscovered G, and there is no reason to prefer it.
 
 The one that protects the science is ``condition_auc`` in group D.  Any degree
@@ -35,8 +35,6 @@ from torch import Tensor
 __all__ = [
     "calibration_metrics",
     "scale_metrics",
-    "hkl_permutation_sensitivity",
-    "hkl_permutation_sensitivity_shape",
     "condition_auc",
     "spearman",
     "grad_norms",
@@ -200,77 +198,6 @@ def scale_metrics(
 # ── D. leakage and degeneracy ──────────────────────────────────────────
 
 
-@torch.no_grad()
-def hkl_permutation_sensitivity(scale, meta, *, seed: int = 0) -> float:
-    """Fraction of ``log K`` variance that moves when hkl labels are permuted.
-
-    A scale that depends on hkl is degenerate with ``I0`` and is the **one
-    channel that can manufacture a difference peak**.
-    Run this every epoch, not once: if it grows as the model strengthens, drop
-    hkl from the features before any light/dark work.
-
-    Only the **self** branch is permuted.  Once the context carries
-    per-reflection channels (the peers' rank within their reflection and its
-    brightness), permuting the whole meta also permutes those lookups, and the
-    monitor then reports legitimate use of them as if it were leakage, even on
-    a model with no hkl feature at all.  The degeneracy that matters is whether ``log_K[j]`` responds to
-    ``j``'s *own* reflection identity, which is a self-branch property.
-    """
-    import dataclasses
-
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    perm = torch.randperm(meta.hkl_idx.numel(), generator=g).to(meta.hkl_idx.device)
-    shuffled = dataclasses.replace(meta, hkl_idx=meta.hkl_idx[perm])
-
-    if hasattr(scale, "predict_split"):
-        base = scale.predict_split(meta, meta).log_K
-        moved = scale.predict_split(shuffled, meta).log_K
-    else:
-        base = scale.predict(meta).log_K
-        moved = scale.predict(shuffled).log_K
-
-    denom = float(base.var().item())
-    numer = float((moved - base).var().item())
-    if denom <= 1e-12:
-        # A constant log_K has no hkl dependence by definition.  Returning NaN
-        # here makes the guard silently un-assertable in exactly the case where
-        # it should read zero (e.g. an untrained or collapsed model).
-        return 0.0 if numer <= 1e-12 else float("inf")
-    return numer / denom
-
-
-@torch.no_grad()
-def hkl_permutation_sensitivity_shape(scale, meta, *, seed: int = 0) -> float:
-    """The same self-branch permutation test for the predicted scatter shape.
-
-    Largest variance fraction that moves, over ``log w`` and every column of
-    the packed mixture ``mix`` (when present).  A shape predicted from the
-    embedding inherits the feature contract, but a width or tail that tracks a
-    reflection's own identity would still let hkl leak into the merge weights,
-    so this is watched alongside :func:`hkl_permutation_sensitivity`.
-    """
-    import dataclasses
-
-    if not hasattr(scale, "predict_split"):
-        return float("nan")
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    perm = torch.randperm(meta.hkl_idx.numel(), generator=g).to(meta.hkl_idx.device)
-    shuffled = dataclasses.replace(meta, hkl_idx=meta.hkl_idx[perm])
-    base = scale.predict_split(meta, meta)
-    moved = scale.predict_split(shuffled, meta)
-    cols = [(base.log_w, moved.log_w)]
-    if base.mix is not None:
-        cols += [(base.mix[:, j], moved.mix[:, j]) for j in range(base.mix.shape[1])]
-    worst = 0.0
-    for b, m in cols:
-        denom, numer = float(b.var().item()), float((m - b).var().item())
-        if denom > 1e-12:
-            worst = max(worst, numer / denom)
-        elif numer > 1e-12:
-            return float("inf")
-    return worst
-
-
 def condition_auc(log_K: Tensor, is_light: Tensor) -> float:
     """AUC of ``log K`` as a light/dark classifier.  **Must be 0.5.**
 
@@ -298,7 +225,7 @@ def grad_norms(module: torch.nn.Module, groups: tuple[str, ...] = ("encoder", "h
     exchange blocks: an aggregate encoder norm cannot distinguish "healthy" from
     "the last two blocks are learning and block 0 sees nothing".  Blocks are
     identified by the integer following ``blocks.`` in the parameter name —
-    ``context_blocks`` and ``self_blocks`` in the Deep Sets encoder.
+    ``ctx_blocks`` and ``query_blocks`` in the fold transformer.
 
     ``gradnorm_depth_ratio`` is last-block / first-block.  Values far above 1
     mean the early blocks are starved; note it is legitimately large at step 0,

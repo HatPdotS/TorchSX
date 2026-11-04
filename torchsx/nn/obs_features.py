@@ -6,12 +6,15 @@ Two tiers, and the split is load-bearing:
 ``self`` features
     What the scale head sees for the observation it is scaling.  Smooth
     diffraction geometry only.  An observation's own intensity is **forbidden**
-    here — with it, ``K_j = I_j / I0_h`` fits perfectly and means nothing.
+    here — with it, ``K_j = I_j / I0_h`` fits perfectly and means nothing.  So
+    are its Miller indices: a scale that depends on the reflection's identity
+    is degenerate with ``I0`` (``K(h) I0(h)``), and it is the one channel that
+    can manufacture a difference peak.
 
 ``context`` features
-    What goes into the pooled branch.  May include intensity and σ, because
-    :func:`~torchsx.nn.pooling.leave_one_out_mean` removes observation ``j``
-    from its own context before it is used.
+    What the observation's peers contribute.  May include intensity and σ,
+    because the encoder keeps every observation's own measurement out of its
+    own embedding.
 
     The peers are not a fallback for missing geometry — they are a **better
     measurement than ``j``'s own geometry can be**.  Reflection ``j``'s
@@ -86,13 +89,12 @@ SELF_FEATURES: tuple[str, ...] = (
     "crystal_res",     # per-crystal diffraction limit (crystal quality)
     "fs", "ss",        # detector position (absorption, geometry)
     "panel",           # detector panel
-    "h", "k", "l",     # Miller indices — see the permutation monitor
 )
 
 #: Recorded disk pixel count; constant, hence dropped, under nominal disks.
 DISK_FEATURE: str = "disk_pix"
 
-#: Measurement channels, legitimate ONLY in the leave-one-out pooled branch.
+#: Measurement channels: context only, never features of the observation being scaled.
 CONTEXT_ONLY_FEATURES: tuple[str, ...] = (
     "signed_log_I",    # sign(I)·log1p(|I|) — keeps the negatives
     "log_sigma",
@@ -128,8 +130,7 @@ CONDITION_FEATURES: frozenset[str] = frozenset(
 class ObsFeatureSpec(nn.Module):
     """Builds ``(x_self, x_ctx)`` from an ``ObsInfo`` slice or gather.
 
-    Raw per-observation channels (``I``, ``bg``, ``sigma``) and the Miller table
-    are held as buffers and addressed by ``meta.obs_id``, so this works
+    Raw per-observation channels (``I``, ``bg``, ``sigma``) are held as buffers and addressed by ``meta.obs_id``, so this works
     identically under a contiguous ``ObsInfo.slice`` and an arbitrary
     crystal-batched ``ObsInfo.gather``.
 
@@ -144,28 +145,29 @@ class ObsFeatureSpec(nn.Module):
         *,
         self_features: tuple[str, ...] = SELF_FEATURES,
         context_features: tuple[str, ...] | None = None,
-        include_hkl: bool = True,
         crystal_features: tuple[str, ...] | None = None,
+        phase_classes=None,
     ) -> None:
         super().__init__()
-        #: Recorded so a checkpoint can say which feature set it was fitted
-        #: under; the flag itself is consumed a few lines below.
-        self.include_hkl = bool(include_hkl)
-        #: Optional reflection-dependent profile (installed by
-        #: :meth:`~torchsx.merging.scale.AmortizedScale.install_pseudo_translation`):
-        #: the Ewald offset is read in units of the reflection's own core width,
-        #: and :meth:`build_self` gives the self features of the broad component.
-        self.phase_width = None
-        self.phase_broad = None
-        self._extra_log_width = None
+        #: Optional pseudo-translation classes
+        #: (:class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses`): each
+        #: observation reads its reflection's phase cosines as the self features
+        #: ``phase_c0 ..``.  A factor of ``h`` they open between scale and
+        #: intensity is held by the tether's ``phase`` term.
+        self.phase_classes = phase_classes
+        phase_names = (tuple(f"phase_c{j}" for j in range(phase_classes.n_translations))
+                       if phase_classes is not None else ())
+        self_features = tuple(self_features) + tuple(f for f in phase_names if f not in self_features)
+        if context_features is not None:
+            context_features = tuple(context_features) + tuple(
+                f for f in phase_names if f not in context_features)
+        stray = [f for f in tuple(self_features) + tuple(context_features or ())
+                 if f.startswith("phase_c") and f not in phase_names]
+        if stray:
+            raise ValueError(f"{stray} need the pseudo-translation classes they were trained with")
 
         if context_features is None:
             context_features = tuple(self_features) + CONTEXT_ONLY_FEATURES
-        if not include_hkl:
-            self_features = tuple(f for f in self_features if f not in ("h", "k", "l"))
-            context_features = tuple(
-                f for f in context_features if f not in ("h", "k", "l")
-            )
 
         leaks = FORBIDDEN_IN_SELF.intersection(self_features)
         if leaks:
@@ -173,8 +175,8 @@ class ObsFeatureSpec(nn.Module):
                 f"{sorted(leaks)} may not be self features: routing an "
                 f"observation's own intensity to the scale head makes "
                 f"K_j = I_j / I0_h fit perfectly and mean nothing. "
-                f"Put them in context_features, where leave-one-out excludes "
-                f"the observation from its own pool."
+                f"Put them in context_features, which the encoder hides from "
+                f"the observation's own readout."
             )
         crystal_features = (
             tuple(crystal_features) if crystal_features is not None
@@ -233,7 +235,10 @@ class ObsFeatureSpec(nn.Module):
         self.register_buffer("_I", I, persistent=False)
         self.register_buffer("_bg", bg, persistent=False)
         self.register_buffer("_sigma", sigma.clamp(min=1e-6), persistent=False)
-        self.register_buffer("_hkl", prep.hkl_valid.float(), persistent=False)
+        self.register_buffer(
+            "_phase", torch.as_tensor(phase_classes.cosines(prep.hkl_valid.long().cpu().numpy()),
+                                      dtype=torch.float32)
+            if phase_classes is not None else torch.zeros(prep.hkl_valid.shape[0], 0), persistent=False)
         self.has_supplied_sigma = (oi.has_sigma if self._store is not None
                                    else oi.sigma is not None)
         # The per-reflection context channels are fixed by the data alone and
@@ -378,12 +383,7 @@ class ObsFeatureSpec(nn.Module):
             if k == "s_sq":
                 out[k] = meta.s_sq.float()
             elif k == "ewald_offset":
-                off = _or_zeros(meta.ewald_offset, meta)
-                if self.phase_width is not None:
-                    off = off * torch.exp(-self.phase_width.log_width(meta.hkl_idx)).to(off.device)
-                if self._extra_log_width is not None:
-                    off = off * torch.exp(-self._extra_log_width).to(off.device)
-                out[k] = off
+                out[k] = _or_zeros(meta.ewald_offset, meta)
             elif k == "fs":
                 out[k] = _or_zeros(meta.fs, meta)
             elif k == "ss":
@@ -404,8 +404,8 @@ class ObsFeatureSpec(nn.Module):
                     meta.panel_id.float() if meta.panel_id is not None
                     else torch.zeros_like(meta.s_sq)
                 )
-            elif k in ("h", "k", "l"):
-                out[k] = self._hkl[meta.hkl_idx, "hkl".index(k)]
+            elif k.startswith("phase_c"):
+                out[k] = self._phase.to(meta.hkl_idx.device)[meta.hkl_idx, int(k[len("phase_c"):])]
             elif k == "signed_log_I":
                 out[k] = torch.sign(I) * torch.log1p(I.abs())
             elif k == "log_sigma":
@@ -446,6 +446,19 @@ class ObsFeatureSpec(nn.Module):
     def n_crystal(self) -> int:
         return len(self.crystal_features)
 
+    #: the self features the fold transformer's geometry correction reads, in its order
+    GEOMETRY = ("ewald_offset", "qx", "qy", "qz", "s_sq", "beam_energy")
+
+    def geometry_columns(self) -> dict:
+        """Columns of ``x_self`` holding the geometry, and their standardisation
+        (:class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`'s ``geometry``)."""
+        missing = [f for f in self.GEOMETRY if f not in self.self_features]
+        if missing:
+            raise ValueError(f"geometry correction needs the self features {missing}")
+        stat = [self._stat_names.index(f) for f in self.GEOMETRY]
+        return {"cols": [self.self_features.index(f) for f in self.GEOMETRY],
+                "mean": self._mean[stat].clone(), "std": self._std[stat].clone()}
+
     def crystal_matrix(self) -> Tensor:
         """``(n_crystals, n_crystal)`` standardised per-crystal table."""
         x = (self._crys_raw - self._crys_mean) / self._crys_std
@@ -462,16 +475,6 @@ class ObsFeatureSpec(nn.Module):
             raise ValueError("ObsFeatureSpec.build needs ObsInfo.obs_id")
         x_ctx = self._matrix(meta, self.context_features)
         return self._matrix(meta, self.self_features), x_ctx, self.crystal_matrix()
-
-    def build_self(self, meta: ObsInfo, extra_log_width: Tensor) -> Tensor:
-        """``x_self`` with every observation's Ewald offset further divided by
-        ``exp(extra_log_width)`` (per row): the self features of the broad
-        profile component."""
-        self._extra_log_width = extra_log_width
-        try:
-            return self._matrix(meta, self.self_features)
-        finally:
-            self._extra_log_width = None
 
 
 def _or_zeros(t: Tensor | None, meta: ObsInfo) -> Tensor:

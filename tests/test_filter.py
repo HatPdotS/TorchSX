@@ -48,9 +48,9 @@ def test_filter_cell(sample_core):
 
 def test_filter_cell_removes_outlier():
     """Cell filter should remove crystals with deviant cells."""
-    from torchsx._core import _SFXStreamCore
+    from torchsx._core import SFXStreamCore
 
-    core = _SFXStreamCore(
+    core = SFXStreamCore(
         hkl=torch.tensor([[1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=torch.int16),
         I=torch.tensor([10.0, 20.0, 30.0]),
         sigma=torch.tensor([1.0, 2.0, 3.0]),

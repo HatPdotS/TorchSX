@@ -1,8 +1,8 @@
 """Per-observation Poisson noise model for SFX integration.
 
-Provides σ²_poisson per observation from CrystFEL ring-integration geometry
-(peak counts, background, integration radii) and a gain calibration using
-off-Bragg observations, or the negative intensities when a source has none.
+Provides the CrystFEL ring-integration pixel counts (peak and background
+rings from the integration radii) and a gain calibration using off-Bragg
+observations, or the negative intensities when a source has none.
 """
 
 from __future__ import annotations
@@ -31,21 +31,6 @@ def calibration_candidates(I_obs: Tensor, background: Tensor, ewald_offset: Tens
     off_bragg = ((background > OFF_BRAGG_BG_MIN) & (ewald_offset.abs() > OFF_BRAGG_EWALD_MIN)
                  & torch.isfinite(ewald_offset))
     return off_bragg | ((I_obs < 0) & (background > NEGATIVE_BG_MIN))
-
-
-def compute_sigma2_LN(alpha: Tensor, beta: Tensor) -> Tensor:
-    """Log-space variance of GenGauss noise (first-order approximation):
-    σ²_LN = α² · Γ(3/β) / Γ(1/β)."""
-    lgamma_1b = torch.lgamma(1.0 / beta)
-    lgamma_3b = torch.lgamma(3.0 / beta)
-    return alpha ** 2 * torch.exp(lgamma_3b - lgamma_1b)
-
-
-def compute_sigma2_LN_exact(alpha: Tensor, beta: Tensor) -> Tensor:
-    """Exact linear-space variance of exp(ε) for ε ~ GenGauss(0, α, β):
-    Var = exp(σ²_log) · (exp(σ²_log) − 1)."""
-    sigma2_log = compute_sigma2_LN(alpha, beta)
-    return torch.exp(sigma2_log) * torch.expm1(sigma2_log)
 
 
 def _crystfel_pixel_counts(r_peak: float, r_gap: float, r_bg: float) -> tuple[int, int]:
@@ -94,21 +79,16 @@ class PoissonNoiseModel:
     gain :
         ADU-to-photon conversion factor; calibrate via ``calibrate_sigma2_of_bg``
         or, without off-Bragg observations, ``calibrate_gain_truncnorm``.
-    exact_pixel_counts :
-        If ``True`` (default), ``n_peak`` and ``n_bg`` are the exact integer
-        pixel counts produced by CrystFEL's mask kernel
-        ([integration.c:404-445](https://gitlab.desy.de/thomas.white/crystfel/-/blob/master/libcrystfel/src/integration.c#L404)).
-        If ``False``, the legacy continuous-disk approximation
-        ``π·r²`` / ``π·(r_bg²−r_gap²)`` is used — only useful for
-        reproducing results computed with that approximation.
+
+    ``n_peak`` and ``n_bg`` are the exact integer pixel counts produced by
+    CrystFEL's mask kernel
+    ([integration.c:404-445](https://gitlab.desy.de/thomas.white/crystfel/-/blob/master/libcrystfel/src/integration.c#L404)).
     """
 
     r_peak: float = 7.0
     r_gap: float = 9.0
     r_bg: float = 11.0
     gain: float = 1.0
-    exact_pixel_counts: bool = True
-    sigma2_bg_slope: float = 0.0
     # σ²_read in ADU² per peak-ring observation (summed over n_peak pixels,
     # including the bg-ring leakage 1+n_peak/n_bg term).  Set by
     # ``calibrate_sigma2_of_bg`` from the per-bg-bin σ²_z(bg) curve.
@@ -117,52 +97,9 @@ class PoissonNoiseModel:
     gain_selection: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.exact_pixel_counts:
-            n_p, n_b = _crystfel_pixel_counts(self.r_peak, self.r_gap, self.r_bg)
-            self.n_peak = float(n_p)
-            self.n_bg = float(n_b)
-        else:
-            self.n_peak = math.pi * self.r_peak ** 2
-            self.n_bg = math.pi * (self.r_bg ** 2 - self.r_gap ** 2)
-
-    def sigma2_raw(self, I_obs: Tensor, background: Tensor) -> Tensor:
-        bg_contrib = background * self.n_peak * (1.0 + self.n_peak / self.n_bg)
-        return (I_obs + bg_contrib).clamp(min=1.0)
-
-    def sigma2(self, I_obs: Tensor, background: Tensor) -> Tensor:
-        return self.gain ** 2 * self.sigma2_raw(I_obs, background)
-
-    def calibrate_gain(self, I_obs: Tensor, background: Tensor) -> float:
-        """Mandel gain calibration from background-limited (negative) peaks.
-
-        Derivation (n_pk photons in peak ring, λ_bg = per-pixel bg rate):
-            Var[I_obs_photon] = n_peak · λ_bg · (1 + n_peak/n_bg)
-        In ADU (g = ADU/photon):
-            Var[I_obs_ADU] = g · n_peak · bg_ADU_per_px · (1 + n_peak/n_bg)
-        Conditioned on I_obs<0 (zero mean),
-            ⟨I²_neg⟩ = Var[I_obs_ADU]  ⇒  g = ⟨I²_neg⟩ / denom.
-
-        Note: assumes the negatives are zero-centred. Real data has a
-        positive μ-bias (signal contamination + centroiding), so this
-        estimator runs high. Prefer ``calibrate_sigma2_of_bg``.
-        """
-        neg = I_obs < 0
-        n_neg = int(neg.sum().item())
-        if n_neg < 100:
-            print(f"  PoissonNoiseModel: only {n_neg} negative obs, "
-                  f"keeping gain={self.gain:.3f}")
-            return self.gain
-
-        bg_neg = background[neg].clamp(min=0)
-        sigma2_pred_ADU = bg_neg * self.n_peak * (1.0 + self.n_peak / self.n_bg)
-        var_ADU = (I_obs[neg] ** 2).mean()
-        denom = sigma2_pred_ADU.mean().clamp(min=1e-12)
-        g = (var_ADU / denom).item()
-        self.gain = g
-        print(f"  PoissonNoiseModel: gain={g:.4f} ADU/photon "
-              f"[n_peak={self.n_peak:.2f}, n_bg={self.n_bg:.2f}, "
-              f"{n_neg} negatives]")
-        return g
+        n_p, n_b = _crystfel_pixel_counts(self.r_peak, self.r_gap, self.r_bg)
+        self.n_peak = float(n_p)
+        self.n_bg = float(n_b)
 
     def _fit_truncnorm_z(
         self,
@@ -335,8 +272,7 @@ class PoissonNoiseModel:
         (gain, mu_bias_in_sigma_units, read_var_adu_sq)
             ``mu_bias`` is the median μ_z across kept bins (diagnostic).
             Sets ``self.gain = gain`` and
-            ``self.read_var_adu_sq = read_var_adu_sq``; also clears
-            ``self.sigma2_bg_slope = 0`` (legacy field).
+            ``self.read_var_adu_sq = read_var_adu_sq``.
             Insufficient observations or background bins return
             ``(nan, 0.0, 0.0)`` with ``gain_calibration_info['valid'] = False``
             and preserve ``self.gain``. There is no negative-only fallback.
@@ -355,7 +291,6 @@ class PoissonNoiseModel:
 
         def unavailable(reason: str) -> tuple[float, float, float]:
             self.gain_calibration_info["reason"] = reason
-            self.sigma2_bg_slope = 0.0
             self.read_var_adu_sq = 0.0
             print(f"  PoissonNoiseModel.sigma2_of_bg: gain calibration unavailable: "
                   f"{reason}.", flush=True)
@@ -443,7 +378,6 @@ class PoissonNoiseModel:
         )
         self.gain = g_fit
         self.read_var_adu_sq = c_fit
-        self.sigma2_bg_slope = 0.0  # legacy field, unused after refit
         self.gain_calibration_info.update(valid=clean_enough and math.isfinite(g_fit) and g_fit > 0,
                                           n_bins=len(sigma2_per_bin), n_clean_bins=sum(abs(m) < mu_z_max for m in mu_per_bin))
 

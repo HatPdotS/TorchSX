@@ -1,10 +1,9 @@
 """Triton kernel for :class:`SplitLogGrid`'s window integral.
 
-Same integrand, same online logsumexp and the same four gated aux statistics
-as ``_fixed_log_grid_triton._fwd_kernel``; the differences are that the node
+An online logsumexp over the nodes with four gated aux statistics.  The node
 positions are built per observation from eight ``(M,)`` grid parameters, and
-that the trapezoid weight enters as a multiplier of the exponential instead of
-a log-weight in the exponent, so the non-uniform spacing costs no extra
+the trapezoid weight enters as a multiplier of the exponential instead of a
+log-weight in the exponent, so the non-uniform spacing costs no extra
 transcendental.  The running maximum is taken over the unweighted integrand;
 every weight is below one (spacings are fractions of a nat), so it remains an
 upper bound and nothing can overflow.
@@ -26,9 +25,18 @@ try:
 except ImportError:                    # pragma: no cover
     HAVE_TRITON = False
 
-from torchsx.merging.quadrature._fixed_log_grid_triton import _lookup_config
-
 _LN2 = 0.6931471805599453
+
+#: Launch configuration by node count (A100 autotune winners).
+_LAUNCH_CONFIG: dict[str, dict[str, int]] = {
+    "K<=1024": {"BLOCK_M": 64, "BLOCK_K": 16, "num_warps": 4, "num_stages": 3},
+    "K>1024":  {"BLOCK_M": 64, "BLOCK_K": 16, "num_warps": 4, "num_stages": 2},
+}
+
+
+def _lookup_config(K: int) -> dict[str, int]:
+    """``{BLOCK_M, BLOCK_K, num_warps, num_stages}`` for ``K`` nodes."""
+    return _LAUNCH_CONFIG["K<=1024" if K <= 1024 else "K>1024"]
 
 
 if HAVE_TRITON:

@@ -1,11 +1,12 @@
-"""Reflection profiles that depend on the structure's translational pseudo-symmetry.
+"""Translational pseudo-symmetry: finding it in the data, and the classes of reflections it makes.
 
 A translation ``t`` relating parts of the crystal -- translational NCS, a
-lattice translocation defect, stacking faults -- makes how a reflection is
-recorded depend on its phase ``h.t``.  Reflections with integer ``h.t`` stay
-sharp; the others spread along the fault direction, and the spread part may
-be broad and shallow while the rest stays sharp.  One partiality profile
-shared by every reflection then fits none of these families.
+lattice translocation defect, stacking faults -- makes a reflection's mean
+intensity, and how it is recorded, depend on its phase ``h.t``.  Reflections
+with integer ``h.t`` stay sharp and keep the copies in phase; the others are
+weakened or spread along the fault direction.  One intensity population and one
+partiality profile shared by every reflection then describe none of these
+families.
 
 **Detection.**  :func:`find_pseudo_translations` finds the translations in the
 data: the Patterson function of ``E2 - 1`` (each reflection's plain mean over
@@ -20,26 +21,11 @@ its harmonics above :data:`MIN_AMPLITUDE`.  A copy of the whole structure gives
 such a peak; the interatomic vectors of a small structure give several peaks
 of similar height, and nothing is kept.
 
-**Profile.**  With ``c_j(h)`` the cosine of ``2 pi h.R t_j`` averaged over the
-point-group rotations ``R`` and ``z`` the standardised resolution, each
-reflection gets a core width ``w(h)`` (:class:`PhaseWidth`) and a broad
-component of relative area ``rho(h)`` and width ``W(h)`` times the core's
-(:class:`PhaseBroad`), all linear in
-
-    c_j,  c_j z,  c_j^2,  c_j^2 z      (per translation j)
-
-and bounded.  The scale model reads the observation's Ewald offset in units of
-``w(h)`` for the core and of ``w(h) W(h)`` for the broad part (a second pass of
-the per-observation branch of the encoder, sharing the crystal context), and
-
-    K = K_core(e / w) / w + rho K_core(e / (w W)) / (w W),
-
-a profile with ``1 + rho`` times the shared one's area.  The fit measures the
-core's intensity; the merge reports ``1 + rho`` times it
-(:meth:`~torchsx.merging.scale.AmortizedScale.readout_log_factor`), the
-reflection's total recorded intensity, core and broad part together.  The
-coefficients start at the shared profile with a small broad part and are
-fitted with the network.
+**Classes.**  With ``c_j(h)`` the cosine of ``2 pi h.R t_j`` averaged over the
+point-group rotations ``R``, :class:`PhaseClasses` gives the scale model the
+``c_j`` as features and the tether the columns that hold every class of
+reflections at its sum of spots; the Wilson prior follows the same translations
+(:mod:`torchsx.merging.priors.modulation`).
 
 Rotations act on Miller indices as rows, ``h' = h @ R``.
 """
@@ -47,16 +33,16 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch import Tensor
 
-__all__ = ["DOMINANCE", "MIN_AMPLITUDE", "PhaseBroad", "PhaseWidth", "find_pseudo_translations",
-           "find_translations", "select_translations"]
+__all__ = ["DOMINANCE", "MIN_AMPLITUDE", "MIN_REFLECTIONS", "PhaseClasses", "find_pseudo_translations", "find_translations",
+           "select_translations"]
 
 #: Translations whose modulation amplitude is below this are not used.
 MIN_AMPLITUDE: float = 0.1
 #: The used translation's amplitude over that of any other non-harmonic translation.
 DOMINANCE: float = 3.0
+#: Observed reflections the search needs: fewer give no noise level to hold a peak against.
+MIN_REFLECTIONS: int = 1000
 
 E2_CLIP = (-5.0, 50.0)
 
@@ -245,14 +231,11 @@ def _reflection_means(prep) -> tuple[np.ndarray, np.ndarray]:
         return np.where(cnt > 0, num / np.maximum(cnt, 1.0), np.nan), cnt
 
 
-def find_pseudo_translations(prep, spacegroup: str | None, *, n_shells: int = 20, **kw) -> list[dict]:
-    """Translations of the structure in the Patterson function of ``E2 - 1``.
-
-    ``E2`` is each reflection's plain mean over its symmetry factor and the mean
-    of that ratio in its resolution shell (equal-count shells in ``1/d^2``).
-    Keyword arguments go to :func:`find_translations`.  Every peak found is
-    returned; :data:`MIN_AMPLITUDE` decides which are used.
-    """
+def normalised_intensities(prep, spacegroup: str | None, *, n_shells: int = 20):
+    """``(hkl, s2, E2, seen)`` of the prepared reflections: ``E2`` is each
+    reflection's plain mean over its symmetry factor and the mean of that ratio
+    in its resolution shell (equal-count shells in ``s2 = 1/d^2``); 1 where a
+    reflection has no observation (``seen`` false)."""
     hkl = prep.hkl_valid.long().cpu().numpy()
     s2 = (1.0 / prep.d_spacing.double() ** 2).cpu().numpy()
     rotations = point_group_rotations(spacegroup or "P 1")
@@ -264,7 +247,20 @@ def find_pseudo_translations(prep, spacegroup: str | None, *, n_shells: int = 20
     shell = np.clip(np.searchsorted(edges, s2, side="right") - 1, 0, n_shells - 1)
     shell_mean = np.array([I[seen & (shell == i)].mean() if (seen & (shell == i)).any() else np.nan
                            for i in range(n_shells)])
-    E2 = np.where(seen, I / shell_mean[shell], 1.0)
+    return hkl, s2, np.where(seen, I / shell_mean[shell], 1.0), seen
+
+
+def find_pseudo_translations(prep, spacegroup: str | None, *, n_shells: int = 20, **kw) -> list[dict]:
+    """Translations of the structure in the Patterson function of ``E2 - 1``
+    (:func:`normalised_intensities`).  Keyword arguments go to
+    :func:`find_translations`.  Every peak found is returned;
+    :data:`MIN_AMPLITUDE` decides which are used.  With fewer than
+    :data:`MIN_REFLECTIONS` observed reflections there is no search and no peak.
+    """
+    hkl, _, E2, seen = normalised_intensities(prep, spacegroup, n_shells=n_shells)
+    if int(seen.sum()) < MIN_REFLECTIONS:
+        return []
+    rotations = point_group_rotations(spacegroup or "P 1")
     cell = prep.median_cell.double().cpu().numpy()
     return find_translations(hkl, cell, E2, rotations, **kw)
 
@@ -291,128 +287,92 @@ def select_translations(peaks: list[dict]) -> tuple[list[dict], str]:
     return used, f"{len(used)} translation(s): one dominant translation and its harmonics"
 
 
-# ── profile ────────────────────────────────────────────────────────────────
+# ── classes ────────────────────────────────────────────────────────────────
 
-def _phase_table(hkl, s2, translations, spacegroup, s_centre, s_scale):
-    """``(table, translations, s_centre, s_scale)``: per translation the columns ``c, c z, c^2, c^2 z``."""
-    hkl = np.asarray(hkl, dtype=np.int64)
-    t = np.asarray(translations, dtype=np.float64).reshape(-1, 3)
-    rotations = point_group_rotations(spacegroup or "P 1")
-    s = np.sqrt(np.asarray(s2, dtype=np.float64)) / 2.0
-    s_centre = float(np.mean(s)) if s_centre is None else float(s_centre)
-    s_scale = float(np.std(s) or 1.0) if s_scale is None else float(s_scale)
-    z = (s - s_centre) / s_scale
-    cols = []
-    for tj in t:
-        c = phase_cos(hkl, tj, rotations)
-        cols += [c, c * z, c * c, c * c * z]
-    X = np.stack(cols, axis=1) if cols else np.zeros((len(hkl), 0))
-    return torch.as_tensor(X, dtype=torch.float32), t.tolist(), s_centre, s_scale
+class PhaseClasses:
+    """The phase cosines ``c_j(h)`` of the used translations, as features and as classes.
 
-
-class PhaseWidth(nn.Module):
-    """``log w(h)``, the core width of each reflection relative to the shared profile.
-
-    ``hkl`` and ``s2`` (``1/d^2``) describe the reflections the scale model
-    indexes by ``hkl_idx``; ``translations`` are fractional ``t_j``,
-    ``spacegroup`` sets the rotations the cosines are averaged over.  The
-    resolution is standardised by ``s_centre`` / ``s_scale`` (fitted on
-    ``s2`` when not given), so a model restored on another reflection set
-    evaluates the same function.
+    :meth:`cosines` are the scale model's phase features: each observation
+    reads its reflection's ``c_j``, so the network can give the families of
+    reflections their own profiles.  A factor of ``h`` is degenerate between
+    the scale and the intensity, and the features open it along every function
+    of ``c``; :meth:`columns` close it again from the counts.  The reflections
+    fall into cells of equal-count bins of every ``c_j`` (``edges``, fitted on
+    the training reflections), and each cell carries the Chebyshev polynomials
+    ``T_0 .. T_degree`` of ``s2 = 1/d^2`` mapped onto ``[-1, 1]`` by
+    ``s2_range``.  The tether holds the arithmetic mean of ``K`` free of a
+    trend along these columns (:class:`~torchsx.merging.tether.terms.PhaseGauge`),
+    so in every cell and at every resolution it is the sum of the spots: the
+    features shape a family's profile, the counts set its brightness.
     """
 
-    #: Largest ``|log w|``: the profile is stretched or narrowed at most e^BOUND-fold.
-    BOUND: float = 3.0
+    #: cells over all translations together; the bins per translation follow
+    N_CELLS = 16
 
-    def __init__(self, hkl, s2, translations, spacegroup: str | None, *,
-                 s_centre: float | None = None, s_scale: float | None = None) -> None:
-        super().__init__()
-        X, self.translations, self.s_centre, self.s_scale = _phase_table(
-            hkl, s2, translations, spacegroup, s_centre, s_scale)
+    def __init__(self, translations, spacegroup: str | None, edges, s2_range, degree: int = 2):
+        self.translations = np.asarray(translations, dtype=np.float64).reshape(-1, 3)
         self.spacegroup = spacegroup
-        self.register_buffer("table", X, persistent=False)
-        self.coef = nn.Parameter(torch.zeros(X.shape[1]))
+        self.edges = [np.asarray(e, dtype=np.float64) for e in edges]
+        self.s2_range = (float(s2_range[0]), float(s2_range[1]))
+        self.degree = int(degree)
 
     @classmethod
-    def from_prep(cls, prep, translations, spacegroup: str | None, **kw) -> "PhaseWidth":
-        return cls(prep.hkl_valid.long().cpu().numpy(), (1.0 / prep.d_spacing.double() ** 2).cpu().numpy(),
-                   translations, spacegroup, **kw)
+    def fit(cls, hkl, s2, translations, spacegroup: str | None, *, degree: int = 2) -> "PhaseClasses":
+        """Bin edges (interior quantiles of each ``c_j``) and the resolution range from the reflections."""
+        t = np.asarray(translations, dtype=np.float64).reshape(-1, 3)
+        s2 = np.asarray(s2, dtype=np.float64)
+        out = cls(t, spacegroup, [np.zeros(0)] * len(t), (s2.min(), s2.max()), degree)
+        if len(t):
+            n_bins = max(2, round(cls.N_CELLS ** (1.0 / len(t))))
+            C = out.cosines(hkl)
+            out.edges = [np.quantile(C[:, j], np.linspace(0, 1, n_bins + 1)[1:-1]) for j in range(len(t))]
+        return out
 
     @classmethod
-    def from_definition(cls, d: dict, prep) -> "PhaseWidth":
-        return cls.from_prep(prep, d["translations"], d.get("spacegroup"),
-                             s_centre=d["s_centre"], s_scale=d["s_scale"])
+    def from_prep(cls, prep, translations, spacegroup: str | None, **kw) -> "PhaseClasses":
+        hkl = prep.hkl_valid.long().cpu().numpy()
+        return cls.fit(hkl, (1.0 / prep.d_spacing.double() ** 2).cpu().numpy(), translations, spacegroup, **kw)
+
+    @property
+    def n_translations(self) -> int:
+        return len(self.translations)
+
+    def cosines(self, hkl) -> np.ndarray:
+        """``c_j(h)`` for every translation, ``(N, P)``."""
+        hkl = np.asarray(hkl, dtype=np.int64)
+        rotations = point_group_rotations(self.spacegroup or "P 1")
+        return (np.stack([phase_cos(hkl, t, rotations) for t in self.translations], axis=1)
+                if len(self.translations) else np.zeros((len(hkl), 0)))
+
+    def cells(self, hkl) -> np.ndarray:
+        """Each reflection's cell, ``0 .. n_cells - 1``."""
+        C = self.cosines(hkl)
+        cell = np.zeros(len(C), dtype=np.int64)
+        for j, e in enumerate(self.edges):
+            cell = cell * (len(e) + 1) + np.searchsorted(e, C[:, j], side="right")
+        return cell
+
+    @property
+    def n_cells(self) -> int:
+        return int(np.prod([len(e) + 1 for e in self.edges])) if self.edges else 1
+
+    def columns(self, hkl, s2) -> np.ndarray:
+        """``(N, n_cells (degree + 1))``: each cell's indicator times ``T_0 .. T_degree`` of the resolution."""
+        s2 = np.asarray(s2, dtype=np.float64)
+        lo, hi = self.s2_range
+        x = np.clip(2.0 * (s2 - lo) / max(hi - lo, 1e-12) - 1.0, -1.0, 1.0)
+        T = np.polynomial.chebyshev.chebvander(x, self.degree)
+        out = np.zeros((len(s2), self.n_cells * (self.degree + 1)))
+        cell = self.cells(hkl)
+        for k in range(self.degree + 1):
+            out[np.arange(len(s2)), cell * (self.degree + 1) + k] = T[:, k]
+        return out
 
     def definition(self) -> dict:
-        return {"translations": self.translations, "spacegroup": self.spacegroup,
-                "s_centre": self.s_centre, "s_scale": self.s_scale,
-                "coef": self.coef.detach().cpu().tolist(), "bound": self.BOUND}
-
-    def log_width(self, hkl_idx: Tensor) -> Tensor:
-        """``log w`` of the reflections ``hkl_idx`` (on the module's device)."""
-        if self.table.shape[1] == 0:
-            return torch.zeros(hkl_idx.shape, device=self.coef.device)
-        eta = self.table.index_select(0, hkl_idx.to(self.table.device).long()) @ self.coef
-        return self.BOUND * torch.tanh(eta / self.BOUND)
-
-
-class PhaseBroad(nn.Module):
-    """The broad component of each reflection's profile: relative area ``rho(h)`` and width ``W(h)``.
-
-    ``log rho = RHO_CENTRE + RHO_HALF tanh(eta_rho / RHO_HALF)`` and
-    ``log W = log W_MIN + W_SPAN sigmoid(eta_W)``, with each ``eta`` an
-    intercept plus the phase table times coefficients.  The intercepts start
-    at ``rho = exp(RHO_CENTRE)`` and ``W = W_INIT``, the coefficients at zero;
-    ``W >= W_MIN`` keeps the two components distinct.
-    """
-
-    RHO_CENTRE: float = -2.5
-    RHO_HALF: float = 5.0
-    W_MIN: float = 2.0
-    W_SPAN: float = 4.0
-    W_INIT: float = 5.0
-
-    def __init__(self, hkl, s2, translations, spacegroup: str | None, *,
-                 s_centre: float | None = None, s_scale: float | None = None) -> None:
-        super().__init__()
-        X, self.translations, self.s_centre, self.s_scale = _phase_table(
-            hkl, s2, translations, spacegroup, s_centre, s_scale)
-        self.spacegroup = spacegroup
-        self.register_buffer("table", X, persistent=False)
-        p = X.shape[1]
-        frac = np.log(self.W_INIT / self.W_MIN) / self.W_SPAN
-        self.rho_coef = nn.Parameter(torch.zeros(p + 1))
-        self.width_coef = nn.Parameter(torch.zeros(p + 1))
-        with torch.no_grad():
-            self.width_coef[0] = float(np.log(frac / (1.0 - frac)))
+        return {"translations": self.translations.tolist(), "spacegroup": self.spacegroup,
+                "edges": [e.tolist() for e in self.edges], "s2_range": list(self.s2_range),
+                "degree": self.degree}
 
     @classmethod
-    def from_prep(cls, prep, translations, spacegroup: str | None, **kw) -> "PhaseBroad":
-        return cls(prep.hkl_valid.long().cpu().numpy(), (1.0 / prep.d_spacing.double() ** 2).cpu().numpy(),
-                   translations, spacegroup, **kw)
-
-    @classmethod
-    def from_definition(cls, d: dict, prep) -> "PhaseBroad":
-        return cls.from_prep(prep, d["translations"], d.get("spacegroup"),
-                             s_centre=d["s_centre"], s_scale=d["s_scale"])
-
-    def definition(self) -> dict:
-        return {"translations": self.translations, "spacegroup": self.spacegroup,
-                "s_centre": self.s_centre, "s_scale": self.s_scale,
-                "rho_coef": self.rho_coef.detach().cpu().tolist(),
-                "width_coef": self.width_coef.detach().cpu().tolist()}
-
-    def _eta(self, coef: Tensor, hkl_idx: Tensor) -> Tensor:
-        eta = coef[0].expand(hkl_idx.shape)
-        if self.table.shape[1]:
-            eta = eta + self.table.index_select(0, hkl_idx.to(self.table.device).long()) @ coef[1:]
-        return eta
-
-    def log_fraction(self, hkl_idx: Tensor) -> Tensor:
-        """``log rho``: the broad part's area relative to the core's."""
-        eta = self._eta(self.rho_coef, hkl_idx)
-        return self.RHO_CENTRE + self.RHO_HALF * torch.tanh(eta / self.RHO_HALF)
-
-    def log_width(self, hkl_idx: Tensor) -> Tensor:
-        """``log W``: the broad part's width relative to the core's (``>= log W_MIN``)."""
-        return float(np.log(self.W_MIN)) + self.W_SPAN * torch.sigmoid(self._eta(self.width_coef, hkl_idx))
+    def from_definition(cls, d: dict) -> "PhaseClasses":
+        return cls(d["translations"], d.get("spacegroup"), d["edges"], d["s2_range"], d.get("degree", 2))
