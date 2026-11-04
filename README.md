@@ -75,7 +75,7 @@ run/
 ├── merged_half2.mtz        ... and from the other half
 ├── merged.metrics.json     in-run precision: CC1/2 and R_split between the two halves
 ├── best.pt                 the network at the lowest validation loss; it made the merges
-├── last.pt                 the network after the last update
+├── last.pt                 the network at the end of training
 ├── prepared/               the prepared observations on disk, reused by later runs on the same input
 ├── run.json                the resolved settings
 ├── training_summary.json   updates, best step, run time; time and GPU memory by phase
