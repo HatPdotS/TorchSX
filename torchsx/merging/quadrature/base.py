@@ -25,8 +25,7 @@ class Quadrature(nn.Module):
     """Signal-marginal integrator.
 
     Returns ``log ∫ p(n | S, bg) · p_scatter(log S − log_mean) · d(log S)``
-    per observation, shape ``(n_obs,)``.  A bg-mixture likelihood wraps
-    this result via ``DetectionLikelihood.combine_with_marginal``.
+    per observation, shape ``(n_obs,)``.
     """
 
 

@@ -480,7 +480,7 @@ def test_off_bragg_calibration_reports_why_it_is_unavailable(monkeypatch, case, 
         pytest.fail("the off-Bragg method reports; prepare_observations decides the fallback")
 
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_gain_truncnorm", no_truncnorm)
-    noise = PoissonNoiseModel(gain=7.0, read_var_adu_sq=12.0, sigma2_bg_slope=3.0)
+    noise = PoissonNoiseModel(gain=7.0, read_var_adu_sq=12.0)
     bg = torch.full((6000,), 10.0, dtype=torch.float64)
     sigma = (bg * noise.n_peak * (1 + noise.n_peak / noise.n_bg)).sqrt()
     rng = torch.Generator().manual_seed(92)
@@ -495,7 +495,7 @@ def test_off_bragg_calibration_reports_why_it_is_unavailable(monkeypatch, case, 
     assert math.isnan(gain)
     assert bias == read_var == 0.0
     assert noise.gain == 7.0
-    assert noise.read_var_adu_sq == noise.sigma2_bg_slope == 0.0
+    assert noise.read_var_adu_sq == 0.0
     info = noise.gain_calibration_info
     assert info["method"] == "off_bragg_variance"
     assert not info["valid"]

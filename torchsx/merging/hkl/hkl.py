@@ -80,39 +80,3 @@ def merge_intensities(
     I_merged = (sum_wI / sum_w.clamp(min=1e-30)).float()
     sigma_merged = (1.0 / sum_w.clamp(min=1e-30).sqrt()).float()
     return I_merged, sigma_merged, count
-
-
-def merge_median(
-    hkl_id: torch.Tensor,
-    I: torch.Tensor,
-    n_unique: int,
-    min_mult: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-HKL median merge, robust to heavy-tailed multiplicative noise.
-
-    Returns (I_median, sigma_MAD, count); NaN where count < min_mult.
-    """
-    order = hkl_id.argsort()
-    I_sorted = I[order]
-    count = torch.zeros(n_unique, dtype=torch.int32, device=I.device)
-    count.scatter_add_(0, hkl_id, torch.ones_like(hkl_id, dtype=torch.int32))
-
-    offsets = torch.zeros(n_unique + 1, dtype=torch.long, device=I.device)
-    offsets[1:] = count.long().cumsum(0)
-
-    I_merged = torch.full((n_unique,), float("nan"), device=I.device)
-    sigma_merged = torch.full((n_unique,), float("nan"), device=I.device)
-
-    for h in range(n_unique):
-        lo, hi = offsets[h].item(), offsets[h + 1].item()
-        n = hi - lo
-        if n < min_mult:
-            continue
-        vals = I_sorted[lo:hi]
-        med = vals.median()
-        I_merged[h] = med
-        if n >= 2:
-            mad = (vals - med).abs().median()
-            sigma_merged[h] = 1.4826 * mad / (n ** 0.5)
-
-    return I_merged, sigma_merged, count

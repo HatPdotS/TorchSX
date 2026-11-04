@@ -7,23 +7,14 @@ from abc import abstractmethod
 import torch.nn as nn
 from torch import Tensor
 
-from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
-
 
 class DetectionLikelihood(nn.Module):
-    """``p(n | signal, bg)`` and (optionally) a bg-mixture wrapper.
+    """``p(n | signal, bg)``.
 
-    Two hooks:
-
-    * ``log_prob_given_signal(n, S, bg)`` — per-grid-point log likelihood.
-      The Quadrature calls this inside the signal integral.
-    * ``combine_with_marginal(n, bg, log_p_sig_marginal, params, meta)`` —
-      post-marginal combining (e.g. mixing in a bg hypothesis).  Default
-      implementation just returns the signal marginal unchanged.
-
-    Plus :meth:`detection_params`, describing how the *stored* ``bg`` — an
-    annulus-derived ESTIMATE, not a measurement — enters the detection model.
+    :meth:`log_prob_given_signal` is the per-grid-point log likelihood the
+    Quadrature calls inside the signal integral; :meth:`detection_params`
+    describes how the *stored* ``bg`` — an annulus-derived ESTIMATE, not a
+    measurement — enters the detection model.
     """
 
     @abstractmethod
@@ -52,13 +43,3 @@ class DetectionLikelihood(nn.Module):
         deliberately keep the raw value and must NOT route through this.
         """
         return bg, None
-
-    def combine_with_marginal(
-        self,
-        n: Tensor,
-        bg: Tensor,
-        log_p_sig_marginal: Tensor,     # (M,)
-        params: Parameters,
-        meta: ObsInfo,
-    ) -> Tensor:                         # (M,)
-        return log_p_sig_marginal
