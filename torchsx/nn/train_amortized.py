@@ -190,11 +190,6 @@ class TrainConfig:
     #: ``target_redundancy * n_hkl`` and the configured value is ignored.
     target_redundancy: float | None = None
     lr: float = 1e-3
-    #: Learning-rate multiplier for the pseudo-translation profile coefficients
-    #: (``PhaseWidth``, ``PhaseBroad``): a handful of scalars that must travel
-    #: O(1) in log width and log fraction, where Adam at the network's rate
-    #: moves them ~lr per update.
-    pseudo_translation_lr_mult: float = 30.0
     #: Learning-rate multiplier for the learned detector noise (per-panel log A,
     #: log B).  They may have to move by several nats within the budget -- B by 2.3
     #: for a gain off by 10x, A up from its near-zero start -- and
@@ -442,12 +437,9 @@ class AmortizedTrainer:
             ref_train = perm[n_held:]
         self.train_crystals = torch.cat([ref_train, other])
 
-        decay, no_decay, profile = [], [], []
-        for name, prm in self.scale.named_parameters():
+        decay, no_decay = [], []
+        for prm in self.scale.parameters():
             if not prm.requires_grad:
-                continue
-            if name.startswith(("features.phase_width.", "features.phase_broad.")):
-                profile.append(prm)
                 continue
             (no_decay if prm.ndim <= 1 else decay).append(prm)
         # the objective may carry its own scalars (the miss fraction); they are
@@ -466,10 +458,6 @@ class AmortizedTrainer:
             groups.append({"params": noise, "weight_decay": 0.0,
                            "lr": self.cfg.lr * self.cfg.noise_lr_mult,
                            "lr_mult": float(self.cfg.noise_lr_mult)})
-        if profile:
-            groups.append({"params": profile, "weight_decay": 0.0,
-                           "lr": self.cfg.lr * self.cfg.pseudo_translation_lr_mult,
-                           "lr_mult": float(self.cfg.pseudo_translation_lr_mult)})
         self.opt = torch.optim.AdamW(groups, lr=self.cfg.lr)
         self.n_decayed = sum(p.numel() for p in decay)
         self.n_undecayed = sum(p.numel() for p in no_decay)
@@ -1004,10 +992,6 @@ class AmortizedTrainer:
                     "lam_tether": float(self.cfg.lam_tether),
                     "phase_classes": (None if getattr(self.scale.features, "phase_classes", None) is None
                                       else self.scale.features.phase_classes.definition()),
-                    "pseudo_translation": (
-                        None if getattr(self.scale.features, "phase_broad", None) is None
-                        else {"width": self.scale.features.phase_width.definition(),
-                              "broad": self.scale.features.phase_broad.definition()}),
                 },
                 "splits": list(self.split_names or []),
                 # scatter family and miss component, so a merge rebuilds the
@@ -1217,9 +1201,6 @@ class AmortizedTrainer:
                 bessel = cnt / (cnt - 1).clamp(min=1)
                 var_emp = ss * bessel / (sumK * sumK)
                 I_sd = torch.maximum(var_pois, var_emp).sqrt()
-            log_c = self.scale.readout_log_factor(torch.arange(n_hkl, device=dev))
-            if log_c is not None:
-                I, I_sd = I * log_c.exp().to(I), I_sd * log_c.exp().to(I_sd)
             return {
                 "estimator": estimator,
                 "I": I.float(), "I_sd": I_sd.float(),
@@ -1328,13 +1309,6 @@ class AmortizedTrainer:
                 d_spacing=self.prep.d_spacing)
             del lk, h, cid
         _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
-        log_c = self.scale.readout_log_factor(torch.arange(n_hkl, device=dev))
-        if log_c is not None:
-            # Fitted core intensity -> total recorded intensity: the grid, and
-            # with it every moment below, moves by log(1 + rho) per reflection.
-            log_c = log_c.to(v)
-            v = v + log_c[:, None]
-            I0, I0_sd = I0 * log_c.exp(), I0_sd * log_c.exp()
 
         # F as a posterior moment of sqrt(I0) on the same weights, not the
         # plug-in sqrt(E[I]) -- they differ exactly where the relative

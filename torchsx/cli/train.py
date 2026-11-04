@@ -91,13 +91,13 @@ def _build_parser():
     # on; off with --no-refine-geometry).
     p.add_argument("--refine-geometry", action=argparse.BooleanOptionalAction, default=None,
                    help=argparse.SUPPRESS)
-    p.add_argument("--pseudo-translation", choices=("off", "auto"), default="off",
-                   help="for crystals with translational NCS or a lattice translocation: auto finds the "
-                        "structure's translations in the data's Patterson function and gives each reflection a "
-                        "profile (core width, and a broad part of its own area and width) that depends on its "
-                        "phase h.t; the merged intensity is the reflection's total.  Without a translation "
-                        "above the threshold the model is unchanged.  off (default).  The merge inherits the "
-                        "checkpoint")
+    p.add_argument("--pseudo-translation", choices=("off", "auto"), default="auto",
+                   help="translational NCS or a lattice translocation defect: auto (default) finds the "
+                        "structure's translations in the Patterson function of the data's plain means.  With "
+                        "a dominant one, the Wilson prior's mean follows the modulation of the intensities by "
+                        "the phase h.t, the scale model reads each reflection's phase, and the tether holds "
+                        "every class of reflections at its sum of spots.  Without one the model is unchanged.  "
+                        "off skips the search.  The merge inherits the checkpoint")
     p.add_argument("--tether", type=_tether_terms, default=None, metavar="TERMS",
                    help="directions the likelihood leaves to the model, held at the raw counts, the sum of "
                         "each reflection's spots: gauge (the rocking-curve integral of the scale is the same "
@@ -105,15 +105,6 @@ def _build_parser():
                         "instead.  Default: gauge.  The merge inherits the checkpoint")
     # Weight of the tether's penalty (nats^2 per observation, default 1).
     p.add_argument("--tether-weight", type=_positive, default=1.0, help=argparse.SUPPRESS)
-    # The Wilson prior's mean follows the structure's pseudo-translations: the symmetry factor
-    # and the modulation of the mean intensity by h.t, fitted to the data's plain means before
-    # training (torchsx.merging.priors.modulation); auto, or off (default).
-    p.add_argument("--structured-prior", choices=("off", "auto"), default="off", help=argparse.SUPPRESS)
-    # The scale model reads each reflection's pseudo-translation phase cosines, and the tether's
-    # phase term holds the rocking-curve integral of every class of them at the sum of its spots
-    # (torchsx.merging.scale.pseudo_translation.PhaseClasses); auto, or off (default).  Needs the
-    # tether.
-    p.add_argument("--phase-classes", choices=("off", "auto"), default="off", help=argparse.SUPPRESS)
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
@@ -225,30 +216,15 @@ def find_used_translations(prep, spacegroup) -> tuple[list[dict], str]:
     return used, why
 
 
-def install_pseudo_translation(scale, prep, spacegroup, used, why) -> None:
-    """Give the scale model reflection-dependent profiles from the ``used`` translations."""
-    from torchsx.merging.scale.pseudo_translation import PhaseBroad, PhaseWidth
-    if not used:
-        print(f"pseudo-translation: {why}; one profile for every reflection", flush=True)
-        return
-    t = [p["t"] for p in used]
-    scale.install_pseudo_translation(PhaseWidth.from_prep(prep, t, spacegroup),
-                                     PhaseBroad.from_prep(prep, t, spacegroup))
-    print(f"pseudo-translation: reflection profiles from {why}", flush=True)
-
-
-def install_phase_classes(prep, spacegroup, used, why):
-    """The pseudo-translation classes of the ``used`` translations
-    (:class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses`), or None without any."""
+def phase_classes(prep, spacegroup, used, why):
+    """The classes of reflections the ``used`` translations make
+    (:class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses`)."""
     from torchsx.merging.scale.pseudo_translation import PhaseClasses
-    if not used:
-        print(f"phase classes: {why}; no phase features", flush=True)
-        return None
     classes = PhaseClasses.from_prep(prep, [p["t"] for p in used], spacegroup)
     cells = np.bincount(classes.cells(prep.hkl_valid.long().cpu().numpy()), minlength=classes.n_cells)
-    print(f"phase classes: features phase_c0..{classes.n_translations - 1} from {why}; tether phase term "
-          f"over {classes.n_cells} cells x T0..T{classes.degree} in resolution "
-          f"(reflections per cell {int(cells.min())}..{int(cells.max())})", flush=True)
+    print(f"pseudo-translation: {why}; phase features phase_c0..{classes.n_translations - 1}, tether phase "
+          f"term over {classes.n_cells} cells x T0..T{classes.degree} in resolution (reflections per cell "
+          f"{int(cells.min())}..{int(cells.max())})", flush=True)
     return classes
 
 
@@ -343,18 +319,20 @@ def main(argv=None):
     bundle = P.load_prep(args)
     heldout_ids = attach_heldout_stream(bundle) if args.heldout_stream is not None else None
     used, why = ([], "")
-    if "auto" in (args.pseudo_translation, args.structured_prior, args.phase_classes):
+    if args.pseudo_translation == "auto":
         used, why = find_used_translations(bundle.prep, bundle.spacegroup)
     classes, tether = None, P.tether_terms(args)
-    if args.phase_classes == "auto":
+    if used:
         if not tether:
-            raise SystemExit("--phase-classes needs the tether: its phase term holds the classes' brightness")
-        classes = install_phase_classes(bundle.prep, bundle.spacegroup, used, why)
-        if classes is not None:
-            tether = tuple(tether) + ("phase",)
+            raise SystemExit("the data have a pseudo-translation, and the tether holds its classes of "
+                             "reflections at their sums of spots: drop --tether none, or pass "
+                             "--pseudo-translation off")
+        classes = phase_classes(bundle.prep, bundle.spacegroup, used, why)
+        tether = tuple(tether) + ("phase",)
+    elif args.pseudo_translation == "auto":
+        print(f"pseudo-translation: {why}; one intensity population and one profile for every "
+              "reflection", flush=True)
     prep, params, scale, obj, settings = P.build_stack(bundle, args, phase_classes=classes)
-    if args.pseudo_translation == "auto":
-        install_pseudo_translation(scale, prep, bundle.spacegroup, used, why)
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
         target_redundancy=args.redundancy, lr=1e-3,
@@ -377,11 +355,7 @@ def main(argv=None):
         tr.set_reciprocal_basis(settings["basis"])
         if classes is not None:
             tr.set_phase_classes(classes)
-        if args.structured_prior == "auto":
-            if used:
-                install_structured_prior(tr, prep, bundle.spacegroup, used)
-            else:
-                print(f"structured prior: {why}; the Wilson prior is unchanged", flush=True)
+            install_structured_prior(tr, prep, bundle.spacegroup, used)
         tr.split_names = bundle.split_names
         config = asdict(cfg)
         if heldout_ids is not None:
