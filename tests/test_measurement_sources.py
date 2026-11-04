@@ -574,7 +574,7 @@ def test_invalid_gain_reports_input_and_valid_options(value):
 
 @pytest.mark.parametrize("value,expected", [(None, "auto"), ("auto", "auto"),
     ("trust_input", "trust_input"), ("calibrate", "calibrate"), (2, 2.0),
-    (2.5, 2.5), ("2", 2.0), ("2.5", 2.5), ("stream", "trust_input")])
+    (2.5, 2.5), ("2", 2.0), ("2.5", 2.5)])
 def test_gain_modes(value, expected):
     from torchsx.measurement import parse_gain
     assert parse_gain(value) == expected

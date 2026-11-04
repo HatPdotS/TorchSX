@@ -117,7 +117,6 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
 
 @pytest.mark.parametrize('saved,requested,expected', [
     ('none',None,'none'), ('wilson','none','none'), ('none','wilson','wilson'),
-    ('flat_I0',None,'none'), ('flat_log',None,'flat_log'),
 ])
 def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,requested,expected):
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10)

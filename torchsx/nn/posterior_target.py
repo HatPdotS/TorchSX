@@ -118,9 +118,8 @@ class PosteriorMergeTarget(nn.Module):
         the safer default since width is free.
     prior
         ``"none"`` integrates ``dI0`` (weight ``exp(v)``), with no Wilson
-        density; ``"flat_I0"`` is its legacy alias. ``"flat_log"``
-        integrates ``d log I0``; ``"wilson"`` uses ``p(I) = exp(-I/Sigma)/Sigma``
-        with ``Sigma(h)`` the smooth Wilson surface.  **Use wilson.**  Where the
+        density; ``"flat_log"`` integrates ``d log I0``; ``"wilson"`` uses
+        ``p(I) = exp(-I/Sigma)/Sigma`` with ``Sigma(h)`` the smooth Wilson surface.  **Use wilson.**  Where the
         likelihood is uninformative — and most serial observations are
         noise-limited — the posterior is whatever the prior says, and a
         flat-in-I0 prior on a log grid drags those reflections toward the *top
@@ -142,13 +141,8 @@ class PosteriorMergeTarget(nn.Module):
         max_halfwidth: float = 12.0,
     ) -> None:
         super().__init__()
-        if prior == "flat_I0":
-            prior = "none"
         if prior not in ("none", "flat_log", "wilson"):
-            raise ValueError(
-                f"prior must be 'none' or 'wilson', got {prior!r} "
-                "(legacy 'flat_I0' and 'flat_log' are also accepted)"
-            )
+            raise ValueError(f"prior must be 'none', 'flat_log' or 'wilson', got {prior!r}")
         if k_coarse < 3 or m_fine < k_coarse:
             raise ValueError("need k_coarse >= 3 and m_fine >= k_coarse")
         self.n_hkl = int(I_start.shape[0])
@@ -517,7 +511,7 @@ class PosteriorMergeTarget(nn.Module):
         v = centre[:, None] + sig_h[:, None] * self.u_fine[None, :]
         du = float(2 * self.n_sigma / (self.m_fine - 1))
         log_w = (sig_h * du).log()[:, None].expand_as(v).clone()
-        if self.prior in ("none", "flat_I0"):
+        if self.prior == "none":
             log_w = log_w + v                       # dI0 = I0 dv
         elif self.prior == "wilson":
             # the trained parameter while training; every no-grad pass

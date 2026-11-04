@@ -290,8 +290,7 @@ The prepared observations are stored in `--cache` (default `RUN/prepared`;
 inputs and preparation settings reuses it: the store records the input
 contents and settings, and a mismatch is an error rather than a silent reparse.
 Moved but identical files are accepted. For changed inputs or split
-assignments, give a new `--cache` path. A run prepared before the store
-existed keeps its `prepared.pt`, and `torchsx.merge` reads it.
+assignments, give a new `--cache` path.
 
 The store holds the observations on disk; host memory holds the crystal and
 reflection tables and a few batches. Preparation reads the streams in blocks

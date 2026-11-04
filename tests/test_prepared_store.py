@@ -269,25 +269,6 @@ def test_load_prep_builds_and_reuses_the_store(streams, tmp_path, parser, monkey
         P.load_prep(args, verbose=False)
 
 
-def test_load_prep_reads_a_prepared_blob_of_an_earlier_run(streams, tmp_path, parser):
-    """A run prepared before the store keeps its ``prepared.pt``; a merge reads it."""
-    from tests.test_cli_pipeline import _DataArgs
-    args = _DataArgs(stream=[streams[0]], int_radius=None, gain=None,
-                     cache_prep=tmp_path / "prepared")
-    built = P.load_prep(args, verbose=False)
-    meta = json.loads((tmp_path / "prepared" / "meta.json").read_text())
-    run = tmp_path / "run"
-    run.mkdir()
-    torch.save({"prep": built.prep.materialize(), "recipe": meta["recipe"],
-                "split_names": meta["split_names"], "bg_var_factor": meta["bg_var_factor"],
-                "signature": meta["signature"]}, run / "prepared.pt")
-    args.cache_prep, args.out = None, run / "merged.mtz"
-    args.ckpt = run / "best.pt"
-    old = P.load_prep(args, recipe_defaults=meta["recipe"], verbose=False)
-    assert not isinstance(old.prep, PreparedStore)
-    assert torch.equal(old.prep.I_obs, built.prep.materialize().I_obs)
-
-
 def test_build_replaces_only_its_own_staging(streams, tmp_path):
     """A directory beside the store is replaced only when it is empty or an earlier
     build staged it; anything else stops the build and stays untouched."""

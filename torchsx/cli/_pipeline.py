@@ -191,19 +191,15 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     cache = args.cache_prep
     if cache is None and getattr(args, "out", None) is not None:
         run = args.ckpt.parent if getattr(args, "ckpt", None) else args.out
-        # a run prepared before the on-disk store keeps its blob
-        cache = run / "prepared.pt" if (run / "prepared.pt").is_file() else run / "prepared"
-    blob = stored = None
-    if cache is not None and cache.is_file():
-        blob = torch.load(cache, weights_only=False)
-    elif cache is not None and (cache / "meta.json").is_file():
+        cache = run / "prepared"
+    stored = None
+    if cache is not None and (cache / "meta.json").is_file():
         stored = json.loads((cache / "meta.json").read_text())
-        blob = {"signature": stored.get("signature"), "recipe": stored.get("recipe")}
     elif cache is not None and cache.exists():
         raise SystemExit(f"--cache {cache} exists but is not a prepared cache; "
                          "remove it or point --cache somewhere else.")
-    if blob is not None:
-        if (blob.get("signature") or {}).get("observation_filter_version") != OBSERVATION_FILTER_VERSION:
+    if stored is not None:
+        if (stored.get("signature") or {}).get("observation_filter_version") != OBSERVATION_FILTER_VERSION:
             raise SystemExit(
                 f"Prepared cache {cache} uses an incompatible observation filter. "
                 "Rebuild it from the source using a new --cache path; "
@@ -267,12 +263,12 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     except (OSError, ValueError) as exc:
         raise SystemExit(f"Cannot resolve input measurement: {exc}") from exc
 
-    if blob is not None:
-        got = blob.get("signature")
+    if stored is not None:
+        got = stored.get("signature")
         comparable_got = _comparable_prep_signature(got, {})
         comparable_signature = _comparable_prep_signature(signature, {})
         if isinstance(signature.get("gain"), (float, int)):
-            comparable_got = _comparable_prep_signature(got, blob["recipe"])
+            comparable_got = _comparable_prep_signature(got, stored.get("recipe"))
         if comparable_got != comparable_signature:
             differ = sorted(
                 k for k in set(comparable_signature) | set(comparable_got)
@@ -281,15 +277,10 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                 f"--cache {cache} was built with different settings "
                 f"({', '.join(differ) if differ else 'no signature recorded'}); "
                 f"delete it or point --cache somewhere else.")
-        if stored is not None:
-            from torchsx.merging.store import PreparedStore
-            prep = PreparedStore(cache)
-            bundle = PrepBundle(prep, stored["recipe"], stored.get("split_names", []),
-                                stored["bg_var_factor"])
-        else:
-            prep = blob["prep"]
-            bundle = PrepBundle(prep, blob["recipe"], blob.get("split_names", []),
-                                blob["bg_var_factor"])
+        from torchsx.merging.store import PreparedStore
+        prep = PreparedStore(cache)
+        bundle = PrepBundle(prep, stored["recipe"], stored.get("split_names", []),
+                            stored["bg_var_factor"])
         if verbose:
             print(f"prep from cache {cache} "
                   f"({prep.n_valid:,} reflections, {prep.n_obs_total:,} obs, "
@@ -485,7 +476,7 @@ def _split_labels(args, builder, *, verbose: bool = True):
 
 
 def add_free_args(p: argparse.ArgumentParser) -> None:
-    p.set_defaults(free_frac=0.05, free_seed=20260902, no_free=False)
+    p.set_defaults(free_frac=0.05, free_seed=20260902)
     p.add_argument("--seed", type=int, default=None, help="random seed (default 0; merge reuses the run seed)")
     p.add_argument("--free-from", type=Path, default=None,
                    help="take the free set from an existing .mtz (FreeR_flag / "
@@ -507,7 +498,7 @@ def canonical_hkl(hkl: np.ndarray) -> np.ndarray:
     return h
 
 
-def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | None:
+def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray:
     """``True = working set, False = free`` (CCP4's 0 = free convention).
 
     Reflections absent from a shared free set go to the WORKING set: inventing
@@ -516,8 +507,6 @@ def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | No
     """
     import torch
 
-    if args.no_free:
-        return None
     n = len(hkl)
     if args.free_from is not None:
         if str(args.free_from).endswith(".pkl"):
@@ -561,7 +550,7 @@ def work_mask(hkl: np.ndarray, args, *, verbose: bool = True) -> np.ndarray | No
 
 
 def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
-              work: np.ndarray | None, keep: np.ndarray, merge_friedel: bool = True,
+              work: np.ndarray, keep: np.ndarray, merge_friedel: bool = True,
               verbose: bool = True) -> None:
     """Write F/SIGF (+ free flags) and prove no intensity column landed.
 
@@ -581,7 +570,7 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
         F_sigma=F_sd.detach().cpu()[kt].float().clamp(min=1e-6),
         cell=Cell(list(cell)),
         spacegroup=SpaceGroup(spacegroup),
-        rfree_flags=(None if work is None else torch.from_numpy(work[keep])),
+        rfree_flags=torch.from_numpy(work[keep]),
         friedel_merged=merge_friedel,
     )
     # Deliberately NOT setting data.I / data.I_sigma -- see the module docstring.
@@ -601,46 +590,6 @@ def write_mtz(path: Path, hkl: np.ndarray, F, F_sd, *, cell, spacegroup: str,
             fr = np.array(mtz.column_with_label(free_label), dtype=int)
             print(f"  readback free {100 * (fr == 0).mean():.2f} % "
                   f"({int((fr == 0).sum()):,} of {len(fr):,})", flush=True)
-
-
-def write_intensity_mtz(path: Path, hkl: np.ndarray, I, I_sd, *, cell, spacegroup: str,
-                        keep: np.ndarray, n_meas=None, merge_friedel: bool = True,
-                        verbose: bool = True) -> None:
-    """Write merged intensities as ``I-obs`` / ``SIGI-obs`` (no free flags).
-
-    For the moment estimators, whose product is an intensity; French-Wilson
-    happens downstream.  ``n_meas`` goes out as ``N``, aimless's spelling for the
-    multiplicity.  With ``merge_friedel=False`` the signed indices are pivoted
-    onto ``I-obs(+)``/``I-obs(-)``/``N(+)``/``N(-)``, since a negative ASU index
-    in the file is not what a reader takes for a Bijvoet mate.
-    """
-    import pandas as pd
-    from torchref.io.mtz import write
-
-    def _np(t, dtype=np.float64):
-        return np.asarray(t.detach().cpu().numpy() if hasattr(t, "detach") else t,
-                          dtype=dtype)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    I, I_sd = _np(I), _np(I_sd)
-    keep = np.asarray(keep, dtype=bool) & np.isfinite(I) & np.isfinite(I_sd) & (I_sd > 0)
-
-    cols = {"I-obs": I[keep], "SIGI-obs": I_sd[keep]}
-    if n_meas is not None:
-        cols["N"] = _np(n_meas, np.int32)[keep]
-    if merge_friedel:
-        rows = hkl[keep]
-    else:
-        rows, cols = _bijvoet_columns(hkl[keep], cols, spacegroup)
-        # A mate nobody measured has no intensity, but its multiplicity is 0.
-        for name in ("N(+)", "N(-)"):
-            if name in cols:
-                cols[name] = np.nan_to_num(cols[name]).astype(np.int32)
-    df = pd.DataFrame({"H": rows[:, 0], "K": rows[:, 1], "L": rows[:, 2], **cols})
-    write(df, [float(c) for c in cell], spacegroup, str(path))
-    if verbose:
-        print(f"wrote {path}\n  reflections {len(df):,}  "
-              f"columns {list(df.columns)}", flush=True)
 
 
 def _bijvoet_columns(hkl: np.ndarray, cols: dict,
@@ -868,14 +817,12 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
                         "checkpoint unless set")
 
 
-# Checkpoint ``kind`` markers for the corrected detection stack.  The first of
-# each pair is what this package writes; the second is an earlier wrapper
-# (``annulus_mean_only_v1``) whose checkpoints predate the parameter.
-_BG_MEAN_QUAD_KINDS = ("SplitLogGrid+bgmean", "AnnulusMeanOnlySplitLogGridV1")
-_BG_MEAN_LIK_KINDS = ("Poisson+bgmean", "AnnulusMeanOnlyPoissonV1")
+# Checkpoint ``kind`` markers for the corrected detection stack.
+_BG_MEAN_QUAD_KIND = "SplitLogGrid+bgmean"
+_BG_MEAN_LIK_KIND = "Poisson+bgmean"
 
 
-def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
+def bg_mean_offset_from_ckpt(ck: dict) -> float:
     """The background-mean offset a checkpoint was trained with.
 
     Both ``kind`` markers have to agree: a checkpoint carrying one alone is a
@@ -885,17 +832,16 @@ def bg_mean_offset_from_ckpt(ck: dict, bvf: float) -> float:
     """
     qkind = (ck.get("quadrature") or {}).get("kind")
     lkind = (ck.get("likelihood") or {}).get("kind")
-    corrected = (qkind in _BG_MEAN_QUAD_KINDS, lkind in _BG_MEAN_LIK_KINDS)
+    corrected = (qkind == _BG_MEAN_QUAD_KIND, lkind == _BG_MEAN_LIK_KIND)
     if any(corrected) and not all(corrected):
         raise SystemExit(
             f"checkpoint markers disagree: quadrature {qkind!r} vs likelihood "
             f"{lkind!r}; one says the background mean was corrected and the "
             "other does not")
     stored = (ck.get("likelihood") or {}).get("bg_mean_offset")
-    if stored is not None:
-        return float(stored)
-    # The earlier wrapper recorded no offset; it always used c itself.
-    return float(bvf) if any(corrected) else 0.0
+    if any(corrected) and stored is None:
+        raise SystemExit("checkpoint marks a corrected background mean but records no bg_mean_offset")
+    return float(stored or 0.0)
 
 
 def _refine_geometry(args) -> bool:
@@ -978,7 +924,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
     # the +c mean correction applies to the annulus estimate only
-    bg_mean_offset = (bg_mean_offset_from_ckpt(ck, bvf) if ck
+    bg_mean_offset = (bg_mean_offset_from_ckpt(ck) if ck
                       else 0.0 if bundle.recipe.get("background") == "model" else float(bvf))
     if bg_mean_offset and float(bvf) <= 0.0:
         raise SystemExit(
@@ -986,7 +932,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             "background variance coefficient in the measurement/checkpoint recipe")
     quad = dict(ck.get("quadrature") or {})
     n_points = quad.get("n_points") or DEFAULTS["inner_points"]
-    if quad and quad.get("kind") not in (None, "SplitLogGrid", *_BG_MEAN_QUAD_KINDS):
+    if quad and quad.get("kind") not in (None, "SplitLogGrid", _BG_MEAN_QUAD_KIND):
         raise SystemExit(f"checkpoint was trained with {quad['kind']}; these CLIs "
                          "support SplitLogGrid checkpoints only")
     if ck:
@@ -1059,11 +1005,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     prior = getattr(args, "prior", None)
     if prior is None:
         prior = str(grid.get("prior", "wilson"))
-    if prior == "flat_I0":  # Historical checkpoint spelling.
-        prior = "none"
-    if prior not in ("none", "wilson", "flat_log"):
-        raise ValueError(f"Invalid checkpoint prior {prior!r}; expected 'none' or 'wilson' "
-                         "(legacy 'flat_I0' and 'flat_log' are also readable)")
+    if prior not in ("none", "wilson"):
+        raise ValueError(f"Invalid checkpoint prior {prior!r}; expected 'none' or 'wilson'")
     wilson_degree = int(grid.get("wilson_degree", DEFAULTS["wilson_degree"]))
     # One smooth reciprocal-space basis for the prior's Sigma(h) and the scale's
     # gauge pin, built from the prepared reflections, the median cell and the

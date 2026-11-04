@@ -42,18 +42,16 @@ def test_integrated_poisson_curve_matches_analytic_gamma(prior, centric):
     assert edge.item() < 1e-8
 
 
-def test_none_is_not_flat_in_log_intensity_and_keeps_legacy_alias():
+def test_none_is_not_flat_in_log_intensity():
     targets = [PosteriorMergeTarget(torch.ones(1), prior=p, k_coarse=101,
                                    m_fine=101, n_sigma=2).double()
-               for p in ['none', 'flat_I0', 'flat_log']]
+               for p in ['none', 'flat_log']]
     means = []
     for t in targets:
         t._loc = (torch.zeros(1, dtype=torch.float64), torch.ones(1, dtype=torch.float64))
         means.append(t.integrate(torch.zeros(1, t.k_coarse, dtype=torch.float64))[1].item())
-    assert means[0] == means[1]
     # On finite [exp(-2), exp(2)], constant likelihood under dI is uniform I.
     assert means[0] == pytest.approx((math.exp(2) + math.exp(-2)) / 2, rel=5e-4)
-    assert means[0] > means[2] * 1.5
-    assert targets[1].prior == 'none'
+    assert means[0] > means[1] * 1.5
     assert TrainConfig().posterior_prior == 'wilson'
 

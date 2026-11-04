@@ -89,8 +89,6 @@ def parse_radii(value) -> tuple[float, float, float]:
 def parse_gain(value) -> str | float:
     if value is None:
         return "auto"
-    if str(value) == "stream":  # Older recipes used this name for trust_input.
-        return "trust_input"
     if str(value) in ("trust_input", "auto", "calibrate"):
         return str(value)
     error = (f"Invalid --gain {value!r}. Expected 'auto' (default), 'trust_input', "

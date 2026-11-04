@@ -142,22 +142,21 @@ def test_learned_background_is_refused():
 # ── checkpoint round-trip ─────────────────────────────────────────────
 
 def test_checkpoint_offset_round_trip():
-    bvf = 1.1640625
-    assert bg_mean_offset_from_ckpt({}, bvf) == 0.0
+    assert bg_mean_offset_from_ckpt({}) == 0.0
     assert bg_mean_offset_from_ckpt(
         {"quadrature": {"kind": "SplitLogGrid"},
-         "likelihood": {"kind": "Poisson"}}, bvf) == 0.0
+         "likelihood": {"kind": "Poisson"}}) == 0.0
     assert bg_mean_offset_from_ckpt(
         {"quadrature": {"kind": "SplitLogGrid+bgmean"},
-         "likelihood": {"kind": "Poisson+bgmean", "bg_mean_offset": 1.25}}, bvf) == 1.25
-    # the out-of-tree experiment wrapper's markers, which record no offset
-    assert bg_mean_offset_from_ckpt(
-        {"quadrature": {"kind": "AnnulusMeanOnlySplitLogGridV1"},
-         "likelihood": {"kind": "AnnulusMeanOnlyPoissonV1"}}, bvf) == bvf
+         "likelihood": {"kind": "Poisson+bgmean", "bg_mean_offset": 1.25}}) == 1.25
     with pytest.raises(SystemExit):
         bg_mean_offset_from_ckpt(
             {"quadrature": {"kind": "SplitLogGrid"},
-             "likelihood": {"kind": "AnnulusMeanOnlyPoissonV1"}}, bvf)
+             "likelihood": {"kind": "Poisson+bgmean", "bg_mean_offset": 1.25}})
+    with pytest.raises(SystemExit):
+        bg_mean_offset_from_ckpt(
+            {"quadrature": {"kind": "SplitLogGrid+bgmean"},
+             "likelihood": {"kind": "Poisson+bgmean"}})
 
 
 # ── kernels ───────────────────────────────────────────────────────────
@@ -235,7 +234,7 @@ def test_build_stack_and_checkpoint_carry_the_offset(tmp_path):
     assert ck["likelihood"]["bg_mean_offset"] == pytest.approx(C)
     assert ck["likelihood"]["kind"].endswith("+bgmean")
     assert ck["quadrature"]["kind"].endswith("+bgmean")
-    assert P.bg_mean_offset_from_ckpt(ck, C) == pytest.approx(C)
+    assert P.bg_mean_offset_from_ckpt(ck) == pytest.approx(C)
 
     # a merge inherits it without being told
     args = _build_parser().parse_args(base)
