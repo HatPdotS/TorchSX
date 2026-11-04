@@ -46,7 +46,7 @@ finite observation.
 | --- | --- | --- |
 | `-o`, `--out DIR` | | New directory for the PNGs, one subdirectory per input or state. The cache goes to `DIR-cache`. |
 | `STREAM`, `--split NAME=PATH` | | Inputs. A bare input is labelled by its file name. |
-| `--split-file FILE`, `--select LABEL ...` | all labels | CrystFEL custom-split file (`filename event label`), and the labels to plot. |
+| `--split-file FILE`, `--select LABEL ...` | all labels | CrystFEL custom-split file (`filename event label`), and the labels to plot. A frame listed under several labels counts under each; every sampled frame needs one. |
 | `--spacegroup SG` | | Required for `.stream` input. |
 | `--cell A B C ALPHA BETA GAMMA` | median cell of the input | Cell used for resolution. |
 | `--sample-crystals N\|all` | 50000 | Whole images are drawn at random until N crystals are reached; `all` uses every crystal. |

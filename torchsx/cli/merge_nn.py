@@ -48,7 +48,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = TrainConfig(
         max_obs_per_batch=P.READOUT_MAX_OBS, posterior_k_coarse=S["k_coarse"], posterior_m_fine=S["m_fine"],
         posterior_n_sigma=S["n_sigma"], posterior_max_halfwidth=S["max_halfwidth"],
-        stream_batches=True, encoder_chunk_crystals=400,
+        stream_batches=True,
         locate_windows=(8.0, 1.0, 0.125),
         posterior_prior=S["prior"], wilson_degree=S["wilson_degree"],
         heldout_frac=0.05, device=S["device"], outdir=str(args.out.parent),

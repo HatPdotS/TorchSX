@@ -1,18 +1,18 @@
-"""Filtering operations on ``_SFXStreamCore``.  All return new (immutable) cores."""
+"""Filtering operations on ``SFXStreamCore``.  All return new (immutable) cores."""
 
 from __future__ import annotations
 
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 
 
 def _reindex(
-    core: _SFXStreamCore,
+    core: SFXStreamCore,
     obs_mask: torch.Tensor,
     crystal_mask: torch.Tensor,
     image_mask: torch.Tensor,
-) -> _SFXStreamCore:
+) -> SFXStreamCore:
     """Apply boolean masks to all three levels and rebuild contiguous IDs.
 
     Thin wrapper over the generic columnar cascade
@@ -26,8 +26,8 @@ def _reindex(
 
 
 def filter_resolution(
-    core: _SFXStreamCore, d_min: float = 0.0, d_max: float = 999.0
-) -> _SFXStreamCore:
+    core: SFXStreamCore, d_min: float = 0.0, d_max: float = 999.0
+) -> SFXStreamCore:
     """Keep observations within the resolution range [d_min, d_max] in Å.
 
     D-spacing is computed from the **median** cell, not each crystal's own.
@@ -59,12 +59,12 @@ def filter_resolution(
 
 
 def filter_ewald(
-    core: _SFXStreamCore,
+    core: SFXStreamCore,
     max_offset: float | None = None,
     invert: bool = False,
     *,
     max_offset_rel: float | None = None,
-) -> _SFXStreamCore:
+) -> SFXStreamCore:
     """Keep observations close to the Ewald sphere.
 
     Exactly one threshold mode must be supplied:
@@ -102,7 +102,7 @@ def filter_ewald(
     return _reindex(core, obs_mask, crystal_mask, image_mask)
 
 
-def filter_crystals(core: _SFXStreamCore, mask: torch.Tensor) -> _SFXStreamCore:
+def filter_crystals(core: SFXStreamCore, mask: torch.Tensor) -> SFXStreamCore:
     """Keep crystals where mask is True.  Boolean (N_crystals,) tensor."""
     assert mask.shape[0] == core.n_crystals
 
@@ -115,7 +115,7 @@ def filter_crystals(core: _SFXStreamCore, mask: torch.Tensor) -> _SFXStreamCore:
     return _reindex(core, obs_mask, mask, image_mask)
 
 
-def filter_images(core: _SFXStreamCore, mask: torch.Tensor) -> _SFXStreamCore:
+def filter_images(core: SFXStreamCore, mask: torch.Tensor) -> SFXStreamCore:
     """Keep images where mask is True.  Boolean (N_images,) tensor."""
     assert mask.shape[0] == core.n_images
 
@@ -125,7 +125,7 @@ def filter_images(core: _SFXStreamCore, mask: torch.Tensor) -> _SFXStreamCore:
     return _reindex(core, obs_mask, crystal_mask, mask)
 
 
-def filter_outliers(core: _SFXStreamCore, n_sigma: float = 4.0) -> _SFXStreamCore:
+def filter_outliers(core: SFXStreamCore, n_sigma: float = 4.0) -> SFXStreamCore:
     """Remove per-HKL outlier observations beyond n_sigma."""
     hkl = core.hkl.long()
     h_off = hkl[:, 0] - hkl[:, 0].min()
@@ -162,7 +162,7 @@ def filter_outliers(core: _SFXStreamCore, n_sigma: float = 4.0) -> _SFXStreamCor
     return _reindex(core, obs_mask, crystal_mask, image_mask)
 
 
-def filter_cell(core: _SFXStreamCore, tolerance: float = 0.1) -> _SFXStreamCore:
+def filter_cell(core: SFXStreamCore, tolerance: float = 0.1) -> SFXStreamCore:
     """Remove crystals whose cell parameters deviate by > tolerance fractionally."""
     median_cell = core.cell.median(dim=0).values
     frac_dev = ((core.cell - median_cell) / median_cell).abs()

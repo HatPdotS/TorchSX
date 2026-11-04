@@ -3,7 +3,7 @@
 The native ``torchsx_native.write_stream`` must:
 
 1. **Byte-exact vs. Python** — the file it produces must be byte-identical to
-   what the pure-Python writer produces from the same ``_SFXStreamCore``.
+   what the pure-Python writer produces from the same ``SFXStreamCore``.
    Caught by a single ``read_bytes() == read_bytes()`` comparison.
 2. **Round-trip** — write → re-parse → recover the same tensors. All integer
    tensors must round-trip exactly. Float tensors are allowed up to a few
@@ -32,10 +32,7 @@ from torchsx.stream import SFXStream
 
 @pytest.fixture(scope="module")
 def native():
-    mod = _native.load()
-    if mod is None:
-        pytest.skip("native module not installed")
-    return mod
+    return _native.load()
 
 
 @pytest.fixture(scope="module")

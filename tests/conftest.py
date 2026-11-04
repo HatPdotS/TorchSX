@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 from torchsx.geometry import Geometry, Panel
 from torchsx.io._metadata import StreamMetadata
 
@@ -71,12 +71,12 @@ def sample_geometry():
 
 @pytest.fixture
 def sample_core(sample_geometry):
-    """Small synthetic _SFXStreamCore with 2 crystals, 5 observations, 2 images."""
+    """Small synthetic SFXStreamCore with 2 crystals, 5 observations, 2 images."""
     n_obs = 5
     n_crys = 2
     n_imgs = 2
 
-    return _SFXStreamCore(
+    return SFXStreamCore(
         # Observations
         hkl=torch.tensor([[1, 0, 0], [0, 1, 0], [1, 1, 0], [2, 0, 0], [0, 2, 0]], dtype=torch.int16),
         I=torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0], dtype=torch.float32),

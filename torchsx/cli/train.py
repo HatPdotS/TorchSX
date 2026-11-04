@@ -56,9 +56,9 @@ def _build_parser():
                    help="initial fraction of the learnable miss component (a predicted reflection "
                         "that recorded no signal); 0 = off (default 0.03; the merge inherits the "
                         "checkpoint)")
-    p.add_argument("--outlier-frac", type=_fraction, default=None,
-                   help="initial fraction of the learnable detector-outlier component "
-                        "(default 0 = off; the merge inherits the checkpoint)")
+    # Initial fraction of the learnable detector-outlier component (default 0 = off;
+    # the merge inherits the checkpoint).
+    p.add_argument("--outlier-frac", type=_fraction, default=None, help=argparse.SUPPRESS)
     p.add_argument("--detector-noise", choices=("off", "auto", "panel"), default="off",
                    help="learned detector variance A + B (lam + sig_b2), fitted with the network. "
                         "off (default): none; auto: one global B (a gain correction on the integrated "
@@ -70,18 +70,9 @@ def _build_parser():
                         "B alone is a per-panel gain correction)")
     # Research controls: they work, but --help does not list them.
     p.add_argument("--noise-lr-mult", type=float, default=30.0, help=argparse.SUPPRESS)
-    p.add_argument("--peer-attention", type=int, default=None,
-                   help="cross-attention layers from each observation onto the other observations "
-                        "of its crystal (default 2; 0 = mean pool only); the merge inherits the checkpoint")
-    # Width inside each peer-attention layer (default: the encoder width), or a
-    # comma-separated width per layer for a tapered stack, e.g. 128,128,32,32.
-    p.add_argument("--peer-dim", default=None, help=argparse.SUPPRESS)
-    # Crystal context pooling: K >= 2 folds (context from the other K-1 folds of the
-    # crystal, default 2), or 0 = leave-one-out; the merge inherits the checkpoint.
+    # Fold transformer: K >= 2 masked runs per crystal (default 5); the merge
+    # inherits the checkpoint, as for every setting of the network.
     p.add_argument("--context-folds", type=int, default=None, help=argparse.SUPPRESS)
-    # Scale encoder: fold (default), the masked-fold transformer (K = --context-folds
-    # runs per crystal, default 5), or deepsets; the merge inherits the checkpoint.
-    p.add_argument("--encoder", choices=("deepsets", "fold"), default=None, help=argparse.SUPPRESS)
     # Fold transformer depth: self-attention blocks over each run (default 2) and
     # cross-attention blocks from each masked observation onto its run (default 1).
     p.add_argument("--ctx-layers", type=int, default=None, help=argparse.SUPPRESS)
@@ -108,13 +99,10 @@ def _build_parser():
     p.add_argument("--redundancy", type=_positive, default=100,
                    help="target observations per reflection in a batch (default 100)")
     p.add_argument("--no-merge", action="store_true", help="save checkpoints; merge separately")
-    # Encoder width (default 128) and number of blocks (default 5).
+    # Encoder width (default 128).
     p.add_argument("--d-model", type=int, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--n-layers", type=int, default=None, help=argparse.SUPPRESS)
     # Held-out evaluation and checkpoint every this many updates per state.
     p.add_argument("--eval-every", type=int, default=100, help=argparse.SUPPRESS)
-    # Stop after this many evaluations without a new held-out minimum (0 = never).
-    p.add_argument("--patience", type=int, default=0, help=argparse.SUPPRESS)
     # Patterns of the first split scored as the held-out set: never trained on, never
     # merged into the outputs; one file across runs puts their held-out NLL on the
     # same crystals.
@@ -246,15 +234,13 @@ def install_structured_prior(tr, prep, spacegroup, used) -> None:
           f"q99 {np.quantile(g, 0.99):.3f} over {len(g):,} reflections", flush=True)
 
 
-def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=None):
-    """Run a fixed update budget, with the evaluation cadence per state;
-    with ``patience`` > 0, stop after that many evaluations without a new
-    held-out minimum.  ``probe`` (:class:`~torchsx.cli._pipeline.ResourceProbe`)
-    records every update's time.  When the last ``average_last`` updates
-    oscillate, each evaluation and checkpoint holds their mean
-    (``tr.averaged()``), and so does the trainer when the budget ends."""
+def run_updates(tr, steps, *, eval_every: int = 100, probe=None):
+    """Run a fixed update budget, with the evaluation cadence per state.
+    ``probe`` (:class:`~torchsx.cli._pipeline.ResourceProbe`) records every
+    update's time.  When the last ``average_last`` updates oscillate, each
+    evaluation and checkpoint holds their mean (``tr.averaged()``), and so
+    does the trainer when the budget ends."""
     evaluate_every = max(1, int(eval_every)) * tr.n_conditions
-    stale = 0
     updates = [0] * tr.n_conditions
     has_validation = bool(tr.heldout_crystals.numel())
     upcoming = _batch(tr) if steps else None
@@ -294,13 +280,8 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=No
                         held = f"mean of the last {a['window']} updates" if a["averaged"] else "latest update"
                         note = f"; {held} (step reversal {a['step_reversal']:+.2f})"
                     print(f"  validation state 0: nll/obs {result['nll_per_obs']:.5f}{note}", flush=True)
-                    stale = 0 if tr.best_step == tr.step_i else stale + 1
                 tr.save_best()
                 _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
-            if patience > 0 and stale >= patience:
-                print(f"early stop at update {tr.step_i}: {stale} evaluations without a new "
-                      f"held-out minimum (best at {tr.best_step})", flush=True)
-                break
     if not steps:
         tr.save_best()
         _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
@@ -356,7 +337,7 @@ def main(argv=None):
         posterior_max_halfwidth=settings["max_halfwidth"],
         locate_windows=(8.0, 1.0, 0.125), posterior_prior=settings["prior"],
         wilson_degree=settings["wilson_degree"],
-        posterior_checkpoint_nodes=True, encoder_chunk_crystals=400,
+        posterior_checkpoint_nodes=True,
         stream_batches=True, heldout_frac=0.05,
         device=settings["device"], outdir=str(args.out), seed=args.seed,
         heldout_crystal_ids=None if heldout_ids is None else heldout_ids.tolist(),
@@ -385,8 +366,7 @@ def main(argv=None):
         print(f"train {tr.train_crystals.numel():,}, validation {tr.heldout_crystals.numel():,} crystals; "
               f"{args.steps} total updates across {tr.n_conditions} states", flush=True)
         probe.begin("train")
-        updates = run_updates(tr, args.steps, eval_every=args.eval_every, patience=args.patience,
-                              probe=probe)
+        updates = run_updates(tr, args.steps, eval_every=args.eval_every, probe=probe)
         probe.end()
         summary_path = args.out / "training_summary.json"
         summary = dict(steps=args.steps, updates_per_state=updates, best_step=tr.best_step,

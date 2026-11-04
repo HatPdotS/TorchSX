@@ -19,12 +19,10 @@ everything else is built on.
 
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.observations import ObsInfo, PreparedObs, prepare_observations
-from torchsx.merging.parameters import Parameters
 
 __all__ = [
     "MergeConfig",
     "ObsInfo",
-    "Parameters",
     "PreparedObs",
     "prepare_observations",
 ]

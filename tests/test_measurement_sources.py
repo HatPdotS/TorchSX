@@ -15,6 +15,7 @@ from torchsx.measurement import MEASUREMENT_KEY, gain_from_measurement, resolve_
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.hkl.noise import PoissonNoiseModel, _crystfel_pixel_counts
 from torchsx.merging.observations import prepare_observations
+from tests import python_parser
 
 
 @pytest.fixture
@@ -32,11 +33,6 @@ def stream_file(tmp_path, sample_core):
     text = text.replace("adu_per_eV = 1.0", "adu_per_photon = 1.0")
     path.write_text(text)
     return path
-
-
-@pytest.fixture
-def python_parser(monkeypatch):
-    monkeypatch.setattr(_native, "load", lambda: None)
 
 
 def _args(path, **kwargs):
@@ -141,18 +137,18 @@ def test_panel_gains_and_gradient_background(stream_file, monkeypatch):
     assert sum("Gradient background" in str(w.message) for w in record) == 1
 
 
-def test_named_dispatch_and_future_seams(stream_file, python_parser):
+def test_named_dispatch_and_unknown_kinds(stream_file):
     stream = SFXStream.read(SourceInput("crystfel", {"stream": stream_file}), spacegroup="P 1")
     assert stream.measurement.producer == "crystfel"
     with pytest.raises(FileNotFoundError, match="x.duckdb"):  # probixi dispatches to its reader
         SFXStream.read(SourceInput("probixi", {"database": "x.duckdb"}))
-    with pytest.raises(NotImplementedError, match="dials"):
+    with pytest.raises(ValueError, match="Unknown datasource kind"):
         SFXStream.read(SourceInput("dials", {"experiments": "x.expt", "reflections": "x.refl"}))
     with pytest.raises(ValueError, match="requires exactly"):
         SFXStream.read(SourceInput("crystfel", {"reflections": stream_file}))
 
 
-def test_raw_identity_and_spec_survive_transforms(stream_file, python_parser, tmp_path):
+def test_raw_identity_and_spec_survive_transforms(stream_file, tmp_path):
     from torchsx.io._parser import parse_stream
 
     parsed = parse_stream(stream_file, spacegroup="P 1")
@@ -183,7 +179,7 @@ def test_raw_identity_and_spec_survive_transforms(stream_file, python_parser, tm
         assert torch.equal(restored.hkl, stream.observed_hkl)
 
 
-def test_parser_modes_are_equivalent(stream_file, python_parser):
+def test_parser_modes_are_equivalent(stream_file):
     raw = SFXStream.read(stream_file, spacegroup="P 1", merge_friedel=False)
     for sequential in (True, False):
         sample = SFXStream.read(stream_file, spacegroup="P 1", merge_friedel=False,
@@ -194,7 +190,7 @@ def test_parser_modes_are_equivalent(stream_file, python_parser):
                 assert torch.equal(level[column], sample._core.levels[name][column]), (name, column)
 
 
-def test_lattice_identity_is_not_renumbered(stream_file, python_parser):
+def test_lattice_identity_is_not_renumbered(stream_file):
     text = stream_file.read_text()
     start = text.index("--- Begin crystal")
     end = text.index("--- End crystal\n", start) + len("--- End crystal\n")
@@ -207,7 +203,7 @@ def test_lattice_identity_is_not_renumbered(stream_file, python_parser):
     assert selected.filenames == ["/raw/a.h5"] and selected.events == ["//5"]
 
 
-def test_concat_retains_each_sources_provenance(stream_file, python_parser, tmp_path):
+def test_concat_retains_each_sources_provenance(stream_file, tmp_path):
     other_path = tmp_path / "other.stream"
     other_path.write_text(stream_file.read_text().replace("indexamajig ", "indexamajig -i another.lst "))
     streams = [SFXStream.read(p, spacegroup="P 1") for p in (stream_file, other_path)]
@@ -217,11 +213,8 @@ def test_concat_retains_each_sources_provenance(stream_file, python_parser, tmp_
 
 
 def test_native_matches_python(stream_file, monkeypatch):
-    native = _native.load()
-    if native is None:
-        pytest.skip("native parser unavailable")
     fast = SFXStream.read(stream_file, spacegroup="P 1", merge_friedel=False)
-    monkeypatch.setattr(_native, "load", lambda: None)
+    monkeypatch.setattr(_native, "load", lambda: python_parser)
     slow = SFXStream.read(stream_file, spacegroup="P 1", merge_friedel=False)
     assert fast.measurement == slow.measurement
     for name, level in fast._core.levels.items():
@@ -229,8 +222,7 @@ def test_native_matches_python(stream_file, monkeypatch):
             assert torch.equal(level[column], slow._core.levels[name][column]), (name, column)
 
 
-def test_auto_metadata_matches_explicit_prep_and_posterior(stream_file, python_parser, tmp_path):
-    from torchsx.merging.parameters import Parameters
+def test_auto_metadata_matches_explicit_prep_and_posterior(stream_file, tmp_path):
     from tests.test_cli_pipeline import _stack
     auto = P.load_prep(_args(stream_file), verbose=False)
     explicit_args = _args(stream_file)
@@ -253,7 +245,7 @@ def test_auto_metadata_matches_explicit_prep_and_posterior(stream_file, python_p
         assert torch.allclose(results[0][key], results[1][key], rtol=1e-5, atol=1e-6), key
 
 
-def test_preparation_accepts_semantics_from_a_future_adapter(stream_file, python_parser):
+def test_preparation_accepts_semantics_from_a_future_adapter(stream_file):
     raw = SFXStream.read(stream_file, spacegroup="P 1")
     expected = prepare_observations(raw, MergeConfig())
     metadata = StreamMetadata(raw.metadata)
@@ -269,7 +261,7 @@ def test_preparation_accepts_semantics_from_a_future_adapter(stream_file, python
 
 
 @pytest.mark.parametrize("mode", ["auto", "calibrate"])
-def test_requested_gain_calibration_still_runs(stream_file, python_parser, monkeypatch, mode):
+def test_requested_gain_calibration_still_runs(stream_file, monkeypatch, mode):
     calls = []
     def calibrate(self, *args):
         calls.append(mode)
@@ -289,7 +281,7 @@ def test_requested_gain_calibration_still_runs(stream_file, python_parser, monke
     assert torch.equal(calibrated.obs_info.sigma, explicit.obs_info.sigma)
 
 
-def test_prepared_cache_recipe_and_legacy_compatibility(stream_file, python_parser, tmp_path, monkeypatch):
+def test_prepared_cache_recipe_and_legacy_compatibility(stream_file, tmp_path, monkeypatch):
     cache, sfx = tmp_path / "prepared", tmp_path / "parsed.sfx"
     args = _args(stream_file, cache_prep=cache, sfx_cache=sfx)
     built = P.load_prep(args, verbose=False)
@@ -330,7 +322,7 @@ def test_legacy_sfx_requires_recipe_and_refuses_to_invent_hkl_state(sample_core,
 
 @pytest.mark.parametrize("trust", [False, True])
 @pytest.mark.parametrize("version", [None, -1])
-def test_prepared_cache_requires_current_observation_filter(stream_file, python_parser, tmp_path, trust, version):
+def test_prepared_cache_requires_current_observation_filter(stream_file, tmp_path, trust, version):
     cache = tmp_path / "prepared"
     args = _args(stream_file, cache_prep=cache)
     P.load_prep(args, verbose=False)
@@ -349,7 +341,7 @@ def test_prepared_cache_requires_current_observation_filter(stream_file, python_
     (1.4, None, 1.0), (1.5, None, 1.0), (1.51, None, 1.51),
     (0.5, None, 1.0), (0.49, None, 0.49),
 ])
-def test_auto_gain_threshold_and_units(stream_file, python_parser, monkeypatch,
+def test_auto_gain_threshold_and_units(stream_file, monkeypatch,
                                        calibrated, tolerance, selected):
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg",
                         lambda self, *args: (calibrated, 0.0, 0.0))
@@ -371,7 +363,7 @@ def test_auto_gain_threshold_and_units(stream_file, python_parser, monkeypatch,
 
 
 @pytest.mark.parametrize("calibrated,valid", [(float("nan"), False), (-1.0, True), (3.0, False)])
-def test_unusable_calibration_keeps_declared_gain(stream_file, python_parser, monkeypatch, calibrated, valid):
+def test_unusable_calibration_keeps_declared_gain(stream_file, monkeypatch, calibrated, valid):
     def calibrate(self, *args):
         self.gain_calibration_info = {"valid": valid, "method": "fixture"}
         return calibrated, 0.0, 0.0
@@ -385,7 +377,7 @@ def test_unusable_calibration_keeps_declared_gain(stream_file, python_parser, mo
 
 @pytest.mark.parametrize("declaration", ["", "adu_per_photon = 0.0",
                                           "m0/adu_per_photon = 1.0\nm1/adu_per_photon = 2.0"])
-def test_missing_or_invalid_stream_gain_uses_calibration(stream_file, python_parser, monkeypatch, declaration):
+def test_missing_or_invalid_stream_gain_uses_calibration(stream_file, monkeypatch, declaration):
     stream_file.write_text(stream_file.read_text().replace("adu_per_photon = 1.0", declaration))
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", lambda self, *args: (2.0, 0.0, 0.0))
     decision = P.load_prep(_args(stream_file), verbose=False).recipe["measurement"]["gain_selection"]
@@ -393,13 +385,13 @@ def test_missing_or_invalid_stream_gain_uses_calibration(stream_file, python_par
     assert decision["declaration_error"]
 
 
-def test_no_gain_and_no_calibration_fails(stream_file, python_parser):
+def test_no_gain_and_no_calibration_fails(stream_file):
     stream_file.write_text(stream_file.read_text().replace("adu_per_photon = 1.0", ""))
     with pytest.raises(SystemExit, match="No usable stream gain or gain calibration"):
         P.load_prep(_args(stream_file), verbose=False)
 
 
-def test_checkpoint_pins_gain_without_recalibration(stream_file, python_parser, monkeypatch):
+def test_checkpoint_pins_gain_without_recalibration(stream_file, monkeypatch):
     def no_calibration(*args):
         pytest.fail("resolved checkpoint gain must not be recalibrated")
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", no_calibration)
@@ -410,7 +402,7 @@ def test_checkpoint_pins_gain_without_recalibration(stream_file, python_parser, 
 
 @pytest.mark.parametrize("mode", ["auto", "calibrate"])
 @pytest.mark.parametrize("change", ["tolerance", "policy", "previous_policy"])
-def test_auto_gain_cache_policy_is_checked(stream_file, python_parser, tmp_path, monkeypatch, change, mode):
+def test_auto_gain_cache_policy_is_checked(stream_file, tmp_path, monkeypatch, change, mode):
     if mode == "calibrate" and change == "tolerance":
         pytest.skip("calibrate does not use a discrepancy tolerance")
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg",
@@ -480,7 +472,7 @@ def test_off_bragg_calibration_reports_why_it_is_unavailable(monkeypatch, case, 
         pytest.fail("the off-Bragg method reports; prepare_observations decides the fallback")
 
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_gain_truncnorm", no_truncnorm)
-    noise = PoissonNoiseModel(gain=7.0, read_var_adu_sq=12.0, sigma2_bg_slope=3.0)
+    noise = PoissonNoiseModel(gain=7.0, read_var_adu_sq=12.0)
     bg = torch.full((6000,), 10.0, dtype=torch.float64)
     sigma = (bg * noise.n_peak * (1 + noise.n_peak / noise.n_bg)).sqrt()
     rng = torch.Generator().manual_seed(92)
@@ -495,7 +487,7 @@ def test_off_bragg_calibration_reports_why_it_is_unavailable(monkeypatch, case, 
     assert math.isnan(gain)
     assert bias == read_var == 0.0
     assert noise.gain == 7.0
-    assert noise.read_var_adu_sq == noise.sigma2_bg_slope == 0.0
+    assert noise.read_var_adu_sq == 0.0
     info = noise.gain_calibration_info
     assert info["method"] == "off_bragg_variance"
     assert not info["valid"]
@@ -536,7 +528,7 @@ def test_truncnorm_without_negatives_is_unavailable():
     assert not noise.gain_calibration_info["valid"]
 
 
-def test_auto_falls_back_to_truncnorm_without_off_bragg(stream_file, python_parser, monkeypatch):
+def test_auto_falls_back_to_truncnorm_without_off_bragg(stream_file, monkeypatch):
     def truncnorm(self, *args, **kwargs):
         self.gain_calibration_info = {"method": "negative_truncnorm", "valid": True,
                                       "n_observations": 500}
@@ -551,7 +543,7 @@ def test_auto_falls_back_to_truncnorm_without_off_bragg(stream_file, python_pars
     assert calibration["off_bragg"]["method"] == "off_bragg_variance"
 
 
-def test_auto_retains_declared_gain_when_no_calibration_is_usable(stream_file, python_parser):
+def test_auto_retains_declared_gain_when_no_calibration_is_usable(stream_file):
     # The fixture has no negative intensities, so the fallback is unavailable too.
     result = P.load_prep(_args(stream_file), verbose=False)
     decision = result.recipe["measurement"]["gain_selection"]
@@ -575,14 +567,14 @@ def test_invalid_gain_reports_input_and_valid_options(value):
 
 @pytest.mark.parametrize("value,expected", [(None, "auto"), ("auto", "auto"),
     ("trust_input", "trust_input"), ("calibrate", "calibrate"), (2, 2.0),
-    (2.5, 2.5), ("2", 2.0), ("2.5", 2.5), ("stream", "trust_input")])
+    (2.5, 2.5), ("2", 2.0), ("2.5", 2.5)])
 def test_gain_modes(value, expected):
     from torchsx.measurement import parse_gain
     assert parse_gain(value) == expected
 
 
 @pytest.mark.parametrize("mode", ["trust_input", 2.0])
-def test_trusted_or_numeric_gain_never_calibrates(stream_file, python_parser, monkeypatch, mode):
+def test_trusted_or_numeric_gain_never_calibrates(stream_file, monkeypatch, mode):
     def no_calibration(*args):
         pytest.fail("explicit input gain must not be calibrated")
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", no_calibration)
@@ -592,7 +584,7 @@ def test_trusted_or_numeric_gain_never_calibrates(stream_file, python_parser, mo
     assert result.recipe["measurement"]["gain_adu_per_photon"] == (1.0 if mode == "trust_input" else mode)
 
 
-def test_calibrate_uses_estimate_even_within_tolerance(stream_file, python_parser, monkeypatch):
+def test_calibrate_uses_estimate_even_within_tolerance(stream_file, monkeypatch):
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", lambda self, *args: (1.1, 0.0, 0.0))
     args = _args(stream_file)
     args.gain = "calibrate"
@@ -603,7 +595,7 @@ def test_calibrate_uses_estimate_even_within_tolerance(stream_file, python_parse
     assert decision["mode"] == "calibrate"
 
 
-def test_calibrate_fails_when_unavailable_despite_valid_input_gain(stream_file, python_parser):
+def test_calibrate_fails_when_unavailable_despite_valid_input_gain(stream_file):
     args = _args(stream_file)
     args.gain = "calibrate"
     with pytest.raises(SystemExit, match="Gain calibration unavailable"):
@@ -612,7 +604,7 @@ def test_calibrate_fails_when_unavailable_despite_valid_input_gain(stream_file, 
 
 @pytest.mark.parametrize("override", [None, 3.0])
 def test_gain_selection_provenance_follows_checkpoint_or_override(
-        stream_file, python_parser, override):
+        stream_file, override):
     previous = {"mode": "auto", "selected_gain": 2.0, "selected": "calibration"}
     args = _args(stream_file)
     args.gain = override
@@ -626,7 +618,7 @@ def test_gain_selection_provenance_follows_checkpoint_or_override(
 
 @pytest.mark.parametrize("flag,expected", [(None, False), (True, True)])
 def test_friedel_recipe_reaches_loader_and_cache(
-        stream_file, python_parser, tmp_path, monkeypatch, flag, expected):
+        stream_file, tmp_path, monkeypatch, flag, expected):
     from torchsx.merging.prepare_store import StoreBuilder
     init = StoreBuilder.__init__
     observed = []

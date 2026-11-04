@@ -17,7 +17,6 @@ from torch import Tensor
 
 from torchsx.merging.likelihood.base import DetectionLikelihood
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scatter.base import ScatterModel
 
 
@@ -25,8 +24,7 @@ class Quadrature(nn.Module):
     """Signal-marginal integrator.
 
     Returns ``log ∫ p(n | S, bg) · p_scatter(log S − log_mean) · d(log S)``
-    per observation, shape ``(n_obs,)``.  A bg-mixture likelihood wraps
-    this result via ``DetectionLikelihood.combine_with_marginal``.
+    per observation, shape ``(n_obs,)``.
     """
 
 
@@ -46,25 +44,6 @@ class Quadrature(nn.Module):
             for log_pi, offset, view in scatter.components(meta)
         ]
         return torch.logsumexp(torch.stack(terms, dim=0), dim=0)
-
-    def _reject_unmodelled_bg(
-        self, likelihood: DetectionLikelihood, *, variance: bool = False,
-    ) -> None:
-        """Refuse a detection background this quadrature does not implement.
-
-        For the handful of quadratures that reimplement the plain-Poisson
-        integrand instead of calling ``log_prob_given_signal``: silently
-        computing the uncorrected quantity is the failure mode that a merge
-        would never surface, so they say so instead.
-        """
-        if float(getattr(likelihood, "bg_mean_offset", 0.0) or 0.0):
-            raise NotImplementedError(
-                f"{type(self).__name__} hardcodes the plain-Poisson integrand "
-                "and would silently ignore the likelihood's bg_mean_offset")
-        if variance and float(getattr(likelihood, "bg_var_factor", 0.0) or 0.0):
-            raise NotImplementedError(
-                f"{type(self).__name__} hardcodes the plain-Poisson integrand "
-                "and would silently ignore the likelihood's bg_var_factor")
 
     def log_miss(
         self, likelihood: DetectionLikelihood, n_ph: Tensor, bg: Tensor,
@@ -91,7 +70,7 @@ class Quadrature(nn.Module):
         log_mean: Tensor,          # (n_obs,)
         n_ph: Tensor,              # (n_obs,) — peak photon counts (I_obs + bg)
         bg: Tensor,                # (n_obs,)
-        params: Parameters,
+        params: None,
         meta: ObsInfo,
         obs_range: tuple[int, int] | None = None,
     ) -> Tensor:                   # (n_obs,)

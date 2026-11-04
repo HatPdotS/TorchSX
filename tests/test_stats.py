@@ -79,9 +79,17 @@ def test_custom_splits_strict_and_selection(sample_core, tmp_path):
     main(argv)
     t = load_cache(tmp_path / 'png-cache')['dark']
     assert int(t['n_input']) == 3
-    split.write_text('/a.h5 //0 dark\n/a.h5 //0 light\n')
-    argv[argv.index(str(tmp_path / 'png'))] = str(tmp_path / 'bad')
-    with pytest.raises(UserWarning, match='conflicting'):
+    # A frame listed under several labels counts under each of them.
+    split.write_text('/a.h5 //0 dark\n/a.h5 //0 light\n/b.h5 //1 light\n/a.h5 //0 light\n')
+    argv[argv.index(str(tmp_path / 'png'))] = str(tmp_path / 'both')
+    argv[argv.index('--select') + 1:argv.index('--select') + 2] = ['dark', 'light']
+    main(argv)
+    both = load_cache(tmp_path / 'both-cache')
+    assert int(both['dark']['n_input']) == 3 and int(both['light']['n_input']) == 5
+    assert int(both['dark']['n_images']) == 1 and int(both['light']['n_images']) == 2
+    split.write_text('/a.h5 //0 dark\n')
+    argv[argv.index(str(tmp_path / 'both'))] = str(tmp_path / 'bad')
+    with pytest.raises(ValueError, match='unlabelled'):
         main(argv)
 
 

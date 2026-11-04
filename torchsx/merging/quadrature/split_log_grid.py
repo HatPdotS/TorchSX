@@ -2,8 +2,9 @@
 
 The integrand is ``GenGauss(log S - log_mean) * L(S)`` with ``L`` the detection
 likelihood (Poisson, optionally deviance-corrected for the background
-estimate's error).  ``FixedLogGrid`` covers ``log S`` in ``[-34.5, 34.5]`` with
-1355 uniform nodes because the two factors set opposite requirements: the
+estimate's error).  One grid shared by every observation has to cover
+``log S`` in ``[-34.5, 34.5]`` with 1355 uniform nodes, because the two factors
+set opposite requirements: the
 Poisson factor of a bright observation is ``1/sqrt(n)`` wide, while the
 exponential-tailed GenGauss of a weak one carries mass 30 alpha below the
 counting floor.  Roughly 95 % of those evaluations land where the integrand is
@@ -36,7 +37,7 @@ smooth function of the parameters and the analytic per-node gradients of the
 Triton kernel remain exact.  The window is sized from the Poisson factor but
 does not cut the scatter tail: the tail is integrated in closed form.
 
-The window is typically 7-15 nats against the fixed grid's 69, so the same
+The window is typically 7-15 nats against the shared grid's 69, so the same
 0.1-nat resolution the narrowest predicted scatter needs costs several times
 fewer integrand evaluations.
 
@@ -55,7 +56,6 @@ from torch import Tensor
 from torchsx.merging.likelihood.base import DetectionLikelihood
 from torchsx.merging.likelihood.poisson import Poisson, poisson_logpeak
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.quadrature.base import Quadrature
 from torchsx.merging.scatter.base import ScatterModel
 from torchsx.merging.scatter.gengauss import (
@@ -71,7 +71,8 @@ except ImportError:                                  # pragma: no cover
     HAVE_TRITON = False
     marginalize_signal_split_triton = None  # type: ignore[assignment]
 
-_DISABLE_TRITON = os.environ.get("TORCHSX_FIXEDLOGGRID_NO_TRITON", "") == "1"
+#: ``TORCHSX_NO_TRITON=1`` forces the eager path.
+_DISABLE_TRITON = os.environ.get("TORCHSX_NO_TRITON", "") == "1"
 
 __all__ = ["SplitLogGrid"]
 
@@ -333,7 +334,7 @@ class SplitLogGrid(Quadrature):
         log_mean: Tensor,        # (M,)
         n_ph: Tensor,            # (M,)
         bg: Tensor,              # (M,)
-        params: Parameters,
+        params: None,
         meta: ObsInfo,
         obs_range: tuple[int, int] | None = None,
         noise=None,  # (A, B) per observation: detector noise

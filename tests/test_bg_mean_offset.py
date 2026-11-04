@@ -10,18 +10,16 @@ The two things these tests exist to catch:
 
 * the offset silently going missing in one of the paths that reimplement the
   Poisson integrand instead of calling ``log_prob_given_signal`` (the eager
-  window, both Triton kernels, the analytic tail, the miss term), and
+  window, the Triton kernels, the analytic tail, the miss term), and
 * the mirror-image failure -- applying it twice, once in the likelihood and
   again in a quadrature that only meant to place its grid.
 """
-import math
 
 import pytest
 import torch
 
 from torchsx.cli._pipeline import bg_mean_offset_from_ckpt
 from torchsx.merging.likelihood import Poisson
-from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid, eager_only
 from torchsx.merging.quadrature.split_log_grid import SplitLogGrid, HAVE_TRITON
 from torchsx.nn.objective import MarginalNLL
 from tests.test_split_log_grid import _batch, _reference, _scatter
@@ -141,36 +139,24 @@ def test_learned_background_is_refused():
         lik.detection_params(bg.clone().requires_grad_(True))
 
 
-def test_quadratures_that_cannot_model_it_raise():
-    """A path that hardcodes the plain Poisson says so rather than compute
-    the uncorrected quantity."""
-    n_ph, bg, la, lb, mu = _batch("cpu", M=64)
-    lik = Poisson(bg_var_factor=C, bg_mean_offset=C)
-    with pytest.raises(NotImplementedError):
-        FixedLogGrid(S_min=1e-6, S_max=1e6, n_points=64) \
-            .marginalize_signal_with_reml_aux(
-                _scatter(la, lb), lik, mu, n_ph, bg, None, None)
-
-
 # ── checkpoint round-trip ─────────────────────────────────────────────
 
 def test_checkpoint_offset_round_trip():
-    bvf = 1.1640625
-    assert bg_mean_offset_from_ckpt({}, bvf) == 0.0
+    assert bg_mean_offset_from_ckpt({}) == 0.0
     assert bg_mean_offset_from_ckpt(
         {"quadrature": {"kind": "SplitLogGrid"},
-         "likelihood": {"kind": "Poisson"}}, bvf) == 0.0
+         "likelihood": {"kind": "Poisson"}}) == 0.0
     assert bg_mean_offset_from_ckpt(
         {"quadrature": {"kind": "SplitLogGrid+bgmean"},
-         "likelihood": {"kind": "Poisson+bgmean", "bg_mean_offset": 1.25}}, bvf) == 1.25
-    # the out-of-tree experiment wrapper's markers, which record no offset
-    assert bg_mean_offset_from_ckpt(
-        {"quadrature": {"kind": "AnnulusMeanOnlySplitLogGridV1"},
-         "likelihood": {"kind": "AnnulusMeanOnlyPoissonV1"}}, bvf) == bvf
+         "likelihood": {"kind": "Poisson+bgmean", "bg_mean_offset": 1.25}}) == 1.25
     with pytest.raises(SystemExit):
         bg_mean_offset_from_ckpt(
             {"quadrature": {"kind": "SplitLogGrid"},
-             "likelihood": {"kind": "AnnulusMeanOnlyPoissonV1"}}, bvf)
+             "likelihood": {"kind": "Poisson+bgmean", "bg_mean_offset": 1.25}})
+    with pytest.raises(SystemExit):
+        bg_mean_offset_from_ckpt(
+            {"quadrature": {"kind": "SplitLogGrid+bgmean"},
+             "likelihood": {"kind": "Poisson+bgmean"}})
 
 
 # ── kernels ───────────────────────────────────────────────────────────
@@ -213,31 +199,6 @@ def test_split_triton_matches_eager_under_offset(offset):
         assert dg < 2e-2 * float(ge.abs().max().clamp(min=1e-6)) + 1e-3, (name, dg)
 
 
-@pytest.mark.skipif(not (CUDA and HAVE_TRITON), reason="needs CUDA + triton")
-@pytest.mark.parametrize("offset", [0.0, C])
-def test_fixed_eager_matches_triton_under_offset(offset):
-    """The double-apply trap.
-
-    ``FixedLogGrid``'s eager branch delegates to ``log_prob_given_signal``, so
-    it must hand over the RAW bg and let the likelihood shift it; its Triton
-    branch reimplements the integrand, so it must hand the kernel the shifted
-    one.  Getting that backwards applies the offset twice on one path and not at
-    all on the other, and this is what notices.
-    """
-    n_ph, bg, la, lb, mu = _batch("cuda", seed=2, M=1024)
-    lik = Poisson(bg_var_factor=C, bg_mean_offset=offset)
-    q = FixedLogGrid(S_min=math.exp(-20), S_max=math.exp(20), n_points=1024).to("cuda")
-    with eager_only():
-        ref = q.marginalize_signal(_scatter(la, lb), lik, mu, n_ph, bg, None, None)
-    got = q.marginalize_signal(_scatter(la, lb), lik, mu, n_ph, bg, None, None)
-    d = (got - ref).abs()
-    # same float32 kernel bars as the split grid; a double application would
-    # shift lam by another c and move this by O(1) nat, not 1e-2
-    assert float(d.median()) < 2e-5, float(d.median())
-    assert float(d.quantile(0.99)) < 1e-2, float(d.quantile(0.99))
-    assert float(d.max()) < 3e-2, float(d.max())
-
-
 # ── end to end through build_stack ────────────────────────────────────
 
 def test_build_stack_and_checkpoint_carry_the_offset(tmp_path):
@@ -273,7 +234,7 @@ def test_build_stack_and_checkpoint_carry_the_offset(tmp_path):
     assert ck["likelihood"]["bg_mean_offset"] == pytest.approx(C)
     assert ck["likelihood"]["kind"].endswith("+bgmean")
     assert ck["quadrature"]["kind"].endswith("+bgmean")
-    assert P.bg_mean_offset_from_ckpt(ck, C) == pytest.approx(C)
+    assert P.bg_mean_offset_from_ckpt(ck) == pytest.approx(C)
 
     # a merge inherits it without being told
     args = _build_parser().parse_args(base)

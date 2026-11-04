@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from torchsx import SFXStream
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 from torchsx.cli import _pipeline as P
 from torchsx.io import _native
 from torchsx.io._metadata import StreamMetadata
@@ -17,6 +17,7 @@ from torchsx.merging.hkl.noise import PoissonNoiseModel
 from torchsx.merging.observations import prepare_observations
 from torchsx.merging.store import RECORD, ObservationStore, PreparedStore
 from torchsx.nn.merge_target import plain_mean, unity_merge
+from tests import python_parser
 
 OBS_FIELDS = ("crystal_id", "s_sq", "hkl_idx", "panel_id", "fs", "ss", "peak", "background",
               "ewald_offset", "sigma", "q_dir", "beam_energy", "crystal_res", "n_pix")
@@ -65,7 +66,7 @@ def _synthetic_core(geometry, *, n_images=40, seed=0, sigma_bad=True):
             else torch.stack(v) for k, v in crys.items()}
     meta = StreamMetadata(image={"filename": [f"/raw/run{i // 10}.h5" for i in range(n_images)],
                                  "event": [f"//{i}" for i in range(n_images)]})
-    return _SFXStreamCore(
+    return SFXStreamCore(
         **obs, **crys,
         beam_energy=12960.0 + torch.randn(n_images, generator=g) * 5,
         det_shift_x=torch.randn(n_images, generator=g) * 0.01,
@@ -90,13 +91,10 @@ def streams(tmp_path, sample_geometry):
             for s in range(2)]
 
 
-@pytest.fixture(params=[False, True], ids=["python", "native"])
+@pytest.fixture(params=["python", "native"])
 def parser(request, monkeypatch):
-    if request.param:
-        if _native.load() is None:
-            pytest.skip("native parser unavailable")
-    else:
-        monkeypatch.setattr(_native, "load", lambda: None)
+    if request.param == "python":
+        monkeypatch.setattr(_native, "load", lambda: python_parser)
 
 
 def _reference(paths, *, spacegroup, merge_friedel, d_min, gain, extra=None):
@@ -267,25 +265,6 @@ def test_load_prep_builds_and_reuses_the_store(streams, tmp_path, parser, monkey
     (cache / "meta.json").write_text(json.dumps(meta))
     with pytest.raises(SystemExit, match="Rebuild it from the source"):
         P.load_prep(args, verbose=False)
-
-
-def test_load_prep_reads_a_prepared_blob_of_an_earlier_run(streams, tmp_path, parser):
-    """A run prepared before the store keeps its ``prepared.pt``; a merge reads it."""
-    from tests.test_cli_pipeline import _DataArgs
-    args = _DataArgs(stream=[streams[0]], int_radius=None, gain=None,
-                     cache_prep=tmp_path / "prepared")
-    built = P.load_prep(args, verbose=False)
-    meta = json.loads((tmp_path / "prepared" / "meta.json").read_text())
-    run = tmp_path / "run"
-    run.mkdir()
-    torch.save({"prep": built.prep.materialize(), "recipe": meta["recipe"],
-                "split_names": meta["split_names"], "bg_var_factor": meta["bg_var_factor"],
-                "signature": meta["signature"]}, run / "prepared.pt")
-    args.cache_prep, args.out = None, run / "merged.mtz"
-    args.ckpt = run / "best.pt"
-    old = P.load_prep(args, recipe_defaults=meta["recipe"], verbose=False)
-    assert not isinstance(old.prep, PreparedStore)
-    assert torch.equal(old.prep.I_obs, built.prep.materialize().I_obs)
 
 
 def test_build_replaces_only_its_own_staging(streams, tmp_path):

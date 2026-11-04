@@ -182,17 +182,17 @@ def test_extra_components_may_be_wider_above_than_component_0():
     assert bool((la_hi[:, 1:] > la_hi[:, :1]).any())
 
 
-def test_mixture_scale_model_primes_the_mixture_scatter_and_chunks_exactly():
+def test_mixture_scale_model_primes_the_mixture_scatter():
     from tests.test_amortized_training import _synthetic
     from torchsx.merging.scale import AmortizedScale
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=12)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, n_components=3)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_components=3)
     assert isinstance(scale.scatter, PredictedMixtureScatter) and scale.scatter.n_components == 3
-    # break the zero init so chunking has something non-trivial to reproduce
+    # break the zero init
     with torch.no_grad():
         for prm in scale.parameters():
             prm.add_(0.05 * torch.randn_like(prm))
-    # the trainer feeds crystal-grouped rows and chunking requires that order
+    # crystal-grouped rows, as the trainer feeds them
     order = torch.argsort(prep.obs_info.crystal_id, stable=True)
     meta = prep.obs_info.gather(order)
     pred = scale.prime(meta)
@@ -203,13 +203,7 @@ def test_mixture_scale_model_primes_the_mixture_scatter_and_chunks_exactly():
     assert pred.mix.shape[1] == 15
     scale.clear()
     assert not scale.scatter.has_prediction
-    full = scale.predict(meta)
-    scale.set_encoder_chunking(5)
-    chunked = scale.predict(meta)
-    for name in ("log_K", "log_w", "log_e_s", "mix"):
-        torch.testing.assert_close(getattr(chunked, name), getattr(full, name), atol=1e-5, rtol=1e-5)
     # gradients reach the conditioner
-    scale.set_encoder_chunking(0)
     out = scale.predict(meta)
     (out.log_e_s.sum() + out.mix.sum()).backward()
     assert scale.heads.mixture.weight.grad is not None and scale.heads.mixture.weight.grad.abs().sum() > 0
@@ -300,7 +294,7 @@ def test_mixture_trainer_step_runs_and_trains_the_mixture_head(tmp_path):
     from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
     torch.manual_seed(0)
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=16)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, n_components=3)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_components=3)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1), miss_frac=0.03)
     cfg = TrainConfig(max_obs_per_batch=6000, lr=1e-2, log_every=10 ** 9,
                       heldout_frac=0.0, posterior_k_coarse=9, posterior_m_fine=33,

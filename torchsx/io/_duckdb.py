@@ -1,4 +1,4 @@
-"""Load a probixi DuckDB run into an :class:`~torchsx._core._SFXStreamCore`.
+"""Load a probixi DuckDB run into an :class:`~torchsx._core.SFXStreamCore`.
 
 One ``frames`` row per image and one ``crystals`` row per lattice (older
 databases keep the crystal on ``frames``) map to the observation → crystal →
@@ -38,7 +38,7 @@ from pathlib import Path
 import duckdb
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 from torchsx.geometry import Geometry
 from torchsx.io._metadata import StreamMetadata
 from torchsx.measurement import MEASUREMENT_KEY, MeasurementSpec
@@ -47,7 +47,7 @@ from torchsx.measurement import MEASUREMENT_KEY, MeasurementSpec
 _NM_INV_PER_A_INV = 10.0
 
 #: ``resolution`` fallback (Å) when a frame has no diffraction limit, matching
-#: the stream parser's sentinel in ``io/_parse/records.py``.
+#: the stream parser's sentinel.
 _NO_RESOLUTION = 999.0
 #: newest probixi database schema this reader understands
 SUPPORTED_DB_SCHEMA = 1
@@ -180,7 +180,7 @@ def load_duckdb(
     geometry: Geometry | None = None,
     load_geom_file: bool = True,
     clipped: bool = False,
-) -> _SFXStreamCore:
+) -> SFXStreamCore:
     """Build a stream core from a probixi DuckDB run.
 
     Read legacy and multi-lattice databases, omitting unindexed images. Multiple
@@ -202,7 +202,7 @@ def load_duckdb(
 
     Returns
     -------
-    _SFXStreamCore
+    SFXStreamCore
         Wrap with ``SFXStream(core)``, or call
         :meth:`~torchsx.stream.SFXStream.from_duckdb`.
     """
@@ -337,7 +337,7 @@ def load_duckdb(
         per_frame = _tensor(images, "photon_energy_eV", torch.float32, float("nan"))
         beam_energy = torch.where(torch.isfinite(per_frame) & (per_frame > 0), per_frame, beam_energy)
 
-    core = _SFXStreamCore(
+    core = SFXStreamCore(
         hkl=hkl,
         I=_o("intensity"),
         sigma=_o("sigma"),

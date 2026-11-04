@@ -31,11 +31,9 @@ Two facts collapse it:
    ``(n_obs, M_fine)`` tensor never exists.
 
 With the Triton inner kernel the remaining cost is small: it never materialises
-the ``(M, K_inner)`` integrand (it saves six tensors of size M), so a pass
-moves a few percent of the eager traffic, and 31 passes come to roughly one
-eager pass — a few percent of a training step.  Use a **wide** FixedLogGrid so
-the Triton path applies without truncating the scatter; the inner node count is
-nearly free.
+the ``(M, K_inner)`` integrand, so a pass moves a few percent of the eager
+traffic, and 31 passes come to roughly one eager pass — a few percent of a
+training step.
 
 Grid geometry (centre, width) is **detached**: it only places quadrature nodes,
 exactly like choosing integration limits, and the answer is insensitive to it
@@ -56,14 +54,6 @@ import torch.nn as nn
 from torch import Tensor
 
 from torchsx.nn.pooling import group_sum
-
-try:
-    from torchsx.merging.quadrature._fused_posterior_triton import (
-        fused_posterior_logp,
-    )
-    _HAVE_FUSED = True
-except ImportError:                                  # pragma: no cover
-    _HAVE_FUSED = False
 
 __all__ = ["PosteriorOut", "PosteriorMergeTarget"]
 
@@ -128,9 +118,8 @@ class PosteriorMergeTarget(nn.Module):
         the safer default since width is free.
     prior
         ``"none"`` integrates ``dI0`` (weight ``exp(v)``), with no Wilson
-        density; ``"flat_I0"`` is its legacy alias. ``"flat_log"``
-        integrates ``d log I0``; ``"wilson"`` uses ``p(I) = exp(-I/Sigma)/Sigma``
-        with ``Sigma(h)`` the smooth Wilson surface.  **Use wilson.**  Where the
+        density; ``"flat_log"`` integrates ``d log I0``; ``"wilson"`` uses
+        ``p(I) = exp(-I/Sigma)/Sigma`` with ``Sigma(h)`` the smooth Wilson surface.  **Use wilson.**  Where the
         likelihood is uninformative — and most serial observations are
         noise-limited — the posterior is whatever the prior says, and a
         flat-in-I0 prior on a log grid drags those reflections toward the *top
@@ -149,17 +138,11 @@ class PosteriorMergeTarget(nn.Module):
         floor: float = 1e-3,
         scan_points: int = 9,
         scan_halfwidth: float = 8.0,
-        use_fused: bool = False,
         max_halfwidth: float = 12.0,
     ) -> None:
         super().__init__()
-        if prior == "flat_I0":
-            prior = "none"
         if prior not in ("none", "flat_log", "wilson"):
-            raise ValueError(
-                f"prior must be 'none' or 'wilson', got {prior!r} "
-                "(legacy 'flat_I0' and 'flat_log' are also accepted)"
-            )
+            raise ValueError(f"prior must be 'none', 'flat_log' or 'wilson', got {prior!r}")
         if k_coarse < 3 or m_fine < k_coarse:
             raise ValueError("need k_coarse >= 3 and m_fine >= k_coarse")
         self.n_hkl = int(I_start.shape[0])
@@ -184,7 +167,6 @@ class PosteriorMergeTarget(nn.Module):
         # redundancy than a small one at the same batch size, and that is what
         # it buys back.
         self.checkpoint_nodes = False
-        self.use_fused = bool(use_fused)
         #: Lower bound of a grid centre, in nats below the Wilson surface.
         self.centre_floor_nats = 4.0
 
@@ -487,63 +469,6 @@ class PosteriorMergeTarget(nn.Module):
                 noise=noise,
             )
 
-        # Fused path -- OFF by default, not deprecated.  One launch
-        # for all C nodes instead of C, hoisting the Poisson factor out of the
-        # node loop and replacing the online-logsumexp maximum with a
-        # closed-form bound.  Against the float64 oracle it gives *better*
-        # values than the per-column path and is ~2x faster at C = 32, but its
-        # gradient DIRECTION is orders of magnitude worse (about 5 degrees on
-        # d/d log_alpha).
-        #
-        # Cause: dropping the per-(m, c) running max costs dynamic range.  When
-        # one observation's accumulator underflows at a node, that node is
-        # floored, S[h, c] is annihilated, and with it the gradient
-        # contribution of every OTHER observation at that node.  The values
-        # survive because the node carried little weight; the direction does
-        # not.  Flooring higher instead over-estimates such nodes by hundreds
-        # of nats, which is worse.  A periodic rescale would fix it and
-        # would give back part of the speed the running max was costing.
-        #
-        # Speed also depends sharply on C, because the tile is next_pow2(C):
-        # it only pays at a power-of-two k_coarse.
-        #
-        # Falls back silently -- it is a GenGauss x Poisson x FixedLogGrid
-        # specialisation with no d/d bg statistic, so a learned background must
-        # use the eager loop.
-        if self.use_fused and noise is None:
-            from torchsx.merging.likelihood import Poisson
-            from torchsx.merging.quadrature.fixed_log_grid import FixedLogGrid
-            from torchsx.merging.scatter.gengauss import GenGaussLogScatter
-            q = getattr(objective, "quadrature", None)
-            if (
-                _HAVE_FUSED and n_ph.is_cuda
-                and isinstance(q, FixedLogGrid)
-                and isinstance(getattr(objective, "likelihood", None), Poisson)
-                and isinstance(scatter, GenGaussLogScatter)
-                and not getattr(objective, "renormalize", False)
-                and not bg.requires_grad
-                # The fused kernel hardcodes the plain Poisson integrand, so a
-                # likelihood carrying extra structure -- e.g. bg_var_factor,
-                # which marginalises the background estimate's own error --
-                # would be SILENTLY ignored here while the eager loop honours
-                # it.  Refuse the fast path rather than compute a different
-                # quantity from the one the loss asked for.
-                and not float(getattr(objective.likelihood, "bg_var_factor",
-                                      0.0) or 0.0)
-                # Same argument for the background MEAN: the kernel's
-                # `lam = S + bg` is the raw estimate, so a bg_mean_offset would
-                # be dropped here while the loss honours it.
-                and not float(getattr(objective.likelihood, "bg_mean_offset",
-                                      0.0) or 0.0)
-            ):
-                la, lb = scatter.log_alpha_beta_obs(params, meta)
-                lp = fused_posterior_logp(
-                    base.contiguous(), n_ph, bg, la, lb, hkl_id, v_nodes,
-                    q.log_S_grid, q._trap_log_w(q.log_S_grid, q.n_points),
-                )
-                out = base.new_zeros(self.n_hkl, v_nodes.shape[1])
-                return out.index_add(0, hkl_id, lp)
-
         cols = []
         ckpt = self.checkpoint_nodes and torch.is_grad_enabled() and base.requires_grad
         for c in range(v_nodes.shape[1]):   # not k_coarse: locate() uses its own width
@@ -586,7 +511,7 @@ class PosteriorMergeTarget(nn.Module):
         v = centre[:, None] + sig_h[:, None] * self.u_fine[None, :]
         du = float(2 * self.n_sigma / (self.m_fine - 1))
         log_w = (sig_h * du).log()[:, None].expand_as(v).clone()
-        if self.prior in ("none", "flat_I0"):
+        if self.prior == "none":
             log_w = log_w + v                       # dI0 = I0 dv
         elif self.prior == "wilson":
             # the trained parameter while training; every no-grad pass

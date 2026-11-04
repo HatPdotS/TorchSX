@@ -13,7 +13,7 @@ F. Optimisation health.
 The one that decides the project is ``between_frac`` in group C.  A per-crystal
 G model puts 100 % of its ``log K`` variance between crystals.  The entire
 premise of amortising is that the *within*-crystal part — partiality — is real
-and predictable from a leave-one-out context.  If ``within`` stays near zero the
+and predictable from a context without the observation.  If ``within`` stays near zero the
 network has merely rediscovered G, and there is no reason to prefer it.
 
 The one that protects the science is ``condition_auc`` in group D.  Any degree
@@ -225,7 +225,7 @@ def grad_norms(module: torch.nn.Module, groups: tuple[str, ...] = ("encoder", "h
     exchange blocks: an aggregate encoder norm cannot distinguish "healthy" from
     "the last two blocks are learning and block 0 sees nothing".  Blocks are
     identified by the integer following ``blocks.`` in the parameter name —
-    ``context_blocks`` and ``self_blocks`` in the Deep Sets encoder.
+    ``ctx_blocks`` and ``query_blocks`` in the fold transformer.
 
     ``gradnorm_depth_ratio`` is last-block / first-block.  Values far above 1
     mean the early blocks are starved; note it is legitimately large at step 0,

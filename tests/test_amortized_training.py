@@ -21,10 +21,8 @@ import torch
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.scale import AmortizedScale
-from torchsx.merging.scatter_shape import FreePerHKLShape
 from torchsx.nn.metrics import scale_metrics, spearman
 from torchsx.nn.objective import MarginalNLL
 from torchsx.cli.train import run_updates
@@ -78,25 +76,20 @@ def _synthetic(n_hkl=60, n_xtal=150, per=40, seed=0, n_cond=1, shift=1.5):
         I_obs=I, hkl_id=hkl, bg=bg,
         obs_counts=torch.bincount(hkl, minlength=n_hkl),
         n_obs_total=hkl.numel(),
-        obs_info=oi, partiality=None,
+        obs_info=oi,
         shell_id_fw=torch.arange(n_hkl) % 4,
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
     )
-    params = Parameters(
-        log_I0_init=torch.full((n_hkl,), math.log(60.0)),
-        scatter_shape=FreePerHKLShape(torch.full((n_hkl,), 1.65).log(),
-                                      torch.full((n_hkl,), 2.0).log()),
-    )
-    return prep, params, log_G, cid, per
+    return prep, None, log_G, cid, per
 
 
 @pytest.mark.slow
-def test_leave_one_out_context_recovers_a_hidden_per_crystal_scale(tmp_path):
+def test_crystal_context_recovers_a_hidden_per_crystal_scale(tmp_path):
     prep, params, log_G, cid, per = _synthetic()
     n_xtal = log_G.numel()
 
     scale = AmortizedScale.from_prep(
-        prep, d_model=64, n_layers=3
+        prep, d_model=64
     )
     obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
     # ~30 updates to converge from zero-init.  The scale ramps up from 0 and
@@ -228,7 +221,7 @@ def test_batches_are_condition_pure_and_complete():
 
 def _two_condition_trainer(tmp_path, **cfg_kw):
     prep, params, log_G, cid, per = _synthetic(n_hkl=40, n_xtal=120, per=40, n_cond=2)
-    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2)
+    scale = AmortizedScale.from_prep(prep, d_model=32)
     obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
     cfg = TrainConfig(
         max_obs_per_batch=1000, lr=1e-3, log_every=1,
@@ -304,7 +297,7 @@ def test_evaluation_changes_no_state(tmp_path, prior):
     """Scoring held-out data must not feed its intensities into later training."""
     prep, params, *_ = _synthetic(n_hkl=12, n_xtal=24, per=12, n_cond=2)
     scale = AmortizedScale.from_prep(
-        prep, d_model=8, n_layers=1, context_folds=2,
+        prep, d_model=8, context_folds=2,
     )
     tr = AmortizedTrainer(
         prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
@@ -349,7 +342,7 @@ def test_reported_nll_is_relative_to_the_saturated_poisson(tmp_path):
     from scipy.stats import poisson
 
     prep, params, *_ = _synthetic(n_hkl=40, n_xtal=24, per=8)
-    scale = AmortizedScale.from_prep(prep, d_model=8, n_layers=1, context_folds=2)
+    scale = AmortizedScale.from_prep(prep, d_model=8, context_folds=2)
     tr = AmortizedTrainer(
         prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(device="cpu", outdir=str(tmp_path), heldout_frac=0.25,
@@ -436,8 +429,8 @@ def test_deferred_encoder_backward_is_the_one_pass_gradient(tmp_path):
     give every parameter the gradient of the single checkpointed pass."""
     prep, params, *_ = _synthetic(n_xtal=40, per=20)
     torch.manual_seed(0)
-    scale = AmortizedScale.from_prep(prep, d_model=16, n_layers=2, peer_heads=4,
-                                     encoder="fold", context_folds=3, ctx_layers=2, query_layers=1)
+    scale = AmortizedScale.from_prep(prep, d_model=16, n_heads=4,
+                                     context_folds=3, ctx_layers=2, query_layers=1)
     scale.encoder.tokens = 1 << 8                     # several blocks
     cfg = TrainConfig(max_obs_per_batch=10 ** 6, lr=3e-3, heldout_frac=0.0,
                       device="cpu", outdir=str(tmp_path))
@@ -469,8 +462,8 @@ def test_fold_predictions_without_autograd_run_flex_and_match_the_masked_kernel(
     torch._dynamo.reset()
     prep, params, *_ = _synthetic(n_xtal=40, per=20)
     torch.manual_seed(0)
-    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2, peer_heads=2,
-                                     encoder="fold", context_folds=3, ctx_layers=2, query_layers=1,
+    scale = AmortizedScale.from_prep(prep, d_model=32, n_heads=2,
+                                     context_folds=3, ctx_layers=2, query_layers=1,
                                      anchor_stat="median").cuda()
     scale.encoder.tokens = 1 << 9                     # several blocks
     for prm in scale.parameters():                    # away from the unity-scale start

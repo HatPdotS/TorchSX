@@ -30,7 +30,7 @@ from tests.test_amortized_training import _synthetic
 
 
 def _stack(prep, params, tmp_path, *, n_cond=1):
-    scale = AmortizedScale.from_prep(prep, d_model=32, n_layers=2)
+    scale = AmortizedScale.from_prep(prep, d_model=32)
     obj = MarginalNLL(SplitLogGrid(n_points=64), Poisson(bg_var_factor=0.1))
     cfg = TrainConfig(
         max_obs_per_batch=6000, lr=1e-2, log_every=10 ** 9, heldout_frac=0.0,
@@ -182,7 +182,6 @@ def test_checkpoint_carries_the_recipe(tmp_path):
 
 class _FreeArgs:
     def __init__(self, **kw):
-        self.no_free = False
         self.free_from = None
         self.free_frac = 0.05
         self.free_seed = 20260902
@@ -207,7 +206,6 @@ def test_free_flags_are_reproducible_and_copied(tmp_path):
     c = P.work_mask(hkl, _FreeArgs(free_seed=1), verbose=False)
     assert (a == b).all() and not (a == c).all()
     assert abs((~a).mean() - 0.05) < 0.01
-    assert P.work_mask(hkl, _FreeArgs(no_free=True), verbose=False) is None
 
     # a set taken from a file is copied, and absent reflections go to WORK
     src = {tuple(int(v) for v in k): 0 for k in P.canonical_hkl(hkl[:50])}
@@ -298,30 +296,6 @@ def test_anomalous_products_unstack_onto_asu_rows(tmp_path):
     assert mtz.nreflections == n_asu
     flag = np.array(mtz.column_with_label("R-free-flags"), dtype=int)
     assert set(np.unique(flag)) <= {0, 1}          # one flag per ASU row, not per mate
-
-    out_i = tmp_path / "anom_i.mtz"
-    counts = torch.arange(n) % 5 + 1
-    P.write_intensity_mtz(out_i, signed, val, val * 0.1, cell=cell, spacegroup=sg,
-                          keep=keep, n_meas=counts, merge_friedel=False, verbose=False)
-    mtz_i = gemmi.read_mtz_file(str(out_i))
-    labels_i = [c.label for c in mtz_i.columns]
-    assert {"I-obs(+)", "SIGI-obs(+)", "I-obs(-)", "SIGI-obs(-)",
-            "N(+)", "N(-)"} <= set(labels_i)
-    assert {c.type for c in mtz_i.columns if c.label.startswith("N(")} == {"I"}
-    assert mtz_i.nreflections == n_asu
-    asu = gemmi.ReciprocalAsu(gemmi.SpaceGroup(sg))
-    written = np.array(mtz_i, dtype=float)[:, :3].astype(int)
-    assert all(asu.is_in(row.tolist()) for row in written)
-    # Every measurement is filed under exactly one branch, none invented.
-    n_plus = np.array(mtz_i.column_with_label("N(+)"))
-    n_minus = np.array(mtz_i.column_with_label("N(-)"))
-    assert (n_plus + n_minus).sum() == counts.sum()
-
-    out_m = tmp_path / "merged_i.mtz"
-    P.write_intensity_mtz(out_m, np.abs(signed), val, val * 0.1, cell=cell,
-                          spacegroup=sg, keep=keep, n_meas=counts, verbose=False)
-    mtz_m = gemmi.read_mtz_file(str(out_m))
-    assert next(c.type for c in mtz_m.columns if c.label == "N") == "I"
 
 
 def test_radii_and_gain_parsing():
@@ -603,9 +577,8 @@ def test_defaults_are_the_wilson_prior_and_the_tether(tmp_path):
     assert P.build_stack(bundle, off, verbose=False)[2].anchor_stat == "basis" and P.tether_terms(off) == ()
 
 
-@pytest.mark.parametrize("flags,kind,refine", [([], "fold", True), (["--no-refine-geometry"], "fold", False),
-                                              (["--encoder", "deepsets"], "deepsets", None)])
-def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path, flags, kind, refine):
+@pytest.mark.parametrize("flags,refine", [([], True), (["--no-refine-geometry"], False)])
+def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path, flags, refine):
     from torchsx.cli import _pipeline as P
     from torchsx.cli.train import _build_parser as train_parser
     from torchsx.nn.fold_transformer import FoldTransformerEncoder
@@ -613,10 +586,9 @@ def test_default_encoder_is_the_fold_transformer_with_refined_geometry(tmp_path,
     bundle = P.PrepBundle(prep, {"d_min": 0.9, "spacegroup": "P 1", "gain": 1.0, "radii": [7.0, 9.0, 11.0]}, [], 0.1)
     targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu", *flags])
     enc = P.build_stack(bundle, targs, verbose=False)[2].encoder
-    assert isinstance(enc, FoldTransformerEncoder) == (kind == "fold")
-    if kind == "fold":
-        assert (enc.context_folds, len(enc.ctx_blocks), len(enc.query_blocks)) == (5, 2, 1)
-        assert enc.refine_geometry == refine
+    assert isinstance(enc, FoldTransformerEncoder)
+    assert (enc.context_folds, len(enc.ctx_blocks), len(enc.query_blocks)) == (5, 2, 1)
+    assert enc.refine_geometry == refine
 
 
 # ── detector noise under the gain policy ───────────────────────────────

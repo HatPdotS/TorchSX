@@ -273,9 +273,6 @@ class PreparedStore:
     with the records, so nothing reads the full file when training starts.
     """
 
-    partiality = None
-    obs_weights = None
-
     def __init__(self, path: str | Path):
         self.path = Path(path)
         meta = json.loads((self.path / "meta.json").read_text())
@@ -433,7 +430,7 @@ class PreparedStore:
             hkl_valid=self.hkl_valid, d_spacing=self.d_spacing, n_valid=self.n_valid,
             median_cell=self.median_cell, I_obs=I_obs, hkl_id=oi.hkl_idx, bg=bg,
             obs_counts=self.obs_counts, n_obs_total=self.n_obs_total, obs_info=oi,
-            partiality=None, shell_id_fw=self.shell_id_fw, is_centric=self.is_centric,
+            shell_id_fw=self.shell_id_fw, is_centric=self.is_centric,
         )
 
     def gather(self, idx: Tensor) -> ObsInfo:

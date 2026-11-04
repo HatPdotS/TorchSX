@@ -76,7 +76,7 @@ def calculate(hkl, intensity, frames, cell, spacegroup, *, friedel=True, sigma=N
 def read_inputs(args):
     """Reuse production I/O, with explicit sampling and strict split assignment."""
     from torchsx.stream import SFXStream
-    from torchsx.io.times import load_split_labels
+    from torchsx.io.times import event_key, load_split_labels
     from torchsx.cli._pipeline import _workers
     inputs = []
     for entry in args.split:
@@ -89,12 +89,7 @@ def read_inputs(args):
         raise ValueError('Supply inputs with unique names')
     if args.split_file and len(inputs) != 1:
         raise ValueError('--split-file requires exactly one input')
-    lookup = None
-    if args.split_file:
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter('error')  # Conflicting labels must not silently win.
-            lookup = load_split_labels(args.split_file)
+    lookup = load_split_labels(args.split_file) if args.split_file else None
     results, sources = {}, []
     for name, path in inputs:
         stamp = path.stat()
@@ -128,18 +123,20 @@ def read_inputs(args):
         print(f'{name}: {stream.n_crystals:,} crystals, {stream.n_images:,} images; '
               f'{spacegroup}, cell {cell.tolist()}', flush=True)
         frame = array(stream.image_id)[array(stream.crystal_id).astype(int)]
-        labels = np.full(stream.n_images, name, dtype=object)
+        # The labels of each image; a frame of a custom split can carry several.
+        members = [{name}] * stream.n_images
         if lookup is not None:
             if len(stream.filenames) != stream.n_images or len(stream.events) != stream.n_images:
                 raise ValueError('Custom splits require filename/event metadata')
-            labels = np.array([lookup.get(k) for k in zip(stream.filenames, stream.events)], dtype=object)
-            if any(v is None for v in labels):
+            members = [lookup.get((f, event_key(e)), set()) for f, e in zip(stream.filenames, stream.events)]
+            if not all(members):
                 raise ValueError('Custom split file leaves sampled images unlabelled')
-        selected = args.select or sorted(set(labels))
+        selected = args.select or sorted(set().union(*members))
         for label in selected:
             if label in results or not label or Path(label).name != label or label in ('.', '..'):
                 raise ValueError(f'Unsafe or duplicate output label: {label!r}')
-            mask = labels[frame] == label
+            in_label = np.array([label in m for m in members], dtype=bool)
+            mask = in_label[frame]
             if not mask.any():
                 raise ValueError(f'No observations for requested label {label!r}')
             sigma = stream._core.levels['obs'].get('sigma')
@@ -148,8 +145,8 @@ def read_inputs(args):
             results[label]['cell'] = cell
             results[label]['spacegroup'] = np.array(spacegroup)
             results[label]['merge_friedel'] = np.array(args.merge_friedel)
-            results[label]['n_images'] = np.array(int((labels == label).sum()))
-            results[label]['n_crystals'] = np.array(int((labels[array(stream.image_id)] == label).sum()))
+            results[label]['n_images'] = np.array(int(in_label.sum()))
+            results[label]['n_crystals'] = np.array(int(in_label[array(stream.image_id)].sum()))
         if (path.stat().st_size, path.stat().st_mtime_ns) != (stamp.st_size, stamp.st_mtime_ns):
             raise ValueError('Input changed during reading')
         sources.append(dict(path=str(path.resolve()), size=stamp.st_size, mtime_ns=stamp.st_mtime_ns,

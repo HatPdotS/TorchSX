@@ -15,9 +15,8 @@ from tests.test_amortized_scale import _randomise, _toy_prep_with_crystal_feat
 
 def _scale(prep, *, folds=3, ctx=2, query=1, seed=3, heads=4):
     torch.manual_seed(seed)
-    return AmortizedScale.from_prep(prep, d_model=16, anchor_log_k=False, encoder="fold",
-                                    context_folds=folds, ctx_layers=ctx, query_layers=query,
-                                    peer_heads=heads)
+    return AmortizedScale.from_prep(prep, d_model=16, anchor_log_k=False, context_folds=folds,
+                                    ctx_layers=ctx, query_layers=query, n_heads=heads)
 
 
 def _encoder(folds=3, ctx=2, query=1, n_self=4, n_ctx=7, meas=(4, 5, 6), **kw):

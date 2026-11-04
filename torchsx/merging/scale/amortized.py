@@ -22,7 +22,6 @@ from torch import Tensor
 
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
-from torchsx.nn.deepsets import DeepSetsEncoder, ScaleEncoder
 from torchsx.nn.fold_transformer import FoldTransformerEncoder, scatter_positions
 from torchsx.nn.heads import ScaleHeads, ScalePrediction
 from torchsx.nn.obs_features import ObsFeatureSpec
@@ -39,7 +38,7 @@ class AmortizedScale(nn.Module):
         Tiered feature builder; enforces the own-intensity and
         condition-blindness contracts.
     encoder
-        Anything satisfying :class:`~torchsx.nn.deepsets.ScaleEncoder`.
+        :class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`.
     heads
         :class:`~torchsx.nn.heads.ScaleHeads`.
     n_crystals
@@ -66,7 +65,7 @@ class AmortizedScale(nn.Module):
     def __init__(
         self,
         features: ObsFeatureSpec,
-        encoder: ScaleEncoder,
+        encoder: FoldTransformerEncoder,
         heads: ScaleHeads,
         n_crystals: int,
         *,
@@ -84,13 +83,9 @@ class AmortizedScale(nn.Module):
         # prediction -- the rank-p generalisation of the scalar anchor, removing
         # the K(h) -> K(h) g(h), I0 -> I0 / g(h) freedom for every smooth g.
         self.register_buffer("gauge_phi", torch.zeros(0, 0), persistent=False)
-        #: Crystals per encoder chunk; 0 runs the whole batch in one shot.
-        #: See :meth:`predict` -- the encoder is separable across crystals, so
-        #: chunking is exact and moves the checkpoint boundary off the blocks.
-        self.chunk_crystals = 0
-        #: fold path in training: the blocks' outputs enter the graph as leaves
-        #: and :meth:`encoder_backward` back-propagates them through the blocks
-        #: after the loss's backward pass (:meth:`_predict_fold`)
+        #: in training the blocks' outputs enter the graph as leaves and
+        #: :meth:`encoder_backward` back-propagates them through the blocks
+        #: after the loss's backward pass (:meth:`predict`)
         self.defer_encoder_backward = False
         self._deferred = None
         self.anchor_log_k = bool(anchor_log_k)
@@ -109,32 +104,26 @@ class AmortizedScale(nn.Module):
         prep: PreparedObs,
         *,
         d_model: int = 128,
-        n_layers: int = 5,
         d_hidden: int | None = None,
-        context_folds: int = 0,
-        obs_context_layers: int | None = None,
-        obs_self_layers: int | None = None,
-        peer_attention_layers: int = 0,
-        peer_heads: int = 8,
-        peer_dim: int | list[int] | None = None,
+        context_folds: int = 5,
+        ctx_layers: int = 2,
+        query_layers: int = 1,
+        n_heads: int = 8,
+        refine_geometry: bool = False,
         w_init: float = 1.65,
         n_components: int = 4,
         anchor_log_k: bool = True,
         anchor_stat: str = "median",
-        dropout: float = 0.0,
         self_features: tuple[str, ...] | None = None,
         context_features: tuple[str, ...] | None = None,
         crystal_features: tuple[str, ...] | None = None,
-        encoder: str = "deepsets",
-        ctx_layers: int = 2,
-        query_layers: int = 1,
-        refine_geometry: bool = False,
         phase_classes=None,
     ) -> "AmortizedScale":
-        """``encoder="fold"`` builds :class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`
-        with ``context_folds`` folds, ``ctx_layers`` / ``query_layers`` blocks,
-        ``refine_geometry`` and ``peer_heads`` heads; the Deep Sets arguments are
-        then unused.  ``phase_classes``
+        """The fold transformer
+        (:class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`: ``context_folds``
+        runs per crystal, ``ctx_layers`` / ``query_layers`` blocks of ``n_heads``
+        heads, ``refine_geometry``) and the heads, on ``prep``'s features.
+        ``phase_classes``
         (:class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses`) adds the
         reflections' phase cosines to the self features."""
         # None keeps each tier's default; a checkpoint passes its recorded tiers
@@ -143,34 +132,18 @@ class AmortizedScale(nn.Module):
             crystal_features=crystal_features, phase_classes=phase_classes,
             **({} if self_features is None else {"self_features": tuple(self_features)}),
         )
-        if encoder not in ("deepsets", "fold"):
-            raise ValueError(f"encoder must be 'deepsets' or 'fold', got {encoder!r}")
-        if encoder == "fold":
-            # the measurement: what a visible token carries beyond the geometry
-            geometry = set(features.self_features)
-            meas = [i for i, f in enumerate(features.context_features) if f not in geometry]
-            enc = FoldTransformerEncoder(
-                features.n_self, features.n_context, meas,
-                d_model=d_model, n_heads=peer_heads, folds=context_folds,
-                ctx_layers=ctx_layers, query_layers=query_layers,
-                refine_geometry=refine_geometry,
-                geometry=features.geometry_columns() if refine_geometry else None,
-                d_hidden=d_hidden,
-                n_crystal_features=features.n_crystal,
-            )
-        else:
-            enc = DeepSetsEncoder(
-                features.n_self, features.n_context,
-                d_model=d_model, n_layers=n_layers, d_hidden=d_hidden,
-                dropout=dropout,
-                n_crystal_features=features.n_crystal,
-                context_folds=context_folds,
-                obs_context_layers=obs_context_layers,
-                obs_self_layers=obs_self_layers,
-                peer_attention_layers=peer_attention_layers,
-                peer_heads=peer_heads,
-                peer_dim=peer_dim,
-            )
+        # the measurement: what a visible token carries beyond the geometry
+        geometry = set(features.self_features)
+        meas = [i for i, f in enumerate(features.context_features) if f not in geometry]
+        enc = FoldTransformerEncoder(
+            features.n_self, features.n_context, meas,
+            d_model=d_model, n_heads=n_heads, folds=context_folds,
+            ctx_layers=ctx_layers, query_layers=query_layers,
+            refine_geometry=refine_geometry,
+            geometry=features.geometry_columns() if refine_geometry else None,
+            d_hidden=d_hidden,
+            n_crystal_features=features.n_crystal,
+        )
         heads = ScaleHeads(d_model, w_init=w_init, n_components=n_components)
         return cls(
             features, enc, heads,
@@ -181,129 +154,12 @@ class AmortizedScale(nn.Module):
 
     # ── forward ────────────────────────────────────────────────────────
 
-    def set_encoder_chunking(self, crystals_per_chunk: int) -> None:
-        """Chunk the encoder over crystals, moving the checkpoint boundary.
-
-        Sets both halves of the change together: the chunk size, and turning
-        OFF the encoder's per-block checkpointing, which the chunk-level
-        checkpoint replaces.  Leaving both on would nest a recompute inside a
-        recompute and keep the per-block boundaries we are trying to drop.
-        """
-        n = int(crystals_per_chunk)
-        self.chunk_crystals = max(n, 0)
-        self.encoder.checkpoint = not (n > 0)
-
-    @staticmethod
-    def _crystal_chunks(crystal_id: Tensor, per_chunk: int):
-        """Slice bounds that never cut a crystal in half.
-
-        ``leave_one_out_mean`` pools WITHIN a crystal, so a chunk edge that
-        falls inside one silently gives that crystal a context built from part
-        of itself.  Rows arrive grouped by crystal (``CrystalIndex.rows``
-        concatenates per-crystal blocks), so the boundaries are just the points
-        where ``crystal_id`` changes.
-        """
-        n = crystal_id.numel()
-        change = (crystal_id[1:] != crystal_id[:-1]).nonzero().squeeze(1) + 1
-        # Chunking is only exact if each crystal occupies ONE contiguous run.
-        # `PreparedObs` is sorted by hkl, not by crystal, so passing it whole
-        # would split crystals across chunks and give each a context built from
-        # part of itself -- wrong, and silent.  `CrystalIndex.rows()` returns
-        # crystal-grouped rows, which is what the trainer feeds.
-        if change.numel() + 1 != int(torch.unique(crystal_id).numel()):
-            raise ValueError(
-                "encoder chunking needs crystal-grouped observations: "
-                f"{change.numel() + 1} contiguous runs for "
-                f"{int(torch.unique(crystal_id).numel())} crystals. "
-                "Index through CrystalIndex.rows() rather than passing "
-                "hkl-sorted PreparedObs directly."
-            )
-        edges = torch.cat([
-            crystal_id.new_zeros(1), change, crystal_id.new_tensor([n])
-        ]).tolist()
-        out, lo = [], 0
-        for i in range(1, len(edges)):
-            if i - lo >= per_chunk or i == len(edges) - 1:
-                out.append((edges[lo], edges[i]))
-                lo = i
-        return out
-
-    def predict(self, meta: ObsInfo) -> ScalePrediction:
-        """One forward pass: ``meta`` → per-observation (log K, log w, β, log α).
-
-        With ``chunk_crystals > 0`` the encoder runs in crystal-aligned chunks,
-        each wrapped in a SINGLE checkpoint.  That moves the checkpoint boundary
-        from the block to the chunk: the encoder otherwise retains 16
-        ``(M, d_model)`` tensors at 512 B per observation each (``d_model =
-        128``), and every one of them is interior -- only ``log_K``,
-        ``log_w`` and ``beta`` leave.  Storing the chunk's inputs and outputs
-        instead is ~52 B per observation, and the 16 are rematerialised one
-        chunk at a time in backward.  The fold transformer packs and
-        checkpoints its own blocks (:meth:`_predict_fold`) and ignores the
-        chunk size.
-        """
-        if getattr(self.encoder, "kind", None) == "fold":
-            return self._predict_fold(meta)
-        n_chunk = int(getattr(self, "chunk_crystals", 0) or 0)
-        if n_chunk > 0:
-            # Chunk in EVERY mode, not only when building a graph.  The
-            # no-grad paths -- the locate sweep, evaluation, the merge -- store
-            # nothing, but a single SiLU on a whole batch is still one
-            # allocation: at a high target redundancy on a large cell that is
-            # tens of millions of rows and many GB, enough to exhaust a 40 GB
-            # card before any checkpointing question arises.  The
-            # checkpoint is what is conditional on grad, not the chunking.
-            return self._predict_chunked(meta, n_chunk)
-        x_self, x_ctx, x_crys = self.features.build(meta)
-        z = self.encoder(x_self, x_ctx, meta.crystal_id, self.n_crystals, x_crys=x_crys)
-        pred = self.heads(z)
-        return self._anchor(pred, meta)
-
-    def _predict_chunked(self, meta: ObsInfo, per_chunk: int) -> ScalePrediction:
-        # Features are built once and persist: they are (M, ~10), i.e. 40 B per
-        # observation, against 8 KB for the interior tensors they let us drop.
-        x_self, x_ctx, x_crys = self.features.build(meta)
-        cid = meta.crystal_id
-        spans = self._crystal_chunks(cid, per_chunk)
-
-        # The encoder's per-block checkpointing must be OFF for the whole
-        # lifetime of this call, not just the forward: toggling it back before
-        # backward makes recomputation take a different path from the original
-        # forward, and non-reentrant checkpoint detects that as a differing
-        # number of saved tensors and raises.  `set_encoder_chunking` turns it
-        # off permanently, so this only asserts it.
-        if self.encoder.checkpoint and torch.is_grad_enabled() and self.training:
-            raise RuntimeError(
-                "encoder.checkpoint must be False when chunk_crystals > 0; "
-                "use AmortizedScale.set_encoder_chunking() to set both"
-            )
-
-        names = self._prediction_names()
-
-        def run(xs, xc, ci, xcr):
-            z = self.encoder(xs, xc, ci, self.n_crystals, x_crys=xcr)
-            p = self.heads(z)
-            return tuple(getattr(p, name) for name in names)
-
-        ckpt = torch.is_grad_enabled() and self.training
-        parts = [
-            torch.utils.checkpoint.checkpoint(
-                run, x_self[a:b], x_ctx[a:b], cid[a:b], x_crys, use_reentrant=False
-            )
-            if ckpt else run(x_self[a:b], x_ctx[a:b], cid[a:b], x_crys)
-            for a, b in spans
-        ]
-
-        cols = list(zip(*parts))
-        pred = ScalePrediction(**{name: torch.cat(t) for name, t in zip(names, cols)})
-        return self._anchor(pred, meta)
-
     def _prediction_names(self) -> list[str]:
         """The :class:`ScalePrediction` fields the heads fill."""
         return ["log_K", "log_w", "log_e_s", "mix"]
 
-    def _predict_fold(self, meta: ObsInfo) -> ScalePrediction:
-        """The fold transformer and the heads, one packed block at a time.
+    def predict(self, meta: ObsInfo) -> ScalePrediction:
+        """One forward pass: the fold transformer and the heads, one packed block at a time.
 
         The encoder packs the batch's crystals into blocks once
         (:meth:`~torchsx.nn.fold_transformer.FoldTransformerEncoder.layout`).
@@ -362,7 +218,7 @@ class AmortizedScale(nn.Module):
         return self._anchor(pred, meta)
 
     def encoder_backward(self) -> None:
-        """The encoder's share of a deferred backward pass (:meth:`_predict_fold`):
+        """The encoder's share of a deferred backward pass (:meth:`predict`):
         each block again, with autograd, back-propagated from the gradient its
         outputs received; one block's activations at a time.  The batch's
         predictions are spent by then, and released first (:meth:`clear`)."""
