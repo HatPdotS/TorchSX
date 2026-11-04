@@ -124,6 +124,9 @@ def _build_parser():
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
                    help="learning rate after the warm-up: constant (default) or a cosine "
                         "decay to zero at the last update")
+    p.add_argument("--average-last", type=int, default=5, metavar="N",
+                   help="validate, checkpoint and merge the mean of the network after each of the "
+                        "last N updates per state (default 5; 0 = the last update alone)")
     return p
 
 
@@ -229,7 +232,9 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=No
     """Run a fixed update budget, with the evaluation cadence per state;
     with ``patience`` > 0, stop after that many evaluations without a new
     held-out minimum.  ``probe`` (:class:`~torchsx.cli._pipeline.ResourceProbe`)
-    records every update's time."""
+    records every update's time.  Each evaluation and checkpoint holds the
+    mean of the last ``average_last`` updates (``tr.averaged()``), and so does
+    the trainer when the budget ends."""
     evaluate_every = max(1, int(eval_every)) * tr.n_conditions
     stale = 0
     updates = [0] * tr.n_conditions
@@ -263,12 +268,13 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=No
                   + (f", tether gauge {rec['tether_gauge']:.4f} nats" if "tether_gauge" in rec else ""),
                   flush=True)
         if tr.step_i % evaluate_every == 0 or sum(updates) == steps:
-            if has_validation:
-                result = tr.evaluate(tr.heldout_crystals)
-                print(f"  validation state 0: nll/obs {result['nll_per_obs']:.5f}", flush=True)
-                stale = 0 if tr.best_step == tr.step_i else stale + 1
-            tr.save_best()
-            _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
+            with tr.averaged():
+                if has_validation:
+                    result = tr.evaluate(tr.heldout_crystals)
+                    print(f"  validation state 0: nll/obs {result['nll_per_obs']:.5f}", flush=True)
+                    stale = 0 if tr.best_step == tr.step_i else stale + 1
+                tr.save_best()
+                _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
             if patience > 0 and stale >= patience:
                 print(f"early stop at update {tr.step_i}: {stale} evaluations without a new "
                       f"held-out minimum (best at {tr.best_step})", flush=True)
@@ -276,6 +282,7 @@ def run_updates(tr, steps, *, eval_every: int = 100, patience: int = 0, probe=No
     if not steps:
         tr.save_best()
         _save_current(tr, Path(tr.cfg.outdir) / "last.pt")
+    tr.load_average()
     return updates
 
 
@@ -309,6 +316,7 @@ def main(argv=None):
         target_redundancy=args.redundancy, lr=1e-3,
         warmup_steps=(25 if args.warmup is None else args.warmup) * n_states,
         lr_schedule=args.lr_schedule, total_steps=args.steps,
+        average_last=max(0, args.average_last) * n_states,
         grad_clip=20.0, log_every=25,
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
         posterior_max_halfwidth=settings["max_halfwidth"],
@@ -329,7 +337,9 @@ def main(argv=None):
         if heldout_ids is not None:
             config["heldout_crystal_ids"] = f"{heldout_ids.numel()} crystals of {args.heldout_stream}"
         recipe = dict(version=1, steps=args.steps, config=config,
-                      checkpoint_selection="minimum validation NLL in state 0; last.pt retains endpoint",
+                      checkpoint_selection="minimum validation NLL in state 0; last.pt retains endpoint"
+                      + (f"; each the mean of the last {cfg.average_last} updates"
+                         if cfg.average_last > 1 else ""),
                       validation="5% of condition-zero crystals; all observations retained for export",
                       evaluate_every=args.eval_every * n_states,
                       readout={k: v for k, v in settings.items() if k != "basis"})

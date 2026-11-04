@@ -39,6 +39,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--redundancy N` | 100 | Target observations per reflection in a batch. |
 | `--warmup N` | 25 | Learning-rate warm-up, in updates per state. |
 | `--lr-schedule` | `constant` | Learning rate after the warm-up: `constant`, or `cosine` decay to zero at the last update. |
+| `--average-last N` | 5 | Validate, checkpoint and merge the mean of the network after each of the last N updates per state; 0 uses the last update alone. |
 | `--peer-attention N` | 2 | Cross-attention layers from each observation onto the other observations of its crystal; 0 pools by mean only. |
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
 | `--outlier-frac F` | 0 | Initial weight of a detector-outlier component; 0 turns it off. |
@@ -69,7 +70,11 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
    one state, and the states take turns: 400 updates over two states give 200
    per state.
 4. `best.pt` keeps the network at the lowest validation loss, `last.pt` the
-   network after the last update.
+   network at the end of training. Both hold the mean of the network after
+   each of the last `--average-last` updates per state: at a constant learning
+   rate, consecutive updates scatter around the optimum, and the mean does not
+   carry that scatter into the merge. Training itself continues from the latest
+   update.
 5. With `best.pt`, all crystals of each state are merged into `merged.mtz`, and
    each half of the crystals into `merged_half1.mtz` and `merged_half2.mtz`.
    `merged.metrics.json` records CC<sub>1/2</sub> and R<sub>split</sub> between

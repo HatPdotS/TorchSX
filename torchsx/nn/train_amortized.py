@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -213,6 +215,14 @@ class TrainConfig:
     lr_schedule: str = "constant"
     total_steps: int = 0
     min_lr_frac: float = 0.0
+    #: Evaluate and checkpoint the mean of the parameters after each of the
+    #: last ``average_last`` updates (everything the optimizer updates: the
+    #: network, the objective's scalars, the Wilson surfaces) instead of the
+    #: latest update alone (:meth:`AmortizedTrainer.averaged`); training
+    #: continues from the latest update.  At a constant learning rate the late
+    #: updates scatter around the optimum from batch to batch, and a single
+    #: update hands that scatter to the merge.  0 or 1: the latest update.
+    average_last: int = 0
     #: Decoupled (AdamW) weight decay.  Applied to matrix parameters ONLY --
     #: norm gains and biases are excluded, because decaying an RMSNorm gain
     #: shrinks the network's effective scale rather than regularising it.
@@ -473,6 +483,8 @@ class AmortizedTrainer:
         self.n_decayed = sum(p.numel() for p in decay)
         self.n_undecayed = sum(p.numel() for p in no_decay)
         self._base_lr = self.cfg.lr
+        #: the parameters after each of the last ``average_last`` updates
+        self._recent: deque[list[Tensor]] = deque(maxlen=max(1, int(self.cfg.average_last)))
         self.logger = MetricLogger(self.cfg.outdir)
         self.step_i = 0
         self.best_heldout = float("inf")
@@ -723,6 +735,8 @@ class AmortizedTrainer:
         gn["grad_was_clipped"] = bool(float(total_norm) > self.cfg.grad_clip)
         gn["step_skipped"] = skipped
         self.scale.clear()
+        if self.cfg.average_last > 1:
+            self._recent.append([p.detach().clone() for p in self._trained_parameters()])
 
         rec = {
             "step": self.step_i,
@@ -1021,6 +1035,7 @@ class AmortizedTrainer:
                 "detector_noise": self._detector_noise_record(),
                 "best_step": self.best_step,
                 "best_heldout": self.best_heldout,
+                "average_last": int(self.cfg.average_last),
                 "n_crystals": self.index.n_crystals,
                 "n_hkl": self.prep.n_valid,
                 "n_conditions": self.n_conditions,
@@ -1062,6 +1077,44 @@ class AmortizedTrainer:
                 t.set_wilson_coef(c)
                 if t.wilson_coef_param is not None:
                     t.wilson_coef_param.data.copy_(c)
+        return True
+
+    def _trained_parameters(self) -> list[Tensor]:
+        return [p for group in self.opt.param_groups for p in group["params"]]
+
+    @torch.no_grad()
+    def _install(self, values: list[Tensor]) -> None:
+        for p, v in zip(self._trained_parameters(), values, strict=True):
+            p.copy_(v)
+        for t in self.targets:
+            t.sync_evidence_prior()
+
+    def _mean_of_recent(self) -> list[Tensor]:
+        return [torch.stack(vs).mean(0) for vs in zip(*self._recent)]
+
+    @contextmanager
+    def averaged(self):
+        """Hold the mean of the parameters after each of the last
+        ``average_last`` updates for the body (a held-out evaluation, a
+        checkpoint), and the latest update again after it, so that training
+        continues from where it was."""
+        if len(self._recent) < 2 or self.opt is None:
+            yield
+            return
+        latest = [p.detach().clone() for p in self._trained_parameters()]
+        self._install(self._mean_of_recent())
+        try:
+            yield
+        finally:
+            self._install(latest)
+
+    def load_average(self) -> bool:
+        """Keep the mean of the last ``average_last`` updates' parameters: the
+        end of training.  Returns False when there is nothing to average."""
+        if len(self._recent) < 2 or self.opt is None:
+            return False
+        self._install(self._mean_of_recent())
+        self._recent.clear()
         return True
 
     @torch.no_grad()
@@ -1410,6 +1463,7 @@ class AmortizedTrainer:
             self.opt.add_param_group({"params": [t.enable_evidence_prior() for t in self.targets],
                                       "lr": self.cfg.lr * mult, "lr_mult": mult,
                                       "weight_decay": 0.0, "name": "wilson_surface"})
+        self._recent.clear()          # the trained parameters are different ones now
 
     def wilson_fit_info(self) -> dict:
         """Diagnostics of the Wilson surface on the first target (empty without a basis)."""
