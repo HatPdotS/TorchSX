@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (2026-11-04)
+## v0.2.0
 
 Nothing is backwards compatible with 0.1.0: retrain, and rebuild prepared caches.
 
