@@ -2,7 +2,8 @@
 
 Per-image timepoints come from a times file (3-col whitespace,
 ``filename event timepoint``) — see :func:`load_times_file` +
-:func:`assign_timepoints_to_images`.
+:func:`assign_timepoints_to_images`. Per-frame labels come from a CrystFEL
+custom-split file — see :func:`load_split_labels`.
 
 Times-file format
 -----------------
@@ -21,7 +22,7 @@ Public entry points
 ``load_times_file(path)`` → ``dict[(filename, event), float]``
 ``assign_timepoints_to_images(filenames, events, lookup)`` →
     ``(timepoints, report)``.
-``load_split_labels(path)`` → ``dict[(filename, event), label]``.
+``load_split_labels(path)`` → ``dict[(filename, event), set of labels]``.
 """
 
 from __future__ import annotations
@@ -164,42 +165,35 @@ def assign_timepoints_to_images(
 
 def load_split_labels(
     path: str | Path,
-) -> dict[tuple[str, str], str]:
-    """Load a CrystFEL/partialator ``.split`` file.
+) -> dict[tuple[str, str], set[str]]:
+    """Load a CrystFEL custom-split file (partialator's ``--custom-split``).
 
-    Format: each line ``<filename> <event> <label>`` (whitespace separated).
-    ``label`` is the partialator dataset name (e.g. ``"dark"``,
-    ``"100ps"``).
+    Each line is ``filename event dataset``, whitespace separated; ``#``
+    starts a comment, and fields after the third are ignored. The unit is a
+    frame, and a frame listed under several dataset names belongs to each of
+    them; a repeated identical row counts once.
 
-    Returns a dict mapping ``(filename, event) → label`` for all rows.
-    Duplicate keys keep the last value with a warning.
+    Returns ``(filename, event) → {dataset, ...}``. Match a stream's frames
+    with ``(filename, event_key(event))``.
     """
-    import warnings
-
-    lookup: dict[tuple[str, str], str] = {}
-    n_dup = 0
+    lookup: dict[tuple[str, str], set[str]] = {}
     with open(path) as f:
         for ln_no, raw in enumerate(f, start=1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
+            line = raw.split("#", 1)[0].split()
+            if not line:
                 continue
-            parts = line.split(None, 2)
-            if len(parts) < 3:
+            if len(line) < 3:
                 raise ValueError(
-                    f"{path}:{ln_no}: expected 'filename event label', got {line!r}"
+                    f"{path}:{ln_no}: expected 'filename event dataset', got {raw.rstrip()!r}"
                 )
-            fname, event, label = parts[0], parts[1], parts[2].strip()
-            key = (fname, event)
-            if key in lookup and lookup[key] != label:
-                n_dup += 1
-            lookup[key] = label
-    if n_dup:
-        warnings.warn(
-            f"load_split_labels({path}): {n_dup} duplicate (filename, event) "
-            "keys with conflicting labels — last value wins",
-            stacklevel=2,
-        )
+            lookup.setdefault((line[0], line[1]), set()).add(line[2])
     return lookup
+
+
+def event_key(event) -> str:
+    """A frame's event as a split file writes it: a database records the
+    integer ``N``, a split file names it ``//N``."""
+    return event if isinstance(event, str) else f"//{int(event)}"
 
 
 def unique_finite_timepoints(timepoints: Iterable[float]) -> list[float]:

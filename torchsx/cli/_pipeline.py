@@ -386,11 +386,6 @@ def _recipe(args, d, splits, d_min, spacegroup, merge_friedel, gain, radii, nois
     return recipe
 
 
-# a custom-split file names events //N; a database records the integer
-def _event_key(event) -> str:
-    return event if isinstance(event, str) else f"//{int(event)}"
-
-
 def _split_labels(args, builder, *, verbose: bool = True):
     """``(labels, names, extra)``: the split of every prepared crystal, the split
     names, and the masks over the surviving crystals that are prepared once
@@ -407,16 +402,12 @@ def _split_labels(args, builder, *, verbose: bool = True):
             # CrystFEL custom-split file: "filename event dataset", the unit
             # being a frame, not a crystal. All crystals of a frame belong
             # to each of its named splits.
-            lookup = {}
-            for raw in open(args.split_file):
-                line = raw.split("#", 1)[0].split()
-                if not line:
-                    continue
-                if len(line) < 3:
-                    raise SystemExit(
-                        f"{args.split_file}: expected 'filename event dataset', "
-                        f"got {raw.rstrip()!r}")
-                lookup.setdefault((line[0], line[1]), set()).add(line[2])
+            from torchsx.io.times import event_key, load_split_labels
+
+            try:
+                lookup = load_split_labels(args.split_file)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from None
             names = sorted({name for bins in lookup.values() for name in bins})
             index = {n: i for i, n in enumerate(names)}
             fnames, evts = builder.surviving_filenames, builder.surviving_events
@@ -425,7 +416,7 @@ def _split_labels(args, builder, *, verbose: bool = True):
                     "the stream carries no image filename/event metadata, so a "
                     "custom-split file cannot be matched to it; re-parse from "
                     "the .stream, or pass a .pt label tensor")
-            memberships = [sorted(index[name] for name in lookup.get((f, _event_key(e)), ()))
+            memberships = [sorted(index[name] for name in lookup.get((f, event_key(e)), ()))
                            for f, e in zip(fnames, evts)]
             image_id = builder.surviving_image_id
             per_image = torch.tensor([bins[0] if bins else -1 for bins in memberships],
@@ -438,7 +429,7 @@ def _split_labels(args, builder, *, verbose: bool = True):
                       f"unmatched", flush=True)
             # The trainer consumes one label per crystal. Add another copy
             # of the frame's crystals/observations for each extra membership.
-            # Sets above prevent duplicate rows from double-counting a bin.
+            # A repeated row is one membership, so no bin counts a crystal twice.
             label_parts = [labels]
             for slot in range(1, max(map(len, memberships), default=0)):
                 more = torch.tensor([bins[slot] if len(bins) > slot else -1
