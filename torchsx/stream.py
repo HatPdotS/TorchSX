@@ -7,7 +7,7 @@ from typing import Sequence
 
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 from torchsx.geometry import Geometry
 from torchsx.io._metadata import StreamMetadata
 from torchsx.io.sources import SourceInput
@@ -29,7 +29,7 @@ class SFXStream:
     >>> filtered.save("filtered.sfx")
     """
 
-    def __init__(self, core: _SFXStreamCore):
+    def __init__(self, core: SFXStreamCore):
         self._core = core
 
     # --- Construction ---

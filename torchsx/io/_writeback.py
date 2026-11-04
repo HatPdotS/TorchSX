@@ -8,11 +8,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 
 
 def write_stream_reconstruct(
-    core: _SFXStreamCore,
+    core: SFXStreamCore,
     path: str | Path,
     original_stream: str | Path | None = None,
     n_threads: int = 1,
@@ -24,7 +24,7 @@ def write_stream_reconstruct(
 
     Parameters
     ----------
-    core : _SFXStreamCore
+    core : SFXStreamCore
     path : output .stream file path
     original_stream : if provided, copy geometry/unit cell sections verbatim
     n_threads : ≥1. Native-only: images are formatted on this many threads in
@@ -44,7 +44,7 @@ def write_stream_reconstruct(
     return _write_stream_reconstruct_native(core, path, original_stream, mod, n_threads)
 
 
-def _build_header_blob(core: _SFXStreamCore, original_stream: str | Path | None) -> str:
+def _build_header_blob(core: SFXStreamCore, original_stream: str | Path | None) -> str:
     """Assemble the stream preamble: magic + geometry + unit-cell sections."""
     buf = io.StringIO()
     buf.write("CrystFEL stream format 2.3\n")
@@ -90,7 +90,7 @@ def _np(t: torch.Tensor, dtype) -> np.ndarray:
 
 
 def _write_stream_reconstruct_native(
-    core: _SFXStreamCore,
+    core: SFXStreamCore,
     path: str | Path,
     original_stream: str | Path | None,
     mod,
@@ -160,7 +160,7 @@ def _write_stream_reconstruct_native(
 
 
 def _write_stream_reconstruct_python(
-    core: _SFXStreamCore,
+    core: SFXStreamCore,
     path: str | Path,
     original_stream: str | Path | None = None,
 ):

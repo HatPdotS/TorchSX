@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from torchsx import SFXStream
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 from torchsx.cli import _pipeline as P
 from torchsx.io import _native
 from torchsx.io._metadata import StreamMetadata
@@ -65,7 +65,7 @@ def _synthetic_core(geometry, *, n_images=40, seed=0, sigma_bad=True):
             else torch.stack(v) for k, v in crys.items()}
     meta = StreamMetadata(image={"filename": [f"/raw/run{i // 10}.h5" for i in range(n_images)],
                                  "event": [f"//{i}" for i in range(n_images)]})
-    return _SFXStreamCore(
+    return SFXStreamCore(
         **obs, **crys,
         beam_energy=12960.0 + torch.randn(n_images, generator=g) * 5,
         det_shift_x=torch.randn(n_images, generator=g) * 0.01,

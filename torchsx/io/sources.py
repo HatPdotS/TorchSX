@@ -11,7 +11,7 @@ from torchsx.measurement import MEASUREMENT_KEY, MeasurementSpec
 
 @dataclass(frozen=True)
 class SourceInput:
-    """Named files for one datasource (e.g. DIALS experiments + reflections)."""
+    """Named files for one datasource (e.g. a CrystFEL stream)."""
     kind: str
     files: Mapping[str, str | Path]
 
@@ -34,8 +34,6 @@ def source_input(source: str | Path | SourceInput) -> SourceInput:
 
 
 def _path(source: SourceInput) -> Path:
-    if source.kind == "dials":
-        raise NotImplementedError("The dials measurement adapter is not implemented yet.")
     name = {"crystfel": "stream", "sfx": "cache", "probixi": "database"}.get(source.kind)
     if name is None:
         raise ValueError(f"Unknown datasource kind {source.kind!r}")

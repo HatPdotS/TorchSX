@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 
 
-def completeness(core: _SFXStreamCore, n_bins: int = 20) -> torch.Tensor:
+def completeness(core: SFXStreamCore, n_bins: int = 20) -> torch.Tensor:
     """Resolution-binned completeness (fraction of unique HKLs observed)."""
     from torchref.base.reciprocal.hkl import get_d_spacing, generate_possible_hkl
     from torchref.base.alignment.normalization import (
@@ -45,7 +45,7 @@ def completeness(core: _SFXStreamCore, n_bins: int = 20) -> torch.Tensor:
     return comp
 
 
-def multiplicity(core: _SFXStreamCore, n_bins: int = 20) -> torch.Tensor:
+def multiplicity(core: SFXStreamCore, n_bins: int = 20) -> torch.Tensor:
     """Resolution-binned mean multiplicity."""
     from torchref.base.reciprocal.hkl import get_d_spacing
     from torchref.base.alignment.normalization import (

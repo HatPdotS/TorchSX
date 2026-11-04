@@ -4,13 +4,10 @@ The three-level SX data model (observation / crystal / image) is stored as a set
 of :class:`~torchsx.levels.Level` columnar tables joined by integer key columns
 (``crystal_id``: obs→crystal, ``image_id``: crystal→image). ``BaseStream`` holds
 the generic columnar/join machinery; ``SFXStreamCore`` adds the SX field layout,
-the legacy keyword constructor, and validation; ``ShoeboxStreamCore`` is just an
-``SFXStreamCore`` that additionally carries per-observation pixel patches.
-
-``_SFXStreamCore`` is kept as an alias of ``SFXStreamCore`` so existing imports and
-the keyword constructor ``_SFXStreamCore(hkl=…, I=…, …)`` keep working unchanged;
-attribute access (``core.hkl``, ``core.cell``, ``core.beam_energy``) is served by a
-``__getattr__`` shim over the levels.
+the keyword constructor ``SFXStreamCore(hkl=…, I=…, …)``, and validation;
+``ShoeboxStreamCore`` is just an ``SFXStreamCore`` that additionally carries
+per-observation pixel patches.  Attribute access (``core.hkl``, ``core.cell``,
+``core.beam_energy``) is served by ``__getattr__`` over the levels.
 """
 
 from __future__ import annotations
@@ -58,7 +55,7 @@ from torchsx.io._metadata import StreamMetadata
 from torchsx.levels import ColumnSpec, Level
 
 
-# Field → level routing for the SX layout (drives the legacy keyword constructor).
+# Field → level routing for the SX layout (drives the keyword constructor).
 _OBS_FIELDS = ["hkl", "I", "sigma", "background", "peak", "fs", "ss", "panel_id", "crystal_id"]
 _CRYSTAL_FIELDS = [
     "astar", "bstar", "cstar", "cell", "profile_rad", "resolution",
@@ -107,7 +104,7 @@ def _sx_joins_with_peaks() -> list[JoinSpec]:
     not) and joins straight to ``image`` (peaks are an image-level product, not a
     crystal one). Used by any reduction front-end that carries the peak search
     through (probixi's ``peaks`` table, say); the two-join default is kept for
-    peak-less streams (parsed/legacy).
+    peak-less streams (a parsed CrystFEL stream, say).
     """
     return _default_sx_joins() + [JoinSpec("peak", "peak_image_id", "image")]
 
@@ -190,7 +187,7 @@ class BaseStream:
         source_path: str,
         friedel_merged: bool = True,
     ) -> "BaseStream":
-        """Build a new stream from levels, bypassing the legacy constructor,
+        """Build a new stream from levels, bypassing the keyword constructor,
         and refine to the most specific subclass given which columns exist."""
         target = _classify(levels)
         obj = target.__new__(target)
@@ -454,8 +451,8 @@ class BaseStream:
 class SFXStreamCore(BaseStream):
     """Serial-crystallography stream core with the canonical three-level layout.
 
-    Provides the legacy keyword constructor and the original ``__post_init__``
-    validation (row-count + join-key-range checks, ``camera_length`` synthesis).
+    Provides the keyword constructor and its validation (row-count +
+    join-key-range checks, ``camera_length`` synthesis).
     """
 
     def __init__(
@@ -596,7 +593,3 @@ def _merge_metadata(metas: list[StreamMetadata]) -> StreamMetadata:
     if spec is not None:
         merged[MEASUREMENT_KEY] = {"record": spec.to_dict()}
     return merged
-
-
-# Backwards-compatible alias: existing imports and the keyword constructor.
-_SFXStreamCore = SFXStreamCore

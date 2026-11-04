@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 from torchsx.geometry import Geometry
 from torchsx.io._metadata import StreamMetadata
 from torchsx.io._parse.indexing import (
@@ -37,7 +37,7 @@ def parse_stream(
     max_crystals: int | None = None,
     seed: int = 0,
     sequential: bool = False,
-) -> _SFXStreamCore:
+) -> SFXStreamCore:
     """Parse reflections and attach source semantics.
 
     All full/sampled/native/Python paths converge here. Retaining observed
@@ -50,7 +50,7 @@ def parse_stream(
     return _attach_source(core, path, spec)
 
 
-def _attach_source(core: _SFXStreamCore, path, spec) -> _SFXStreamCore:
+def _attach_source(core: SFXStreamCore, path, spec) -> SFXStreamCore:
     """Source columns every parsed core carries."""
     from torchsx.measurement import MEASUREMENT_KEY
 
@@ -161,7 +161,7 @@ def _parse_stream(
     max_crystals: int | None = None,
     seed: int = 0,
     sequential: bool = False,
-) -> _SFXStreamCore:
+) -> SFXStreamCore:
     """Parse a CrystFEL .stream file into stacked tensors.
 
     Parameters
@@ -309,8 +309,8 @@ def _build_core(
     spacegroup: str,
     path: str,
     warn: bool = True,
-) -> _SFXStreamCore:
-    """Wrap parsed columns as a ``_SFXStreamCore``."""
+) -> SFXStreamCore:
+    """Wrap parsed columns as a ``SFXStreamCore``."""
     if warn:
         _warn_report(report, path)
     sigma = tensors["sigma"]
@@ -325,7 +325,7 @@ def _build_core(
     metadata["image"] = {"filename": filenames, "event": events}
     metadata["crystal"] = {"panel_names": geometry.panel_names}
 
-    return _SFXStreamCore(
+    return SFXStreamCore(
         hkl=tensors["hkl"],
         I=tensors["I"],
         sigma=tensors["sigma"],

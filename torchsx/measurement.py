@@ -197,10 +197,10 @@ def resolve_measurement(spec: MeasurementSpec | None, *, radii=None, gain=None,
 
 
 def legacy_stream_gain(core) -> float:
-    """Retain the old direct-reader/explicit legacy-recipe behavior visibly.
+    """Gain of an input without a measurement specification, with a warning.
 
-    The new CLI resolver never selects this path implicitly for missing metadata.
-    Probixi keeps its previous preparation behavior until its adapter is added.
+    The geometry's ``adu_per_eV`` times the mean beam energy.  The CLI resolver
+    never selects this path implicitly for missing metadata.
     """
     import warnings
     warnings.warn("Legacy input has no measurement specification; using the historical "

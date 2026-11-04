@@ -87,7 +87,6 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
                         "columns. Default: the checkpoint recipe, then merge.")
 
 
-# Preserve these import names for callers while keeping one resolver.
 from torchsx.measurement import (parse_gain, parse_radii, GAIN_POLICY_VERSION,
                                  DEFAULT_GAIN_TOLERANCE)
 

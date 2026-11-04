@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import torch
 
-from torchsx._core import _SFXStreamCore
+from torchsx._core import SFXStreamCore
 from torchsx.geometry import Geometry
 from torchsx.io import _native
 from torchsx.io._metadata import StreamMetadata
@@ -310,7 +310,7 @@ def test_writer_formatting_sweep(native, sample_geometry, tmp_path):
     rng = np.random.default_rng(3)
     hkl = rng.integers(-32768, 32768, (n_obs, 3)).astype(np.int16)
     hkl[:4] = [[-32768, 32767, 0], [0, 0, 0], [-5, 5, -1], [1, -1, 100]]
-    core = _SFXStreamCore(
+    core = SFXStreamCore(
         hkl=torch.from_numpy(hkl),
         I=f(1, n_obs), sigma=f(2, n_obs), background=f(3, n_obs), peak=f(4, n_obs),
         fs=f(5, n_obs), ss=f(6, n_obs),

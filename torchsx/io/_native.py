@@ -34,8 +34,8 @@ def _import():
     except ImportError:
         warnings.warn(
             "torchsx_native is not installed; .stream files are read and written "
-            "with the slower pure-Python code. Build it with "
-            "`maturin build --release` in native/ and pip-install the wheel.",
+            "with the slower pure-Python code. Install the torchsx-native package "
+            "(a torchsx dependency) or build it from native/.",
             stacklevel=3,
         )
         return None

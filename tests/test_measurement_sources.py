@@ -141,12 +141,12 @@ def test_panel_gains_and_gradient_background(stream_file, monkeypatch):
     assert sum("Gradient background" in str(w.message) for w in record) == 1
 
 
-def test_named_dispatch_and_future_seams(stream_file, python_parser):
+def test_named_dispatch_and_unknown_kinds(stream_file, python_parser):
     stream = SFXStream.read(SourceInput("crystfel", {"stream": stream_file}), spacegroup="P 1")
     assert stream.measurement.producer == "crystfel"
     with pytest.raises(FileNotFoundError, match="x.duckdb"):  # probixi dispatches to its reader
         SFXStream.read(SourceInput("probixi", {"database": "x.duckdb"}))
-    with pytest.raises(NotImplementedError, match="dials"):
+    with pytest.raises(ValueError, match="Unknown datasource kind"):
         SFXStream.read(SourceInput("dials", {"experiments": "x.expt", "reflections": "x.refl"}))
     with pytest.raises(ValueError, match="requires exactly"):
         SFXStream.read(SourceInput("crystfel", {"reflections": stream_file}))

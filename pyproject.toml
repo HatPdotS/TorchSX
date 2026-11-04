@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "torchsx"
 version = "0.1.0"
-description = "GPU-friendly stacked tensors for unmerged serial crystallography data"
+description = "A PyTorch-based scaling and merging library for serial crystallography"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
