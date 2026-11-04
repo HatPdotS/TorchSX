@@ -59,14 +59,22 @@ def _observations(phi, n_cry=300, per=40, seed=1):
     return lk, h, cid, n_cry
 
 
-def _batch(seed=1):
+def _batch(seed=1, phase=False):
+    """With ``phase``, four classes of reflections, each with a linear trend in the first
+    basis column, as the phase columns."""
     phi, _ = _basis()
     lk, h, cid, n = _observations(phi, seed=seed)
-    return TetherBatch(lk, h, cid, n, phi)
+    cols = None
+    if phase:
+        cls = torch.randint(0, 4, (phi.shape[0],), generator=torch.Generator().manual_seed(seed + 7))
+        onehot = torch.nn.functional.one_hot(cls, 4).to(torch.float64)
+        cols = torch.cat([onehot, onehot * phi[:, :1]], 1)
+        lk = lk + 0.3 * (cls.to(torch.float64) - 1.5)[h]
+    return TetherBatch(lk, h, cid, n, phi, phase=cols)
 
 
 def _with(batch, log_K):
-    return TetherBatch(log_K, batch.hkl_idx, batch.crystal_id, batch.n_crystals, batch.phi)
+    return TetherBatch(log_K, batch.hkl_idx, batch.crystal_id, batch.n_crystals, batch.phi, phase=batch.phase)
 
 
 # ── the exact fit (readout) ────────────────────────────────────────────
@@ -218,7 +226,7 @@ def test_step_reads_a_trend_along_a_column_given_per_observation():
 
 @pytest.mark.parametrize("name", [n for n, t in TERMS.items() if isinstance(t, KMeanTerm)])
 def test_terms_ignore_crystal_constants_and_vanish_at_their_fixed_point(name):
-    batch = _batch()
+    batch = _batch(phase=True)
     tether = Tether([name])
     const = torch.randn(batch.n_crystals, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
     p0, _ = tether.penalty(batch)
@@ -244,7 +252,7 @@ def test_readout_and_penalty_agree_on_the_same_observations():
     """The readout solves exactly what the training step linearises: both report the same
     gauge to first order, and both reach zero together."""
     batch = _batch()
-    tether = Tether(TERMS)
+    tether = Tether(["gauge"])
     out, rec = tether.readout(batch), tether.penalty(batch)[1]
     assert out["n_obs"] == batch.hkl_idx.numel()
     assert math.isclose(out["gauge"]["rms"], rec["tether_gauge"], rel_tol=0.2)
@@ -258,6 +266,7 @@ def test_readout_and_penalty_agree_on_the_same_observations():
 
 def test_terms_parse_in_registry_order():
     assert parse_terms("gauge") == ("gauge",) == parse_terms(["gauge", "gauge"])
+    assert parse_terms("phase,gauge") == ("gauge", "phase")
     assert parse_terms("none") == () and not Tether("none")
     with pytest.raises(ValueError, match="unknown tether term"):
         parse_terms("gauge,wobble")

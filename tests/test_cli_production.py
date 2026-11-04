@@ -43,6 +43,7 @@ def test_research_options_parse_but_stay_out_of_help():
     assert a.tether_weight == 2.0 and a.tether is None
     assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'gauge']).tether == ('gauge',)
     assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'none']).tether == ()
+    assert parser.parse_args(['x.stream', '-o', 'run']).pseudo_translation == 'auto'
     assert parser.parse_args(['x.stream', '-o', 'run', '--no-refine-geometry']).refine_geometry is False
     assert parser.parse_args(['x.stream', '-o', 'run']).steps == 400
 

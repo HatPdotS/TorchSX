@@ -927,8 +927,11 @@ def _refine_geometry(args) -> bool:
 
 
 def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
-                verbose: bool = True):
-    """Build the production model, preserving recorded checkpoint geometry."""
+                verbose: bool = True, phase_classes=None):
+    """Build the production model, preserving recorded checkpoint geometry.
+
+    ``phase_classes`` gives a new model the pseudo-translation classes' phase
+    features; a checkpoint restores its own."""
     import torch
     from torchsx.merging.likelihood import Poisson
     from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
@@ -991,6 +994,12 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             crystal_features=(DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
                               if producer == "probixi" else None),
         )
+    if ck and sc.get("phase_classes"):
+        from torchsx.merging.scale.pseudo_translation import PhaseClasses
+        phase_classes = PhaseClasses.from_definition(sc["phase_classes"])
+    elif ck:
+        phase_classes = None
+    kw.update(phase_classes=phase_classes)
     # encoder: the checkpoint's record (no kind = Deep Sets), else --encoder
     encoder = ((rec(enc, "kind") or "deepsets") if ck
                else (getattr(args, "encoder", None) or DEFAULTS["encoder"]))
@@ -1011,11 +1020,6 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         kw.update(encoder="fold", **fold)
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
     scale.set_encoder_chunking(400)
-    if sc.get("pseudo_translation"):
-        from torchsx.merging.scale.pseudo_translation import PhaseBroad, PhaseWidth
-        pt = sc["pseudo_translation"]
-        scale.install_pseudo_translation(PhaseWidth.from_definition(pt["width"], prep),
-                                         PhaseBroad.from_definition(pt["broad"], prep))
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
     # the +c mean correction applies to the annulus estimate only

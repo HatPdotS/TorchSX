@@ -209,6 +209,10 @@ class PosteriorMergeTarget(nn.Module):
         # installed through set_basis().
         self.register_buffer("wilson_phi", torch.zeros(0, 0))
         self.register_buffer("wilson_coef", torch.zeros(0))
+        # Fixed per-reflection offset of log Sigma on the smooth surface: the
+        # symmetry factor and the pseudo-translation modulation (set_modulation,
+        # :mod:`torchsx.merging.priors.modulation`).  Zero leaves the surface alone.
+        self.register_buffer("wilson_log_mod", torch.zeros_like(self.wilson_sigma), persistent=False)
         self.wilson_fit_iters = 0
         #: Empirical Bayes: with :meth:`enable_evidence_prior` the smooth
         #: surface's coefficients are a parameter of the evidence itself
@@ -406,22 +410,34 @@ class PosteriorMergeTarget(nn.Module):
             self.set_wilson_coef(self.wilson_coef_param)
 
     @torch.no_grad()
+    def set_modulation(self, log_mod: Tensor) -> None:
+        """Install the fixed offset ``log Sigma = phi @ coef + log_mod`` and
+        re-evaluate ``wilson_sigma`` on the installed coefficients."""
+        if log_mod.shape != self.wilson_log_mod.shape:
+            raise ValueError(f"modulation has {log_mod.shape[0]} rows for {self.n_hkl} reflections")
+        self.wilson_log_mod.copy_(log_mod.to(self.wilson_log_mod))
+        if self.has_basis:
+            self.set_wilson_coef(self.wilson_coef.clone())
+
+    @torch.no_grad()
     def set_wilson_coef(self, coef: Tensor) -> None:
-        """Install surface coefficients: ``wilson_sigma = exp(phi @ coef)``."""
+        """Install surface coefficients: ``wilson_sigma = exp(phi @ coef + log_mod)``."""
         if not self.has_basis or coef.shape != self.wilson_coef.shape:
             raise ValueError("coefficients need the installed basis and its width")
         self.wilson_coef.copy_(coef)
         self.wilson_sigma.copy_(
-            (self.wilson_phi.double() @ self.wilson_coef.double()).exp().float().clamp(min=self.floor))
+            (self.wilson_phi.double() @ self.wilson_coef.double() + self.wilson_log_mod.double())
+            .exp().float().clamp(min=self.floor))
 
     @torch.no_grad()
     def fit_wilson_surface(self, reference: Tensor | None = None) -> None:
         """Fit ``log Sigma = phi @ coef`` to ``reference`` (default the unity
-        merge) by Wilson maximum likelihood: the start of the evidence fit."""
+        merge) by Wilson maximum likelihood: the start of the evidence fit.  The
+        installed modulation is divided out first, so ``coef`` is the smooth part."""
         if not self.has_basis:
             raise ValueError("the Wilson surface needs the smooth reciprocal basis (set_basis)")
         from torchsx.merging.priors.reciprocal_basis import fit_wilson_log_sigma
-        reference = self.I_start if reference is None else reference
+        reference = (self.I_start if reference is None else reference) * (-self.wilson_log_mod).exp()
         coef, used = fit_wilson_log_sigma(
             self.wilson_phi, reference.clamp(min=self.floor), self.is_centric)
         self.set_wilson_coef(coef)
@@ -576,7 +592,7 @@ class PosteriorMergeTarget(nn.Module):
             # the trained parameter while training; every no-grad pass
             # (evaluation, merge, readout) reads the mirrored buffers
             if self.wilson_coef_param is not None and torch.is_grad_enabled():
-                log_sig = (self.wilson_phi @ self.wilson_coef_param).clamp(
+                log_sig = (self.wilson_phi @ self.wilson_coef_param + self.wilson_log_mod).clamp(
                     min=math.log(self.floor))[:, None]
                 inv = (-log_sig).exp()
                 rate = torch.where(self.is_centric[:, None], 0.5 * inv, inv)

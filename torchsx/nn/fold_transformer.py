@@ -417,9 +417,6 @@ class FoldTransformerEncoder(nn.Module):
         n_groups: int,
         x_crys: Tensor | None = None,   # (n_groups, n_crystal_features)
     ) -> Tensor:               # (n, d_model)
-        if isinstance(x_self, (tuple, list)):
-            raise NotImplementedError("the fold transformer takes one x_self table "
-                                      "(no pseudo-translation profiles)")
         n = x_self.shape[0]
         if x_ctx.shape[0] != n or group_id.shape[0] != n:
             raise ValueError(f"row mismatch: x_self={n} x_ctx={x_ctx.shape[0]} "

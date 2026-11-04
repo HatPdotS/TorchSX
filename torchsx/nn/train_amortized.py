@@ -190,11 +190,6 @@ class TrainConfig:
     #: ``target_redundancy * n_hkl`` and the configured value is ignored.
     target_redundancy: float | None = None
     lr: float = 1e-3
-    #: Learning-rate multiplier for the pseudo-translation profile coefficients
-    #: (``PhaseWidth``, ``PhaseBroad``): a handful of scalars that must travel
-    #: O(1) in log width and log fraction, where Adam at the network's rate
-    #: moves them ~lr per update.
-    pseudo_translation_lr_mult: float = 30.0
     #: Learning-rate multiplier for the learned detector noise (per-panel log A,
     #: log B).  They may have to move by several nats within the budget -- B by 2.3
     #: for a gain off by 10x, A up from its near-zero start -- and
@@ -367,6 +362,7 @@ class AmortizedTrainer:
 
         self.tether = Tether(self.cfg.tether)
         self._tether_phi = None
+        self._tether_phase = None
         if "gauge" in self.tether.names and getattr(self.scale, "anchor_stat", None) == "basis":
             raise ValueError("the tether's gauge term holds the smooth gauge itself and needs a scale that "
                              "pins the scalar gauge only (anchor_stat 'median' or 'mean'), not 'basis'")
@@ -441,12 +437,9 @@ class AmortizedTrainer:
             ref_train = perm[n_held:]
         self.train_crystals = torch.cat([ref_train, other])
 
-        decay, no_decay, profile = [], [], []
-        for name, prm in self.scale.named_parameters():
+        decay, no_decay = [], []
+        for prm in self.scale.parameters():
             if not prm.requires_grad:
-                continue
-            if name.startswith(("features.phase_width.", "features.phase_broad.")):
-                profile.append(prm)
                 continue
             (no_decay if prm.ndim <= 1 else decay).append(prm)
         # the objective may carry its own scalars (the miss fraction); they are
@@ -465,10 +458,6 @@ class AmortizedTrainer:
             groups.append({"params": noise, "weight_decay": 0.0,
                            "lr": self.cfg.lr * self.cfg.noise_lr_mult,
                            "lr_mult": float(self.cfg.noise_lr_mult)})
-        if profile:
-            groups.append({"params": profile, "weight_decay": 0.0,
-                           "lr": self.cfg.lr * self.cfg.pseudo_translation_lr_mult,
-                           "lr_mult": float(self.cfg.pseudo_translation_lr_mult)})
         self.opt = torch.optim.AdamW(groups, lr=self.cfg.lr)
         self.n_decayed = sum(p.numel() for p in decay)
         self.n_undecayed = sum(p.numel() for p in no_decay)
@@ -585,7 +574,7 @@ class AmortizedTrainer:
                                "set_reciprocal_basis()")
         cid = meta.crystal_id
         n_crystals = int(meta.n_crystals) if getattr(meta, "n_crystals", None) else int(cid.max()) + 1
-        return TetherBatch(log_K, meta.hkl_idx, cid, n_crystals, self._tether_phi)
+        return TetherBatch(log_K, meta.hkl_idx, cid, n_crystals, self._tether_phi, phase=self._tether_phase)
 
     def _forward(self, rows: Tensor, *, grad: bool):
         meta, n_ph, bg, sigma = self._batch(rows)
@@ -1001,10 +990,8 @@ class AmortizedTrainer:
                     "anchor_stat": getattr(self.scale, "anchor_stat", "median"),
                     "tether": list(self.tether.names),
                     "lam_tether": float(self.cfg.lam_tether),
-                    "pseudo_translation": (
-                        None if getattr(self.scale.features, "phase_broad", None) is None
-                        else {"width": self.scale.features.phase_width.definition(),
-                              "broad": self.scale.features.phase_broad.definition()}),
+                    "phase_classes": (None if getattr(self.scale.features, "phase_classes", None) is None
+                                      else self.scale.features.phase_classes.definition()),
                 },
                 "splits": list(self.split_names or []),
                 # scatter family and miss component, so a merge rebuilds the
@@ -1031,6 +1018,8 @@ class AmortizedTrainer:
                     "basis": self.reciprocal_basis.definition(),
                     "coef": [c.cpu() for c in wilson],
                 }),
+                # the prior's pseudo-translation modulation as a function of hkl
+                "intensity_modulation": getattr(self, "intensity_modulation", None),
                 # outer-grid geometry, so a later merge integrates on the SAME grid
                 "posterior_grid": {
                     "k_coarse": self.cfg.posterior_k_coarse, "m_fine": self.cfg.posterior_m_fine,
@@ -1212,9 +1201,6 @@ class AmortizedTrainer:
                 bessel = cnt / (cnt - 1).clamp(min=1)
                 var_emp = ss * bessel / (sumK * sumK)
                 I_sd = torch.maximum(var_pois, var_emp).sqrt()
-            log_c = self.scale.readout_log_factor(torch.arange(n_hkl, device=dev))
-            if log_c is not None:
-                I, I_sd = I * log_c.exp().to(I), I_sd * log_c.exp().to(I_sd)
             return {
                 "estimator": estimator,
                 "I": I.float(), "I_sd": I_sd.float(),
@@ -1319,17 +1305,10 @@ class AmortizedTrainer:
                 h = cid = torch.zeros(0, dtype=torch.int32, device=dev)
             del seen_obs
             tether_rec = Tether(TERMS).readout(
-                TetherBatch(lk, h, cid, self.index.n_crystals, self._tether_phi),
+                TetherBatch(lk, h, cid, self.index.n_crystals, self._tether_phi, phase=self._tether_phase),
                 d_spacing=self.prep.d_spacing)
             del lk, h, cid
         _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
-        log_c = self.scale.readout_log_factor(torch.arange(n_hkl, device=dev))
-        if log_c is not None:
-            # Fitted core intensity -> total recorded intensity: the grid, and
-            # with it every moment below, moves by log(1 + rho) per reflection.
-            log_c = log_c.to(v)
-            v = v + log_c[:, None]
-            I0, I0_sd = I0 * log_c.exp(), I0_sd * log_c.exp()
 
         # F as a posterior moment of sqrt(I0) on the same weights, not the
         # plug-in sqrt(E[I]) -- they differ exactly where the relative
@@ -1410,6 +1389,37 @@ class AmortizedTrainer:
             self.opt.add_param_group({"params": [t.enable_evidence_prior() for t in self.targets],
                                       "lr": self.cfg.lr * mult, "lr_mult": mult,
                                       "weight_decay": 0.0, "name": "wilson_surface"})
+
+    @torch.no_grad()
+    def set_phase_classes(self, classes) -> None:
+        """Give the tether the pseudo-translation classes' columns
+        (:meth:`~torchsx.merging.scale.pseudo_translation.PhaseClasses.columns`) on
+        ``prep.hkl_valid``, for its ``phase`` term."""
+        hkl = self.prep.hkl_valid.long().cpu().numpy()
+        s2 = (1.0 / self.prep.d_spacing.double() ** 2).cpu().numpy()
+        self._tether_phase = torch.as_tensor(classes.columns(hkl, s2), dtype=torch.float64,
+                                             device=self.device)
+
+    @torch.no_grad()
+    def set_intensity_modulation(self, modulation) -> None:
+        """Give every state's prior the pseudo-translation modulation of the mean intensity.
+
+        ``modulation`` (:class:`~torchsx.merging.priors.modulation.PhaseModulation`)
+        is evaluated on ``prep.hkl_valid`` with the symmetry factor and installed
+        as each target's fixed offset of ``log Sigma``; the smooth surface is
+        refitted under it (and the evidence parameter restarted there), after
+        :meth:`set_reciprocal_basis`.  The checkpoint records its definition.
+        """
+        hkl = self.prep.hkl_valid.long().cpu().numpy()
+        s2 = (1.0 / self.prep.d_spacing.double() ** 2).cpu().numpy()
+        log_mod = torch.as_tensor(modulation.log_prior_offset(hkl, s2), dtype=torch.float32)
+        for t in self.targets:
+            t.set_modulation(log_mod.to(t.wilson_log_mod.device))
+            if self.cfg.posterior_prior == "wilson" and t.has_basis:
+                t.fit_wilson_surface()
+                if t.wilson_coef_param is not None:
+                    t.wilson_coef_param.data.copy_(t.wilson_coef)
+        self.intensity_modulation = modulation.definition()
 
     def wilson_fit_info(self) -> dict:
         """Diagnostics of the Wilson surface on the first target (empty without a basis)."""

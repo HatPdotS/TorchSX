@@ -44,7 +44,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--outlier-frac F` | 0 | Initial weight of a detector-outlier component; 0 turns it off. |
 | `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
 | `--tether TERMS` | `gauge` | Directions the likelihood leaves to the model, held at the raw counts; `none` turns it off (see [Sum-of-spots tether](#sum-of-spots-tether)). |
-| `--pseudo-translation` | `off` | `auto`: reflection profiles that depend on the structure's translational pseudo-symmetry (see [Pseudo-translation](#pseudo-translation)). |
+| `--pseudo-translation` | `auto` | Finds translational pseudo-symmetry in the data and, with a dominant translation, handles its classes of reflections; `off` skips the search (see [Pseudo-translation](#pseudo-translation)). |
 | `--seed N` | 0 | Network initialization and batch sampling. |
 | `--device` | `cuda` if available | `cuda` or `cpu`. |
 
@@ -236,30 +236,43 @@ Poisson counting on the spot and the background estimate.
 ## Pseudo-translation
 
 For crystals with translational NCS, a lattice translocation defect or
-stacking faults. A translation `t` relating parts of the crystal makes how a
-reflection is recorded depend on its phase `h·t`: reflections with integer
-`h·t` stay sharp, the others spread along the fault direction, often as a sharp
-core on a broad, shallow part.
+stacking faults. A translation `t` relating parts of the crystal makes a
+reflection's mean intensity, and how it is recorded, depend on its phase `h·t`.
+In each resolution shell the reflections then form classes: some much stronger
+than the shell's mean and some much weaker, some recorded as sharp spots and
+some spread along the fault direction.
 
-`--pseudo-translation auto` finds the translations in the data: the Patterson
-function of the normalised intensities, its significant off-origin peaks
-refined, harmonics `n·t` of a stronger translation placed exactly. The run log
-lists each translation with the amplitude of the intensity modulation it
-implies. A translation is used when it dominates: an amplitude of at least 0.1
-and three times that of any other translation that is not one of its
-harmonics; its harmonics with an amplitude of at least 0.1 are used with it.
-A copy of the whole structure gives such a peak; the interatomic vectors of a
-small structure give several peaks of similar height, and none is used. Each
-reflection then gets a core width and a broad component of its own relative
-area and width, all smooth functions of `cos 2π h·R t` (averaged over the point
-group) and of resolution, fitted with the network. The fit measures the core's
-intensity, and the broad component adds its relative area on top; the merge
-reports the reflection's total recorded intensity, core and broad part
-together. Each update evaluates the
-per-observation part of the network a second time, for the broad component.
+By default (`--pseudo-translation auto`) training first looks for such
+translations in the data: the Patterson function of the normalised plain
+means, its significant off-origin peaks refined, harmonics `n·t` of a stronger
+translation placed exactly. The run log lists each translation with the
+amplitude of the intensity modulation it implies. A translation is used when it
+dominates: an amplitude of at least 0.1 and three times that of any other
+translation that is not one of its harmonics; its harmonics with an amplitude
+of at least 0.1 are used with it. A copy of the whole structure gives such a
+peak; the interatomic vectors of a small structure give several peaks of
+similar height, and none is used. Data with fewer than 1,000 observed
+reflections are not searched.
 
-Without a translation above the threshold the run proceeds with one profile
-for every reflection. `torchsx.merge` takes the profiles from the checkpoint.
+With a translation in use, three things follow the classes it makes, with
+`c(h) = cos 2π h·R t` averaged over the point group:
+
+- **The prior.** The Wilson prior's mean is the smooth surface times a
+  modulation `g(h)`, fitted to the plain means before training: per resolution
+  shell, the amplitude of each translation's `c(h)`, then a non-decreasing
+  link.
+- **The network.** The scale model reads each observation's `c(h)`, so each
+  class can have its own rocking curve, and each crystal its own class pattern.
+- **The tether.** A `phase` term holds the arithmetic mean of K in every class
+  (equal-count bins of the `c(h)`) and along low-order trends in resolution, so
+  the brightness of every class is its sum of spots, whatever the network makes
+  of the features.
+
+The three belong together: with class features, a prior whose mean ignores the
+classes pulls every class toward the shell's mean through the scatter shape,
+and the tether's phase term needs the tether (`--tether none` is refused for
+such data). Without a translation the model is unchanged. `torchsx.merge` takes
+the modulation and the classes from the checkpoint.
 
 ## Cache and reproducibility
 
