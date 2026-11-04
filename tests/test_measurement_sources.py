@@ -230,7 +230,6 @@ def test_native_matches_python(stream_file, monkeypatch):
 
 
 def test_auto_metadata_matches_explicit_prep_and_posterior(stream_file, python_parser, tmp_path):
-    from torchsx.merging.parameters import Parameters
     from tests.test_cli_pipeline import _stack
     auto = P.load_prep(_args(stream_file), verbose=False)
     explicit_args = _args(stream_file)

@@ -56,7 +56,6 @@ from torch import Tensor
 from torchsx.merging.likelihood.base import DetectionLikelihood
 from torchsx.merging.likelihood.poisson import Poisson, poisson_logpeak
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.quadrature.base import Quadrature
 from torchsx.merging.scatter.base import ScatterModel
 from torchsx.merging.scatter.gengauss import (
@@ -335,7 +334,7 @@ class SplitLogGrid(Quadrature):
         log_mean: Tensor,        # (M,)
         n_ph: Tensor,            # (M,)
         bg: Tensor,              # (M,)
-        params: Parameters,
+        params: None,
         meta: ObsInfo,
         obs_range: tuple[int, int] | None = None,
         noise=None,  # (A, B) per observation: detector noise

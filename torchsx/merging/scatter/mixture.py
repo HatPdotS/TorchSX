@@ -30,7 +30,6 @@ import torch.nn as nn
 from torch import Tensor
 
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scatter.base import ScatterModel
 from torchsx.merging.scatter.gengauss import (
     gengauss_log_prob_from_obs,
@@ -257,15 +256,15 @@ class PredictedMixtureScatter(ScatterModel):
         k = self._log_pi[pos].argmax(dim=1)
         return pos, k
 
-    def log_alpha_beta_obs(self, params: Parameters, meta: ObsInfo) -> tuple[Tensor, Tensor]:
+    def log_alpha_beta_obs(self, params: None, meta: ObsInfo) -> tuple[Tensor, Tensor]:
         pos, k = self._dominant(meta)
         return self._log_alpha_lo[pos, k], self._log_beta[pos, k]
 
-    def log_alpha_hi_obs(self, params: Parameters, meta: ObsInfo) -> Tensor | None:
+    def log_alpha_hi_obs(self, params: None, meta: ObsInfo) -> Tensor | None:
         pos, k = self._dominant(meta)
         return self._log_alpha_hi[pos, k]
 
-    def log_prob(self, eps: Tensor, params: Parameters, meta: ObsInfo) -> Tensor:
+    def log_prob(self, eps: Tensor, params: None, meta: ObsInfo) -> Tensor:
         """Mixture log-density at ``eps`` ``(M, K_grid)`` for the observations in ``meta``."""
         pos = self._positions(meta.obs_id)
         terms = []

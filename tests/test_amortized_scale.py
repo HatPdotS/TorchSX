@@ -14,9 +14,7 @@ import pytest
 import torch
 
 from torchsx.merging.observations import ObsInfo, PreparedObs
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scale import AmortizedScale
-from torchsx.merging.scatter_shape import FreePerHKLShape
 from torchsx.nn.obs_features import ObsFeatureSpec
 
 
@@ -72,16 +70,6 @@ def _toy_prep(n_crystals: int = 12, obs_per_crystal: int = 9, n_hkl: int = 20):
         partiality=None,
         shell_id_fw=torch.arange(n_hkl) % 4,
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
-    )
-
-
-def _params(prep) -> Parameters:
-    n = prep.n_valid
-    return Parameters(
-        log_I0_init=torch.full((n,), math.log(30.0)),
-        scatter_shape=FreePerHKLShape(
-            torch.full((n,), 1.65).log(), torch.full((n,), 2.0).log()
-        ),
     )
 
 
@@ -239,7 +227,6 @@ def test_marginal_nll_backward_reaches_the_network():
     from torchsx.merging.config import MergeConfig
 
     prep = _toy_prep()
-    params = _params(prep)
     scale = AmortizedScale.from_prep(prep, d_model=16)
     quad = SplitLogGrid(n_points=96)
     lik = Poisson()
@@ -255,10 +242,10 @@ def test_marginal_nll_backward_reaches_the_network():
     meta = prep.obs_info
     pred = scale.prime(meta)
     n_ph = (prep.I_obs + prep.bg).clamp(min=0)
-    log_mean = params.log_I0[meta.hkl_idx] + pred.log_K
+    log_mean = math.log(30.0) + pred.log_K
 
     log_p = quad.marginalize_mixture(
-        scale.scatter, lik, log_mean, n_ph, prep.bg, params, meta,
+        scale.scatter, lik, log_mean, n_ph, prep.bg, None, meta,
         obs_range=(0, prep.n_obs_total),
     )
     assert torch.isfinite(log_p).all()
@@ -279,16 +266,15 @@ def test_zero_init_still_bootstraps_the_heads():
     from torchsx.merging.config import MergeConfig
 
     prep = _toy_prep()
-    params = _params(prep)
     scale = AmortizedScale.from_prep(prep, d_model=16)
     quad = SplitLogGrid(n_points=96)
 
     meta = prep.obs_info
     pred = scale.prime(meta)
-    log_mean = params.log_I0[meta.hkl_idx] + pred.log_K
+    log_mean = math.log(30.0) + pred.log_K
     log_p = quad.marginalize_mixture(
         scale.scatter, Poisson(), log_mean,
-        (prep.I_obs + prep.bg).clamp(min=0), prep.bg, params, meta,
+        (prep.I_obs + prep.bg).clamp(min=0), prep.bg, None, meta,
         obs_range=(0, prep.n_obs_total),
     )
     (-log_p.sum()).backward()
@@ -310,12 +296,11 @@ def test_scatter_hook_is_what_the_quadrature_reads():
 
 def test_stale_prediction_raises_rather_than_silently_resolving():
     prep = _toy_prep()
-    params = _params(prep)
     scale = AmortizedScale.from_prep(prep, d_model=16)
     meta = prep.obs_info
     scale.prime(meta.gather(torch.arange(10)))
     with pytest.raises(KeyError, match="outside the installed prediction"):
-        scale.scatter.log_alpha_beta_obs(params, meta)
+        scale.scatter.log_alpha_beta_obs(None, meta)
 
 
 def test_calibration_metrics_survive_non_finite_entries():

@@ -21,10 +21,8 @@ import torch
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.scale import AmortizedScale
-from torchsx.merging.scatter_shape import FreePerHKLShape
 from torchsx.nn.metrics import scale_metrics, spearman
 from torchsx.nn.objective import MarginalNLL
 from torchsx.cli.train import run_updates
@@ -82,12 +80,7 @@ def _synthetic(n_hkl=60, n_xtal=150, per=40, seed=0, n_cond=1, shift=1.5):
         shell_id_fw=torch.arange(n_hkl) % 4,
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
     )
-    params = Parameters(
-        log_I0_init=torch.full((n_hkl,), math.log(60.0)),
-        scatter_shape=FreePerHKLShape(torch.full((n_hkl,), 1.65).log(),
-                                      torch.full((n_hkl,), 2.0).log()),
-    )
-    return prep, params, log_G, cid, per
+    return prep, None, log_G, cid, per
 
 
 @pytest.mark.slow

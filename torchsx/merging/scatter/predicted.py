@@ -20,7 +20,6 @@ import torch
 from torch import Tensor
 
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scatter.gengauss import GenGaussLogScatter
 
 
@@ -104,7 +103,7 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
     # ── the seam ───────────────────────────────────────────────────────
 
     def log_alpha_beta_obs(
-        self, params: Parameters, meta: ObsInfo
+        self, params: None, meta: ObsInfo
     ) -> tuple[Tensor, Tensor]:
         if self._log_alpha is None:
             raise RuntimeError(
@@ -119,7 +118,7 @@ class PredictedGenGaussScatter(GenGaussLogScatter):
         pos = self._positions(meta.obs_id)
         return self._log_alpha[pos], self._log_beta[pos]
 
-    def log_alpha_hi_obs(self, params: Parameters, meta: ObsInfo) -> Tensor | None:
+    def log_alpha_hi_obs(self, params: None, meta: ObsInfo) -> Tensor | None:
         if self._log_alpha_hi is None:
             return None
         return self._log_alpha_hi[self._positions(meta.obs_id)]

@@ -17,7 +17,6 @@ from torch import Tensor
 
 from torchsx.merging.likelihood.base import DetectionLikelihood
 from torchsx.merging.observations import ObsInfo
-from torchsx.merging.parameters import Parameters
 from torchsx.merging.scatter.base import ScatterModel
 
 
@@ -71,7 +70,7 @@ class Quadrature(nn.Module):
         log_mean: Tensor,          # (n_obs,)
         n_ph: Tensor,              # (n_obs,) — peak photon counts (I_obs + bg)
         bg: Tensor,                # (n_obs,)
-        params: Parameters,
+        params: None,
         meta: ObsInfo,
         obs_range: tuple[int, int] | None = None,
     ) -> Tensor:                   # (n_obs,)
