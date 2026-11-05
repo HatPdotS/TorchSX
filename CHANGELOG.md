@@ -2,8 +2,7 @@
 
 ## v0.2.1
 
-- Pin torch 2.12.1: torch 2.13.0's compiler fails on the fold encoder's backward pass (`InductorError: CantSplit ... not divisible by ...`) on any GPU. Without the upgrade, `TORCHSX_PEER_COMPILE=0` avoids it, at some speed.
-- Accept TorchRef 0.8 (`torchref>=0.7.0,<0.9`).
+- Exclude torch 2.13: its compiler fails on the fold encoder's backward pass (`InductorError: CantSplit ... not divisible by ...`) on any GPU. Without the upgrade, `TORCHSX_PEER_COMPILE=0` avoids it, at some speed.
 
 ## v0.2.0
 
