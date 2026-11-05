@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.1
+
+- Exclude torch 2.13: its compiler fails on the fold encoder's backward pass (`InductorError: CantSplit ... not divisible by ...`) on any GPU. Without the upgrade, `TORCHSX_PEER_COMPILE=0` avoids it, at some speed.
+
 ## v0.2.0
 
 Nothing is backwards compatible with 0.1.0: retrain, and rebuild prepared caches.
