@@ -52,8 +52,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-${{ matrix.python-version }}-
 
-      # CPU torch at the version pyproject.toml pins, so the next install keeps
-      # it rather than pulling a CUDA build.
+      # CPU torch inside pyproject.toml's bound, so the next install keeps it
+      # rather than pulling a CUDA build.
       # torchsx-native is built from this commit first, so the torchsx pin
       # resolves to it instead of a published wheel.
       # TorchRef comes from PyPI, as for users.

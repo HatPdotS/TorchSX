@@ -164,7 +164,9 @@ class AmortizedScale(nn.Module):
         The encoder packs the batch's crystals into blocks once
         (:meth:`~torchsx.nn.fold_transformer.FoldTransformerEncoder.layout`).
         Each block gathers its rows, runs the network (compiled on CUDA,
-        ``encoder.compile``) and the heads, in training under one checkpoint,
+        ``encoder.compile``, after a dry run on the first block,
+        :meth:`~torchsx.nn.fold_transformer.FoldTransformerEncoder.dry_run`)
+        and the heads, in training under one checkpoint,
         so only the batch tables and the block's outputs are stored.  One
         gather puts the outputs back in row order.
 
@@ -187,11 +189,16 @@ class AmortizedScale(nn.Module):
         run = self._fold_block
         ckpt = torch.is_grad_enabled() and self.training
         defer = ckpt and self.defer_encoder_backward
-        flex_only = (not torch.is_grad_enabled() and enc.compile and x_self.is_cuda and enc.flex
+        flex_eval = (not torch.is_grad_enabled() and x_self.is_cuda and enc.flex
                      and enc.flex_device and any(p.requires_grad for p in enc.parameters()))
+        layout = enc.layout(meta.crystal_id)
+        if layout:
+            enc.dry_run(x_self, x_ctx, x_crys, meta.crystal_id, *layout[0],
+                        autograd=torch.is_grad_enabled() or flex_eval, backward=ckpt)
+        flex_only = flex_eval and enc.compile
         n = x_self.shape[0]
         parts, dest, corrections, blocks = [], [], [], []
-        for idx, valid in enc.layout(meta.crystal_id):
+        for idx, valid in layout:
             args = (x_self, x_ctx, x_crys, meta.crystal_id, idx, valid)
             if flex_only:
                 with torch.enable_grad():

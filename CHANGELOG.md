@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- torch 2.7 to 2.14: inductor's coalescing analysis and mix-order reduction are off on 2.11 to 2.13, where they fail on the fold encoder.
+- The fold encoder is compiled on the first block before training or merging; if torch cannot compile it, it runs uncompiled with a warning, and `training_summary.json` records `compiled`.
+
 ## v0.2.2
 
 - Pin torch 2.9, the version the compiled fold encoder is known to train with. 0.2.1 only excluded torch 2.13, so it installs torch 2.12.1; torch 2.11 fails as well. On 0.2.1, `pip install "torch==2.9.*"` pins it by hand.

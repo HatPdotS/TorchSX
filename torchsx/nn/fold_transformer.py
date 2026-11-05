@@ -53,6 +53,7 @@ embedding.
 from __future__ import annotations
 
 import os
+import warnings
 
 import torch
 import torch.nn as nn
@@ -68,6 +69,20 @@ __all__ = ["AttentionBlock", "FoldTransformerEncoder", "ResidualFF", "fold_layou
 #: forward keeps inductor's choice
 FLEX_KERNEL_OPTIONS: dict | None = dict(bwd_BLOCK_M1=64, bwd_BLOCK_N1=128, bwd_BLOCK_M2=128,
                                          bwd_BLOCK_N2=64, bwd_num_warps=4, bwd_num_stages=2)
+
+
+def compile_options() -> dict:
+    """Inductor settings for the compiled network on the installed torch.
+
+    Inductor of torch 2.11 to 2.13 fails on this network in two of its
+    passes: the memory-coalescing analysis of tiled kernels (2.11, forward)
+    and mix-order reduction (2.12 and 2.13, backward).  On those versions
+    both passes are off; every other version keeps inductor's defaults.
+    """
+    version = torch.torch_version.TorchVersion(torch.__version__)
+    if "2.11" <= version < "2.14":
+        return {"triton.coalesce_tiling_analysis": False, "triton.mix_order_reduction": False}
+    return {}
 
 
 def fold_layout(group_id: Tensor, folds: int, tokens: int = 1 << 18,
@@ -310,11 +325,13 @@ class FoldTransformerEncoder(nn.Module):
     compile, bf16
         Run the network on each packed block (:meth:`network`; the rows are
         gathered eagerly, :meth:`gather`) through
-        ``torch.compile(dynamic=True)`` on CUDA, and the attention itself in
-        half precision on CUDA: bfloat16, or float16 on GPUs of compute
-        capability below 8.0, which have no bfloat16 (:meth:`fit_device`).
-        ``None`` reads ``TORCHSX_PEER_COMPILE`` / ``TORCHSX_PEER_BF16``
-        (default on).
+        ``torch.compile(dynamic=True)`` on CUDA (with :func:`compile_options`),
+        and the attention itself in half precision on CUDA: bfloat16, or
+        float16 on GPUs of compute capability below 8.0, which have no bfloat16
+        (:meth:`fit_device`).  Before its first block the network is compiled
+        on that block (:meth:`dry_run`); when torch cannot compile it, it runs
+        uncompiled.  ``None`` reads ``TORCHSX_PEER_COMPILE`` /
+        ``TORCHSX_PEER_BF16`` (default on).
     flex
         Inside the compiled block, with autograd on, attention reads each
         run's keys through flex attention, which skips the padding instead of
@@ -396,6 +413,8 @@ class FoldTransformerEncoder(nn.Module):
         self.flex_device = True
         self._device = None
         self._compiled = None
+        #: the (autograd, backward) modes :meth:`dry_run` has compiled
+        self._dry_runs: set[tuple[bool, bool]] = set()
         self.ctx_blocks = nn.ModuleList(
             AttentionBlock(d_model, n_heads, d_hidden, self_attention=True,
                            activation=activation, bf16=bf16)
@@ -448,8 +467,13 @@ class FoldTransformerEncoder(nn.Module):
                                  f"{self.n_crystal_features}; x_crys does not match")
         self.fit_device(x_self.device)
         use_ckpt = self.checkpoint and self.training and torch.is_grad_enabled()
+        blocks = self.layout(group_id)
+        if blocks:
+            self.dry_run(x_self, x_ctx, x_crys, group_id, *blocks[0],
+                         autograd=torch.is_grad_enabled(),
+                         backward=self.training and torch.is_grad_enabled())
         zs, dest, corrections = [], [], []
-        for idx, valid in self.layout(group_id):
+        for idx, valid in blocks:
             args = (x_self, x_ctx, x_crys, group_id, idx, valid)
             zb, corr = (torch.utils.checkpoint.checkpoint(self.encode, *args, use_reentrant=False)
                         if use_ckpt else self.encode(*args))
@@ -485,12 +509,50 @@ class FoldTransformerEncoder(nn.Module):
         compiled on CUDA.  ``(B, L, D)`` embeddings of its slots and each run's
         geometry correction."""
         args = self.gather(x_self, x_ctx, x_crys, group_id, idx, valid)
-        run = self.network
-        if self.compile and x_self.is_cuda:
-            if self._compiled is None:
-                self._compiled = torch.compile(self.network, dynamic=True)
-            run = self._compiled
+        run = self._compiled_network() if self.compile and x_self.is_cuda else self.network
         return run(*args)
+
+    def _compiled_network(self):
+        if self._compiled is None:
+            self._compiled = torch.compile(self.network, dynamic=True, options=compile_options())
+        return self._compiled
+
+    def dry_run(self, x_self: Tensor, x_ctx: Tensor, x_crys: Tensor | None, group_id: Tensor,
+                idx: Tensor, valid: Tensor, *, autograd: bool, backward: bool) -> None:
+        """Compile the network on one packed block before the run uses it.
+
+        With ``compile`` on CUDA, the first call per mode runs the compiled
+        network on the block (:func:`fold_layout`) as the run will: the
+        forward pass, with autograd when ``autograd`` (plain and under a
+        checkpoint), and with ``backward`` its backward pass.  The outputs are
+        discarded and no gradient is accumulated.  When torch fails on any of
+        them, the network runs uncompiled from then on (``compile`` off) and a
+        warning names the error.  Callers run it before their first block,
+        outside any checkpoint.
+        """
+        mode = (bool(autograd), bool(backward))
+        if not (self.compile and x_self.is_cuda) or mode in self._dry_runs:
+            return
+        self._dry_runs.add(mode)
+        args = self.gather(x_self, x_ctx, x_crys, group_id, idx, valid)
+        net = self._compiled_network()
+        params = [p for p in self.parameters() if p.requires_grad]
+        try:
+            with torch.set_grad_enabled(autograd):
+                z, _ = net(*args)
+                if backward and params:
+                    torch.autograd.grad(z, params, torch.ones_like(z), allow_unused=True)
+                if autograd:
+                    torch.utils.checkpoint.checkpoint(net, *args, use_reentrant=False)
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as e:
+            self.compile, self._compiled = False, None
+            first = next((line for line in str(e).splitlines() if line.strip()), "")
+            warnings.warn(f"torch {torch.__version__} cannot compile the fold encoder "
+                          f"({type(e).__name__}: {first.strip()}); it runs uncompiled, which "
+                          f"is slower. TORCHSX_PEER_COMPILE=0 skips the attempt.",
+                          RuntimeWarning, stacklevel=2)
 
     def gather(self, x_self: Tensor, x_ctx: Tensor, x_crys: Tensor | None, group_id: Tensor,
                idx: Tensor, valid: Tensor) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
