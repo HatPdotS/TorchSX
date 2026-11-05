@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.2.3
 
-- torch 2.7 to 2.14: inductor's coalescing analysis and mix-order reduction are off on 2.11 to 2.13, where they fail on the fold encoder.
-- The fold encoder is compiled on the first block before training or merging; if torch cannot compile it, it runs uncompiled with a warning, and `training_summary.json` records `compiled`.
+- torch 2.7 to 2.14 instead of 2.9 only: on 2.11 to 2.13 the fold encoder compiles with inductor's coalescing analysis and mix-order reduction off, the two passes that fail on it.
+- The fold encoder is compiled on its first block before training or merging; where torch cannot compile it, it runs uncompiled with a warning, and `training_summary.json` records `compiled`.
 
 ## v0.2.2
 
