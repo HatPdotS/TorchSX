@@ -52,14 +52,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-${{ matrix.python-version }}-
 
-      # CPU torch within TorchRef's bound, so the next install keeps it rather
+      # CPU torch at the version pyproject.toml pins, so the next install keeps it rather
       # than pulling a CUDA build. torchsx-native is built from this commit
       # first, so the torchsx pin resolves to it instead of a published wheel.
       # TorchRef comes from PyPI, as for users.
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install "torch>=2.4,<2.14" --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch==2.12.1" --index-url https://download.pytorch.org/whl/cpu
           pip install ./native
           pip install -e ".[dev]"
 
