@@ -23,7 +23,7 @@ dependencies = [
     "torchref>=0.7.0,<0.8",
     # torch 2.13.0's inductor cannot prove the fold encoder's sizes divisible
     # (CantSplit in its backward kernels); 2.14 fixes that but TorchRef 0.7
-    # stops below it. Pinned to the release the compiled encoder is known to build with.
+    # stops below it. 2.12.1 is the last release before that change.
     "torch==2.12.1",
     "numpy>=2",          # the Python writer's float32 arithmetic (NEP 50)
     "safetensors>=0.4",  # the .sfx working format
