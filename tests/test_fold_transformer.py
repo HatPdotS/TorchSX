@@ -327,7 +327,8 @@ def test_flex_block_is_one_graph_for_every_block_count():
     for prm in enc.parameters():
         if prm.dim() > 1:
             torch.nn.init.normal_(prm, std=0.1)
-    fn = torch.compile(enc.network, dynamic=True, fullgraph=True)
+    fn = torch.compile(enc.network, dynamic=True, fullgraph=True,
+                       options=fold_transformer.compile_options())
     # the runs' queries one block (128) or several (144 to 264), their keys 6 to 11 blocks
     sizes = ([650, 700], [636, 100, 90], [900, 820, 777], [40, 1000, 1001], [1300, 1250], [1100])
     for i, s in enumerate(sizes):
