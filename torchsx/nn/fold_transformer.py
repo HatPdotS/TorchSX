@@ -535,9 +535,9 @@ class FoldTransformerEncoder(nn.Module):
             return
         self._dry_runs.add(mode)
         args = self.gather(x_self, x_ctx, x_crys, group_id, idx, valid)
-        net = self._compiled_network()
         params = [p for p in self.parameters() if p.requires_grad]
         try:
+            net = self._compiled_network()
             with torch.set_grad_enabled(autograd):
                 z, _ = net(*args)
                 if backward and params:

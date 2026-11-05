@@ -166,6 +166,7 @@ def test_packing_is_exact_in_value_and_gradient():
                                rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.compile
 def test_packed_block_compiles_once_for_every_length():
     """Blocks of different B and L run one graph: no size is specialised."""
     import torch._dynamo
@@ -217,6 +218,7 @@ def test_key_prefix_mask_is_create_block_mask(q_len, kv_len):
             assert sorted(a_idx[row][:k].tolist()) == sorted(b_idx[row][:k].tolist()), (idx, row)
 
 
+@pytest.mark.compile
 def test_flex_attention_on_the_prefix_mask_is_masked_attention():
     from torch.nn.attention.flex_attention import flex_attention
     g = torch.Generator().manual_seed(0)
@@ -234,6 +236,7 @@ def test_flex_needs_heads_of_at_least_16():
     assert not FoldTransformerEncoder(4, 7, [4, 5, 6], n_heads=4, **kw).flex
 
 
+@pytest.mark.compile
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
 @pytest.mark.parametrize("flex", [False, True])
 def test_compiled_bf16_is_close_and_keeps_the_exclusion(flex):
@@ -282,6 +285,7 @@ def test_compiled_bf16_is_close_and_keeps_the_exclusion(flex):
         assert (moved[same & ~own] - base[same & ~own]).abs().max() > 1e-2
 
 
+@pytest.mark.compile
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
 @pytest.mark.parametrize("q_len", [40, 300])
 def test_compiled_flex_on_the_prefix_mask_is_masked_attention(q_len):
@@ -309,6 +313,7 @@ def test_compiled_flex_on_the_prefix_mask_is_masked_attention(q_len):
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.compile
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
 def test_flex_block_is_one_graph_for_every_block_count():
     """No graph break, and no size specialised by the number of query or key blocks, one

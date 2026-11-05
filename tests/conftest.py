@@ -18,6 +18,25 @@ REAL_STREAMS = (
 )
 
 
+def _torch_compiles() -> bool:
+    try:
+        torch.compile(lambda x: x)
+    except RuntimeError:
+        return False
+    return True
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tests marked ``compile`` are skipped where torch.compile does not run on the
+    interpreter, as on Python 3.14 before torch 2.10."""
+    if _torch_compiles():
+        return
+    skip = pytest.mark.skip(reason="torch.compile does not run on this interpreter")
+    for item in items:
+        if item.get_closest_marker("compile"):
+            item.add_marker(skip)
+
+
 @pytest.fixture(autouse=True)
 def _float32_matmul_precision():
     """Every test starts at the process's float32 matmul precision.
