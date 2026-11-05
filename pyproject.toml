@@ -19,8 +19,9 @@ classifiers = [
 ]
 dependencies = [
     # Brings torch, triton and gemmi. TorchRef's minor releases change its API,
-    # so the bound follows the minor version torchsx is tested against.
-    "torchref>=0.7.0,<0.8",
+    # so the bound follows the minor versions torchsx is checked against: 0.8
+    # only drops the readers' `verbose` argument, which torchsx does not pass.
+    "torchref>=0.7.0,<0.9",
     # torch 2.13.0's inductor cannot prove the fold encoder's sizes divisible
     # (CantSplit in its backward kernels); 2.14 fixes that but TorchRef 0.7
     # stops below it. 2.12.1 is the last release before that change.
