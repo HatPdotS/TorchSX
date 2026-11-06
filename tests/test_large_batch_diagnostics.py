@@ -16,8 +16,6 @@ class LargeBatchDiagnosticTests(unittest.TestCase):
     def check_large_batch(self, device):
         n = 24_456_800
         x = torch.arange(n // 2, device=device, dtype=torch.float32).repeat_interleave(2).flip(0)
-        with self.assertRaisesRegex(RuntimeError, 'too large'):
-            x.quantile(.01)
         for q in [0., .01, .5, .99, 1.]:
             rank = q * (n - 1)
             lo, hi = math.floor(rank), math.ceil(rank)

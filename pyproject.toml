@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchsx"
-version = "0.2.2"
+version = "0.2.3"
 description = "A PyTorch-based scaling and merging library for serial crystallography"
 readme = "README.md"
 license = "MIT"
@@ -21,10 +21,10 @@ dependencies = [
     # Brings torch, triton and gemmi. TorchRef's minor releases change its API,
     # so the bound follows the minor version torchsx is tested against.
     "torchref>=0.7.0,<0.8",
-    # The compiled fold encoder is version-sensitive: torch 2.13's inductor fails
-    # on its backward pass (CantSplit) and 2.11 fails too. Pinned to 2.9, the
-    # minor version it is known to train with.
-    "torch==2.9.*",
+    # The fold encoder compiles with flex attention and dynamic shapes from 2.7
+    # on (compile_options sets inductor per version); where torch cannot compile
+    # it, it runs uncompiled.
+    "torch>=2.7,<2.15",
     "numpy>=2",          # the Python writer's float32 arithmetic (NEP 50)
     "safetensors>=0.4",  # the .sfx working format
     "matplotlib>=3.7",   # the figures of torchsx.observation-stats and torchsx.merge-stats

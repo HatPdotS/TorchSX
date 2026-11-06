@@ -454,6 +454,7 @@ def test_deferred_encoder_backward_is_the_one_pass_gradient(tmp_path):
         torch.testing.assert_close(grads[1][n], grads[0][n], rtol=1e-5, atol=1e-7, msg=n)
 
 
+@pytest.mark.compile
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled fold path runs on CUDA only")
 def test_fold_predictions_without_autograd_run_flex_and_match_the_masked_kernel():
     """Without autograd the fold path runs each block under a checkpoint with autograd

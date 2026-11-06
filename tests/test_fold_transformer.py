@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from torchsx.merging.scale import AmortizedScale
+from torchsx.nn import fold_transformer
 from torchsx.nn.fold_transformer import FoldTransformerEncoder, fold_layout, key_prefix_mask
 from torchsx.nn.pooling import fold_ids
 
@@ -165,6 +166,7 @@ def test_packing_is_exact_in_value_and_gradient():
                                rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.compile
 def test_packed_block_compiles_once_for_every_length():
     """Blocks of different B and L run one graph: no size is specialised."""
     import torch._dynamo
@@ -216,6 +218,7 @@ def test_key_prefix_mask_is_create_block_mask(q_len, kv_len):
             assert sorted(a_idx[row][:k].tolist()) == sorted(b_idx[row][:k].tolist()), (idx, row)
 
 
+@pytest.mark.compile
 def test_flex_attention_on_the_prefix_mask_is_masked_attention():
     from torch.nn.attention.flex_attention import flex_attention
     g = torch.Generator().manual_seed(0)
@@ -233,6 +236,7 @@ def test_flex_needs_heads_of_at_least_16():
     assert not FoldTransformerEncoder(4, 7, [4, 5, 6], n_heads=4, **kw).flex
 
 
+@pytest.mark.compile
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
 @pytest.mark.parametrize("flex", [False, True])
 def test_compiled_bf16_is_close_and_keeps_the_exclusion(flex):
@@ -262,6 +266,7 @@ def test_compiled_bf16_is_close_and_keeps_the_exclusion(flex):
         z.square().sum().backward()
         outs.append(z.detach())
         grads.append(torch.cat([p.grad.flatten() for p in enc.parameters() if p.grad is not None]))
+    assert fast.compile, "the dry run fell back to the uncompiled network"
     assert (outs[1] - outs[0]).norm() / outs[0].norm() < 2e-2
     assert (grads[1] - grads[0]).norm() / grads[0].norm() < 5e-2
     fast.eval()
@@ -280,6 +285,7 @@ def test_compiled_bf16_is_close_and_keeps_the_exclusion(flex):
         assert (moved[same & ~own] - base[same & ~own]).abs().max() > 1e-2
 
 
+@pytest.mark.compile
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
 @pytest.mark.parametrize("q_len", [40, 300])
 def test_compiled_flex_on_the_prefix_mask_is_masked_attention(q_len):
@@ -307,6 +313,7 @@ def test_compiled_flex_on_the_prefix_mask_is_masked_attention(q_len):
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.compile
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
 def test_flex_block_is_one_graph_for_every_block_count():
     """No graph break, and no size specialised by the number of query or key blocks, one
@@ -320,7 +327,8 @@ def test_flex_block_is_one_graph_for_every_block_count():
     for prm in enc.parameters():
         if prm.dim() > 1:
             torch.nn.init.normal_(prm, std=0.1)
-    fn = torch.compile(enc.network, dynamic=True, fullgraph=True)
+    fn = torch.compile(enc.network, dynamic=True, fullgraph=True,
+                       options=fold_transformer.compile_options())
     # the runs' queries one block (128) or several (144 to 264), their keys 6 to 11 blocks
     sizes = ([650, 700], [636, 100, 90], [900, 820, 777], [40, 1000, 1001], [1300, 1250], [1100])
     for i, s in enumerate(sizes):
@@ -486,3 +494,68 @@ def test_refine_needs_context_and_geometry():
     with pytest.raises(ValueError, match="ctx_layers >= 1"):
         FoldTransformerEncoder(6, 9, [6, 7, 8], d_model=16, n_heads=4, ctx_layers=0, refine_geometry=True,
                                geometry={"cols": list(range(6)), "mean": GEO_MEAN, "std": GEO_STD})
+
+
+@pytest.mark.parametrize("version, off", [("2.10.0+cu126", False), ("2.11.0+cu126", True),
+                                          ("2.12.1", True), ("2.13.0+cu130", True),
+                                          ("2.14.1+cu126", False)])
+def test_compile_options_switch_off_the_failing_passes_on_their_versions(monkeypatch, version, off):
+    monkeypatch.setattr(torch, "__version__", torch.torch_version.TorchVersion(version))
+    expected = ({"triton.coalesce_tiling_analysis": False, "triton.mix_order_reduction": False}
+                if off else {})
+    assert fold_transformer.compile_options() == expected
+
+
+class _FailsBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, z):
+        return z.clone()
+
+    @staticmethod
+    def backward(ctx, g):
+        raise RuntimeError("backward compile failed")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
+@pytest.mark.parametrize("fails", ["forward", "backward"])
+def test_a_network_torch_cannot_compile_runs_uncompiled(monkeypatch, fails):
+    """The dry run catches a compile failure in the forward or the backward pass before
+    the first block; the network then runs uncompiled, equal to an encoder built
+    without compile, and the dry run leaves no gradient behind."""
+    def broken_compile(fn, **kw):
+        def run(*args):
+            if fails == "forward":
+                raise RuntimeError("forward compile failed")
+            z, corr = fn(*args)
+            return _FailsBackward.apply(z), corr
+        return run
+    monkeypatch.setattr(torch, "compile", broken_compile)
+    torch.manual_seed(0)
+    kw = dict(d_model=32, n_heads=4, folds=3, ctx_layers=1, query_layers=1, bf16=False)
+    ref = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=False, **kw).cuda()
+    for prm in ref.parameters():
+        if prm.dim() > 1:
+            torch.nn.init.normal_(prm, std=0.15)
+    enc = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=True, **kw).cuda()
+    enc.load_state_dict(ref.state_dict())
+    sizes = torch.tensor([3, 11, 40, 7])
+    gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes).cuda()
+    xs, xc = torch.randn(gid.numel(), 6, device="cuda"), torch.randn(gid.numel(), 9, device="cuda")
+    grads = []
+    for e in (ref, enc):
+        e.train()
+        if e is enc:
+            with pytest.warns(RuntimeWarning, match="cannot compile the fold encoder"):
+                e.dry_run(xs, xc, None, gid, *e.layout(gid)[0], autograd=True, backward=True)
+            assert not e.compile
+            assert all(p.grad is None for p in e.parameters())
+        z = e(xs, xc, gid, sizes.numel())
+        z.square().sum().backward()
+        grads.append([p.grad for p in e.parameters()])
+        if e is ref:
+            z_ref = z.detach()
+    assert torch.equal(z.detach(), z_ref)
+    for g_enc, g_ref in zip(*reversed(grads)):
+        assert (g_enc is None) == (g_ref is None)
+        if g_ref is not None:
+            assert torch.equal(g_enc, g_ref)

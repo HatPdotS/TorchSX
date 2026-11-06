@@ -369,8 +369,11 @@ def main(argv=None):
         updates = run_updates(tr, args.steps, eval_every=args.eval_every, probe=probe)
         probe.end()
         summary_path = args.out / "training_summary.json"
+        enc = getattr(tr.scale, "encoder", None)
         summary = dict(steps=args.steps, updates_per_state=updates, best_step=tr.best_step,
-                       elapsed_seconds=time.time()-t0, resources=probe.summary())
+                       elapsed_seconds=time.time()-t0, resources=probe.summary(),
+                       torch=torch.__version__,
+                       compiled=bool(getattr(enc, "compile", False)) and str(tr.device).startswith("cuda"))
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
         if args.no_merge:
             print(probe.report(), flush=True)

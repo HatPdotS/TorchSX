@@ -30,12 +30,18 @@ jobs:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
 
   python:
-    name: Python ${{ matrix.python-version }}
+    name: Python ${{ matrix.python-version }}, torch ${{ matrix.torch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # the newest torch TorchRef 0.7 accepts, and the lower end of
+        # pyproject.toml's bound
+        torch: ["2.13"]
+        include:
+          - python-version: "3.10"
+            torch: "2.7"
     steps:
       - uses: actions/checkout@v7
 
@@ -48,19 +54,19 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'native/Cargo.lock') }}
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-torch${{ matrix.torch }}-${{ hashFiles('pyproject.toml', 'native/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-torch${{ matrix.torch }}-
 
-      # CPU torch at the version pyproject.toml pins, so the next install keeps
-      # it rather than pulling a CUDA build.
+      # CPU torch inside pyproject.toml's bound, so the next install keeps it
+      # rather than pulling a CUDA build.
       # torchsx-native is built from this commit first, so the torchsx pin
       # resolves to it instead of a published wheel.
       # TorchRef comes from PyPI, as for users.
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install "torch==2.9.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch==${{ matrix.torch }}.*" --index-url https://download.pytorch.org/whl/cpu
           pip install ./native
           pip install -e ".[dev]"
 
