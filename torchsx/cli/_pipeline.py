@@ -23,6 +23,11 @@ READOUT_MAX_OBS = 1_500_000
 # ── data ───────────────────────────────────────────────────────────────
 
 
+#: Name of the state holding the patterns a split file assigns to no dataset.
+#: They train the network; nothing is merged from them.
+UNASSIGNED = "(unassigned)"
+
+
 @dataclass
 class PrepBundle:
     """A prepared data set plus everything needed to reproduce it."""
@@ -48,21 +53,29 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
     A merge reads the recipe off its checkpoint; the flags then act as overrides.
     """
     p.add_argument("stream", type=Path, nargs="*",
-                   help=".stream, .sfx or probixi .duckdb input.  Omit when every "
-                        "input is given as --split NAME=PATH.")
+                   help=".stream, .sfx or probixi .duckdb input; several form one "
+                        "dataset.  Omit when every input is given as --split "
+                        "NAME=PATH.")
     p.add_argument("--split", action="append", default=[], metavar="NAME=PATH",
-                   help="a named crystal split, one stream each; repeatable. "
-                        "Splits are merged separately and never pooled in an "
-                        "in-batch merge target.  No physical meaning is "
-                        "assumed -- the name is just a label.")
+                   help="a stream of the dataset NAME; repeatable.  Streams given "
+                        "the same name form one dataset, and PATH may be a glob "
+                        "pattern (quote it).  Datasets are merged separately and "
+                        "never pooled in an in-batch merge target.  No physical "
+                        "meaning is assumed -- the name is just a label.")
     p.add_argument("--split-file", type=Path, default=None,
-                   help="crystal splits for a single stream, either a "
+                   help="datasets for the frames of the unnamed streams, either a "
                         "CrystFEL custom-split file (three whitespace columns, "
                         "'filename event dataset', the same file partialator "
                         "takes as --custom-split) or a .pt int64 label per "
-                        "crystal after the d_min filter.  Every crystal must "
-                        "be labelled. Repeat a filename/event with different "
-                        "dataset names to include a frame in multiple splits.")
+                        "crystal after the d_min filter (-1: no dataset).  An "
+                        "event of * names every frame of the file.  Repeat a "
+                        "filename/event with different dataset names to include "
+                        "a frame in multiple datasets.")
+    p.add_argument("--unassigned", choices=("train", "drop", "error"), default=None,
+                   help="patterns --split-file assigns to no dataset: train "
+                        "(default) trains the network on them and merges them "
+                        "into no dataset, drop leaves them out, error refuses "
+                        "the input.  A merge inherits the checkpoint's choice.")
     p.add_argument("--spacegroup", default=None,
                    help='e.g. "P 1", "P 2 21 21".  Stamped into the MTZ and '
                         "used for centric detection.")
@@ -126,27 +139,52 @@ def _comparable_prep_signature(signature: dict | None, recipe: dict) -> dict:
 
 
 def _splits_from_args(args) -> list[tuple[str, Path]]:
-    """``[(name, path)]`` in split order; a bare stream is one unnamed split."""
+    """``[(name, path)]``, one entry per input file in the order given.
+
+    Inputs of the same name form one dataset; unnamed streams are one unnamed
+    dataset.  A ``--split`` path that names no file is expanded as a glob
+    pattern, in sorted order.
+    """
+    import glob
+
     out: list[tuple[str, Path]] = []
     for entry in args.split or []:
         if "=" not in entry:
             raise SystemExit(f"--split wants NAME=PATH, got {entry!r}")
         name, _, path = entry.partition("=")
-        if not name.strip() or not path.strip() or Path(name.strip()).name != name.strip() or name.strip() in (".", ".."):
+        name, path = name.strip(), path.strip()
+        if not name or not path or Path(name).name != name or name in (".", ".."):
             raise SystemExit(f"--split wants a nonempty NAME=PATH with a filename-safe name, got {entry!r}")
-        out.append((name.strip(), Path(path.strip())))
+        if name == UNASSIGNED:
+            raise SystemExit(f"--split: {UNASSIGNED!r} is reserved for the patterns of no dataset")
+        paths = [path]
+        if not Path(path).exists() and glob.has_magic(path):
+            paths = sorted(glob.glob(path))
+            if not paths:
+                raise SystemExit(f"--split {entry!r} matches no file")
+        out.extend((name, Path(q)) for q in paths)
+    named = bool(out)
     for path in args.stream or []:
         out.append(("", Path(path)))
     if not out:
         raise SystemExit("no input: give a stream path or --split NAME=PATH")
-    if len(out) > 1 and any(not n for n, _ in out):
+    if named and any(not n for n, _ in out):
         raise SystemExit("mixing --split with unnamed streams is ambiguous; "
                          "name every input")
-    if len({name for name, _ in out}) != len(out):
-        raise SystemExit("Input split names must be unique")
-    if args.split_file is not None and len(out) != 1:
-        raise SystemExit("--split-file labels one input; use --split NAME=PATH for separate inputs")
+    if args.split_file is not None and len({n for n, _ in out}) != 1:
+        raise SystemExit("--split-file assigns the frames to datasets itself; give "
+                         "its streams unnamed, not as different --split names")
     return out
+
+
+def merged_states(names, n_states: int) -> list[int]:
+    """The states that are merged: all but the patterns of no dataset."""
+    return [k for k in range(n_states) if not (k < len(names) and names[k] == UNASSIGNED)]
+
+
+def _dataset_names(splits) -> list[str]:
+    """The datasets of ``_splits_from_args`` inputs, each once, in the order first given."""
+    return list(dict.fromkeys(name for name, _ in splits))
 
 
 def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True) -> PrepBundle:
@@ -186,6 +224,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         raise SystemExit("Resolution cuts must be finite and satisfy 0 < dmin < dmax")
 
     splits = _splits_from_args(args)
+    unassigned = getattr(args, "unassigned", None) or d.get("unassigned") or "train"
 
     cache = args.cache_prep
     if cache is None and getattr(args, "out", None) is not None:
@@ -224,6 +263,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     }
     if args.split_file is not None:
         signature["split_file_version"] = 2  # Preserve overlapping assignments.
+        signature["unassigned"] = unassigned
 
     sources = [path for _, path in splits]
     try:
@@ -264,6 +304,9 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
 
     if stored is not None:
         got = stored.get("signature")
+        if got and got.get("split_file") and "unassigned" not in got:
+            # built when every crystal had to be labelled: the same store under any choice
+            got = dict(got, unassigned=unassigned)
         comparable_got = _comparable_prep_signature(got, {})
         comparable_signature = _comparable_prep_signature(signature, {})
         if isinstance(signature.get("gain"), (float, int)):
@@ -315,9 +358,9 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         builder.filter_resolution(d_min, args.dmax)
         if verbose:
             for inp in builder.inputs:
-                print(f"  {inp.name or inp.path.name}: {inp.n_crystals:,} crystals, "
+                print(f"  {inp.name + ': ' if inp.name else ''}{inp.path.name}: {inp.n_crystals:,} crystals, "
                       f"{inp.n_obs:,} obs (d >= {d_min} A)", flush=True)
-        labels, names, extra = _split_labels(args, builder, verbose=verbose)
+        labels, names, extra = _split_labels(args, builder, unassigned=unassigned, verbose=verbose)
         builder.set_layout(extra)
 
         noise = PoissonNoiseModel(r_peak=radii[0], r_gap=radii[1], r_bg=radii[2],
@@ -331,6 +374,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
             recipe.update(_recipe(args, d, splits, d_min, builder.spacegroup or spacegroup,
                                   merge_friedel, gain, radii, noise, resolved, measurement,
                                   disk_size, background, per_image_k0))
+            if args.split_file is not None:
+                recipe["unassigned"] = unassigned
             meta_out.update({"signature": signature, "recipe": recipe, "split_names": names,
                              "bg_var_factor": bvf})
             return meta_out
@@ -386,29 +431,43 @@ def _recipe(args, d, splits, d_min, spacegroup, merge_friedel, gain, radii, nois
     return recipe
 
 
-def _split_labels(args, builder, *, verbose: bool = True):
-    """``(labels, names, extra)``: the split of every prepared crystal, the split
-    names, and the masks over the surviving crystals that are prepared once
-    more (a frame named in several splits of a custom-split file)."""
+def _split_labels(args, builder, *, unassigned: str = "train", verbose: bool = True):
+    """``(labels, names, extra)``: the dataset of every prepared crystal, the
+    dataset names, and the masks over the surviving crystals that are prepared
+    once more (a frame named in several datasets of a custom-split file).
+
+    A crystal the split file assigns to no dataset is, by ``unassigned``,
+    labelled with the last state, :data:`UNASSIGNED` (``train``), dropped from
+    ``builder`` (``drop``) or refused (``error``).
+    """
     import torch
 
     names: list[str] = []
     extra: list[torch.Tensor] = []
-    n_surviving = len(builder.primary)
+    label_parts: list[torch.Tensor] = []
     if args.split_file is not None:
         if str(args.split_file).endswith((".pt", ".pth")):
             labels = torch.load(args.split_file).long().reshape(-1)
+            if labels.numel() != len(builder.primary):
+                raise SystemExit(
+                    f"--split-file has {labels.numel():,} labels but the data has "
+                    f"{len(builder.primary):,} crystals (after the resolution filter)")
+            n_named = int(labels.max()) + 1 if labels.numel() else 0
+            names = [str(i) for i in range(n_named)]
         else:
             # CrystFEL custom-split file: "filename event dataset", the unit
             # being a frame, not a crystal. All crystals of a frame belong
             # to each of its named splits.
-            from torchsx.io.times import event_key, load_split_labels
+            from torchsx.io.times import ANY_EVENT, event_key, load_split_labels
 
             try:
                 lookup = load_split_labels(args.split_file)
             except ValueError as exc:
                 raise SystemExit(str(exc)) from None
             names = sorted({name for bins in lookup.values() for name in bins})
+            if UNASSIGNED in names:
+                raise SystemExit(f"--split-file: the dataset name {UNASSIGNED!r} is reserved "
+                                 "for the patterns of no dataset")
             index = {n: i for i, n in enumerate(names)}
             fnames, evts = builder.surviving_filenames, builder.surviving_events
             if not fnames or not evts:
@@ -416,21 +475,20 @@ def _split_labels(args, builder, *, verbose: bool = True):
                     "the stream carries no image filename/event metadata, so a "
                     "custom-split file cannot be matched to it; re-parse from "
                     "the .stream, or pass a .pt label tensor")
-            memberships = [sorted(index[name] for name in lookup.get((f, event_key(e)), ()))
+            nothing = frozenset()
+            memberships = [sorted(index[name] for name in
+                                  lookup.get((f, event_key(e)), nothing) | lookup.get((f, ANY_EVENT), nothing))
                            for f, e in zip(fnames, evts)]
             image_id = builder.surviving_image_id
             per_image = torch.tensor([bins[0] if bins else -1 for bins in memberships],
                                      dtype=torch.long)
             labels = per_image[image_id]
             if verbose:
-                miss = int((labels < 0).sum())
                 print(f"  custom split {args.split_file.name}: {len(lookup):,} "
-                      f"frames, {len(names)} datasets, {miss:,} crystals "
-                      f"unmatched", flush=True)
+                      f"frames, {len(names)} datasets", flush=True)
             # The trainer consumes one label per crystal. Add another copy
             # of the frame's crystals/observations for each extra membership.
             # A repeated row is one membership, so no bin counts a crystal twice.
-            label_parts = [labels]
             for slot in range(1, max(map(len, memberships), default=0)):
                 more = torch.tensor([bins[slot] if len(bins) > slot else -1
                                      for bins in memberships], dtype=torch.long)[image_id]
@@ -438,27 +496,33 @@ def _split_labels(args, builder, *, verbose: bool = True):
                 if mask.any():
                     extra.append(mask)
                     label_parts.append(more[mask])
-            labels = torch.cat(label_parts)
-        n_total = n_surviving + sum(int(m.sum()) for m in extra)
-        if labels.numel() != n_total:
-            raise SystemExit(
-                f"--split-file has {labels.numel():,} labels but the data has "
-                f"{n_total:,} crystals (after the resolution filter)")
-        if int((labels < 0).sum()):
-            raise SystemExit(f"--split-file: {int((labels < 0).sum()):,} unlabelled "
-                             "crystals (-1); every crystal must belong to a split")
-        # A custom-split file defines state names even if filtering empties a state.
-        n_splits = len(names) if names else int(labels.max()) + 1
-        if not names:
-            names = [str(i) for i in range(n_splits)]
-        if len(names) != n_splits:
-            raise SystemExit(f"{len(names)} split names for {n_splits} labels")
-        return labels, names, extra
-    if len(builder.inputs) > 1:
+        free = labels < 0
+        n_free = int(free.sum())
+        if n_free == labels.numel():
+            raise SystemExit("--split-file assigns no crystal of the data to a dataset")
+        if n_free and unassigned == "error":
+            raise SystemExit(f"--split-file: {n_free:,} crystals belong to no dataset "
+                             "(--unassigned error)")
+        if n_free and unassigned == "drop":
+            # a crystal prepared once more has a first dataset, so it stays
+            builder.drop(free)
+            labels, extra = labels[~free], [mask[~free] for mask in extra]
+        elif n_free:
+            labels = torch.where(free, torch.full_like(labels, len(names)), labels)
+            names = names + [UNASSIGNED]
+        if verbose and n_free:
+            fate = {"train": "train the network and are merged into no dataset",
+                    "drop": "are left out"}[unassigned]
+            print(f"  {n_free:,} crystals belong to no dataset: they {fate} "
+                  f"(--unassigned {unassigned})", flush=True)
+        return torch.cat([labels, *label_parts]), names, extra
+    datasets = _dataset_names([(inp.name, inp.path) for inp in builder.inputs])
+    if len(datasets) > 1:
+        position = {name: i for i, name in enumerate(datasets)}
         labels = torch.repeat_interleave(
-            torch.arange(len(builder.inputs)),
+            torch.tensor([position[inp.name] for inp in builder.inputs]),
             torch.tensor([inp.n_crystals for inp in builder.inputs]))
-        return labels, [inp.name for inp in builder.inputs], extra
+        return labels, datasets, extra
     return None, names, extra
 
 

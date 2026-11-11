@@ -15,9 +15,10 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 
 | Option | Default | |
 |---|---|---|
-| `STREAM` | | CrystFEL `.stream`, a prepared `.sfx`, or a probixi `.duckdb` run (see [probixi input](#probixi-input)). |
-| `--split NAME=PATH` | | A named state, one stream each; repeatable. Each state is merged on its own. |
-| `--split-file FILE` | | States for a single stream (see [States](#states)). |
+| `STREAM` | | CrystFEL `.stream`, a prepared `.sfx`, or a probixi `.duckdb` run (see [probixi input](#probixi-input)). Several streams form one data set. |
+| `--split NAME=PATH` | | A stream of the state `NAME`; repeatable. Streams of the same name form one state, and `PATH` may be a quoted glob pattern. Each state is merged on its own. |
+| `--split-file FILE` | | States for the frames of the streams (see [States](#states)). |
+| `--unassigned` | `train` | Patterns `--split-file` assigns to no state: `train` on them without merging them, `drop` them, or refuse the input with `error`. |
 | `--spacegroup SG` | | Space group, e.g. `'P 63'`. Required for `.stream` input. |
 | `--dmin`, `--dmax` | all | High- and low-resolution cut in Å. |
 | `--merge-friedel` / `--no-merge-friedel` | merge | Keep Friedel mates apart with `--no-merge-friedel`; the MTZs then carry (+) and (−) columns. |
@@ -35,7 +36,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 
 | Option | Default | |
 |---|---|---|
-| `--steps N` | 400 | Optimizer updates in total, divided evenly over the states. |
+| `--steps N` | 400 | Optimizer updates in total, divided evenly over the states (see [States](#states) for patterns of no state). |
 | `--redundancy N` | 100 | Target observations per reflection in a batch. |
 | `--warmup N` | 25 | Learning-rate warm-up, in updates per state. |
 | `--lr-schedule` | `constant` | Learning rate after the warm-up: `constant`, or `cosine` decay to zero at the last update. |
@@ -112,20 +113,48 @@ torchsx.train --split dark=dark.stream --split light=light.stream \
   --spacegroup 'P 63' --dmin 2.0 -o joint/
 ```
 
-A single stream can be divided with `--split-file`, either a CrystFEL
-custom-split file (the one partialator takes as `--custom-split`) or a `.pt`
-tensor with one integer label per crystal after the resolution cut:
+A state can come from several streams: repeat its name, or give a glob
+pattern, quoted so that the shell leaves it to TorchSX. Several streams without
+a name are one data set.
 
 ```bash
-torchsx.train combined.stream --split-file states.split \
+torchsx.train --split dark=run1.stream --split dark=run2.stream \
+  --split light='light_runs/*.stream' --spacegroup 'P 63' --dmin 2.0 -o joint/
+torchsx.train run1.stream run2.stream --spacegroup 'P 63' --dmin 2.0 -o pooled/
+```
+
+The frames of one or more streams can instead be divided with `--split-file`,
+either a CrystFEL custom-split file (the one partialator takes as
+`--custom-split`) or a `.pt` tensor with one integer label per crystal after
+the resolution cut (−1: no state):
+
+```bash
+torchsx.train run1.stream run2.stream --split-file states.split \
   --spacegroup 'P 63' --dmin 2.0 -o joint/
 ```
 
-A custom-split file has three columns, `filename event dataset`. Every crystal
-must be labelled. A frame listed under several dataset names goes into each of
-those states; a repeated identical row counts once. States from a split file
-are ordered by name, states from `--split` in the order given. The first state
-supplies the validation crystals.
+A custom-split file has three columns, `filename event dataset`:
+
+```
+/data/run1.h5  //0  dark
+/data/run1.h5  //1  light
+/data/run2.h5  *    light      # every frame of run2.h5
+```
+
+An event of `*` names every frame of the file. A frame listed under several
+dataset names goes into each of those states; a repeated identical row counts
+once. States from a split file are ordered by name, states from `--split` in
+the order first given. The first state supplies the validation crystals.
+
+Patterns the split file assigns to no state are kept by default
+(`--unassigned train`): the state label is not an input to the network, so
+they train it like any other pattern, and they are merged into no MTZ. Their
+batches take the share of the updates that they have of the training crystals,
+spread evenly over the run; the states take turns over the rest. With 400
+updates, two states and a tenth of the crystals unassigned, that is 40 updates
+on the unassigned patterns and 180 per state. `--unassigned drop` leaves them
+out of the prepared store, and `--unassigned error` stops when there are any.
+`torchsx.merge` takes the choice from the checkpoint.
 
 ## probixi input
 

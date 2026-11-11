@@ -192,7 +192,7 @@ class _Input:
     crystals: tuple[int, int]            # raw crystal range
     images: tuple[int, int]              # raw image range
     refl: _KeyCounts = None              # every crystal of the input
-    extra: Tensor = None                 # counts of the crystals prepared once more
+    extra: Tensor = None                 # counts of the crystals prepared once more, less the dropped
     in_range: Tensor = None              # per key: within the resolution cut
     to_valid: Tensor = None              # per key: prepared reflection index, or -1
     on_device: tuple = None              # (keys, to_valid) on the builder's device
@@ -233,7 +233,8 @@ class _Skeleton:
 class StoreBuilder:
     """Builds a :class:`PreparedStore` in ``workdir`` without holding the observations.
 
-    ``add`` every input, ``filter_resolution``, ``set_layout``, ``finish``.
+    ``add`` every input, ``filter_resolution``, optionally ``drop``, ``set_layout``,
+    ``finish``.
     """
 
     def __init__(self, workdir: str | Path, *, spacegroup: str | None, merge_friedel: bool = True,
@@ -506,6 +507,39 @@ class StoreBuilder:
             return []
         return [self.events[i] for i in self.primary_images.tolist()]
 
+    def _adjust_counts(self, sel: Tensor, sign: int) -> None:
+        """Add (``sign`` 1) or take away (-1) the reflection counts of the raw
+        crystals ``sel`` in their inputs' ``extra``."""
+        for blk, hkl, raw in self._crystal_blocks(sel):
+            inp = self.inputs[int(self.input_of_crystal[blk[0]])]
+            bad, valid = _validity(_field(raw, "I"), _field(raw, "background"),
+                                   _field(raw, "sigma") if self.has_sigma else None)
+            idx = torch.searchsorted(inp.refl.keys, hkl_key(hkl))
+            masks = {"all": None, "kept": valid, "positive": valid & (_field(raw, "I") > 0),
+                     "I": bad["I"], "background": bad["background"],
+                     "sigma": bad.get("sigma", torch.zeros_like(valid))}
+            inp.extra += sign * _count(idx, masks, len(inp.refl.keys))
+
+    def drop(self, mask: Tensor) -> None:
+        """Leave the surviving crystals of ``mask`` (one bool per surviving
+        crystal) out of the store: neither they nor their observations are
+        prepared, and a reflection only they recorded is not indexed."""
+        mask = mask.to(torch.bool)
+        if not bool(mask.any()):
+            return
+        gone = self.primary[mask]
+        self._adjust_counts(gone, -1)
+        self.survives[gone] = False
+        for inp in self.inputs:
+            c0, c1 = inp.crystals
+            inp.n_crystals = int(self.survives[c0:c1].sum())
+            inp.n_obs = int((inp.refl.counts + inp.extra)[inp.in_range, 0].sum())
+        self.primary = torch.nonzero(self.survives, as_tuple=True)[0]
+        image_hit = torch.zeros(len(self.filenames), dtype=torch.bool)
+        image_hit[self.crystal["image_id"][self.primary]] = True
+        self.primary_images = torch.nonzero(image_hit, as_tuple=True)[0]
+        self.clock.report("drop")
+
     def set_layout(self, extra: list[Tensor] | None = None) -> None:
         """The prepared crystals: every surviving crystal, then once more those
         of each mask in ``extra`` (one bool per surviving crystal), as
@@ -516,15 +550,7 @@ class StoreBuilder:
             sel = self.primary[mask]
             logical.append(sel)
             images.append(torch.unique(self.crystal["image_id"][sel]))
-            for blk, hkl, raw in self._crystal_blocks(sel):
-                inp = self.inputs[int(self.input_of_crystal[blk[0]])]
-                bad, valid = _validity(_field(raw, "I"), _field(raw, "background"),
-                                       _field(raw, "sigma") if self.has_sigma else None)
-                idx = torch.searchsorted(inp.refl.keys, hkl_key(hkl))
-                masks = {"all": None, "kept": valid, "positive": valid & (_field(raw, "I") > 0),
-                         "I": bad["I"], "background": bad["background"],
-                         "sigma": bad.get("sigma", torch.zeros_like(valid))}
-                inp.extra += _count(idx, masks, len(inp.refl.keys))
+            self._adjust_counts(sel, 1)
         self.logical = torch.cat(logical)
         self.logical_images = torch.cat(images)
         # image index of each prepared crystal within the prepared image list

@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> None:
     out = args.out
     try:
         probe.begin("readout")
-        merge_products(tr, prep, args, names, list(range(tr.n_conditions)),
+        merge_products(tr, prep, args, names, P.merged_states(names, tr.n_conditions),
                        spacegroup=bundle.spacegroup, merge_friedel=bundle.merge_friedel)
         probe.end()
         out.with_suffix(".resources.json").write_text(json.dumps(probe.summary(), indent=2) + "\n")

@@ -367,16 +367,8 @@ def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
     from torchsx.cli import _pipeline as P
     from torchsx.stream import SFXStream
 
-    from torchsx.io._metadata import StreamMetadata
-
-    cache = tmp_path / "s.sfx"
-    metadata = StreamMetadata(image={"filename": ["/raw/a.h5", "/raw/b.h5"],
-                                     "event": ["//0", "//1"]})
-    s = SFXStream(sample_core.replace(metadata=metadata, friedel_merged=False))
-    s = SFXStream.concat([s, s])
-    s = SFXStream(s._core.replace(image_id=torch.tensor([0, 1, 0, 1], dtype=torch.int32),
-                                  crystal_in_image=torch.tensor([0, 0, 1, 1], dtype=torch.int32)))
-    s.save(cache)
+    cache = _two_frame_cache(tmp_path, sample_core)
+    s = SFXStream.read(cache)
     names = ["beta", "alpha"]            # deliberately NOT sorted
     split = tmp_path / "custom.split"
     with open(split, "w") as fh:
@@ -417,15 +409,96 @@ def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
     assert torch.equal(cached.prep.obs_info.delay_bin_idx, expanded_labels)
     torch.testing.assert_close(_in_memory(cached.prep).I_obs, exp_prep.I_obs)
 
-    # a frame the split file does not mention is refused, not silently pooled
+
+def _two_frame_cache(tmp_path, sample_core, name="s.sfx"):
+    """Frames a and b, two identical crystals each (crystals 0, 2 and 1, 3)."""
+    from torchsx.io._metadata import StreamMetadata
+    from torchsx.stream import SFXStream
+
+    cache = tmp_path / name
+    metadata = StreamMetadata(image={"filename": ["/raw/a.h5", "/raw/b.h5"],
+                                     "event": ["//0", "//1"]})
+    s = SFXStream(sample_core.replace(metadata=metadata, friedel_merged=False))
+    s = SFXStream.concat([s, s])
+    s = SFXStream(s._core.replace(image_id=torch.tensor([0, 1, 0, 1], dtype=torch.int32),
+                                  crystal_in_image=torch.tensor([0, 0, 1, 1], dtype=torch.int32)))
+    s.save(cache)
+    return cache
+
+
+def test_patterns_of_no_dataset_train_drop_or_refuse(tmp_path, sample_core):
+    """A frame the split file leaves out trains the network and is merged into
+    nothing by default; ``drop`` leaves it out of the store, ``error`` refuses."""
+    from torchsx.cli import _pipeline as P
+
+    cache = _two_frame_cache(tmp_path, sample_core)
     partial = tmp_path / "partial.split"
-    with open(partial, "w") as fh:
-        frames = list(dict.fromkeys(zip(s.filenames, s.events)))
-        half = frames[: max(1, len(frames) // 2)]
-        for f, e in half:
-            fh.write(f"{f} {e} alpha\n")
-    with pytest.raises(SystemExit, match="unlabelled"):
-        P.load_prep(_DataArgs(stream=[cache], split_file=partial), verbose=False)
+    partial.write_text("/raw/a.h5 //0 alpha\n")
+
+    kept = P.load_prep(_DataArgs(stream=[cache], split_file=partial), verbose=False)
+    assert kept.split_names == ["alpha", P.UNASSIGNED]
+    assert kept.recipe["unassigned"] == "train"
+    labels = kept.prep.obs_info.delay_bin_idx
+    assert labels.tolist() == [0, 1, 0, 1]
+    assert P.merged_states(kept.split_names, 2) == [0]
+
+    dropped = P.load_prep(_DataArgs(stream=[cache], split_file=partial, unassigned="drop",
+                                    cache_prep=tmp_path / "dropped"), verbose=False)
+    assert dropped.split_names == ["alpha"]
+    assert dropped.prep.obs_info.n_crystals == 2
+    assert dropped.prep.obs_info.delay_bin_idx.tolist() == [0, 0]
+    full, part = _in_memory(kept.prep), _in_memory(dropped.prep)
+    in_alpha = labels[full.obs_info.crystal_id] == 0
+    torch.testing.assert_close(part.I_obs.sort().values, full.I_obs[in_alpha].sort().values)
+    assert part.n_obs_total == int(in_alpha.sum())
+    # the store was built for this choice: another one does not read it
+    with pytest.raises(SystemExit, match="different settings"):
+        P.load_prep(_DataArgs(stream=[cache], split_file=partial, unassigned="train",
+                              cache_prep=tmp_path / "dropped"), verbose=False)
+
+    with pytest.raises(SystemExit, match="belong to no dataset"):
+        P.load_prep(_DataArgs(stream=[cache], split_file=partial, unassigned="error"), verbose=False)
+
+    # a frame in two datasets is prepared twice whatever happens to the others
+    both = tmp_path / "both.split"
+    both.write_text("/raw/a.h5 //0 alpha\n/raw/a.h5 //0 beta\n")
+    for mode, want in (("train", [0, 2, 0, 2, 1, 1]), ("drop", [0, 0, 1, 1])):
+        b = P.load_prep(_DataArgs(stream=[cache], split_file=both, unassigned=mode,
+                                  cache_prep=tmp_path / f"both-{mode}"), verbose=False)
+        assert b.prep.obs_info.delay_bin_idx.tolist() == want
+
+    nothing = tmp_path / "nothing.split"
+    nothing.write_text("/raw/other.h5 //0 alpha\n")
+    with pytest.raises(SystemExit, match="assigns no crystal"):
+        P.load_prep(_DataArgs(stream=[cache], split_file=nothing), verbose=False)
+    reserved = tmp_path / "reserved.split"
+    reserved.write_text(f"/raw/a.h5 //0 {P.UNASSIGNED}\n")
+    with pytest.raises(SystemExit, match="reserved"):
+        P.load_prep(_DataArgs(stream=[cache], split_file=reserved), verbose=False)
+
+    # a .pt label tensor marks a crystal of no dataset with -1
+    pt = tmp_path / "labels.pt"
+    torch.save(torch.tensor([0, -1, 1, -1]), pt)
+    b = P.load_prep(_DataArgs(stream=[cache], split_file=pt, cache_prep=tmp_path / "pt"), verbose=False)
+    assert b.split_names == ["0", "1", P.UNASSIGNED]
+    assert b.prep.obs_info.delay_bin_idx.tolist() == [0, 2, 1, 2]
+
+
+def test_split_file_event_wildcard_and_several_streams(tmp_path, sample_core):
+    """``*`` names every frame of a file, and one split file labels the frames
+    of every stream given."""
+    from torchsx.cli import _pipeline as P
+
+    first = _two_frame_cache(tmp_path, sample_core, "first.sfx")
+    second = _two_frame_cache(tmp_path, sample_core, "second.sfx")
+    split = tmp_path / "wild.split"
+    split.write_text("/raw/a.h5 * alpha\n/raw/b.h5 //1 beta\n/raw/b.h5 * gamma\n")
+    b = P.load_prep(_DataArgs(stream=[first, second], split_file=split), verbose=False)
+    assert b.split_names == ["alpha", "beta", "gamma"]
+    # frame b is in beta and gamma: prepared once more for the second
+    assert b.prep.obs_info.delay_bin_idx.tolist() == [0, 1, 0, 1] * 2 + [2] * 4
+    with pytest.raises(SystemExit, match="unnamed"):
+        P.load_prep(_DataArgs(split=[f"x={first}", f"y={second}"], split_file=split), verbose=False)
 
 
 

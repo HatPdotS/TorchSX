@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A state can come from several streams: `--split` names repeat, a `--split` path may be a glob pattern, and several unnamed streams are one data set.
+- `--split-file` labels the frames of any number of streams, and an event of `*` names every frame of a file.
+- Patterns a split file assigns to no state no longer stop the run: by default they train the network, with their share of the updates, and are merged into nothing; `--unassigned drop` or `error` chooses otherwise.
+
 ## v0.2.3
 
 - torch 2.7 to 2.14 instead of 2.9 only: on 2.11 to 2.13 the fold encoder compiles with inductor's coalescing analysis and mix-order reduction off, the two passes that fail on it.
