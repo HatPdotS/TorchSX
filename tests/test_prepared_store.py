@@ -230,36 +230,6 @@ def _train_and_merge(prep, tmp_path):
     return tr.merge()
 
 
-def test_dropped_crystals_leave_the_store_of_the_others(streams, tmp_path, parser):
-    """``drop`` gives the store that the stream without those crystals gives."""
-    kw = dict(spacegroup="P 2 2 2", merge_friedel=True, block_obs=37)
-    b = PS.StoreBuilder(tmp_path / "raw-a", **kw)
-    for i, path in enumerate(streams):
-        b.add(str(i), path)
-    b.filter_resolution(2.0)
-    n = len(b.primary)
-    gone = torch.arange(n) % 3 == 1
-    extra = torch.arange(n) % 5 == 0
-    b.drop(gone)
-    assert len(b.primary) == int((~gone).sum())
-    assert sum(inp.n_crystals for inp in b.inputs) == len(b.primary)
-    b.set_layout([extra[~gone]])
-    noise = PoissonNoiseModel(r_peak=3, r_gap=4, r_bg=7, gain=1.0)
-    got = b.finish(tmp_path / "a", config=MergeConfig(gain=1.0), noise=noise).materialize()
-
-    parts = [SFXStream(filter_resolution(SFXStream.read(p, spacegroup="P 2 2 2")._core, d_min=2.0, d_max=999.0))
-             for p in streams]
-    stream = SFXStream.concat(parts).filter_crystals(~gone)
-    stream = SFXStream.concat([stream, stream.filter_crystals(extra[~gone])])
-    want = prepare_observations(stream, MergeConfig(gain=1.0), poisson_noise=noise)
-    assert got.n_valid == want.n_valid and got.n_obs_total == want.n_obs_total
-    assert torch.equal(got.hkl_valid, want.hkl_valid)
-    a, c = _crystal_major(got), _crystal_major(want)
-    assert torch.equal(got.I_obs[a], want.I_obs[c])
-    assert torch.equal(got.obs_info.crystal_id[a], want.obs_info.crystal_id[c])
-    assert torch.equal(got.obs_info.hkl_idx[a], want.obs_info.hkl_idx[c])
-
-
 def test_trainer_on_store_matches_in_memory(streams, tmp_path, parser):
     store, _ = _build(streams, tmp_path / "store", spacegroup="P 2 2 2", merge_friedel=True,
                       d_min=2.0, gain=1.0)
@@ -267,6 +237,33 @@ def test_trainer_on_store_matches_in_memory(streams, tmp_path, parser):
     in_memory = _train_and_merge(store.materialize(), tmp_path / "b")
     for key in ("F", "F_sd", "I0", "I0_sd", "edge_mass"):
         assert torch.equal(on_disk[key], in_memory[key]), key
+
+
+def test_states_of_a_store_overlap_without_copies(streams, tmp_path, parser):
+    """On a store a batch is its state's whatever its crystals' first state is:
+    a state merges its members, those it shares with another included."""
+    from tests.test_cli_pipeline import _stack
+    store, _ = _build(streams, tmp_path / "store", spacegroup="P 2 2 2", merge_friedel=True,
+                      d_min=2.0, gain=1.0)
+    n = store.obs_info.n_crystals
+    i = torch.arange(n)
+    member = torch.stack([i < 2 * n // 3, i >= n // 3, (i >= n // 3) & (i < 2 * n // 3)], 1)
+    P.assign_states(store.obs_info, member)
+    _, _, tr = _stack(store, None, tmp_path / "run")
+    try:
+        tr.scale.eval()
+        shared = member[:, 2].nonzero(as_tuple=True)[0]
+        ref = tr.merge(condition=2)
+        assert ref["n_crystals"] == shared.numel() and int(ref["seen"].sum())
+        for k in (0, 1):
+            got = tr.merge(crystals=shared, condition=k)
+            assert torch.equal(got["seen"], ref["seen"])
+            torch.testing.assert_close(got["F"], ref["F"], equal_nan=True)
+            assert tr.merge(condition=k)["n_crystals"] == int(member[:, k].sum())
+        rec = tr.step(tr.index.rows(shared), state=1)
+        assert tr._cond == 1 and rec["n_used"]
+    finally:
+        tr.close()
 
 
 def test_load_prep_builds_and_reuses_the_store(streams, tmp_path, parser, monkeypatch):
@@ -281,20 +278,9 @@ def test_load_prep_builds_and_reuses_the_store(streams, tmp_path, parser, monkey
     labels = built.prep.obs_info.delay_bin_idx
     assert labels.tolist() == sorted(labels.tolist()) and set(labels.tolist()) == {0, 1}
 
-    # streams of one name are one dataset, whatever the order they come in
-    per_input = torch.bincount(labels).tolist()
-    pooled = P.load_prep(_DataArgs(split=[f"a={streams[0]}", f"b={streams[1]}", f"a={streams[1]}"],
-                                   int_radius=None, gain=None, spacegroup="P 2 2 2"), verbose=False)
-    assert pooled.split_names == ["a", "b"]
-    assert pooled.prep.obs_info.delay_bin_idx.tolist() == (
-        [0] * per_input[0] + [1] * per_input[1] + [0] * per_input[1])
-    for one in (dict(split=[f"a={streams[0]}", f"a={streams[1]}"]), dict(stream=list(streams)),
-                dict(split=[f"a={tmp_path}/in*.stream"])):
-        single = P.load_prep(_DataArgs(int_radius=None, gain=None, spacegroup="P 2 2 2", **one),
-                             verbose=False)
-        assert single.split_names == [] and single.prep.obs_info.delay_bin_idx is None
-        assert single.prep.obs_info.n_crystals == sum(per_input)
-        assert single.prep.n_obs_total == built.prep.n_obs_total
+    assert built.prep.crystal_input.tolist() == labels.tolist()
+    frames = built.prep.frames()
+    assert len(frames[0]) == len(frames[1]) == int(built.prep.crystal_image.max()) + 1
 
     def no_parse(*a, **k):
         raise AssertionError("a prepared-cache hit must not parse")
@@ -302,6 +288,28 @@ def test_load_prep_builds_and_reuses_the_store(streams, tmp_path, parser, monkey
     again = P.load_prep(args, verbose=False)
     assert again.recipe == built.recipe and again.split_names == built.split_names
     assert torch.equal(again.prep.obs_info.delay_bin_idx, labels)
+
+    # the store holds no states: other names for the same streams read it too
+    per_input = torch.bincount(labels).tolist()
+    for split, names in (([f"b={streams[0]}", f"a={streams[1]}"], ["b", "a"]),
+                         ([f"a={streams[0]}", f"a={streams[1]}"], []),
+                         ([f"a={tmp_path}/in*.stream"], [])):
+        args.split = split
+        other = P.load_prep(args, verbose=False)
+        assert other.split_names == names
+        assert other.recipe["inputs"] == [[e.split("=")[0], str(p)] for e, p in zip(
+            [f"{split[0].split('=')[0]}=", f"{split[-1].split('=')[0]}="], streams)]
+        if names:
+            assert torch.equal(other.prep.obs_info.delay_bin_idx, labels)
+            assert other.prep.obs_info.membership.sum(0).tolist() == per_input
+        else:
+            assert other.prep.obs_info.delay_bin_idx is None and other.prep.obs_info.membership is None
+    args.split, args.stream = [], list(streams)
+    assert P.load_prep(args, verbose=False).split_names == []
+    args.stream = list(streams[::-1])           # another order is another store
+    with pytest.raises(SystemExit, match="different settings"):
+        P.load_prep(args, verbose=False)
+    args.split, args.stream = [f"a={streams[0]}", f"b={streams[1]}"], []
     args.gain = 2
     with pytest.raises(SystemExit, match="different settings"):
         P.load_prep(args, verbose=False)

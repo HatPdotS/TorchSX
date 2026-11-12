@@ -356,7 +356,7 @@ class _DataArgs:
         self.__dict__.update(kw)
 
 
-def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
+def test_custom_split_file_labels_every_crystal(tmp_path, sample_core, monkeypatch):
     """A partialator ``--custom-split`` file is a valid ``--split-file``.
 
     The unit in that file is a frame, so the label reaches a crystal through
@@ -365,6 +365,7 @@ def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
     resolution filter has reindexed the image table.
     """
     from torchsx.cli import _pipeline as P
+    from torchsx.merging import prepare_store as PS
     from torchsx.stream import SFXStream
 
     cache = _two_frame_cache(tmp_path, sample_core)
@@ -375,39 +376,36 @@ def test_custom_split_file_labels_every_crystal(tmp_path, sample_core):
         for i, (f, e) in enumerate(zip(s.filenames, s.events)):
             fh.write(f"{f} {e} {names[i % 2]}\n")
 
-    b = P.load_prep(_DataArgs(stream=[cache], split_file=split), verbose=False)
+    store = tmp_path / "prepared"
+    b = P.load_prep(_DataArgs(stream=[cache], split_file=split, cache_prep=store), verbose=False)
     labels = b.prep.obs_info.delay_bin_idx
     # names come back sorted, so "alpha" is split 0 and takes the odd images
     assert b.split_names == ["alpha", "beta"]
-    assert labels.numel() == b.prep.obs_info.n_crystals
-    assert int(labels.min()) == 0 and int(labels.max()) == 1
-    assert set(labels.tolist()) == {0, 1}
-    assert labels[0] == labels[2] and labels[1] == labels[3]
+    assert labels.tolist() == [1, 0, 1, 0]
+    assert b.prep.obs_info.membership.tolist() == [[False, True], [True, False]] * 2
+    I_obs = _in_memory(b.prep).I_obs
 
-    # Both crystals of frame a belong to three bins. Repeating the same
-    # membership must not count either crystal twice within that bin.
+    # The states are not in the store: another split file reads the same one.
+    def no_parse(*a, **k):
+        raise AssertionError("other states of the same input must not parse it again")
+    monkeypatch.setattr(PS.StoreBuilder, "add", no_parse)
+
+    # Both crystals of frame a belong to three bins.  They are held once, as
+    # members of each; repeating a membership changes nothing.
     overlapping = tmp_path / "overlapping.split"
     overlapping.write_text(
         "/raw/a.h5 //0 beta\n/raw/a.h5 //0 alpha\n"
         "/raw/a.h5 //0 gamma\n/raw/a.h5 //0 alpha\n"
         "/raw/b.h5 //1 alpha\n"
     )
-    overlap_args = _DataArgs(stream=[cache], split_file=overlapping,
-                             cache_prep=tmp_path / "overlapping.pt")
-    expanded = P.load_prep(overlap_args, verbose=False)
+    expanded = P.load_prep(_DataArgs(stream=[cache], split_file=overlapping, cache_prep=store),
+                           verbose=False)
     assert expanded.split_names == ["alpha", "beta", "gamma"]
-    expanded_labels = expanded.prep.obs_info.delay_bin_idx
-    assert torch.bincount(expanded_labels).tolist() == [4, 2, 2]
-    exp_prep, b_prep = _in_memory(expanded.prep), _in_memory(b.prep)
-    obs_labels = expanded_labels[exp_prep.obs_info.crystal_id]
-    original_labels = labels[b_prep.obs_info.crystal_id]
-    for k in range(3):
-        expected = b_prep.I_obs if k == 0 else b_prep.I_obs[original_labels == 1]
-        torch.testing.assert_close(exp_prep.I_obs[obs_labels == k].sort().values,
-                                   expected.sort().values)
-    cached = P.load_prep(overlap_args, verbose=False)
-    assert torch.equal(cached.prep.obs_info.delay_bin_idx, expanded_labels)
-    torch.testing.assert_close(_in_memory(cached.prep).I_obs, exp_prep.I_obs)
+    oi = expanded.prep.obs_info
+    assert oi.n_crystals == 4
+    assert oi.membership.tolist() == [[True, True, True], [True, False, False]] * 2
+    assert oi.delay_bin_idx.tolist() == [0, 0, 0, 0]          # the first state of each
+    torch.testing.assert_close(_in_memory(expanded.prep).I_obs, I_obs)
 
 
 def _two_frame_cache(tmp_path, sample_core, name="s.sfx"):
@@ -428,60 +426,64 @@ def _two_frame_cache(tmp_path, sample_core, name="s.sfx"):
 
 def test_patterns_of_no_dataset_train_drop_or_refuse(tmp_path, sample_core):
     """A frame the split file leaves out trains the network and is merged into
-    nothing by default; ``drop`` leaves it out of the store, ``error`` refuses."""
+    nothing by default; ``drop`` keeps it out of both, ``error`` refuses.  The
+    store is the same under each."""
     from torchsx.cli import _pipeline as P
 
     cache = _two_frame_cache(tmp_path, sample_core)
     partial = tmp_path / "partial.split"
     partial.write_text("/raw/a.h5 //0 alpha\n")
 
-    kept = P.load_prep(_DataArgs(stream=[cache], split_file=partial), verbose=False)
+    def load(split_file, **kw):
+        return P.load_prep(_DataArgs(stream=[cache], split_file=split_file,
+                                     cache_prep=tmp_path / "prepared", **kw), verbose=False)
+
+    kept = load(partial)
     assert kept.split_names == ["alpha", P.UNASSIGNED]
     assert kept.recipe["unassigned"] == "train"
-    labels = kept.prep.obs_info.delay_bin_idx
-    assert labels.tolist() == [0, 1, 0, 1]
+    assert kept.prep.obs_info.delay_bin_idx.tolist() == [0, 1, 0, 1]
     assert P.merged_states(kept.split_names, 2) == [0]
 
-    dropped = P.load_prep(_DataArgs(stream=[cache], split_file=partial, unassigned="drop",
-                                    cache_prep=tmp_path / "dropped"), verbose=False)
-    assert dropped.split_names == ["alpha"]
-    assert dropped.prep.obs_info.n_crystals == 2
-    assert dropped.prep.obs_info.delay_bin_idx.tolist() == [0, 0]
-    full, part = _in_memory(kept.prep), _in_memory(dropped.prep)
-    in_alpha = labels[full.obs_info.crystal_id] == 0
-    torch.testing.assert_close(part.I_obs.sort().values, full.I_obs[in_alpha].sort().values)
-    assert part.n_obs_total == int(in_alpha.sum())
-    # the store was built for this choice: another one does not read it
-    with pytest.raises(SystemExit, match="different settings"):
-        P.load_prep(_DataArgs(stream=[cache], split_file=partial, unassigned="train",
-                              cache_prep=tmp_path / "dropped"), verbose=False)
+    dropped = load(partial, unassigned="drop")
+    assert dropped.split_names == ["alpha"] and dropped.recipe["unassigned"] == "drop"
+    assert dropped.prep.obs_info.n_crystals == 4
+    assert dropped.prep.obs_info.membership.tolist() == [[True], [False], [True], [False]]
 
     with pytest.raises(SystemExit, match="belong to no dataset"):
-        P.load_prep(_DataArgs(stream=[cache], split_file=partial, unassigned="error"), verbose=False)
+        load(partial, unassigned="error")
 
-    # a frame in two datasets is prepared twice whatever happens to the others
+    # a frame in two datasets is a member of both whatever happens to the others
     both = tmp_path / "both.split"
     both.write_text("/raw/a.h5 //0 alpha\n/raw/a.h5 //0 beta\n")
-    for mode, want in (("train", [0, 2, 0, 2, 1, 1]), ("drop", [0, 0, 1, 1])):
-        b = P.load_prep(_DataArgs(stream=[cache], split_file=both, unassigned=mode,
-                                  cache_prep=tmp_path / f"both-{mode}"), verbose=False)
-        assert b.prep.obs_info.delay_bin_idx.tolist() == want
+    for mode, want in (("train", [[True, True, False], [False, False, True]]),
+                       ("drop", [[True, True], [False, False]])):
+        assert load(both, unassigned=mode).prep.obs_info.membership.tolist() == want * 2
+
+    # one state of every crystal is no state at all
+    whole = tmp_path / "whole.split"
+    whole.write_text("/raw/a.h5 * alpha\n/raw/b.h5 * alpha\n")
+    b = load(whole)
+    assert b.split_names == ["alpha"] and b.prep.obs_info.membership is None
+    assert b.prep.obs_info.delay_bin_idx is None
 
     nothing = tmp_path / "nothing.split"
     nothing.write_text("/raw/other.h5 //0 alpha\n")
     with pytest.raises(SystemExit, match="assigns no crystal"):
-        P.load_prep(_DataArgs(stream=[cache], split_file=nothing), verbose=False)
+        load(nothing)
     reserved = tmp_path / "reserved.split"
     reserved.write_text(f"/raw/a.h5 //0 {P.UNASSIGNED}\n")
     with pytest.raises(SystemExit, match="reserved"):
-        P.load_prep(_DataArgs(stream=[cache], split_file=reserved), verbose=False)
+        load(reserved)
 
     # a .pt label tensor marks a crystal of no dataset with -1
     pt = tmp_path / "labels.pt"
     torch.save(torch.tensor([0, -1, 1, -1]), pt)
-    b = P.load_prep(_DataArgs(stream=[cache], split_file=pt, cache_prep=tmp_path / "pt"), verbose=False)
+    b = load(pt)
     assert b.split_names == ["0", "1", P.UNASSIGNED]
     assert b.prep.obs_info.delay_bin_idx.tolist() == [0, 2, 1, 2]
+    torch.save(torch.tensor([0, 1, 1]), pt)
+    with pytest.raises(SystemExit, match="3 labels but the data has 4 crystals"):
+        load(pt)
 
 
 def test_split_file_event_wildcard_and_several_streams(tmp_path, sample_core):
@@ -495,10 +497,65 @@ def test_split_file_event_wildcard_and_several_streams(tmp_path, sample_core):
     split.write_text("/raw/a.h5 * alpha\n/raw/b.h5 //1 beta\n/raw/b.h5 * gamma\n")
     b = P.load_prep(_DataArgs(stream=[first, second], split_file=split), verbose=False)
     assert b.split_names == ["alpha", "beta", "gamma"]
-    # frame b is in beta and gamma: prepared once more for the second
-    assert b.prep.obs_info.delay_bin_idx.tolist() == [0, 1, 0, 1] * 2 + [2] * 4
+    assert b.prep.obs_info.membership.tolist() == [[True, False, False], [False, True, True]] * 4
     with pytest.raises(SystemExit, match="unnamed"):
         P.load_prep(_DataArgs(split=[f"x={first}", f"y={second}"], split_file=split), verbose=False)
+
+
+def test_a_crystal_of_several_states_trains_and_merges_in_each(tmp_path):
+    """With a membership table a crystal is sampled and merged in every state
+    it belongs to, held once; one of no state is left out of everything."""
+    from torchsx.cli import train
+    from torchsx.cli._pipeline import assign_states
+    from torchsx.cli.merge_nn import _export_crystals
+
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=24, per=10)
+    n = prep.obs_info.n_crystals
+    member = torch.zeros(n, 3, dtype=torch.bool)
+    member[:, 0] = torch.arange(n) < 16            # "early"
+    member[:, 1] = torch.arange(n) >= 8            # "late": crystals 8..15 are in both
+    member[:, 1] &= torch.arange(n) < 22           # crystals 22, 23 are in no state
+    member[:, 2] = member[:, 0] & member[:, 1]     # a state made of the overlap alone
+    assign_states(prep.obs_info, member)
+    _, _, tr = _stack(prep, params, tmp_path)
+    try:
+        assert tr.n_conditions == 3 and torch.equal(tr.member, member)
+        used = torch.cat([tr.train_crystals, tr.heldout_crystals])
+        assert sorted(used.tolist()) == list(range(22))
+        assert bool(member[tr.heldout_crystals, 0].all())
+        for k in range(3):
+            assert torch.equal(_export_crystals(tr, k), member[:, k].nonzero(as_tuple=True)[0])
+        # a state's batch is drawn from all its members, the shared ones included
+        tr.cfg.max_obs_per_batch = 10 ** 9
+        for step in range(3):
+            k, rows = train._batch(tr, step)
+            got = torch.unique(prep.obs_info.crystal_id[rows])
+            want = tr.train_crystals[member[tr.train_crystals, k]]
+            assert k == step and sorted(got.tolist()) == sorted(want.tolist())
+        # the batch is its state's whatever its crystals' first state is
+        shared = tr.index.rows(torch.arange(8, 16))
+        for k in range(3):
+            tr.step(shared, state=k)
+            assert tr._cond == k and tr._state is None
+        tr.scale.eval()
+        # a state merges its members with its own target: before any update of
+        # the surfaces apart, the overlap merges the same under each name
+        for t in tr.targets[1:]:
+            t.set_wilson_coef(tr.targets[0].wilson_coef)
+        both = torch.arange(8, 16)
+        ref = tr.merge(condition=2)
+        assert ref["n_crystals"] == 8
+        for k in (0, 1):
+            got = tr.merge(crystals=both, condition=k)
+            torch.testing.assert_close(got["F"], ref["F"], equal_nan=True)
+        assert tr.merge(condition=0)["n_crystals"] == 16 and tr.merge(condition=1)["n_crystals"] == 14
+        assert tr._state is None
+        tr.evaluate(both, phase="probe", state=0)        # first state 0, as it happens
+        assert tr._cond == 0
+        tr.evaluate(both, phase="probe", state=1)
+        assert tr._cond == 1 and tr._state is None
+    finally:
+        tr.close()
 
 
 

@@ -29,6 +29,7 @@ when there is one; every floating-point value is computed on the host, as
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -41,7 +42,7 @@ from torch import Tensor
 
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.hkl import PoissonNoiseModel
-from torchsx.merging.store import RECORD, RECORD_WIDTH, PreparedStore, RecordFile, StoreWriter
+from torchsx.merging.store import FRAMES_FILE, RECORD, RECORD_WIDTH, PreparedStore, RecordFile, StoreWriter
 
 #: One parsed observation before preparation, less its canonical Miller index
 #: (kept in a file of its own, the one column the resolution cut reads).
@@ -192,7 +193,7 @@ class _Input:
     crystals: tuple[int, int]            # raw crystal range
     images: tuple[int, int]              # raw image range
     refl: _KeyCounts = None              # every crystal of the input
-    extra: Tensor = None                 # counts of the crystals prepared once more, less the dropped
+    extra: Tensor = None                 # counts of the crystals prepared once more
     in_range: Tensor = None              # per key: within the resolution cut
     to_valid: Tensor = None              # per key: prepared reflection index, or -1
     on_device: tuple = None              # (keys, to_valid) on the builder's device
@@ -233,8 +234,7 @@ class _Skeleton:
 class StoreBuilder:
     """Builds a :class:`PreparedStore` in ``workdir`` without holding the observations.
 
-    ``add`` every input, ``filter_resolution``, optionally ``drop``, ``set_layout``,
-    ``finish``.
+    ``add`` every input, ``filter_resolution``, ``set_layout``, ``finish``.
     """
 
     def __init__(self, workdir: str | Path, *, spacegroup: str | None, merge_friedel: bool = True,
@@ -507,39 +507,6 @@ class StoreBuilder:
             return []
         return [self.events[i] for i in self.primary_images.tolist()]
 
-    def _adjust_counts(self, sel: Tensor, sign: int) -> None:
-        """Add (``sign`` 1) or take away (-1) the reflection counts of the raw
-        crystals ``sel`` in their inputs' ``extra``."""
-        for blk, hkl, raw in self._crystal_blocks(sel):
-            inp = self.inputs[int(self.input_of_crystal[blk[0]])]
-            bad, valid = _validity(_field(raw, "I"), _field(raw, "background"),
-                                   _field(raw, "sigma") if self.has_sigma else None)
-            idx = torch.searchsorted(inp.refl.keys, hkl_key(hkl))
-            masks = {"all": None, "kept": valid, "positive": valid & (_field(raw, "I") > 0),
-                     "I": bad["I"], "background": bad["background"],
-                     "sigma": bad.get("sigma", torch.zeros_like(valid))}
-            inp.extra += sign * _count(idx, masks, len(inp.refl.keys))
-
-    def drop(self, mask: Tensor) -> None:
-        """Leave the surviving crystals of ``mask`` (one bool per surviving
-        crystal) out of the store: neither they nor their observations are
-        prepared, and a reflection only they recorded is not indexed."""
-        mask = mask.to(torch.bool)
-        if not bool(mask.any()):
-            return
-        gone = self.primary[mask]
-        self._adjust_counts(gone, -1)
-        self.survives[gone] = False
-        for inp in self.inputs:
-            c0, c1 = inp.crystals
-            inp.n_crystals = int(self.survives[c0:c1].sum())
-            inp.n_obs = int((inp.refl.counts + inp.extra)[inp.in_range, 0].sum())
-        self.primary = torch.nonzero(self.survives, as_tuple=True)[0]
-        image_hit = torch.zeros(len(self.filenames), dtype=torch.bool)
-        image_hit[self.crystal["image_id"][self.primary]] = True
-        self.primary_images = torch.nonzero(image_hit, as_tuple=True)[0]
-        self.clock.report("drop")
-
     def set_layout(self, extra: list[Tensor] | None = None) -> None:
         """The prepared crystals: every surviving crystal, then once more those
         of each mask in ``extra`` (one bool per surviving crystal), as
@@ -550,7 +517,15 @@ class StoreBuilder:
             sel = self.primary[mask]
             logical.append(sel)
             images.append(torch.unique(self.crystal["image_id"][sel]))
-            self._adjust_counts(sel, 1)
+            for blk, hkl, raw in self._crystal_blocks(sel):
+                inp = self.inputs[int(self.input_of_crystal[blk[0]])]
+                bad, valid = _validity(_field(raw, "I"), _field(raw, "background"),
+                                       _field(raw, "sigma") if self.has_sigma else None)
+                idx = torch.searchsorted(inp.refl.keys, hkl_key(hkl))
+                masks = {"all": None, "kept": valid, "positive": valid & (_field(raw, "I") > 0),
+                         "I": bad["I"], "background": bad["background"],
+                         "sigma": bad.get("sigma", torch.zeros_like(valid))}
+                inp.extra += _count(idx, masks, len(inp.refl.keys))
         self.logical = torch.cat(logical)
         self.logical_images = torch.cat(images)
         # image index of each prepared crystal within the prepared image list
@@ -772,7 +747,16 @@ class StoreBuilder:
             "shell_id_fw": fw_shell_ids(d_valid, config.fw_n_shells),
             "is_centric": centric_flags(self.spacegroup, hkl_valid).cpu(),
             "sum_wI": sums["wI"], "sum_w": sums["w"], "sum_I": sums["I"], "count": sums["n"],
+            # where each crystal came from, for labels given after preparation
+            "crystal_input": self.input_of_crystal[self.logical],
+            "crystal_image": self.logical_image_id,
         }
+        if self._has_names:
+            images = self.logical_images.tolist()
+            (tmp / FRAMES_FILE).write_text(json.dumps(
+                {"filename": [self.filenames[i] for i in images],
+                 "event": [e if isinstance(e, str) else int(e)
+                           for e in (self.events[i] for i in images)]}) + "\n")
         if delay_bin_idx is not None:
             tables["delay_bin_idx"] = delay_bin_idx
             tables["unique_timepoints"] = unique_timepoints

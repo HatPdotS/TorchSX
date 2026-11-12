@@ -145,7 +145,7 @@ def _export_crystals(tr, k: int):
     external held-out set (``--heldout-stream``), which is scored, never merged."""
     import torch
 
-    in_cond = (tr.condition == k).nonzero(as_tuple=True)[0]
+    in_cond = tr.member[:, k].nonzero(as_tuple=True)[0]
     ext = getattr(tr, "external_heldout", None)
     if ext is not None:
         in_cond = in_cond[~torch.isin(in_cond, ext.cpu())]

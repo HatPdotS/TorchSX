@@ -75,12 +75,13 @@ def test_updates_follow_the_share_of_the_patterns_of_no_dataset():
     assert train.unassigned_share(tr, []) is None
 
 
-def test_patterns_of_no_dataset_train_and_are_not_merged(tmp_path, monkeypatch):
+def test_patterns_of_no_dataset_train_and_are_not_merged(tmp_path, monkeypatch, capsys):
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10,n_cond=2)
-    # a third state from every fourth crystal: the patterns of no dataset
-    oi=prep.obs_info
-    oi.delay_bin_idx=torch.where(torch.arange(oi.n_crystals)%4==3, torch.tensor(2), oi.delay_bin_idx)
-    oi.unique_timepoints=torch.arange(3,dtype=torch.float64)
+    # every fourth crystal is a pattern of no dataset, and every eighth is in both
+    i=torch.arange(prep.obs_info.n_crystals)
+    free=i%4==3
+    member=torch.stack([(i%2==0)|(i%8==1), (i%2==1)&~free, free],1)
+    P.assign_states(prep.obs_info,member)
     names=['dark','light',P.UNASSIGNED]
     bundle=P.PrepBundle(prep,{'spacegroup':'P 1','d_min':0.9,'gain':1.0,'radii':[7,9,11]},names,0.1)
     monkeypatch.setattr(P,'load_prep',lambda *a,**k: bundle)
@@ -95,6 +96,9 @@ def test_patterns_of_no_dataset_train_and_are_not_merged(tmp_path, monkeypatch):
     wanted={f'merged_{n}{half}.mtz' for n in ('dark','light') for half in ('','_half1','_half2')}
     assert {p.name for p in run.glob('*.mtz')}==wanted
     assert set(json.loads((run/'merged.metrics.json').read_text()))=={'dark','light'}
+    out=capsys.readouterr().out
+    # the crystals of both states are merged in each, held once
+    assert 'merge [dark]: 25 crystals' in out and 'merge [light]: 10 crystals' in out
     merge_nn.main([str(run/'best.pt'),'x.stream','-o',str(tmp_path/'again.mtz'),'--device','cpu'])
     assert {p.name for p in tmp_path.glob('*.mtz')}=={n.replace('merged','again') for n in wanted}
 

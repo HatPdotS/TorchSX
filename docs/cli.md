@@ -18,7 +18,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `STREAM` | | CrystFEL `.stream`, a prepared `.sfx`, or a probixi `.duckdb` run (see [probixi input](#probixi-input)). Several streams form one data set. |
 | `--split NAME=PATH` | | A stream of the state `NAME`; repeatable. Streams of the same name form one state, and `PATH` may be a quoted glob pattern. Each state is merged on its own. |
 | `--split-file FILE` | | States for the frames of the streams (see [States](#states)). |
-| `--unassigned` | `train` | Patterns `--split-file` assigns to no state: `train` on them without merging them, `drop` them, or refuse the input with `error`. |
+| `--unassigned` | `train` | Patterns `--split-file` assigns to no state: `train` on them without merging them, `drop` them from both, or refuse the input with `error`. |
 | `--spacegroup SG` | | Space group, e.g. `'P 63'`. Required for `.stream` input. |
 | `--dmin`, `--dmax` | all | High- and low-resolution cut in Å. |
 | `--merge-friedel` / `--no-merge-friedel` | merge | Keep Friedel mates apart with `--no-merge-friedel`; the MTZs then carry (+) and (−) columns. |
@@ -55,7 +55,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `-o`, `--out RUN` | | Run directory. |
 | `--no-merge` | | Stop after saving the checkpoints, for a separate `torchsx.merge`. |
 | `--free-from FILE` | 5 % new | Copy the free set from an `.mtz` (`R-free-flags` or `FreeR_flag`). |
-| `--cache DIR` | `RUN/prepared` | Where the prepared observations are stored. |
+| `--cache DIR` | `RUN/prepared` | Where the prepared observations are stored. The store depends on the inputs and the measurement settings, not on the states. |
 
 `torchsx.train --help` lists the same options.
 
@@ -142,9 +142,12 @@ A custom-split file has three columns, `filename event dataset`:
 ```
 
 An event of `*` names every frame of the file. A frame listed under several
-dataset names goes into each of those states; a repeated identical row counts
-once. States from a split file are ordered by name, states from `--split` in
-the order first given. The first state supplies the validation crystals.
+dataset names is a member of each of those states: it is stored once, drawn
+into the batches of each and merged into each, so states may overlap or
+contain one another (every light frame next to each delay, say). A repeated
+identical row counts once. States from a split file are ordered by name,
+states from `--split` in the order first given. The first state supplies the
+validation crystals, which are held out of the training of every state.
 
 Patterns the split file assigns to no state are kept by default
 (`--unassigned train`): the state label is not an input to the network, so
@@ -152,9 +155,24 @@ they train it like any other pattern, and they are merged into no MTZ. Their
 batches take the share of the updates that they have of the training crystals,
 spread evenly over the run; the states take turns over the rest. With 400
 updates, two states and a tenth of the crystals unassigned, that is 40 updates
-on the unassigned patterns and 180 per state. `--unassigned drop` leaves them
-out of the prepared store, and `--unassigned error` stops when there are any.
-`torchsx.merge` takes the choice from the checkpoint.
+on the unassigned patterns and 180 per state. `--unassigned drop` neither
+trains on them nor merges them, and `--unassigned error` stops when there are
+any. `torchsx.merge` takes the choice from the checkpoint.
+
+The prepared store holds every crystal of the inputs once and no state; the
+states are assigned each time it is opened. The same streams with other names,
+another split file or another `--unassigned` therefore reuse the store, in
+`torchsx.train` and in `torchsx.merge`:
+
+```bash
+torchsx.merge joint/best.pt combined.stream --split-file by_delay.split -o by_delay/merged.mtz
+```
+
+This merges the training data into the states of `by_delay.split` without
+preparing it again. A state the network was not trained with takes the Wilson
+surface of the first trained state. Because the store holds all crystals,
+dropped patterns still count in what is formed from the whole store before
+training: the reflection list, the gain calibration and the start values.
 
 ## probixi input
 

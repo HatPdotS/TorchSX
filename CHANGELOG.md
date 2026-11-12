@@ -5,6 +5,8 @@
 - A state can come from several streams: `--split` names repeat, a `--split` path may be a glob pattern, and several unnamed streams are one data set.
 - `--split-file` labels the frames of any number of streams, and an event of `*` names every frame of a file.
 - Patterns a split file assigns to no state no longer stop the run: by default they train the network, with their share of the updates, and are merged into nothing; `--unassigned drop` or `error` chooses otherwise.
+- The prepared store carries no states; they are assigned when it is opened. Other state names, another split file or another `--unassigned` reuse the store, so `torchsx.merge` can merge a run's data into new states without preparing it again. Prepared caches of earlier versions are rebuilt.
+- A frame in several states is stored once and is a member of each, instead of being prepared once per state.
 
 ## v0.2.3
 
