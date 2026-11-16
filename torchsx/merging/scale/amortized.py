@@ -194,7 +194,8 @@ class AmortizedScale(nn.Module):
         layout = enc.layout(meta.crystal_id)
         if layout:
             enc.dry_run(x_self, x_ctx, x_crys, meta.crystal_id, *layout[0],
-                        autograd=torch.is_grad_enabled() or flex_eval, backward=ckpt)
+                        autograd=torch.is_grad_enabled() or flex_eval, backward=ckpt,
+                        plain=not flex_eval)
         flex_only = flex_eval and enc.compile
         n = x_self.shape[0]
         parts, dest, corrections, blocks = [], [], [], []

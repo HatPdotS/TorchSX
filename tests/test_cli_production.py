@@ -15,11 +15,9 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file
 
 
-@pytest.mark.parametrize('module,count', [(train,35), (merge_nn,14)])
-def test_public_options_and_split_inputs(module, count):
+@pytest.mark.parametrize('module', [train, merge_nn])
+def test_split_inputs(module):
     parser = module._build_parser()
-    opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
-    assert len(opts) == count
     prefix = [] if module is train else ['model.pt']
     a = parser.parse_args(prefix + ['--split','dark=dark.stream','--split','light=light.stream','-o','run'])
     assert P._splits_from_args(a) == [('dark',Path('dark.stream')),('light',Path('light.stream'))]

@@ -216,7 +216,7 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
         h1, h2 = _split_halves(tr, k, args.seed + 1000000007)
         sets += [(1, h1), (2, h2)]
         merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior",
-                                 tether_readout=half == 0)
+                                 tether_readout=half == 0 and args.tether_report)
                   for half, crystals in sets}
         post = merges[0]
         label = names[k] if k < len(names) else str(k)

@@ -360,15 +360,16 @@ def _cli(monkeypatch):
 
 def test_a_default_run_holds_the_gauge(tmp_path, monkeypatch):
     """A default run: the record carries the gauge, the checkpoint and run.json the terms,
-    the scale pins the scalar gauge only, every state's merge reports the gauge by
-    resolution shell, and torchsx.merge reproduces the readout from the checkpoint."""
+    the scale pins the scalar gauge only, with --tether-report every state's merge reports
+    the gauge by resolution shell and torchsx.merge reproduces the readout from the
+    checkpoint, and without it a merge carries no report."""
     import numpy as np
 
     from torchsx.cli import merge_nn, train
 
     P = _cli(monkeypatch)
     run = tmp_path / 'run'
-    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '4', '--seed', '3'])
+    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '4', '--seed', '3', '--tether-report'])
     ck = torch.load(run / 'best.pt', weights_only=False)
     assert ck['scale']['anchor_stat'] == 'median' and ck['scale']['tether'] == ['gauge']
     assert json.loads((run / 'run.json').read_text())['training']['config']['tether'] == ['gauge']
@@ -389,12 +390,16 @@ def test_a_default_run_holds_the_gauge(tmp_path, monkeypatch):
         return out
 
     monkeypatch.setattr(P, 'build_stack', capture)
-    merge_nn.main([str(run / 'best.pt'), 'x.stream', '-o', str(tmp_path / 'again.mtz'), '--device', 'cpu'])
+    merge_nn.main([str(run / 'best.pt'), 'x.stream', '-o', str(tmp_path / 'again.mtz'), '--device', 'cpu',
+                   '--tether-report'])
     assert built['anchor'] == 'median'
     again = json.loads((tmp_path / 'again.metrics.json').read_text())
     for name in ('dark', 'light'):
         assert np.isclose(again[name]['tether']['gauge']['rms'], metrics[name]['tether']['gauge']['rms'],
                           rtol=1e-4, atol=1e-7)
+    merge_nn.main([str(run / 'best.pt'), 'x.stream', '-o', str(tmp_path / 'plain.mtz'), '--device', 'cpu'])
+    plain = json.loads((tmp_path / 'plain.metrics.json').read_text())
+    assert set(plain) == {'dark', 'light'} and not any('tether' in rec for rec in plain.values())
 
 
 def test_tether_none_restores_the_basis_gauge(tmp_path, monkeypatch):
@@ -402,7 +407,8 @@ def test_tether_none_restores_the_basis_gauge(tmp_path, monkeypatch):
 
     _cli(monkeypatch)
     run = tmp_path / 'run'
-    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '2', '--tether', 'none'])
+    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '2', '--tether', 'none',
+                '--tether-report'])
     ck = torch.load(run / 'best.pt', weights_only=False)
     assert ck['scale']['anchor_stat'] == 'basis' and ck['scale']['tether'] == []
     steps = [json.loads(line) for line in (run / 'metrics.jsonl').read_text().splitlines()]

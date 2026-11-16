@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The merge's report of the sum-of-spots tether is opt-in (`--tether-report`, off by default). It fits all of a state's observations at once, at about 100 bytes of device memory each, and set the GPU peak of large merges; the merged intensities never depended on it.
+- The compile dry run of the fold encoder holds one pass at a time, and an evaluation on flex attention dry-runs only the checkpointed pass it uses. Before, the dry run of the first evaluation held a plain pass with its autograd graph while it ran the checkpointed one, and set the device memory peak of training.
+
 ## v0.2.3
 
 - torch 2.7 to 2.14 instead of 2.9 only: on 2.11 to 2.13 the fold encoder compiles with inductor's coalescing analysis and mix-order reduction off, the two passes that fail on it.

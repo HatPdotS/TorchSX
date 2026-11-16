@@ -559,3 +559,29 @@ def test_a_network_torch_cannot_compile_runs_uncompiled(monkeypatch, fails):
         assert (g_enc is None) == (g_ref is None)
         if g_ref is not None:
             assert torch.equal(g_enc, g_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled stack runs on CUDA only")
+@pytest.mark.parametrize("plain, backward", [(False, False), (True, False), (True, True)])
+def test_the_dry_run_runs_its_passes_one_at_a_time(monkeypatch, plain, backward):
+    """The dry run runs the plain pass only when asked, and every pass starts with the
+    device memory the first one started with: no pass's outputs or graph outlive it."""
+    entries = []
+
+    def recording_compile(fn, **kw):
+        def run(*args):
+            entries.append(torch.cuda.memory_allocated())
+            return fn(*args)
+        return run
+    monkeypatch.setattr(torch, "compile", recording_compile)
+    torch.manual_seed(0)
+    enc = FoldTransformerEncoder(6, 9, [6, 7, 8], compile=True, d_model=32, n_heads=4, folds=3,
+                                 ctx_layers=1, query_layers=1, bf16=False).cuda()
+    enc.train(backward)
+    sizes = torch.tensor([40, 300, 120, 7])
+    gid = torch.repeat_interleave(torch.arange(sizes.numel()), sizes).cuda()
+    xs, xc = torch.randn(gid.numel(), 6, device="cuda"), torch.randn(gid.numel(), 9, device="cuda")
+    enc.dry_run(xs, xc, None, gid, *enc.layout(gid)[0], autograd=True, backward=backward, plain=plain)
+    assert len(entries) == 1 + plain
+    assert entries[-1] - entries[0] < 1 << 16
+    assert enc.compile and all(p.grad is None for p in enc.parameters())
