@@ -7,6 +7,8 @@
 - Patterns a split file assigns to no state no longer stop the run: by default they train the network, with their share of the updates, and are merged into nothing; `--unassigned drop` or `error` chooses otherwise.
 - The prepared store carries no states; they are assigned when it is opened. Other state names, another split file or another `--unassigned` reuse the store, so `torchsx.merge` can merge a run's data into new states without preparing it again. Prepared caches of earlier versions are rebuilt.
 - A frame in several states is stored once and is a member of each, instead of being prepared once per state.
+- The merge's report of the sum-of-spots tether is opt-in (`--tether-report`, off by default). It fits all of a state's observations at once, at about 100 bytes of device memory each, and set the GPU peak of large merges; the merged intensities never depended on it.
+- The compile dry run of the fold encoder holds one pass at a time, and an evaluation on flex attention dry-runs only the checkpointed pass it uses. Before, the dry run of the first evaluation held a plain pass with its autograd graph while it ran the checkpointed one, and set the device memory peak of training.
 
 ## v0.2.3
 

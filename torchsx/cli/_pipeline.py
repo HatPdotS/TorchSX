@@ -862,6 +862,10 @@ def add_model_args(p: argparse.ArgumentParser) -> None:
                    help="intensity prior: wilson (default; one surface per state, trained by the "
                         "evidence) or none (flat in positive intensity); merge inherits the "
                         "checkpoint unless set")
+    p.add_argument("--tether-report", action="store_true",
+                   help="report the sum-of-spots tether's terms over each state's merged observations "
+                        "in merged.metrics.json; the fit holds all of a state's observations on the "
+                        "device at once")
 
 
 # Checkpoint ``kind`` markers for the corrected detection stack.

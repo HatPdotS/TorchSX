@@ -54,6 +54,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 |---|---|---|
 | `-o`, `--out RUN` | | Run directory. |
 | `--no-merge` | | Stop after saving the checkpoints, for a separate `torchsx.merge`. |
+| `--tether-report` | off | Report the tether's terms over each state's merged observations in `merged.metrics.json` (see [Sum-of-spots tether](#sum-of-spots-tether)). |
 | `--free-from FILE` | 5 % new | Copy the free set from an `.mtz` (`R-free-flags` or `FreeR_flag`). |
 | `--cache DIR` | `RUN/prepared` | Where the prepared observations are stored. The store depends on the inputs and the measurement settings, not on the states. |
 
@@ -94,7 +95,7 @@ torchsx.merge RUN/best.pt --split dark=dark.stream --split light=light.stream -o
 Merges the given streams with a trained network. The checkpoint supplies the
 network, the Wilson surface, the measurement settings (radii, gain, detector
 noise) and the seed for the halves; `--int-radius`, `--gain`, `--prior` and
-`--merge-friedel` override them. The streams can be the training data, more
+`--merge-friedel` override them. `--tether-report` adds the tether's report. The streams can be the training data, more
 data from the same experiment, or other states. Merging the training data
 reproduces the merge written by `torchsx.train`.
 
@@ -270,9 +271,12 @@ every term is where the counts put it.
 With `--tether none` the smooth common mode of the log scale is projected out of
 every batch instead, which pins its geometric rather than its arithmetic mean.
 
-`merged.metrics.json` reports every term over each state's merged observations
-(`tether`), whichever terms the network was trained with. `torchsx.merge` takes
-the setting from the checkpoint.
+With `--tether-report`, `merged.metrics.json` reports every term over each
+state's merged observations (`tether`), whichever terms the network was trained
+with. The report is a check only; the merged intensities do not depend on it.
+It fits all of a state's observations at once, at about 100 bytes of device
+memory each, so it is off by default. `torchsx.merge` takes the terms from the
+checkpoint.
 
 ## Model
 
