@@ -9,6 +9,7 @@
 - A frame in several states is stored once and is a member of each, instead of being prepared once per state.
 - The merge's report of the sum-of-spots tether is opt-in (`--tether-report`, off by default). It fits all of a state's observations at once, at about 100 bytes of device memory each, and set the GPU peak of large merges; the merged intensities never depended on it.
 - The compile dry run of the fold encoder holds one pass at a time, and an evaluation on flex attention dry-runs only the checkpointed pass it uses. Before, the dry run of the first evaluation held a plain pass with its autograd graph while it ran the checkpointed one, and set the device memory peak of training.
+- `SFXStream.completeness()` and `.multiplicity()` work again: they imported a TorchRef module that does not exist and failed on every call. Both now count unique reflections in the stream's space group with Friedel mates merged, whether or not the stream was symmetrized; completeness leaves out systematic absences, and the shells are equal in `1/d^3` over the observed resolution range in the median cell.
 
 ## v0.2.3
 
