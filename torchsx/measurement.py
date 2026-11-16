@@ -13,8 +13,11 @@ import math
 MEASUREMENT_KEY = "_torchsx_measurement"
 # 3: off-Bragg calibration, else a truncated normal on the negative sums; a gain the
 # calibration replaced can be refined in training by one global B (--detector-noise auto).
-GAIN_POLICY_VERSION = 3
-DEFAULT_GAIN_TOLERANCE = 0.5
+# 4: auto takes the calibrated gain whenever a valid calibration exists (tolerance 0).
+# 5: both calibrations whiten each observation with its own recorded disk, where the source has one.
+GAIN_POLICY_VERSION = 5
+#: relative difference up to which ``auto`` keeps a declared gain; 0 takes every valid calibration
+DEFAULT_GAIN_TOLERANCE = 0.0
 _PLANE_WARNED: set[str] = set()
 
 

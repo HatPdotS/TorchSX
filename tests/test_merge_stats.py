@@ -10,9 +10,9 @@ from torchref.io.mtz import write as write_mtz_frame
 from torchref.symmetry import SpaceGroup
 
 from torchsx.cli.merge_stats import discover, main
-from torchsx.merge_stats import (LOCAL_NEIGHBOURS, d_spacing, design, difference_stats, halves_stats, load_merge,
-                                 local_neighbours, merge_from_arrays, possible_reflections, resolution_shells,
-                                 split_half_stats, summary_stats)
+from torchsx.merge_stats import (LOCAL_NEIGHBOURS, cross_stats, d_spacing, design, difference_stats, halves_stats,
+                                 load_merge, local_neighbours, merge_from_arrays, possible_reflections,
+                                 resolution_shells, split_half_stats, summary_stats, unit_scattering_vectors)
 
 CELL = (40.0, 50.0, 60.0, 90.0, 90.0, 90.0)
 SG = 'P 21 21 21'
@@ -344,8 +344,9 @@ def test_cli_rejects_bad_arguments(merges, tmp_path, monkeypatch):
     (tmp_path / 'exists').mkdir()
     monkeypatch.chdir(tmp_path)
     bad = [
-        ['--dataset', 'x', merges['dark_A'], merges['dark_B'], merges['light_A'], '-o', str(tmp_path / 'a')],
-        [merges['dark_A'], merges['dark_B'], merges['light_A'], '-o', str(tmp_path / 'a')],
+        ['--dataset', 'x', merges['dark_A'], merges['dark_B'], merges['light_A'], merges['light_B'],
+         '-o', str(tmp_path / 'a')],
+        [merges['dark_A'], merges['dark_B'], merges['light_A'], merges['light_B'], '-o', str(tmp_path / 'a')],
         [merges['dark_A'], '--reference', 'nope', '-o', str(tmp_path / 'b')],
         [str(hkl_only), '-o', str(tmp_path / 'c')],
         [merges['dark_A'], '-o', str(tmp_path / 'exists')],
@@ -442,3 +443,90 @@ def test_cli_single_state_export_has_no_difference(tmp_path, capsys):
     assert (row['kind'], row['name']) == ('halves', 'merged') and float(row['cc_half']) > 0.8
     assert set(rows(pair / 'shells_halves.tsv')[0]) == {'name', 'shell', 'd_max', 'd_min', 'inv_d2', 'n', 'cc_half',
                                                         'cc_half_flat', 'r_split'}
+
+
+def _halves_and_merge(rng, hkl, signal, noise):
+    A, B = (signal + noise * rng.standard_normal(len(hkl)) for _ in range(2))
+    sig = np.full(len(hkl), noise)
+    return merge(hkl, 0.5 * (A + B), sig / np.sqrt(2)), (merge(hkl, A, sig), merge(hkl, B, sig))
+
+
+def test_unit_scattering_vectors_match_the_resolution():
+    cell = (40.0, 50.0, 60.0, 80.0, 95.0, 110.0)
+    hkl = np.array([[1, 0, 0], [0, 2, 0], [3, -4, 5], [-2, 7, 1]])
+    a, b, c, al, be, ga = cell
+    al, be, ga = np.radians([al, be, ga])
+    cx, cy = c * np.cos(be), c * (np.cos(al) - np.cos(be) * np.cos(ga)) / np.sin(ga)
+    A = np.array([[a, b * np.cos(ga), cx], [0, b * np.sin(ga), cy], [0, 0, np.sqrt(c * c - cx * cx - cy * cy)]])
+    s = hkl @ np.linalg.inv(A)
+    np.testing.assert_allclose(1 / np.linalg.norm(s, axis=1), d_spacing(hkl, cell), rtol=1e-9)
+    u = unit_scattering_vectors(hkl, cell)
+    np.testing.assert_allclose(np.linalg.norm(u, axis=1), 1.0)
+    np.testing.assert_allclose(u, s / np.linalg.norm(s, axis=1, keepdims=True))
+
+
+def test_cross_cc_meets_the_expectation_when_both_merges_measure_the_signal():
+    rng = np.random.default_rng(11)
+    hkl = asu()
+    truth = 50.0 + 10.0 * rng.standard_normal(len(hkl))
+    other, other_halves = _halves_and_merge(rng, hkl, truth, 6.0)
+    ref, ref_halves = _halves_and_merge(rng, hkl, truth, 4.0)
+    res = cross_stats(other, ref, other_halves, ref_halves, n_shells=5)
+    o = res['overall']
+    assert o['cc_cross'] == pytest.approx(o['cc_expected'], abs=0.02)
+    assert all(s['cc_ratio'] > 0.9 for s in res['shells'])
+    assert res['headline']['cc_ratio_min'] > 0.9
+    assert o['direction_r2_other'] < 0.05
+    assert o['cc_half_residual_other'] == pytest.approx(o['cc_half_other'], abs=0.03)
+
+
+def test_cross_cc_exposes_halves_that_agree_on_a_shared_smooth_surface():
+    rng = np.random.default_rng(12)
+    hkl = asu()
+    truth = 50.0 + 10.0 * rng.standard_normal(len(hkl))
+    x, y, z = unit_scattering_vectors(hkl, CELL).T
+    surface = 50.0 + 25.0 * (x * x - z * z) + 15.0 * x * y
+    other, other_halves = _halves_and_merge(rng, hkl, surface, 3.0)
+    ref, ref_halves = _halves_and_merge(rng, hkl, truth, 4.0)
+    res = cross_stats(other, ref, other_halves, ref_halves, n_shells=5)
+    o = res['overall']
+    assert o['cc_half_other'] > 0.8 and abs(o['cc_cross']) < 0.1
+    assert res['headline']['cc_ratio_min'] < 0.2
+    assert o['direction_r2_other'] > 0.7
+    assert abs(o['cc_half_residual_other']) < 0.1
+    assert o['direction_r2_ref'] < 0.05
+
+
+def test_cross_without_halves_reports_the_correlation_alone():
+    rng = np.random.default_rng(13)
+    hkl = asu()
+    truth = 50.0 + 10.0 * rng.standard_normal(len(hkl))
+    other, _ = _halves_and_merge(rng, hkl, truth, 6.0)
+    ref, _ = _halves_and_merge(rng, hkl, truth, 4.0)
+    res = cross_stats(other, ref, n_shells=5)
+    assert res['overall']['cc_cross'] > 0.8 and 'cc_expected' not in res['overall']
+    assert np.isnan(res['headline']['cc_ratio_min'])
+
+
+def test_cli_cross_against_a_reference_with_merge_and_halves(tmp_path, capsys):
+    rng = np.random.default_rng(14)
+    hkl = asu(2.0)
+    truth = 50.0 + 10.0 * rng.standard_normal(len(hkl))
+    files = {}
+    for name, noise in (('tsx', 6.0), ('ref', 4.0)):
+        m, (a, b) = _halves_and_merge(rng, hkl, truth, noise)
+        for tag, part in (('', m), ('_half1', a), ('_half2', b)):
+            files[name + tag] = tmp_path / f'{name}{tag}.mtz'
+            write_mtz(files[name + tag], part.hkl, {'F-obs': part.F, 'SIGF-obs': part.SIGF})
+    out = tmp_path / 'stats'
+    main([str(files['tsx']), str(files['tsx_half1']), str(files['tsx_half2']), '--name', 'tsx',
+          '--dataset', 'ref', str(files['ref']), str(files['ref_half1']), str(files['ref_half2']),
+          '--reference', 'ref', '--shells', '5', '--format', 'tsv', 'json', 'plots', '-o', str(out)])
+    assert 'cross       tsx vs ref' in capsys.readouterr().out
+    cross = [r for r in rows(out / 'summary.tsv') if r['kind'] == 'cross']
+    assert len(cross) == 1 and float(cross[0]['cc_ratio_min']) > 0.9
+    shells = rows(out / 'shells_cross.tsv')
+    assert len(shells) == 5 and {'cc_cross', 'cc_expected', 'cc_ratio', 'direction_r2_other',
+                                 'cc_half_residual_other'} <= set(shells[0])
+    assert (out / 'cross.png').is_file()
+    assert len(json.loads((out / 'stats.json').read_text())['cross']) == 1

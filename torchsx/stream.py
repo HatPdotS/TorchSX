@@ -157,6 +157,8 @@ class SFXStream:
         merge_friedel: bool = True,
         geometry=None,
         clipped: bool = False,
+        crystals_where: str | None = None,
+        enrich_alpha: float | str | None = "auto",
     ) -> SFXStream:
         """Load a probixi DuckDB run (its ``.duckdb`` output).
 
@@ -176,6 +178,12 @@ class SFXStream:
         geometry : optional :class:`~torchsx.geometry.Geometry`; by default the
             embedded geometry text is parsed, with support for legacy file paths.
         clipped : keep disks clipped by the mask, the frame edge or a neighbour.
+        crystals_where : SQL predicate on probixi's ``crystals`` table; only the
+            crystals it accepts are loaded.
+        enrich_alpha : the enrichment gate. ``"auto"`` (default) drops the
+            lattices whose ``enrich_p`` exceeds the alpha the database records,
+            else 1e-3. None or ``"off"`` loads every lattice. See
+            :func:`torchsx.io._duckdb.read_enrichment_gate`.
         """
         import warnings
         from torchsx.io._duckdb import load_duckdb
@@ -191,7 +199,8 @@ class SFXStream:
             spacegroup = "P 1"
 
         stream = cls(load_duckdb(path, spacegroup=spacegroup, geometry=geometry,
-                                 clipped=clipped))
+                                 clipped=clipped, crystals_where=crystals_where,
+                                 enrich_alpha=enrich_alpha))
         return stream.symmetrize(separate_friedel=not merge_friedel)
 
     def save(self, path: str | Path):

@@ -338,8 +338,8 @@ def test_prepared_cache_requires_current_observation_filter(stream_file, tmp_pat
 
 
 @pytest.mark.parametrize("calibrated,tolerance,selected", [
-    (1.4, None, 1.0), (1.5, None, 1.0), (1.51, None, 1.51),
-    (0.5, None, 1.0), (0.49, None, 0.49),
+    (1.4, None, 1.4), (1.05, None, 1.05), (1.51, None, 1.51),   # auto takes every valid calibration
+    (0.5, None, 0.5), (0.49, None, 0.49),
 ])
 def test_auto_gain_threshold_and_units(stream_file, monkeypatch,
                                        calibrated, tolerance, selected):
@@ -350,7 +350,7 @@ def test_auto_gain_threshold_and_units(stream_file, monkeypatch,
     decision = result.recipe["measurement"]["gain_selection"]
     assert decision["declared_gain"] == 1.0
     assert decision["calibrated_gain"] == calibrated
-    assert decision["tolerance"] == (0.5 if tolerance is None else tolerance)
+    assert decision["tolerance"] == (0.0 if tolerance is None else tolerance)
     assert decision["selected_gain"] == selected
     assert decision["selected"] == ("input" if selected == 1.0 else "calibration")
     args.gain = selected
@@ -438,6 +438,30 @@ def test_off_bragg_calibration_recovers_known_gain():
     assert noise.gain_calibration_info["method"] == "off_bragg_variance"
     assert gain == pytest.approx(2.5, rel=0.05)
     assert abs(bias) < 0.1
+
+
+@pytest.mark.parametrize("method", ["off_bragg", "truncnorm"])
+def test_calibration_uses_the_recorded_disk(method):
+    # Two thirds of the observations were integrated with a disk larger than the
+    # nominal one (probixi grows the disk with resolution).  Whitened with the
+    # nominal disk the calibration reports the disk ratio as gain; with the
+    # recorded disk it returns the detector's.
+    noise = PoissonNoiseModel(r_peak=1.5, r_gap=5, r_bg=8)
+    assert noise.n_peak == 9
+    rng = torch.Generator().manual_seed(95)
+    bg = torch.logspace(1.5, 3.0, 90000, dtype=torch.float64)
+    n_pix = torch.where(torch.arange(bg.numel()) % 3 == 0, 9.0, 21.0).double()
+    variance = 10.0 * bg * n_pix * (1 + n_pix / noise.n_bg)
+    I = variance.sqrt() * torch.randn(bg.shape, dtype=bg.dtype, generator=rng)
+    if method == "off_bragg":
+        run = lambda **kw: noise.calibrate_sigma2_of_bg(I, bg, torch.ones_like(bg), **kw)[0]
+    else:
+        run = lambda **kw: noise.calibrate_gain_truncnorm(I, bg, **kw)[0]
+    assert run(n_pix=n_pix) == pytest.approx(10.0, rel=0.05)
+    assert noise.gain_calibration_info["valid"]
+    # unrecorded disks (0) fall back to the nominal one
+    assert run(n_pix=torch.zeros_like(bg)) == pytest.approx(run(), rel=1e-9)
+    assert run() > 15.0
 
 
 def test_signal_contaminated_bins_are_not_valid_calibration():
@@ -536,7 +560,7 @@ def test_auto_falls_back_to_truncnorm_without_off_bragg(stream_file, monkeypatch
     monkeypatch.setattr(PoissonNoiseModel, "calibrate_gain_truncnorm", truncnorm)
     decision = P.load_prep(_args(stream_file), verbose=False).recipe["measurement"]["gain_selection"]
     assert decision["selected"] == "calibration" and decision["selected_gain"] == 2.0
-    assert decision["reason"] == "disagreement_exceeds_tolerance"
+    assert decision["reason"] == "calibration_available"
     calibration = decision["calibration"]
     assert calibration["method"] == "negative_truncnorm"
     assert calibration["fallback_reason"] == "insufficient off-Bragg observations"
@@ -632,3 +656,25 @@ def test_friedel_recipe_reaches_loader_and_cache(
     loaded = P.load_prep(args, recipe_defaults=built.recipe, verbose=False)
     assert loaded.merge_friedel is expected
     assert observed == [expected]
+
+
+def test_background_model_needs_a_probixi_source(stream_file, tmp_path):
+    from torchsx.cli import _pipeline as P
+
+    args = _args(stream_file)
+    args.background = "model"
+    with pytest.raises(SystemExit, match="background model"):
+        P.load_prep(args, verbose=False)
+
+
+def test_db_suffix_dispatches_to_probixi_only_for_a_duckdb_file(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    from torchsx.io.sources import source_input
+
+    db = tmp_path / "probixi.db"
+    duckdb.connect(str(db)).close()
+    assert source_input(db).kind == "probixi"
+    other = tmp_path / "other.db"
+    other.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
+    with pytest.raises(ValueError, match="Cannot infer datasource"):
+        source_input(other)

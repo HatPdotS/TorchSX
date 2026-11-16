@@ -32,9 +32,17 @@ class MergeConfig:
         (the source's own count, probixi's ``n_pixels``).
     background
         ``annulus`` (ring mean times disk pixels) or ``model`` (the source's
-        background model, probixi's ``background_model``).
+        background model, probixi's ``background_model``).  ``model`` keeps the
+        measured count over the recorded disk and replaces the supplied sigma
+        with the model's own, ``V_model (1 + n_bg / n) + max(I, 0)`` in photons.
     per_image_k0
         Ewald offsets at each image's own wavelength instead of the median.
+    model_sigma_scale
+        With ``background="model"``: the factor k on the model's background
+        variance, ``sigma^2 = k V_model (1 + n_bg / n) + max(I, 0)``.  ``auto``
+        fits k so that the robust spread of ``I / sigma`` is one over the
+        observations past their own crystal's diffraction limit; ``off`` is
+        k = 1 (probixi's variance as recorded); a number sets k.
     """
 
     min_obs: int = 0
@@ -44,3 +52,4 @@ class MergeConfig:
     disk_size: str = "nominal"
     background: str = "annulus"
     per_image_k0: bool = False
+    model_sigma_scale: str | float = "auto"

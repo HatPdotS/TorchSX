@@ -49,6 +49,7 @@ def _build_parser():
     P.add_data_args(p)
     P.add_model_args(p)
     P.add_free_args(p)
+    P.add_export_args(p)
     p.add_argument("-o", "--out", type=Path, required=True, help="run directory")
     p.add_argument("--steps", type=_steps, default=400,
                    help="total optimizer updates, balanced across states (default 400)")

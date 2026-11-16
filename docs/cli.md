@@ -21,6 +21,8 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--spacegroup SG` | | Space group, e.g. `'P 63'`. Required for `.stream` input. |
 | `--dmin`, `--dmax` | all | High- and low-resolution cut in Å. |
 | `--merge-friedel` / `--no-merge-friedel` | merge | Keep Friedel mates apart with `--no-merge-friedel`; the MTZs then carry (+) and (−) columns. |
+| `--enrich-alpha ALPHA` | `auto` | probixi database only: the enrichment gate (see [probixi input](#probixi-input)). `off` reads every lattice. |
+| `--crystals-where SQL` | | probixi database only: an SQL predicate on its `crystals` table. Only the crystals it accepts are read. It applies on top of the gate. |
 
 ### Measurement
 
@@ -80,8 +82,27 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
    `merged.metrics.json` records CC<sub>1/2</sub> and R<sub>split</sub> between
    the halves.
 
+The merge is the `wls` estimator: for each reflection, the inverse-variance
+mean of `(n - bg) / K` over its observations, with the scales K and the
+per-observation variance from the trained network. It uses no prior. Its
+intensities, which can be negative, become amplitudes by French-Wilson. The
+halves are the same estimator on each half of the crystals, and
+`merged.metrics.json` records their agreement as `split_half_wls`.
+
+`--estimator posterior` writes the Wilson-posterior amplitudes of the shape
+likelihood instead. Two posterior halves share the Wilson prior, and where the
+data are weak their agreement measures the prior. The half files then hold the
+pooled merge, `sum(n - bg) / sum(K)`, and the log reports both
+`split_half_pooled` and `split_half_posterior_shared_prior`.
+
 The halves share the network. For independent merges, train two runs on
 disjoint sets of patterns.
+
+`--also ESTIMATOR ...` merges all crystals with further estimators and writes
+`merged_ESTIMATOR.mtz` and `merged_ESTIMATOR.tsv` for each, plus the table of
+the product. `flat` and `ml` read the posterior curve without the prior.
+`pooled`, `mean` and `wls` are moment estimators on the trained scales; their
+tables keep negative intensities.
 
 ## torchsx.merge
 
@@ -150,6 +171,15 @@ this on; a checkpoint keeps what it was trained with:
 - when the frames' photon energies differ, the Ewald offsets at each image's
   own wavelength rather than the median one.
 
+A probixi database keeps every lattice, including those the indexer found by
+chance. probixi scores each lattice with `enrich_p`, the probability that its
+predicted spots land on signal as often as they do by chance. TorchSX reads
+only the lattices with `enrich_p` at most alpha. `--enrich-alpha auto` takes the
+alpha the database records (`integration.bg_model_var_alpha`), else 1e-3, the
+default of probixi's own `--enrich-alpha`. `--enrich-alpha off` reads every
+lattice. The log prints the gate and the number of lattices it keeps, and the
+recipe records it.
+
 Without `--dmin`, a probixi database is cut at the 10th percentile of its
 crystals' diffraction limits, so shells with no signal do not enter the merge
 or its statistics.
@@ -163,16 +193,25 @@ misstates the counting noise. `--gain` takes:
 
 | Value | |
 |---|---|
-| `auto` | Estimate the gain from the data and compare it with the gain in the stream. Keep the stream's gain unless the two differ by more than 50 %. |
+| `auto` | Estimate the gain from the data and use the estimate. Use the stream's gain when no estimate is possible. |
 | `trust_input` | Use the stream's gain. |
 | `calibrate` | Use the estimate; fail if there is none. |
 | a number | Use this gain in ADU per photon. |
 
 The estimate fits a truncated normal to the core of the negative integrated
-intensities, whose spread is set by the counting noise. It is biased, hence
-the 50 % tolerance. `auto` uses the stream's gain when no estimate is possible and the
-estimate when the stream has no gain. The selected gain and the reason for it
-are printed and recorded in `run.json`.
+intensities, whose spread is set by the counting noise. It is biased, but a
+declared gain that understates the noise does more harm: at several thousand
+observations per reflection, a variance one third too small already appears
+as intensity in the weak shells. The selected gain and the reason for it are
+printed and recorded in `run.json`.
+
+Both estimates divide the scatter of signal-free sums by the counting noise of
+the integration disk. A probixi database records the pixels of every disk, and
+the estimate uses them. A stream states one disk in its header. For a stream
+whose reflections were integrated with larger disks, the estimate returns the
+detector gain multiplied by the ratio of the disk areas, and the counting noise
+of those reflections is understated. probixi writes such streams with `--disk
+shell`; its default stream uses one disk.
 
 Integration radii come from `--int-radius`, else the checkpoint, else the
 indexamajig command recorded in the stream. Omitted indexamajig options take

@@ -101,6 +101,21 @@ class PoissonNoiseModel:
         self.n_peak = float(n_p)
         self.n_bg = float(n_b)
 
+    def _var_pred_g1(self, background: Tensor, n_pix: Tensor | None) -> tuple[Tensor, str]:
+        """``(bg n (1 + n / n_bg), label)``: the counting variance of a background-
+        subtracted sum at unit gain, with ``n`` the pixels of each observation's
+        own disk where ``n_pix`` records one (> 0) and the nominal ``n_peak``
+        elsewhere.  A calibration that takes the nominal disk for a larger one
+        reports the ratio of the two as gain."""
+        if n_pix is None:
+            n = torch.full_like(background, self.n_peak)
+            label = f"n_peak={self.n_peak:.2f}"
+        else:
+            n_pix = n_pix.to(dtype=background.dtype)
+            n = torch.where(n_pix > 0, n_pix, torch.full_like(background, self.n_peak))
+            label = f"n_peak=recorded (median {float(n.median()):.0f}, nominal {self.n_peak:.0f})"
+        return background * n * (1.0 + n / self.n_bg), label
+
     def _fit_truncnorm_z(
         self,
         z: Tensor,
@@ -148,6 +163,7 @@ class PoissonNoiseModel:
         I_obs: Tensor,
         background: Tensor,
         *,
+        n_pix: Tensor | None = None,
         bg_min: float = NEGATIVE_BG_MIN,
         tail_cut: float = 3.0,
         max_pool: int = 1_000_000,
@@ -157,7 +173,8 @@ class PoissonNoiseModel:
         """Gain from the negative integrated intensities: the stream fallback.
 
         Each negative ``I_j`` is whitened by its predicted σ at g=1,
-        ``z_j = I_j / sqrt(bg_j · n_peak · (1 + n_peak/n_bg))``. The pool of
+        ``z_j = I_j / sqrt(bg_j · n_j · (1 + n_j/n_bg))``, ``n_j`` the recorded
+        disk of the observation (``n_pix``) or the nominal ``n_peak``. The pool of
         ``z`` values in (-tail_cut·s0, 0), s0 their robust scale, is fit by MLE
         to a Normal(μ, σ) truncated to that interval; the gain is ``g = σ²``.
         Signal contamination is absorbed into μ instead of inflating σ as in
@@ -188,8 +205,8 @@ class PoissonNoiseModel:
 
         I_neg = I_obs[neg].to(dtype=dtype)
         bg_neg = background[neg].to(dtype=dtype)
-        sigma_pred_g1 = (bg_neg * self.n_peak * (1.0 + self.n_peak / self.n_bg)).sqrt()
-        z = I_neg / sigma_pred_g1.clamp(min=1e-12)
+        var_g1, disk = self._var_pred_g1(bg_neg, None if n_pix is None else n_pix[neg])
+        z = I_neg / var_g1.sqrt().clamp(min=1e-12)
         z = z[z < 0.0]
         # Over-subtracted outliers (a strong neighbour in the ring) give the negatives
         # a heavy tail that inflates sigma.  So the fit keeps z > -tail_cut * s0
@@ -216,7 +233,7 @@ class PoissonNoiseModel:
         print(
             f"  PoissonNoiseModel.truncnorm: gain={gain:.4f} ADU/photon  "
             f"σ_z={sigma_hat:.3f}  μ_z={mu_hat:+.3f}σ  "
-            f"[n_peak={self.n_peak:.2f}, n_bg={self.n_bg:.2f}, "
+            f"[{disk}, n_bg={self.n_bg:.2f}, "
             f"{int(z.numel())}/{n_neg} negatives]",
             flush=True,
         )
@@ -228,6 +245,7 @@ class PoissonNoiseModel:
         background: Tensor,
         ewald_offset: Tensor,
         *,
+        n_pix: Tensor | None = None,
         bg_min: float = OFF_BRAGG_BG_MIN,
         z_max: float = 25.0,
         ewald_min: float = OFF_BRAGG_EWALD_MIN,
@@ -241,8 +259,9 @@ class PoissonNoiseModel:
 
             Var[I_obs_ADU] = g · σ²_pred_g1²  +  σ²_read_ADU
 
-        where ``σ²_pred_g1² = bg · n_peak · (1 + n_peak/n_bg)`` is the
-        Poisson predicted variance at unit gain.  Dividing by σ²_pred_g1²,
+        where ``σ²_pred_g1² = bg · n · (1 + n/n_bg)`` is the
+        Poisson predicted variance at unit gain, with ``n`` the recorded disk
+        of the observation (``n_pix``) or the nominal ``n_peak``.  Dividing by σ²_pred_g1²,
 
             σ²_z(x) = g  +  c / x,    x = σ²_pred_g1²,   c = σ²_read_ADU
 
@@ -301,19 +320,21 @@ class PoissonNoiseModel:
 
         I_off = I_obs[mask].to(dtype=dtype)
         bg_off = background[mask].to(dtype=dtype)
-        sigma_pred_g1 = (bg_off * self.n_peak * (1.0 + self.n_peak / self.n_bg)).sqrt()
-        z = I_off / sigma_pred_g1.clamp(min=1e-12)
+        var_g1, disk = self._var_pred_g1(bg_off, None if n_pix is None else n_pix[mask])
+        z = I_off / var_g1.sqrt().clamp(min=1e-12)
         keep = z.abs() < z_max
         z = z[keep]
         bg_off = bg_off[keep]
+        var_g1 = var_g1[keep]
         self.gain_calibration_info["n_usable_observations"] = int(z.numel())
         if z.numel() < 5000:
             return unavailable("insufficient usable off-Bragg observations")
 
-        # Quantile-bin in log(bg).  ``torch.quantile`` caps at 2²⁴ elements
+        # Quantile-bin in log of the predicted variance (for one disk size this
+        # is the binning in log(bg)).  ``torch.quantile`` caps at 2²⁴ elements
         # (int32 internal sort indexing), so do the quantile by sort+gather
         # which uses 64-bit indices.
-        log_bg = bg_off.log10()
+        log_bg = var_g1.log10()
         sorted_log_bg, _ = log_bg.sort()
         n_sorted = sorted_log_bg.numel()
         qs = torch.linspace(0.0, 1.0, n_bins + 1, dtype=dtype, device=device)
@@ -324,7 +345,6 @@ class PoissonNoiseModel:
             torch.bucketize(log_bg, edges, right=True) - 1
         ).clamp(min=0, max=n_bins - 1)
 
-        denom = float(self.n_peak * (1.0 + self.n_peak / self.n_bg))
         bg_med_per_bin: list[float] = []
         x_med_per_bin: list[float] = []   # sigma_pred_g1² median per bin
         sigma2_per_bin: list[float] = []
@@ -342,7 +362,7 @@ class PoissonNoiseModel:
             sigma2_k = float(z_k.var(unbiased=True).item())
             bg_med = float(bg_k.median().item())
             bg_med_per_bin.append(bg_med)
-            x_med_per_bin.append(bg_med * denom)
+            x_med_per_bin.append(float(var_g1[bin_mask].median().item()))
             sigma2_per_bin.append(sigma2_k)
             mu_per_bin.append(mu_k)
             n_per_bin.append(n_k)
@@ -396,7 +416,7 @@ class PoissonNoiseModel:
             f"(read_var_photons={read_var_ph:.4g})  "
             f"kept_bins={len(clean)}/{len(sigma2_per_bin)}  "
             f"μ_z_median={mu_median:+.3f}σ  "
-            f"[n_peak={self.n_peak:.2f}, n_bg={self.n_bg:.2f}, "
+            f"[{disk}, n_bg={self.n_bg:.2f}, "
             f"{int(z.numel())}/{n_sel} off-Bragg obs, "
             f"ewald_min={ewald_min:.3f} Å⁻¹]",
             flush=True,

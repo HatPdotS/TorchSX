@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- The merge written to `merged.mtz` and its halves is the `wls` estimator, the inverse-variance mean of `(n - bg) / K` on the trained scales, with French-Wilson amplitudes. `--estimator posterior` writes the Wilson-posterior amplitudes as before.
+- The gain calibration whitens each observation with its recorded disk where the source has one (probixi databases). With the nominal disk it returned the detector gain times the ratio of the disk areas for databases whose disk grows with resolution. Prepared caches are rebuilt.
+- `--gain auto` takes the calibrated gain whenever a valid calibration exists (it kept a declared gain within 50 % of the estimate). Prepared caches made under `auto` are rebuilt.
+- probixi databases are read through the enrichment gate by default: lattices with `enrich_p` above alpha are dropped (`--enrich-alpha auto|off|ALPHA`, `enrich_alpha=` in `load_duckdb`, `SFXStream.from_duckdb` and `SFXStream.read`). `auto` takes `integration.bg_model_var_alpha` when the database records it, else 1e-3. Prepared caches of probixi databases are rebuilt.
+- `--crystals-where SQL` reads only the crystals of a probixi database that the predicate accepts.
+- A posterior that sits on one grid node or at a grid edge is re-placed on a narrower or shifted grid before the readout; the merge report counts the reflections re-placed and those whose sigF stays below 0.001 of the median.
+- With `--estimator posterior`, `merged_half1.mtz` and `merged_half2.mtz` hold the pooled, prior-free merge, and the log and `merged.metrics.json` report the pooled and the shared-prior half statistics.
+- `--also posterior|flat|ml|pooled|mean|wls` writes further estimators of the full merge as MTZ and as a table.
+- The merge report lists the multiplicity of the reflections whose posterior reaches the top grid edge.
+- `torchsx.merge-stats` reports the cross-correlation with a reference dataset per shell, against the value expected from the two CC1/2.
+- probixi databases with the `.db` suffix are accepted.
+
 ## v0.2.3
 
 - torch 2.7 to 2.14 instead of 2.9 only: on 2.11 to 2.13 the fold encoder compiles with inductor's coalescing analysis and mix-order reduction off, the two passes that fail on it.

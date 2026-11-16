@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from torchsx.merge_stats import (AMPLITUDES, FORMATS, LABEL_KEYS, difference_stats, file_format, load_merge, render,
-                                 split_half_stats, summary_stats)
+from torchsx.merge_stats import (AMPLITUDES, FORMATS, LABEL_KEYS, cross_stats, difference_stats, file_format,
+                                 load_merge, render, split_half_stats, summary_stats)
 
 
 def _labels(items):
@@ -28,6 +28,7 @@ class Dataset:
     name: str
     merge: Path | None = None
     halves: tuple[Path, Path] | None = None
+    discovered: bool = False
 
     @property
     def files(self):
@@ -35,6 +36,8 @@ class Dataset:
 
 
 def _from_files(name, files):
+    if len(files) == 3:
+        return Dataset(name, merge=files[0], halves=tuple(files[1:]))
     return Dataset(name, merge=files[0]) if len(files) == 1 else Dataset(name, halves=tuple(files))
 
 
@@ -63,7 +66,7 @@ def discover(folder):
                 halves = (half1, half2) if half1.is_file() and half2.is_file() else None
                 if merge.is_file() or halves:
                     name = base.name if len(exports) > 1 else (state or stem)
-                    datasets.append(Dataset(name, merge if merge.is_file() else None, halves))
+                    datasets.append(Dataset(name, merge if merge.is_file() else None, halves, discovered=True))
                     break
     return datasets
 
@@ -72,19 +75,23 @@ def _build_parser():
     p = argparse.ArgumentParser(prog='torchsx.merge-stats', description=__doc__,
         epilog='A dataset is one merge (summary statistics), two independent halves (CC1/2, flat CC1/2 '
                'on intensities standardised against their running mean and spread, and R_split), '
-               'or, for each state of a torchsx output directory, both. Every dataset other than the '
-               'reference is also scored as a difference against it, when both have two halves; a run '
-               'with one state has no differences. Inputs: MTZ, CrystFEL .hkl/.hkl1/.hkl2, mmCIF '
-               'structure factors. CPU only.')
+               'or a merge followed by its two halves, as for each state of a torchsx output directory. '
+               'Every dataset other than the reference is also scored as a difference against it, when '
+               'both have two halves; a run with one state has no differences. When both have a merge '
+               'and are not states of one export, the merge is also correlated with the reference per '
+               'shell (cross), against the CC* x CC* that the two CC1/2 predict. Inputs: MTZ, CrystFEL '
+               '.hkl/.hkl1/.hkl2, mmCIF structure factors. CPU only.')
     p.add_argument('files', nargs='*', type=Path, metavar='PATH',
-                   help='the first dataset: one merge or two independent halves; or a torchsx.train / '
+                   help='the first dataset: one merge, two independent halves, or a merge and its two '
+                        'halves; or a torchsx.train / '
                         'torchsx.merge output directory, one dataset per state. Default: the current '
                         'directory, when it holds a torchsx export')
     p.add_argument('--name', help='name of the first dataset (default: stem of its first file, '
                                     'without _half1)')
     p.add_argument('--dataset', action='append', nargs='+', default=[], metavar=('NAME', 'FILE'),
-                   help='an additional dataset: a name and one merge or two halves; repeatable')
-    p.add_argument('--reference', metavar='NAME', help='dataset the differences are taken against (default: the first)')
+                   help='an additional dataset: a name and one merge, two halves, or a merge and its '
+                        'two halves; repeatable')
+    p.add_argument('--reference', metavar='NAME', help='dataset the differences and cross-correlations are taken against (default: the first)')
     p.add_argument('--amplitudes', choices=AMPLITUDES, default='french-wilson',
                    help='amplitudes from intensity-only files: French-Wilson posterior (default) or sqrt(I) for I > 0')
     p.add_argument('--cell', type=float, nargs=6, metavar=('A', 'B', 'C', 'ALPHA', 'BETA', 'GAMMA'),
@@ -124,8 +131,9 @@ def _datasets(p, args):
         print(f'{p.prog}: {folder.resolve()}: ' + ', '.join(
             f"{d.name} ({' + '.join(['merge'] * bool(d.merge) + ['halves'] * bool(d.halves))})" for d in datasets))
     elif args.files:
-        if len(args.files) > 2:
-            p.error(f'the first dataset takes one merge or two halves, got {len(args.files)} files')
+        if len(args.files) > 3:
+            p.error(f'the first dataset takes one merge, two halves, or a merge and its two halves, '
+                    f'got {len(args.files)} files')
         stem = args.files[0].name.split('.')[0]
         if len(args.files) == 2:
             stem = stem.removesuffix('_half1')
@@ -133,8 +141,9 @@ def _datasets(p, args):
     elif args.name:
         p.error('--name names the positional dataset; give its files')
     for entry in args.dataset:
-        if len(entry) not in (2, 3):
-            p.error(f'dataset {entry[0]!r} takes one merge or two halves, got {len(entry) - 1} files')
+        if len(entry) not in (2, 3, 4):
+            p.error(f'dataset {entry[0]!r} takes one merge, two halves, or a merge and its two halves, '
+                    f'got {len(entry) - 1} files')
         datasets.append(_from_files(entry[0], [Path(f) for f in entry[1:]]))
     names = [d.name for d in datasets]
     if len(set(names)) != len(names):
@@ -198,6 +207,11 @@ def write_tsv(results, out):
                         'files': ';'.join(r['files']), **r['headline']})
         shells['difference'] += [{'name': r['name'], 'reference': r['reference'], **s} for s in r['shells']]
         bins += [{'name': r['name'], 'reference': r['reference'], **b} for b in r['bins']]
+    for r in results.get('cross', []):
+        summary.append({'kind': 'cross', 'name': r['name'], 'reference': r['reference'],
+                        'files': ';'.join(r['files']), **r['headline']})
+        shells.setdefault('cross', []).extend({'name': r['name'], 'reference': r['reference'], **s}
+                                              for s in r['shells'])
     written = ['summary.tsv']
     _write_tsv(out / 'summary.tsv', summary)
     for kind, rows in shells.items():
@@ -231,6 +245,12 @@ def table(results):
         h = r['headline']
         rows.append(f"difference  {r['name'] + ' - ' + r['reference']:<16} n {h['n_common']:>8d}  "
                     f"bits {_f(h['bits'], '.0f')}  bits_res_only {_f(h['bits_res_only'], '.0f')}")
+    for r in results.get('cross', []):
+        h = r['headline']
+        rows.append(f"cross       {r['name'] + ' vs ' + r['reference']:<16} n {h['n_common']:>8d}  "
+                    f"CC {_f(h['cc_cross'], '.4f')}  outer {_f(h['cc_cross_outer'], '.4f')}  "
+                    f"expected outer {_f(h['cc_expected_outer'], '.4f')}  "
+                    f"lowest CC/expected {_f(h['cc_ratio_min'], '.2f')}")
     return '\n'.join(rows)
 
 
@@ -258,7 +278,7 @@ def main(argv=None):
 
     results = {'settings': {'reference': reference, 'amplitudes': args.amplitudes, 'shells': args.shells,
                             'sigma_bins': args.sigma_bins, 'dmin': args.dmin, 'dmax': args.dmax, 'labels': labels},
-               'datasets': [], 'differences': []}
+               'datasets': [], 'differences': [], 'cross': []}
     for d in datasets:
         if d.merge is not None:
             results['datasets'].append({'name': d.name, 'kind': 'summary', 'files': [str(d.merge)],
@@ -267,6 +287,13 @@ def main(argv=None):
             results['datasets'].append({'name': d.name, 'kind': 'halves', 'files': [str(f) for f in d.halves],
                                         **split_half_stats(*(merges[f] for f in d.halves), n_shells=args.shells)})
     ref = by_name[reference]
+    for d in datasets:
+        if d is ref or d.merge is None or ref.merge is None or (d.discovered and ref.discovered):
+            continue
+        pair = lambda x: None if x.halves is None else tuple(merges[f] for f in x.halves)  # noqa: E731
+        res = cross_stats(merges[d.merge], merges[ref.merge], pair(d), pair(ref), n_shells=args.shells)
+        results['cross'].append({'name': d.name, 'reference': reference,
+                                 'files': [str(f) for f in d.files + ref.files], **res})
     for d in datasets:
         if d is ref:
             continue

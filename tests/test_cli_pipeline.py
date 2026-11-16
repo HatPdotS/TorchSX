@@ -137,6 +137,14 @@ def test_merge_estimators(tmp_path):
     # Same reflections, finite, positive sigma at least the model variance,
     # and every estimate inside the range of its own observations.
     wls = tr.merge(estimator="wls")
+    # merge is a readout: every estimator calls the scale model with autograd
+    # off (a graph kept across the batches of a full dataset exhausts the GPU)
+    grad_modes, prime = [], tr.scale.prime
+    tr.scale.prime = lambda meta: (grad_modes.append(torch.is_grad_enabled()), prime(meta))[1]
+    for est in ("posterior", "pooled", "wls"):
+        tr.merge(estimator=est)
+    tr.scale.prime = prime
+    assert grad_modes and not any(grad_modes)
     assert torch.equal(wls["n_meas"], pooled["n_meas"]) and torch.isfinite(wls["I"]).all()
     assert (wls["I_sd"] > 0).all()
     lo = torch.full((prep.n_valid,), float("inf")).scatter_reduce(0, prep.obs_info.hkl_idx, prep.I_obs, "amin")

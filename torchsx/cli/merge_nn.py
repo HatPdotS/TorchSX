@@ -1,4 +1,8 @@
-"""Export raw posterior amplitudes and their own uncertainties for every state and half.
+"""Export merged amplitudes and their uncertainties for every state.
+
+The product is the inverse-variance (wls) merge on the trained scales, for all
+crystals and for each half. ``--estimator posterior`` writes the Wilson-posterior
+amplitudes instead; its half files then hold pooled amplitudes, which share no prior.
 
 Model and likelihood settings come from the checkpoint.
 """
@@ -16,11 +20,12 @@ from torchsx.merge_stats import r_split
 
 
 def _build_parser():
-    p = argparse.ArgumentParser(prog="torchsx.merge", description="Export raw posterior full/half MTZs for every supplied state.")
+    p = argparse.ArgumentParser(prog="torchsx.merge", description="Export merged full/half MTZs for every supplied state.")
     p.add_argument("ckpt", type=Path, help="checkpoint from torchsx.train")
     P.add_data_args(p)
     P.add_model_args(p)
     P.add_free_args(p)
+    P.add_export_args(p)
     p.add_argument("-o", "--out", type=Path, required=True,
                    help="output MTZ, e.g. merged.mtz; with several states one file per state, "
                         "merged_STATE.mtz, each with its _half1/_half2 companions; time and GPU "
@@ -187,7 +192,7 @@ def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0", rank=None) -> dic
     cc_o, _ = _agree(I1[outer], I2[outer])
     by_shell = []
     order = torch.argsort(dd, descending=True)
-    for chunk in torch.tensor_split(order, 10):
+    for chunk in torch.tensor_split(order, min(10, order.numel())):
         c, r = _agree(I1[chunk], I2[chunk])
         by_shell.append({"d_lo": float(dd[chunk].max()), "d_hi": float(dd[chunk].min()),
                          "cc_half": c, "r_split": r, "n": int(chunk.numel())})
@@ -195,7 +200,7 @@ def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0", rank=None) -> dic
     score = (0.5 * (I1 + I2) if rank is None
              else rank.detach().cpu().double()[both][ok])
     by_quintile = []
-    for chunk in torch.tensor_split(torch.argsort(score), 5):
+    for chunk in torch.tensor_split(torch.argsort(score), min(5, score.numel())):
         c, r = _agree(I1[chunk], I2[chunk])
         by_quintile.append({"cc_half": c, "r_split": r, "n": int(chunk.numel())})
     return {"cc_half": cc, "r_split": rs, "cc_half_outer": cc_o,
@@ -203,55 +208,134 @@ def _split_half_stats(a: dict, b: dict, d, *, key: str = "I0", rank=None) -> dic
             "by_shell": by_shell, "by_quintile": by_quintile}
 
 
+def _amplitudes(po: dict, hkl=None, d=None, spacegroup: str | None = None):
+    """Amplitude, its uncertainty and the reflections that have one.
+
+    A posterior merge carries its own amplitudes. A moment estimator carries
+    intensities, which may be negative: with ``hkl``, ``d`` and ``spacegroup``
+    they go through French-Wilson, else they are truncated at zero.
+    """
+    import torch
+
+    seen = po["seen"].cpu().numpy()
+    if "F" in po:
+        F, F_sd = po["F"].detach().cpu(), po["F_sd"].detach().cpu()
+        return F, F_sd, seen & np.isfinite(F.numpy())
+    I, sd = po["I"].detach().cpu(), po["I_sd"].detach().cpu()
+    usable = seen & np.isfinite(I.numpy()) & np.isfinite(sd.numpy()) & (sd.numpy() > 0)
+    if hkl is not None and spacegroup is not None and usable.any():
+        from torchsx.merge_stats import _french_wilson
+        try:
+            f, s, ok = _french_wilson(hkl[usable], I.numpy()[usable], sd.numpy()[usable],
+                                      np.asarray(d)[usable], spacegroup)
+        except Exception as exc:  # noqa: BLE001 - too few reflections for the Wilson fit
+            print(f"  French-Wilson unavailable ({exc}); amplitudes are sqrt(max(I, 0))", flush=True)
+        else:
+            F = torch.zeros(len(seen)); F_sd = torch.ones(len(seen))
+            idx = np.flatnonzero(usable)
+            F[idx] = torch.as_tensor(f, dtype=torch.float32)
+            F_sd[idx] = torch.as_tensor(s, dtype=torch.float32)
+            keep = np.zeros(len(seen), dtype=bool)
+            keep[idx[ok]] = True
+            return F, F_sd, keep
+    F = I.clamp(min=0).sqrt()
+    return F, sd / (2 * F).clamp(min=sd.sqrt().clamp(min=1e-30)), usable
+
+
+def _report_halves(rec: dict, key: str, name: str, stats: dict | None) -> None:
+    if stats is None:
+        return
+    rec[key] = stats
+    print(f"  half-datasets  {name}  CC1/2 {stats['cc_half']:.4f}  "
+          f"R_split {stats['r_split']:.4f} on {stats['n']:,} reflections", flush=True)
+    print("    R_split by intensity quintile, weak to strong: "
+          + "  ".join(f"{100 * q['r_split']:.1f}%" for q in stats["by_quintile"])
+          + f"; outer shell {100 * stats['by_shell'][-1]['r_split']:.1f}% "
+          f"(CC1/2 {stats['by_shell'][-1]['cc_half']:.3f})", flush=True)
+
+
 def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
                    merge_friedel: bool = True, verbose: bool = True) -> dict:
-    """Write raw posterior amplitudes for each requested split and its halves."""
+    """Write the merged amplitudes of each requested split and of its two halves.
+
+    ``args.estimator`` selects the product. ``wls`` (default) is the
+    inverse-variance mean on the trained scales, for the full set and for each
+    half, turned into amplitudes by French-Wilson. ``posterior`` is the
+    Wilson-posterior amplitude; its half files hold the pooled merge, because
+    two posterior halves share the prior.
+    """
+    product = getattr(args, "estimator", None) or P.ESTIMATORS[0]
+    also = [e for e in (getattr(args, "also", None) or ()) if e != product]
     hkl = prep.hkl_valid.detach().cpu().numpy().astype(int)
     d = prep.d_spacing.detach().cpu().numpy()
     cell = prep.median_cell.detach().cpu().tolist()
     summary = {}
     for k in wanted:
         cond = k if tr.n_conditions > 1 else None
-        sets = [(0, _export_crystals(tr, k) if getattr(tr, "external_heldout", None) is not None else None)]
+        everyone = _export_crystals(tr, k) if getattr(tr, "external_heldout", None) is not None else None
         h1, h2 = _split_halves(tr, k, args.seed + 1000000007)
-        sets += [(1, h1), (2, h2)]
-        merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior",
-                                 tether_readout=half == 0)
-                  for half, crystals in sets}
-        post = merges[0]
         label = names[k] if k < len(names) else str(k)
-        print(f"\nmerge [{label or 'all'}]: {post['n_crystals']:,} crystals", flush=True)
-        P.report_merge(post, verbose=verbose)
-        if not post["n_crystals"] or not int(post["seen"].sum()):
+        if product == "posterior":
+            sets = [(0, everyone), (1, h1), (2, h2)]
+            merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior",
+                                     tether_readout=half == 0)
+                      for half, crystals in sets}
+            full = merges[0]
+        else:
+            full = tr.merge(crystals=everyone, condition=cond, estimator=product, tether_readout=True)
+        print(f"\nmerge [{label or 'all'}]: {full['n_crystals']:,} crystals", flush=True)
+        P.report_merge(full, hkl=hkl, verbose=verbose)
+        if not full["n_crystals"] or not int(full["seen"].sum()):
             print(f"  [{label or 'all'}] nothing written for this split", flush=True)
             continue
         out = args.out
         if len(wanted) > 1:
             out = out.with_name(f"{out.stem}_{label}{out.suffix}")
         work = P.work_mask(hkl, args, verbose=verbose)
-        for half, po in merges.items():
-            stem = out.stem if half == 0 else f"{out.stem}_half{half}"
-            F = po["F"].detach().cpu(); F_sd = po["F_sd"].detach().cpu()
-            keep = po["seen"].cpu().numpy() & np.isfinite(F.numpy())
+        if product == "posterior":
+            halves = [tr.merge(crystals=c, condition=cond, estimator="pooled") for c in (h1, h2)]
+        else:
+            halves = [tr.merge(crystals=c, condition=cond, estimator=product) for c in (h1, h2)]
+
+        def write(stem: str, res: dict, verbose_mtz: bool = False) -> None:
+            F, F_sd, keep = _amplitudes(res, hkl, d, spacegroup)
             if keep.any():
                 P.write_mtz(out.with_name(f"{stem}{out.suffix}"), hkl, F, F_sd,
                             cell=cell, spacegroup=spacegroup, work=work, keep=keep,
-                            merge_friedel=merge_friedel,
-                            verbose=verbose and half == 0)
-        rec = {"split": label, "products": ["posterior"], "prior": post["prior"]}
-        tether = post.get("tether")
+                            merge_friedel=merge_friedel, verbose=verbose_mtz)
+
+        for half, po in enumerate((full, *halves)):
+            write(out.stem if half == 0 else f"{out.stem}_half{half}", po, verbose and half == 0)
+        rec = {"split": label, "products": [product], "estimator": product,
+               "prior": full.get("prior", tr.cfg.posterior_prior)}
+        tether = full.get("tether")
         if tether and tether.get("n_obs"):
             rec["tether"] = tether
             print("  " + P.tether_summary(tether), flush=True)
-        stats = _split_half_stats(merges[1], merges[2], d, rank=merges[0]["I0"])
-        if stats is not None:
-            rec["split_half_posterior"] = stats
-            print(f"  half-datasets  posterior  CC1/2 {stats['cc_half']:.4f}  "
-                  f"R_split {stats['r_split']:.4f} on {stats['n']:,} reflections", flush=True)
-            print("  R_split by intensity quintile, weak to strong: "
-                  + "  ".join(f"{100 * q['r_split']:.1f}%" for q in stats["by_quintile"])
-                  + f"; outer shell {100 * stats['by_shell'][-1]['r_split']:.1f}% "
-                  f"(CC1/2 {stats['by_shell'][-1]['cc_half']:.3f})", flush=True)
+        if product == "posterior":
+            rec["sigF_collapsed"] = P.collapsed_sigma(full, hkl)
+            rec["top_edge"] = P.top_edge(full, hkl)
+            _report_halves(rec, "split_half_pooled", "pooled, no prior",
+                           _split_half_stats(*halves, d, key="I", rank=full["I0"]))
+            _report_halves(rec, "split_half_posterior_shared_prior", "posterior, halves share the prior",
+                           _split_half_stats(merges[1], merges[2], d, rank=full["I0"]))
+        else:
+            _report_halves(rec, f"split_half_{product}", f"{product}, no prior",
+                           _split_half_stats(*halves, d, key="I", rank=full["I"]))
+        for est in also:
+            # diagnostic readouts of the same crystals, to compare with the product
+            res = tr.merge(crystals=everyone, condition=cond, estimator=est)
+            if est == "posterior":
+                P.report_merge(res, hkl=hkl, verbose=verbose)
+                rec["sigF_collapsed"] = P.collapsed_sigma(res, hkl)
+                rec["top_edge"] = P.top_edge(res, hkl)
+            write(f"{out.stem}_{est}", res)
+            P.write_merge_table(out.with_name(f"{out.stem}_{est}.tsv"), hkl, d, res)
+            rec["products"].append(est)
+            print(f"  also        {est}: {int(res['seen'].sum()):,} reflections -> "
+                  f"{out.stem}_{est}{out.suffix}, {out.stem}_{est}.tsv", flush=True)
+        if getattr(args, "also", None):  # the product's own table, to compare the others with
+            P.write_merge_table(out.with_name(f"{out.stem}_{product}.tsv"), hkl, d, full)
         summary[label] = rec
     store = getattr(tr, "_store", None)
     if verbose and store is not None:
@@ -260,7 +344,6 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.with_suffix(".metrics.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
-
 
 if __name__ == "__main__":
     main()

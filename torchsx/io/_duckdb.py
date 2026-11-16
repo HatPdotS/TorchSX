@@ -105,6 +105,50 @@ def _columns(conn, table: str) -> set[str]:
     return {r[0] for r in conn.execute(f"DESCRIBE {table}").fetchall()}  # noqa: S608
 
 
+#: relative spread of the per-rank gains above which the loader warns
+RANK_GAIN_TOLERANCE = 0.02
+
+
+def _calibration_rows(conn, frame_cols: set[str]) -> list[dict]:
+    """Every ``calibration`` row, rank 0 first, each with ``n_frames``: the
+    indexed frames its rank processed (one row and no ``rank``: every frame)."""
+    cols = _columns(conn, "calibration")
+    if "rank" in cols and "rank" in frame_cols:
+        cur = conn.execute("""
+            SELECT c.*, (SELECT count(*) FROM frames f
+                         WHERE f.indexed AND f.rank IS NOT DISTINCT FROM c.rank) AS n_frames
+            FROM calibration c ORDER BY c.rank NULLS FIRST""")
+    else:
+        cur = conn.execute("SELECT *, NULL AS n_frames FROM calibration")
+    names = [d[0] for d in cur.description]
+    return [dict(zip(names, row)) for row in cur.fetchall()]
+
+
+def _rank_gain(cals: list[dict], path: Path) -> tuple[float, int, float] | None:
+    """``(gain, ranks, relative spread)``: the ranks' gains weighted by their
+    indexed frames.  A multi-GPU probixi run calibrates each rank on its own
+    frames; one detector should give one gain, so a spread above
+    ``RANK_GAIN_TOLERANCE`` warns rather than silently picking rank 0."""
+    rows = [r for r in cals if r.get("gain") is not None and float(r["gain"]) > 0]
+    if not rows:
+        return None
+    gains = [float(r["gain"]) for r in rows]
+    if len(rows) == 1:
+        return gains[0], 1, 0.0
+    weights = [float(r["n_frames"] or 0) for r in rows]
+    if sum(weights) <= 0:
+        weights = [1.0] * len(rows)
+    gain = sum(g * w for g, w in zip(gains, weights)) / sum(weights)
+    spread = (max(gains) - min(gains)) / gain
+    if spread > RANK_GAIN_TOLERANCE:
+        import warnings
+        per_rank = ", ".join(f"rank {r.get('rank')}: {g:.4g}" for r, g in zip(rows, gains))
+        warnings.warn(f"{path}: per-rank calibrated gains differ by {100 * spread:.1f} % "
+                      f"({per_rank}); using their frame-weighted mean {gain:.4g}",
+                      stacklevel=3)
+    return gain, len(rows), spread
+
+
 def _measurement(conn, path: Path) -> MeasurementSpec:
     tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
     integ = _scalar_row(conn, "integration") if "integration" in tables else {}
@@ -123,6 +167,12 @@ def _measurement(conn, path: Path) -> MeasurementSpec:
     provenance = [("producer", "probixi")]
     if integ.get("aperture"):
         provenance.append(("aperture", str(integ["aperture"])))
+    if integ.get("bg_annulus_pixels"):  # pixels behind background_model's variance
+        provenance.append(("bg_annulus_pixels", f"{float(integ['bg_annulus_pixels']):g}"))
+    if integ.get("bg_model_var_scale") is not None:  # probixi >= 0.10.3 rescaled the variance
+        provenance.append(("bg_model_var_scale", f"{float(integ['bg_model_var_scale']):.6g}"))
+        if integ.get("bg_model_var_dmin_A") is not None:  # the fit's resolution cut
+            provenance.append(("bg_model_var_dmin_A", f"{float(integ['bg_model_var_dmin_A']):.4g}"))
     frame_cols = _columns(conn, "frames") if "frames" in tables else set()
     if "photon_energy_eV" in frame_cols:
         lo, hi = conn.execute("SELECT min(photon_energy_eV), max(photon_energy_eV) FROM frames "
@@ -135,17 +185,23 @@ def _measurement(conn, path: Path) -> MeasurementSpec:
                            "WHERE diffraction_limit_nm_inv > 0").fetchone()[0]
         if p10:
             provenance.append(("diffraction_limit_p10_A", f"{float(p10):.3f}"))
-    cal = _scalar_row(conn, "calibration") if "calibration" in tables else {}
-    if cal:
-        if (cal.get("schema_version") or 0) > SUPPORTED_DB_SCHEMA:
-            raise ValueError(f"{path}: probixi database schema {cal['schema_version']} is newer "
+    cals = _calibration_rows(conn, frame_cols) if "calibration" in tables else []
+    cal = cals[0] if cals else {}
+    for row in cals:
+        if (row.get("schema_version") or 0) > SUPPORTED_DB_SCHEMA:
+            raise ValueError(f"{path}: probixi database schema {row['schema_version']} is newer "
                              f"than this TorchSX supports ({SUPPORTED_DB_SCHEMA})")
+    if cal:
         for k in ("probixi_version", "schema_version", "flux_variance", "mf_threshold", "tail_ratio"):
             if cal.get(k) is not None:
                 provenance.append((k, str(cal[k])))
-        if cal.get("gain") is not None:
-            gain = cal["gain"]
+        rank_gain = _rank_gain(cals, path)
+        if rank_gain is not None:
+            gain, n_ranks, spread = rank_gain
             declarations = (("calibration", "adu_per_photon", float(gain)),)
+            if n_ranks > 1:
+                provenance.append(("calibration_ranks", str(n_ranks)))
+                provenance.append(("gain_rank_spread", f"{spread:.4g}"))
     unresolved = [k for k, v in (("radii", radii), ("gain", gain)) if v is None]
     return MeasurementSpec(
         producer="probixi",
@@ -160,6 +216,102 @@ def _measurement(conn, path: Path) -> MeasurementSpec:
         source_files=(str(path.resolve()),), provenance=tuple(provenance),
         unresolved=tuple(unresolved),
     )
+
+
+#: probixi's default for ``--enrich-alpha``, used when the database records no alpha
+DEFAULT_ENRICH_ALPHA = 1e-3
+
+
+def parse_enrich_alpha(value) -> float | str | None:
+    """``"auto"``, ``None`` (``"off"``) or a probability in (0, 1].
+
+    ``auto`` takes the alpha the database records and falls back to
+    :data:`DEFAULT_ENRICH_ALPHA`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text == "auto":
+            return "auto"
+        if text in ("off", "none"):
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            raise ValueError(f"enrich_alpha must be auto, off or a probability, got {value!r}") from None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"enrich_alpha must be auto, off or a probability, got {value!r}")
+    alpha = float(value)
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"enrich_alpha must lie in (0, 1], got {alpha:g}")
+    return alpha
+
+
+def _enrichment_gate(conn, enrich_alpha="auto") -> dict:
+    """The enrichment gate on an open probixi database.
+
+    Returns ``predicate`` (SQL on ``crystals``, or None), ``alpha``, ``origin``
+    and the crystal counts ``n_total`` and ``n_kept`` before any other filter.
+    """
+    alpha = parse_enrich_alpha(enrich_alpha)
+    tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
+    gate = {"predicate": None, "alpha": None, "origin": "off", "n_total": None, "n_kept": None}
+    if "crystals" not in tables:
+        gate["origin"] = "no crystals table"
+        return gate
+    n_total = int(conn.execute("SELECT count(*) FROM crystals").fetchone()[0])
+    gate["n_total"] = gate["n_kept"] = n_total
+    if alpha is None:
+        return gate
+    if "enrich_p" not in _columns(conn, "crystals") or not conn.execute(
+            "SELECT count(enrich_p) FROM crystals").fetchone()[0]:
+        gate["origin"] = "no enrich_p recorded"
+        return gate
+    origin = "requested"
+    if alpha == "auto":
+        recorded = None
+        if "integration" in tables and "bg_model_var_alpha" in _columns(conn, "integration"):
+            recorded = _scalar_row(conn, "integration").get("bg_model_var_alpha")
+        if recorded is not None and 0.0 < float(recorded) <= 1.0:
+            alpha, origin = float(recorded), "database, integration.bg_model_var_alpha"
+        else:
+            alpha, origin = DEFAULT_ENRICH_ALPHA, "torchsx default"
+    predicate = f"enrich_p <= {alpha!r}"
+    n_kept = int(conn.execute(f"SELECT count(*) FROM crystals WHERE {predicate}").fetchone()[0])
+    gate.update(predicate=predicate, alpha=alpha, origin=origin, n_kept=n_kept)
+    return gate
+
+
+def read_enrichment_gate(path: str | Path, enrich_alpha="auto") -> dict:
+    """The enrichment gate :func:`load_duckdb` applies to a probixi run.
+
+    probixi scores every lattice with ``enrich_p``, the probability that its
+    predicted spots land on signal as often as they do by chance. A database
+    keeps every lattice. The loader drops the lattices with
+    ``enrich_p > alpha``.
+
+    Parameters
+    ----------
+    path : the probixi database.
+    enrich_alpha : ``"auto"`` (the alpha the database records in
+        ``integration.bg_model_var_alpha``, else :data:`DEFAULT_ENRICH_ALPHA`),
+        a probability in (0, 1], or None / ``"off"`` for no gate.
+
+    Returns
+    -------
+    dict
+        ``predicate`` (SQL on ``crystals``, None without a gate), ``alpha``,
+        ``origin``, ``n_total`` and ``n_kept``.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"no such DuckDB run: {path}")
+    conn = duckdb.connect(str(path), read_only=True)
+    try:
+        return _enrichment_gate(conn, enrich_alpha)
+    finally:
+        conn.close()
 
 
 def read_measurement(path: str | Path) -> MeasurementSpec:
@@ -180,6 +332,8 @@ def load_duckdb(
     geometry: Geometry | None = None,
     load_geom_file: bool = True,
     clipped: bool = False,
+    crystals_where: str | None = None,
+    enrich_alpha: float | str | None = "auto",
 ) -> SFXStreamCore:
     """Build a stream core from a probixi DuckDB run.
 
@@ -199,6 +353,14 @@ def load_duckdb(
         also supported; missing files leave the geometry unset.
     clipped : keep disks clipped by the mask, the frame edge or a neighbour;
         dropped by default, as probixi's stream writer does.
+    crystals_where : SQL predicate on the columns of probixi's ``crystals``
+        table, for example ``enrich_p <= 0.05``. Only the crystals it accepts
+        are loaded, and an image left without a crystal is omitted. It applies
+        on top of the enrichment gate.
+    enrich_alpha : the enrichment gate, see :func:`read_enrichment_gate`.
+        ``"auto"`` (default) drops the lattices whose ``enrich_p`` exceeds the
+        alpha the database records, else :data:`DEFAULT_ENRICH_ALPHA`. None or
+        ``"off"`` loads every lattice.
 
     Returns
     -------
@@ -219,6 +381,15 @@ def load_duckdb(
         tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
         multi = "crystals" in tables
         source = "crystals" if multi else "frames"
+        gate = _enrichment_gate(conn, enrich_alpha)["predicate"]
+        if crystals_where:
+            if not multi:
+                raise ValueError(f"{path}: crystals_where needs a database with a crystals table")
+            if ";" in crystals_where:
+                raise ValueError("crystals_where takes one SQL predicate, without ';'")
+        accepted = [f"({p})" for p in (gate, crystals_where) if p]
+        if accepted:
+            source = f"(SELECT * FROM crystals WHERE {' AND '.join(accepted)})"
         key = "crystal_id" if multi else "frame_id"
         lattice = "c.lattice_index" if multi else "0"
         refl_cols = _columns(conn, "reflections")
@@ -259,7 +430,10 @@ def load_duckdb(
 
     n_crystals = len(crys["cid"])
     if n_crystals == 0:
-        raise ValueError(f"{path}: no indexed frames (nothing to load)")
+        raise ValueError(f"{path}: no indexed frames (nothing to load)"
+                         + (f" with crystals_where {crystals_where!r}" if crystals_where else "")
+                         + (f" under the enrichment gate {gate} (enrich_alpha='off' loads "
+                            f"every lattice)" if gate else ""))
 
     def _tensor(table, name, dtype=torch.float32, fill=0):
         col = table[name]

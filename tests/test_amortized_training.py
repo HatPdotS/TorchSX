@@ -92,12 +92,12 @@ def test_crystal_context_recovers_a_hidden_per_crystal_scale(tmp_path):
         prep, d_model=64
     )
     obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
-    # ~30 updates to converge from zero-init.  The scale ramps up from 0 and
-    # OVERSHOOTS around update 10 (slope of predicted-on-true peaks near 1.6
-    # before settling at ~0.94), so a short run measures the overshoot, not the
-    # answer.  Same endpoint at lr 5e-4, just slower.
+    # The production learning rate. The fold encoder converges within 35 updates
+    # at 1e-3 (slope of predicted on true 0.95, and 1.03 after 400 updates). At
+    # 3e-3 it is unstable: the recovered spread is 0.42 of the true one after 35
+    # updates and 2.0 after 400.
     cfg = TrainConfig(
-        max_obs_per_batch=6000, lr=3e-3, log_every=5, heldout_frac=0.1,
+        max_obs_per_batch=6000, lr=1e-3, log_every=5, heldout_frac=0.1,
         device="cpu", outdir=str(tmp_path),
     )
     trainer = AmortizedTrainer(prep, scale, obj, params, config=cfg)
@@ -117,8 +117,6 @@ def test_crystal_context_recovers_a_hidden_per_crystal_scale(tmp_path):
     assert after > 0.85, f"failed to recover the hidden scale (rho={after})"
 
     # Magnitude, not just ranking: the recovered spread should match the truth.
-    # Converged slope is ~0.94 — mild shrinkage, which is what a regularised
-    # predictor should do.
     scale.eval()
     with torch.no_grad():
         lk = scale.predict(prep.obs_info).log_K
