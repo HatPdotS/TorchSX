@@ -1173,7 +1173,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         noise_mode = "global_B" if selection.get("selected") == "calibration" else "off"
         if verbose:
             print(f"detector noise auto: {noise_mode} (gain from "
-                  f"{'calibration' if noise_mode == 'global_B' else 'input'})", flush=True)
+                  f"{'calibration' if noise_mode == 'global_B' else selection.get('selected') or 'input'})", flush=True)
     if noise_rec or noise_mode in ("global_B", "panel"):
         from torchsx.merging.likelihood.detector_noise import DetectorNoise
         if noise_rec:

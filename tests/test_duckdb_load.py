@@ -1041,6 +1041,42 @@ def test_model_sigma_scale_defers_to_probixi(db_path, tmp_path, monkeypatch):
     assert fixed.recipe["model_sigma_scale_fit"] == {"policy": "fixed", "k": 0.25}
 
 
+def test_auto_gain_is_the_declared_gain_times_the_noise_scale_probixi_records(db_path, tmp_path, monkeypatch):
+    """A database with ``bg_model_var_scale`` settles ``--gain auto`` without a
+    calibration, and ``--detector-noise auto`` then fits nothing; ``calibrate``
+    still estimates; without the scale ``auto`` estimates as before."""
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging.hkl.noise import PoissonNoiseModel
+
+    calls = []
+
+    def calibrate(self, I, background, ewald, **kw):
+        calls.append(1)
+        self.gain_calibration_info = {"valid": True, "method": "fixture"}
+        return 3.0 * GAIN, 0.0, 0.0
+
+    monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", calibrate)
+
+    def selection(name, gain):
+        args = _build_parser().parse_args([str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0",
+                                           "--gain", gain, "--device", "cpu", "-o", str(tmp_path / name)])
+        return P.load_prep(args, verbose=False).recipe["measurement"]
+
+    before = selection("before", "auto")
+    assert calls and before["gain_selection"]["selected"] == "calibration"
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE integration SET bg_model_var_scale = 0.8")
+    calls.clear()
+    m = selection("auto", "auto")
+    assert not calls
+    assert m["gain_selection"]["selected"] == "source_noise_scale"
+    assert m["gain_selection"]["declared_gain"] == pytest.approx(GAIN)
+    assert m["gain_adu_per_photon"] == pytest.approx(0.8 * GAIN)
+    forced = selection("calibrate", "calibrate")
+    assert calls and forced["gain_adu_per_photon"] == pytest.approx(3.0 * GAIN)
+
+
 def test_crystals_where_keeps_only_the_accepted_crystals(db_path):
     core = load_duckdb(db_path, clipped=True, crystals_where="enrich_p <= 1e-5")
     assert (core.n_images, core.n_crystals, core.n_observations) == (2, 2, 5)

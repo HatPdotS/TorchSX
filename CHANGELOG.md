@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--gain auto` on a probixi database that records its noise scale (`integration.bg_model_var_scale`, probixi 0.10.3 and later) uses the declared gain times that scale instead of estimating the gain from the integrated sums. Prepared caches made under `auto` are rebuilt. `--gain calibrate` keeps the estimate.
 - The merge written to `merged.mtz` and its halves is the `wls` estimator, the inverse-variance mean of `(n - bg) / K` on the trained scales, with French-Wilson amplitudes. `--estimator posterior` writes the Wilson-posterior amplitudes as before.
 - The gain calibration whitens each observation with its recorded disk where the source has one (probixi databases). With the nominal disk it returned the detector gain times the ratio of the disk areas for databases whose disk grows with resolution. Prepared caches are rebuilt.
 - `--gain auto` takes the calibrated gain whenever a valid calibration exists (it kept a declared gain within 50 % of the estimate). Prepared caches made under `auto` are rebuilt.

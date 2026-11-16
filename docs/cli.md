@@ -30,7 +30,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 |---|---|---|
 | `--int-radius R_PEAK,R_GAP,R_BG` | from the stream | The integration radii in pixels, as given to indexamajig. |
 | `--gain` | `auto` | Detector gain in ADU per photon (see [Gain](#gain)). |
-| `--detector-noise` | `off` | Learned detector variance A + B (λ + σ<sub>b</sub>²): `auto` fits one global B when the gain was calibrated, `panel` fits it per detector panel. |
+| `--detector-noise` | `off` | Learned detector variance A + B (λ + σ<sub>b</sub>²): `auto` fits one global B when the gain was estimated from the data, `panel` fits it per detector panel. |
 | `--noise-terms` | `AB` | With `--detector-noise panel`: which of A and B are fitted. B alone is a per-panel gain correction. |
 
 ### Training
@@ -193,7 +193,7 @@ misstates the counting noise. `--gain` takes:
 
 | Value | |
 |---|---|
-| `auto` | Estimate the gain from the data and use the estimate. Use the stream's gain when no estimate is possible. |
+| `auto` | For a probixi database that records its noise scale, use the declared gain times that scale. Otherwise estimate the gain from the data and use the estimate. Use the stream's gain when no estimate is possible. |
 | `trust_input` | Use the stream's gain. |
 | `calibrate` | Use the estimate; fail if there is none. |
 | a number | Use this gain in ADU per photon. |
@@ -204,6 +204,12 @@ declared gain that understates the noise does more harm: at several thousand
 observations per reflection, a variance one third too small already appears
 as intensity in the weak shells. The selected gain and the reason for it are
 printed and recorded in `run.json`.
+
+probixi (0.10.3 and later) fits the variance of the background under its disks
+against the Poisson law at the declared gain and records the ratio in
+`integration.bg_model_var_scale`. The declared gain times this ratio is the
+gain at which the photon counts carry Poisson noise, measured on the frames.
+`auto` uses it and makes no estimate of its own; `calibrate` still does.
 
 Both estimates divide the scatter of signal-free sums by the counting noise of
 the integration disk. A probixi database records the pixels of every disk, and

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -186,6 +188,32 @@ def source_var_scale(spec) -> float | None:
         return float(dict(spec.provenance)["bg_model_var_scale"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def source_noise_gain(spec, beam_energy_eV: float) -> tuple[float, float, float] | None:
+    """``(gain, declared gain, k)`` for a source that measured its own noise scale, else None.
+
+    probixi (>= 0.10.3) fits the variance of the background under its disks against
+    the Poisson law at the declared gain and records the ratio k
+    (``integration.bg_model_var_scale``).  ``k * gain`` is then the variance of the
+    detector signal per unit mean, in ADU: the gain at which the photon counts carry
+    Poisson noise.  Inputs that record different k have no single such gain.
+    """
+    from torchsx.measurement import gain_from_measurement
+
+    if spec is None:
+        return None
+    scales = {value for key, value in spec.provenance if key == "bg_model_var_scale"}
+    if len(scales) != 1:
+        return None
+    try:
+        k = float(next(iter(scales)))
+        declared = gain_from_measurement(spec, beam_energy_eV)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(k) and k > 0):
+        return None
+    return declared * k, declared, k
 
 
 def source_n_bg(spec) -> float | None:
@@ -636,6 +664,14 @@ def resolve_gain(core, spec, resolved_measurement, config: MergeConfig,
         mean_eV = float(core.beam_energy.float().mean().item())
         gain = gain_from_measurement(spec, mean_eV) if spec is not None else legacy_stream_gain(core)
         gain_src = "source measurement declaration" if spec is not None else "legacy geometry (unverified)"
+    elif gain_cfg == "auto" and source_noise_gain(spec, float(core.beam_energy.float().mean().item())):
+        # The source measured the noise scale on its own frames: take it.  The
+        # calibration below reads the same scale off the integrated sums and is biased.
+        gain, declared, k = source_noise_gain(spec, float(core.beam_energy.float().mean().item()))
+        poisson_noise.gain_selection = dict(mode=gain_cfg, declared_gain=declared, source_noise_scale=k,
+                                            selected="source_noise_scale", reason="source_measured_noise",
+                                            selected_gain=gain)
+        gain_src = f"auto: declared {declared:.4g} x noise scale {k:.4g} measured by the source"
     elif gain_cfg in ("auto", "calibrate"):
         import math
         tolerance = float(config.gain_tolerance)
