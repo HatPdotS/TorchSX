@@ -72,18 +72,18 @@ def completeness(core: SFXStreamCore, n_bins: int = 20) -> torch.Tensor:
     that is systematically absent does not count.  Returns ``(n_bins,)``,
     lowest resolution first; a shell with no possible reflection reads 0.
     """
-    from torchref.base.reciprocal.hkl import generate_possible_hkl, get_d_spacing
+    from torchref.base.reciprocal.hkl import get_d_spacing
+    from torchref.io.datasets.fcalc_data import FcalcDataset
 
     group, cell, hkl_obs, _, d_obs = _observed(core)
     d_min, d_max = d_obs.min().item(), d_obs.max().item()
 
-    # Generate with slack, then cut the range on the ASU indices with the same
-    # d computation as the observed ones, so a reflection on the boundary is
-    # judged identically on both sides.
-    possible = generate_possible_hkl(cell, d_min * (1 - 1e-6))
-    possible = possible[~group.is_absent(possible).to(possible.device)]
-    possible = group.canonicalize_hkl(possible.int(), include_friedel=True, sort=False)[0]
-    possible = torch.unique(possible, dim=0)
+    # The unique ASU reflections of the group (absences excluded), generated
+    # with slack and then cut on the same d computation as the observed ones,
+    # so a reflection on the boundary is judged identically on both sides.
+    possible = FcalcDataset.from_cell_and_resolution(
+        cell, group, d_min=d_min * (1 - 1e-6), device=cell.device, dtype=torch.float64,
+    ).hkl
     d_possible = get_d_spacing(possible.double(), cell)
     in_range = (d_possible >= d_min) & (d_possible <= d_max)
     possible, d_possible = possible[in_range], d_possible[in_range]
