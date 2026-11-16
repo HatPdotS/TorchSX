@@ -119,8 +119,42 @@ def _build_parser():
     return p
 
 
+def unassigned_share(tr, names) -> float | None:
+    """The share of the updates that goes to the patterns of no dataset
+    (``names`` ends with :data:`~torchsx.cli._pipeline.UNASSIGNED`): their share
+    of the training crystals.  None when every pattern has a dataset."""
+    if not names or names[-1] != P.UNASSIGNED or tr.n_conditions != len(names):
+        return None
+    n = tr.train_crystals.numel()
+    return float(_in_state(tr, tr.train_crystals, len(names) - 1).sum()) / max(1, n)
+
+
+def _in_state(tr, crystals, k: int):
+    """Which of ``crystals`` are members of state ``k``."""
+    member = getattr(tr, "member", None)
+    return tr.condition[crystals] == k if member is None else member[crystals, k]
+
+
+def _state_of_step(tr, step: int) -> tuple[int, int]:
+    """``(state, draw)`` of an update: the state its batch holds and the index
+    that seeds the batch's draw.
+
+    The states take turns.  With patterns of no dataset (``tr.unassigned_share``
+    set) their state, the last one, takes that share of the updates, spread
+    evenly, and the datasets take turns over the rest.
+    """
+    share = getattr(tr, "unassigned_share", None)
+    if share is None:
+        return step % tr.n_conditions, step // tr.n_conditions
+    before = int(step * share)
+    if int((step + 1) * share) > before or tr.n_conditions == 1:
+        return tr.n_conditions - 1, step
+    return (step - before) % (tr.n_conditions - 1), step
+
+
 def _batch(tr, step=None):
-    """Sample complete crystals from one state, alternating states per update.
+    """Sample complete crystals from one state, the states taking turns
+    (:func:`_state_of_step`).
 
     ``step`` (default: the trainer's next update) fixes the draw, so a coming
     batch can be named, and read ahead, before its update runs.
@@ -128,11 +162,11 @@ def _batch(tr, step=None):
     import torch
 
     step = tr.step_i if step is None else int(step)
-    k = step % tr.n_conditions
-    pool = tr.train_crystals[tr.condition[tr.train_crystals] == k]
+    k, draw = _state_of_step(tr, step)
+    pool = tr.train_crystals[_in_state(tr, tr.train_crystals, k)]
     if not pool.numel():
         raise ValueError(f"State {k} has no training crystals after observation filtering")
-    g = torch.Generator().manual_seed(tr.cfg.seed + 1000003 * (step // tr.n_conditions))
+    g = torch.Generator().manual_seed(tr.cfg.seed + 1000003 * draw)
     perm = pool[torch.randperm(len(pool), generator=g)]
     counts = tr.index.counts[perm].cumsum(0)
     requested = tr.cfg.max_obs_per_batch
@@ -181,6 +215,14 @@ def attach_heldout_stream(bundle, name: str = "heldout"):
         raise ValueError(f"no {name!r} split to attach")
     h = names.index(name)
     oi = bundle.prep.obs_info
+    member = getattr(oi, "membership", None)
+    if member is not None:
+        ids = member[:, h].nonzero(as_tuple=True)[0]
+        member = member.clone()
+        member[ids, 0] = True
+        P.assign_states(oi, member[:, [i for i in range(len(names)) if i != h]])
+        bundle.split_names = [n for i, n in enumerate(names) if i != h]
+        return ids
     lab = oi.delay_bin_idx.clone()
     ext = lab == h
     ids = ext.nonzero(as_tuple=True)[0]
@@ -243,11 +285,13 @@ def run_updates(tr, steps, *, eval_every: int = 100, probe=None):
     evaluate_every = max(1, int(eval_every)) * tr.n_conditions
     updates = [0] * tr.n_conditions
     has_validation = bool(tr.heldout_crystals.numel())
+    # the validation crystals are scored as crystals of the state they were drawn from
+    held_state = tr.cfg.heldout_condition if tr.n_conditions > 1 else None
     upcoming = _batch(tr) if steps else None
     if upcoming is not None:
         tr.prefetch(upcoming[1])
     if has_validation:
-        tr.evaluate(tr.heldout_crystals, phase="heldout_init")
+        tr.evaluate(tr.heldout_crystals, phase="heldout_init", state=held_state)
     for i in range(steps):
         k, rows = upcoming
         if i + 1 < steps:
@@ -260,7 +304,7 @@ def run_updates(tr, steps, *, eval_every: int = 100, probe=None):
                                           shuffle=False), None)
             if first is not None:
                 tr.prefetch(first[1])
-        rec = tr.step(rows.to(tr.device))
+        rec = tr.step(rows.to(tr.device), state=k if tr.n_conditions > 1 else None)
         if rec.get("step_skipped") or not rec.get("n_used"):
             raise FloatingPointError(f"Update {tr.step_i} for state {k} was unusable; see metrics.jsonl")
         updates[k] += 1
@@ -274,7 +318,7 @@ def run_updates(tr, steps, *, eval_every: int = 100, probe=None):
         if tr.step_i % evaluate_every == 0 or sum(updates) == steps:
             with tr.averaged():
                 if has_validation:
-                    result = tr.evaluate(tr.heldout_crystals)
+                    result = tr.evaluate(tr.heldout_crystals, state=held_state)
                     a, note = tr.averaging, ""
                     if a is not None:
                         held = f"mean of the last {a['window']} updates" if a["averaged"] else "latest update"
@@ -351,6 +395,7 @@ def main(argv=None):
             tr.set_phase_classes(classes)
             install_structured_prior(tr, prep, bundle.spacegroup, used)
         tr.split_names = bundle.split_names
+        tr.unassigned_share = unassigned_share(tr, bundle.split_names)
         config = asdict(cfg)
         if heldout_ids is not None:
             config["heldout_crystal_ids"] = f"{heldout_ids.numel()} crystals of {args.heldout_stream}"
@@ -365,6 +410,9 @@ def main(argv=None):
         (args.out / "run.json").write_text(json.dumps(tr.data_recipe, indent=2) + "\n")
         print(f"train {tr.train_crystals.numel():,}, validation {tr.heldout_crystals.numel():,} crystals; "
               f"{args.steps} total updates across {tr.n_conditions} states", flush=True)
+        if tr.unassigned_share is not None:
+            print(f"  the patterns of no dataset are {100 * tr.unassigned_share:.1f} % of the training "
+                  f"crystals and take that share of the updates", flush=True)
         probe.begin("train")
         updates = run_updates(tr, args.steps, eval_every=args.eval_every, probe=probe)
         probe.end()
@@ -389,7 +437,8 @@ def main(argv=None):
             target.set_grid(settings["k_coarse"], settings["m_fine"], settings["n_sigma"])
             target.max_halfwidth = settings["max_halfwidth"]
         args.out = args.out / "merged.mtz"
-        merge_products(tr, prep, args, bundle.split_names or [""], list(range(tr.n_conditions)),
+        merge_products(tr, prep, args, bundle.split_names or [""],
+                       P.merged_states(bundle.split_names, tr.n_conditions),
                        spacegroup=bundle.spacegroup, merge_friedel=bundle.merge_friedel)
         probe.end()
         summary.update(elapsed_seconds=time.time()-t0, resources=probe.summary())

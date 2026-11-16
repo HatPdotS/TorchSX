@@ -42,6 +42,8 @@ from torchsx.merging.observations import ObsInfo
 
 STORE_FORMAT = "torchsx-prepared-store"
 STORE_VERSION = 1
+#: ``{"filename": [...], "event": [...]}`` per prepared image, when the inputs name their frames
+FRAMES_FILE = "frames.json"
 
 #: One observation.  ``I_obs``, ``bg`` and ``sigma`` are in photons (divided by
 #: the detector gain; ``bg`` summed over the ``n_pix`` pixels of the disk),
@@ -261,6 +263,10 @@ class StoreObsInfo:
     has_sigma: bool
     delay_bin_idx: Tensor | None = None
     unique_timepoints: Tensor | None = None
+    #: ``(n_crystals, n_states)`` bool: the states of each crystal, when one may
+    #: be in several or in none.  Set by the caller that labels the crystals;
+    #: the store itself carries no labels.
+    membership: Tensor | None = None
 
 
 class PreparedStore:
@@ -316,6 +322,27 @@ class PreparedStore:
 
     def crystal_counts(self) -> Tensor:
         return self.crystal_offsets[1:] - self.crystal_offsets[:-1]
+
+    # ── where the crystals came from ───────────────────────────────────
+
+    @property
+    def crystal_input(self) -> Tensor | None:
+        """Per crystal, the position of its input among the inputs prepared."""
+        return self.tables.get("crystal_input")
+
+    @property
+    def crystal_image(self) -> Tensor | None:
+        """Per crystal, its image in :meth:`frames`."""
+        return self.tables.get("crystal_image")
+
+    def frames(self) -> tuple[list, list] | None:
+        """``(filenames, events)`` of the prepared images, or None when an
+        input did not name its frames."""
+        path = self.path / FRAMES_FILE
+        if not path.is_file():
+            return None
+        d = json.loads(path.read_text())
+        return d["filename"], d["event"]
 
     # ── reflection sums ────────────────────────────────────────────────
 

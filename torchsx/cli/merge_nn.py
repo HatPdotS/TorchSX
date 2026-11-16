@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> None:
     out = args.out
     try:
         probe.begin("readout")
-        merge_products(tr, prep, args, names, list(range(tr.n_conditions)),
+        merge_products(tr, prep, args, names, P.merged_states(names, tr.n_conditions),
                        spacegroup=bundle.spacegroup, merge_friedel=bundle.merge_friedel)
         probe.end()
         out.with_suffix(".resources.json").write_text(json.dumps(probe.summary(), indent=2) + "\n")
@@ -145,7 +145,7 @@ def _export_crystals(tr, k: int):
     external held-out set (``--heldout-stream``), which is scored, never merged."""
     import torch
 
-    in_cond = (tr.condition == k).nonzero(as_tuple=True)[0]
+    in_cond = tr.member[:, k].nonzero(as_tuple=True)[0]
     ext = getattr(tr, "external_heldout", None)
     if ext is not None:
         in_cond = in_cond[~torch.isin(in_cond, ext.cpu())]

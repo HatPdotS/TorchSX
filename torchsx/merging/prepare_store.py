@@ -29,6 +29,7 @@ when there is one; every floating-point value is computed on the host, as
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -41,7 +42,7 @@ from torch import Tensor
 
 from torchsx.merging.config import MergeConfig
 from torchsx.merging.hkl import PoissonNoiseModel
-from torchsx.merging.store import RECORD, RECORD_WIDTH, PreparedStore, RecordFile, StoreWriter
+from torchsx.merging.store import FRAMES_FILE, RECORD, RECORD_WIDTH, PreparedStore, RecordFile, StoreWriter
 
 #: One parsed observation before preparation, less its canonical Miller index
 #: (kept in a file of its own, the one column the resolution cut reads).
@@ -746,7 +747,16 @@ class StoreBuilder:
             "shell_id_fw": fw_shell_ids(d_valid, config.fw_n_shells),
             "is_centric": centric_flags(self.spacegroup, hkl_valid).cpu(),
             "sum_wI": sums["wI"], "sum_w": sums["w"], "sum_I": sums["I"], "count": sums["n"],
+            # where each crystal came from, for labels given after preparation
+            "crystal_input": self.input_of_crystal[self.logical],
+            "crystal_image": self.logical_image_id,
         }
+        if self._has_names:
+            images = self.logical_images.tolist()
+            (tmp / FRAMES_FILE).write_text(json.dumps(
+                {"filename": [self.filenames[i] for i in images],
+                 "event": [e if isinstance(e, str) else int(e)
+                           for e in (self.events[i] for i in images)]}) + "\n")
         if delay_bin_idx is not None:
             tables["delay_bin_idx"] = delay_bin_idx
             tables["unique_timepoints"] = unique_timepoints

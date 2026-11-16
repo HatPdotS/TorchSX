@@ -111,8 +111,11 @@ torchsx.train --split dark=dark.stream --split light=light.stream \
 ```
 
 One network is trained on both states, and each state is merged on its own:
-`merged_dark.mtz` and `merged_light.mtz`, each with its two halves. A single
-stream with a CrystFEL custom-split file works too (`--split-file`).
+`merged_dark.mtz` and `merged_light.mtz`, each with its two halves. A state
+can come from several streams (repeat its name), and streams with a CrystFEL
+custom-split file work too (`--split-file`); patterns the file assigns to no
+state still train the network. See
+[States](https://github.com/HatPdotS/TorchSX/blob/master/docs/cli.md#states).
 
 ## How it works, by analogy
 

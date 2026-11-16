@@ -373,7 +373,24 @@ class AmortizedTrainer:
             self.index = CrystalIndex(oi.crystal_id.cpu(), oi.n_crystals,
                                       condition=self.condition)
         self.n_conditions = self.index.n_conditions
+        # The states of each crystal.  ``obs_info.membership`` lets a crystal be
+        # in several states, or in none; ``condition`` is then its first state
+        # and only a way to cut batches.  Without it every crystal is in the
+        # state of its label.
+        member = getattr(oi, "membership", None)
+        if member is not None:
+            member = member.detach().to(torch.bool).cpu()
+            if member.ndim != 2 or member.shape[0] != oi.n_crystals:
+                raise ValueError(f"membership must be (n_crystals, n_states), got {tuple(member.shape)}")
+            self.n_conditions = member.shape[1]
+        else:
+            member = torch.nn.functional.one_hot(self.condition, self.n_conditions).bool()
+        #: ``(n_crystals, n_states)`` bool
+        self.member = member
         self._cond = 0                      # condition of the batch in flight
+        #: the state every batch belongs to while set (:meth:`in_state`); None
+        #: reads it off the batch's first crystal
+        self._state: int | None = None
         if is_light is None and self.n_conditions > 1:
             is_light = self.condition != 0
         self.is_light = None if is_light is None else is_light.to(self.device)
@@ -382,8 +399,7 @@ class AmortizedTrainer:
         # condition and score across them.
         self._auc_pool: list = [None] * self.n_conditions
         if self.n_conditions > 1:
-            n_per = torch.bincount(self.condition[self.index.nonempty],
-                                   minlength=self.n_conditions).tolist()
+            n_per = self.member[self.index.nonempty].sum(0).tolist()
             print(f"  [condition] {self.n_conditions} conditions, crystals per "
                   f"condition {n_per}; batches are condition-pure", flush=True)
         if self.cfg.target_redundancy is not None:
@@ -441,7 +457,8 @@ class AmortizedTrainer:
         self._best_wilson: list | None = None
 
         self.gen = torch.Generator().manual_seed(self.cfg.seed)
-        pool = self.index.nonempty
+        # a crystal of no state is neither trained on nor scored
+        pool = self.index.nonempty[self.member[self.index.nonempty].any(1)]
         # Held-out crystals come from ONE condition (cfg.heldout_condition), so
         # the held-out NLL and every split-half statistic below are
         # same-condition numbers.  Training gets the rest of that condition
@@ -460,13 +477,13 @@ class AmortizedTrainer:
                     f"heldout_condition={hc} but the data has "
                     f"{self.n_conditions} condition(s)"
                 )
-            in_ref = self.condition[pool] == hc
+            in_ref = self.member[pool, hc]
             ref_pool, other = pool[in_ref], pool[~in_ref]
         perm = ref_pool[torch.randperm(ref_pool.numel(), generator=self.gen)]
         self.external_heldout: Tensor | None = None
         if self.cfg.heldout_crystal_ids is not None:
             ids = torch.as_tensor(self.cfg.heldout_crystal_ids, dtype=torch.long).cpu()
-            if hc is not None and bool((self.condition[ids] != hc).any()):
+            if hc is not None and not bool(self.member[ids, hc].all()):
                 raise ValueError(f"heldout_crystal_ids must all belong to condition {hc}")
             held = torch.isin(perm, ids)
             self.heldout_crystals = perm[held]
@@ -568,15 +585,17 @@ class AmortizedTrainer:
         only the gathered rows cross the bus; otherwise this is the plain
         indexing it replaces, so the two paths give identical tensors.
         """
+        if self._state is not None:
+            self._cond = self._state
         if self._store is not None:
             meta = self._store.batch(rows, self.device)
-            if self.n_conditions > 1 and rows.numel():
+            if self._state is None and self.n_conditions > 1 and rows.numel():
                 self._cond = int(self.condition[self._store.crystal_of_row(int(rows[0]))])
             n_ph = (meta.I_obs + meta.bg).clamp(min=0)
             sigma = (meta.sigma if meta.sigma is not None
                      else (n_ph + meta.bg.clamp(min=0) + 1.0).sqrt())
             return meta, n_ph, meta.bg, sigma
-        if self.n_conditions > 1 and rows.numel():
+        if self._state is None and self.n_conditions > 1 and rows.numel():
             # The batch is condition-pure (CrystalIndex guarantees it), so the
             # first row names the condition for the whole batch.  This is the
             # one choke point every forward, evaluate, merge and diagnostic
@@ -593,6 +612,18 @@ class AmortizedTrainer:
             self.prep.bg[r].to(self.device, non_blocking=True),
             self.sigma[r].to(self.device, non_blocking=True),
         )
+
+    @contextmanager
+    def in_state(self, state: int | None):
+        """Every batch inside belongs to ``state``, whatever its crystals' first
+        state is; None leaves that to each batch's first crystal."""
+        if state is not None and not 0 <= int(state) < self.n_conditions:
+            raise ValueError(f"state {state} outside 0..{self.n_conditions - 1}")
+        previous, self._state = self._state, None if state is None else int(state)
+        try:
+            yield
+        finally:
+            self._state = previous
 
     def prefetch(self, rows: Tensor) -> None:
         """Start reading the observations of a coming batch (a no-op in memory)."""
@@ -696,7 +727,13 @@ class AmortizedTrainer:
         )
         return tgt, post.log_Z
 
-    def step(self, rows: Tensor) -> dict:
+    def step(self, rows: Tensor, state: int | None = None) -> dict:
+        """One update on the observations ``rows`` of ``state`` (None: the
+        state of their first crystal)."""
+        with self.in_state(state if state is not None else self._state):
+            return self._step(rows)
+
+    def _step(self, rows: Tensor) -> dict:
         self.scale.train()
         if self.cfg.warmup_steps > 0 or self.cfg.lr_schedule != "constant":
             scale_lr = lr_factor(self.step_i, warmup=self.cfg.warmup_steps, total=self.cfg.total_steps,
@@ -916,12 +953,18 @@ class AmortizedTrainer:
         return out
 
     @torch.no_grad()
-    def evaluate(self, crystals: Tensor, *, phase: str = "heldout") -> dict:
-        """Score crystals the network never trained on.
+    def evaluate(self, crystals: Tensor, *, phase: str = "heldout",
+                 state: int | None = None) -> dict:
+        """Score crystals the network never trained on, as crystals of
+        ``state`` (None: of each one's first state).
 
         In-batch loss falling while this does not is co-adaptation through the
         merge rather than learning.
         """
+        with self.in_state(state if state is not None else self._state):
+            return self._evaluate(crystals, phase)
+
+    def _evaluate(self, crystals: Tensor, phase: str) -> dict:
         self.scale.eval()
         tot, ped, n_tot, n_hkl, recs = 0.0, 0.0, 0, 0, []
         for sel, rows in self._batches(
@@ -1154,7 +1197,12 @@ class AmortizedTrainer:
         return True
 
     @torch.no_grad()
-    def merge(
+    def merge(self, *, crystals: Tensor | None = None, condition: int | None = None, **kwargs) -> dict:
+        """:meth:`_merge`, every batch read as one of ``condition``'s when it is given."""
+        with self.in_state(condition if condition is not None else self._state):
+            return self._merge(crystals=crystals, condition=condition, **kwargs)
+
+    def _merge(
         self,
         *,
         crystals: Tensor | None = None,
@@ -1164,6 +1212,11 @@ class AmortizedTrainer:
         tether_readout: bool = False,
     ) -> dict:
         """Merge a crystal set and return everything an MTZ needs.
+
+        ``condition`` merges the members of that state (``crystals``, when
+        given, cut down to them) with its merge target and Wilson surface.
+        Without it the crystals must share their first state; no crystals at
+        all means every crystal that is in a state.
 
         The single merge implementation the CLIs use.  ``_merge_set`` keeps its
         own shorter path: it feeds the training-time CC1/2 and R_split, which
@@ -1205,16 +1258,12 @@ class AmortizedTrainer:
         if estimator not in ("posterior", "flat", "ml", "pooled", "mean", "wls"):
             raise ValueError(f"unknown estimator {estimator!r}")
         if condition is not None:
-            if not (0 <= condition < self.n_conditions):
-                raise ValueError(
-                    f"condition {condition} outside 0..{self.n_conditions - 1}"
-                )
             self._cond = int(condition)
-            in_cond = (self.condition == condition).nonzero(as_tuple=True)[0]
+            in_cond = self.member[:, condition].nonzero(as_tuple=True)[0]
             crystals = (in_cond if crystals is None
                         else crystals[torch.isin(crystals.cpu(), in_cond)])
         elif crystals is None:
-            crystals = torch.arange(self.index.n_crystals)
+            crystals = self.member.any(1).nonzero(as_tuple=True)[0]
         if self.n_conditions > 1 and condition is None:
             cb = self.condition[crystals.cpu()].unique()
             if cb.numel() != 1:
