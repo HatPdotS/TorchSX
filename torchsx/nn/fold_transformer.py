@@ -413,8 +413,8 @@ class FoldTransformerEncoder(nn.Module):
         self.flex_device = True
         self._device = None
         self._compiled = None
-        #: the (autograd, backward) modes :meth:`dry_run` has compiled
-        self._dry_runs: set[tuple[bool, bool]] = set()
+        #: the (autograd, backward, plain) modes :meth:`dry_run` has compiled
+        self._dry_runs: set[tuple[bool, bool, bool]] = set()
         self.ctx_blocks = nn.ModuleList(
             AttentionBlock(d_model, n_heads, d_hidden, self_attention=True,
                            activation=activation, bf16=bf16)
@@ -518,19 +518,23 @@ class FoldTransformerEncoder(nn.Module):
         return self._compiled
 
     def dry_run(self, x_self: Tensor, x_ctx: Tensor, x_crys: Tensor | None, group_id: Tensor,
-                idx: Tensor, valid: Tensor, *, autograd: bool, backward: bool) -> None:
+                idx: Tensor, valid: Tensor, *, autograd: bool, backward: bool,
+                plain: bool = True) -> None:
         """Compile the network on one packed block before the run uses it.
 
         With ``compile`` on CUDA, the first call per mode runs the compiled
-        network on the block (:func:`fold_layout`) as the run will: the
-        forward pass, with autograd when ``autograd`` (plain and under a
-        checkpoint), and with ``backward`` its backward pass.  The outputs are
-        discarded and no gradient is accumulated.  When torch fails on any of
-        them, the network runs uncompiled from then on (``compile`` off) and a
-        warning names the error.  Callers run it before their first block,
-        outside any checkpoint.
+        network on the block (:func:`fold_layout`) as the run will: the plain
+        forward pass when ``plain``, with autograd when ``autograd`` and with
+        ``backward`` its backward pass, and with ``autograd`` the forward pass
+        under a checkpoint.  A run that uses only the checkpointed pass (an
+        evaluation on flex attention) passes ``plain=False``.  The passes run
+        one at a time: each one's outputs, and with them its graph, are
+        released before the next, and no gradient is accumulated.  When torch
+        fails on any of them, the network runs uncompiled from then on
+        (``compile`` off) and a warning names the error.  Callers run it before
+        their first block, outside any checkpoint.
         """
-        mode = (bool(autograd), bool(backward))
+        mode = (bool(autograd), bool(backward), bool(plain))
         if not (self.compile and x_self.is_cuda) or mode in self._dry_runs:
             return
         self._dry_runs.add(mode)
@@ -539,9 +543,11 @@ class FoldTransformerEncoder(nn.Module):
         try:
             net = self._compiled_network()
             with torch.set_grad_enabled(autograd):
-                z, _ = net(*args)
-                if backward and params:
-                    torch.autograd.grad(z, params, torch.ones_like(z), allow_unused=True)
+                if plain:
+                    z = net(*args)[0]
+                    if backward and params:
+                        torch.autograd.grad(z, params, torch.ones_like(z), allow_unused=True)
+                    del z
                 if autograd:
                     torch.utils.checkpoint.checkpoint(net, *args, use_reentrant=False)
         except torch.cuda.OutOfMemoryError:
