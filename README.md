@@ -17,6 +17,11 @@
 
 </div>
 
+TorchSX merges serial crystallography data with an error model learned for
+every single observation instead of a few parameters per crystal. On the
+time-resolved tubulin data below, its difference maps from 3,875 images per
+state are as good as Partialator's from 31,000.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/HatPdotS/TorchSX/master/assets/readme-tubulin-overview.webp" alt="TorchSX overview: a fold transformer predicts a scale and a scatter law for every observation; tubulin azo-combretastatin difference maps from TorchSX and Partialator against the number of images per state" width="100%">
 </p>
@@ -27,39 +32,43 @@ observations it is predicting, and the crystal's cell, energy and resolution.
 For every observation it predicts a scale K and a scatter law, a mixture of
 Gaussians in log intensity whose components cover pooled, partial, outlier
 and sharp observations. **Bottom:** light-minus-dark difference maps of
-azo-combretastatin unbinding from tubulin, 1 ns after light activation, as a
-function of the number of images per state in the merge. TorchSX with 3,875
-images per state matches Partialator with 31,000 (8×) in correlation with the
-noise-free map. Open symbols: the full merge (A + B).
+azo-combretastatin unbinding from tubulin, 1 ns after light activation
+(Wranik et al.<sup>[1](#references)</sup>), against the number of images per
+state in the merge. The correlation with the noise-free map is estimated as
+√CC, where CC is the correlation between the maps of two independent merges,
+A and B, of disjoint images; open symbols are the full merge (A + B). Shaded: TorchSX with
+3,875 images per state and Partialator with 31,000 (8×), the closest pair in
+that correlation.
 
-In serial crystallography every reflection is seen once per crystal, with an
-unknown partiality, incident intensity and crystal volume. Established programs
-scale each crystal with a few parameters and average. TorchSX instead works
-from a generative model of every observation. The signal that reached the
-detector aperture of observation *j* of reflection *h* is
+## What it does
 
-    S_j = K_j · I_h · exp(ε_j)
+- **Learns an error model per observation.** One network per dataset predicts,
+  for every observation, a scale K (partiality, pulse intensity, crystal
+  volume) and how far the measurement may plausibly fall from it.
+- **Never uses an observation to predict itself.** Each crystal's observations
+  are split into five folds. The network reads the whole crystal once per
+  fold, with that fold's measurements hidden, and predicts the hidden ones
+  from their geometry and the rest of the crystal. On the way it corrects the
+  crystal's orientation and photon energy.
+- **Merges by posterior, not by averaging.** Each reflection's intensity is
+  integrated out under a Wilson prior. `F-obs` and `SIGF-obs` are the mean and
+  standard deviation of the posterior of |F| given all its observations.
+- **Cannot see light or dark.** The scale network is never given a state,
+  delay or timepoint, so it cannot absorb a difference signal. One network
+  serves all states, and each state is merged on its own.
+- **Holds the merge at the sum of the spots.** A tether keeps the mean scale
+  free of trends in resolution and direction, so partiality stays in K and the
+  fall-off of the integrated intensities stays in the merged data.
+- **Handles pseudo-translation.** Translational NCS, lattice translocation
+  defects and stacking faults are found in the data and modelled in the prior
+  and the scale model.
 
-where I_h is the reflection's true intensity, a latent variable with a Wilson
-prior; K_j is a scale predicted for this observation; and ε_j is a random
-multiplicative scatter, with E[exp(ε_j)] = 1, whose distribution is also
-predicted for this observation (a mixture of two-width Gaussians in log space).
-The detector then records Poisson counts of S_j on top of the background. One
-neural network per dataset predicts K_j and the scatter distribution from the
-observation's geometry, its crystal's metadata and the crystal's other
-observations. Merging is a posterior integral rather than an average: each
-merged amplitude and its uncertainty are moments of the posterior of I_h given
-all its observations. The network is trained on random batches of crystals
-sized to a given multiplicity, maximising the marginal likelihood of their
-observations with I_h integrated out.
+TorchSX reads integrated CrystFEL `.stream` files and probixi `.duckdb` runs
+and writes merged MTZs. DIALS input is in progress. TorchSX is under active
+development: if something behaves unexpectedly, please open an issue on GitHub.
 
-TorchSX starts from integrated CrystFEL `.stream` files and writes merged MTZs.
-We are working on integration with dials and integration of Probixi. 
-
-TorchSX is under active development, if you find something behaving unexpectedly please create an issue on GitHub. 
-
-Refinement and difference maps in this repo were done with
-[TorchRef](https://github.com/HatPdotS/TorchRef). TorchSX output should be compatible with any classical refinement or map calculation program. 
+The output works with any refinement or map program. Refinement and difference
+maps in this repo were done with [TorchRef](https://github.com/HatPdotS/TorchRef)<sup>[2](#references)</sup>.
 
 ## Install
 
@@ -68,13 +77,24 @@ pip install torchsx
 ```
 
 Python ≥ 3.10. This brings TorchRef 0.7, torch, triton, gemmi and
-`torchsx-native`, the compiled `.stream` reader for your platform. TorchSX is intended to be run on a GPU; its core algorithms are Triton kernels, and we have not investigated CPU runtime or even functionality. GPU memory should not exceed 10 GB. It scales with the redundancy requested for training (default 100) and the number of unique HKLs, not with the amount of data. Host RAM does not scale with the amount of data either: the streams are prepared block by block into an on-disk store of 56 bytes per observation, and training and merging read it one batch at a time, with the next batch read while the current one is computed.
+`torchsx-native`, the compiled `.stream` reader for your platform.
+
+- **GPU.** TorchSX is meant to run on a GPU: its core algorithms are Triton
+  kernels, and CPU runtime, or whether it runs on a CPU at all, has not been
+  investigated.
+- **GPU memory** should stay below 10 GB. It scales with the redundancy
+  requested for training (default 100) and the number of unique reflections,
+  not with the amount of data.
+- **Host memory** does not scale with the amount of data either. The inputs
+  are prepared block by block into an on-disk store of 56 bytes per
+  observation, and training and merging read it one batch at a time, the next
+  batch while the current one is computed.
 
 From a checkout, build the native package first (needs Rust, see
 [native/README.md](https://github.com/HatPdotS/TorchSX/blob/master/native/README.md)):
 `pip install ./native`, then `pip install -e .`.
 
-## Usage
+## Quick start
 
 ```bash
 torchsx.train indexed.stream --spacegroup 'P 63' --dmin 2.0 -o run/
@@ -115,8 +135,7 @@ files carry `F-obs(+)`, `SIGF-obs(+)`, `F-obs(-)` and `SIGF-obs(-)`.
 The two halves split the crystals, not the training: both are merged with the
 same network, so the CC1/2 and R_split in `merged.metrics.json` measure the
 in-run precision, not the agreement of independent merges. For independent
-halves, as in the comparison below, train two runs on disjoint sets of
-patterns.
+halves, train two runs on disjoint sets of patterns.
 
 ### Light and dark
 
@@ -129,56 +148,34 @@ One network is trained on both states, and each state is merged on its own:
 `merged_dark.mtz` and `merged_light.mtz`, each with its two halves. A single
 stream with a CrystFEL custom-split file works too (`--split-file`).
 
-## How it works, by analogy
+## The model
 
-Every crystal is a witness that saw each reflection once, under its own
-conditions: how much of the reflection the Ewald sphere caught, how bright the
-pulse was, how big the crystal was (partiality, incident intensity and crystal
-volume, none of them known per observation). Established programs correct each
-witness with a few parameters per crystal and then average the testimonies
-(per-crystal scale and B factor, then a weighted mean).
+The signal that reached the detector aperture of observation *j* of
+reflection *h* is
 
-TorchSX instead learns, from the whole data set, how reliable each kind of
-testimony is. One network reads every observation together with the other
-spots on the same image and predicts two things: how bright this observation
-should be, and how far from that it may plausibly fall (a scale factor K and a
-scatter distribution, a mixture of two-width Gaussians in log space, for every
-observation).
+    S_j = K_j · I_h · exp(ε_j)
 
-Merging then does not average. It asks which true intensities are consistent
-with all the testimonies given their predicted reliabilities, and reports the
-centre of that range as the merged value and its width as the uncertainty (the
-posterior of each reflection's intensity under the product of per-observation
-likelihoods and a Wilson prior.).
+where I_h is the reflection's true intensity, a latent variable with a Wilson
+prior; K_j is the predicted scale of this observation; and ε_j is a random
+multiplicative scatter, with E[exp(ε_j)] = 1, whose distribution is also
+predicted for this observation: a mixture of four Gaussians in log space, each
+of which may be wider below its centre than above it, as the scatter of
+partial observations is. The detector then records Poisson counts of S_j on
+top of the background.
 
-The network is trained the way a weather forecaster is scored: rewarded for
-confidence where the data agree with it, penalised for confidence where they do
-not, so the predicted scatter stays honest (maximising the marginal
-likelihood, with each reflection's true intensity integrated out).
+The network is trained on random batches of whole crystals, sized to a given
+multiplicity (`--redundancy`, default 100), by maximising the marginal
+likelihood of their observations with every I_h integrated out. No point
+estimate of the intensity enters the loss, so the quantity that is scored is
+the quantity that is merged. Like a weather forecaster scored on its
+forecasts, the network is rewarded for confidence where the data agree and
+penalised for it where they do not; a wider scatter costs likelihood, so
+agreement cannot be bought by widening it. The integrals over I_h and ε_j run
+in Triton kernels that never hold the full integrand in memory.
 
-## Compared with Partialator
-
-On the bacteriorhodopsin (bR) data of Weinert et al.<sup>[1](#references)</sup>:
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/HatPdotS/TorchSX/master/assets/readme-br-rfree.png" alt="bR R-free against dark patterns per merge, TorchSX and Partialator" width="65%">
-</p>
-
-R<sub>free</sub> of models refined from one starting model against each dark
-merge, on the reflections common to both programs at each size, as a function
-of the number of dark patterns per merge. Points, mean of two independent
-merges; bars, their range. Initial models were refined against a larger merge
-with the respective method. Refinement used TorchRef with one protocol for all
-merges.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/HatPdotS/TorchSX/master/assets/readme-br-maps.png" alt="bR light-minus-dark difference maps from two independent halves, TorchSX and Partialator" width="100%">
-</p>
-
-Light-minus-dark difference maps from two independent merges of disjoint
-patterns (7,800 per state each), phased with the dark model. Shown: the end of helix E, the EF loop and helix F of the dark model
-(grey) and of the open state 6RPH<sup>[1](#references)</sup> (orange). The
-number under each program is the correlation of its two maps over helix F.
+The [command-line reference](https://github.com/HatPdotS/TorchSX/blob/master/docs/cli.md#model)
+describes the model, the tether and the pseudo-translation search in more
+detail.
 
 ## Other commands
 
@@ -201,9 +198,9 @@ stream with its geometry and measurement settings.
 
 ## References
 
-1. Weinert, T. et al. Proton uptake mechanism in bacteriorhodopsin captured by
-   serial synchrotron crystallography. *Science* **365**, 61–65 (2019).
-   [doi:10.1126/science.aaw8634](https://doi.org/10.1126/science.aaw8634)
+1. Wranik, M. et al. Watching the release of a photopharmacological drug from
+   tubulin using time-resolved serial crystallography. *Nat. Commun.* **14**,
+   903 (2023). [doi:10.1038/s41467-023-36481-5](https://doi.org/10.1038/s41467-023-36481-5)
 2. Seidel, H.-P., Standfuss, J. & Weinert, T. TorchRef: an open-source PyTorch
    framework for crystallographic refinement. *J. Appl. Cryst.*, accepted (2026).
 
