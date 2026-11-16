@@ -113,7 +113,7 @@ def test_end_to_end(tmp_path, monkeypatch):
     _cli(monkeypatch)
     _found(monkeypatch, train)
     run = tmp_path / 'run'
-    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '3', '--seed', '3'])
+    train.main(['x.stream', '-o', str(run), '--device', 'cpu', '--steps', '3', '--seed', '3', '--tether-report'])
     ck = torch.load(run / 'best.pt', weights_only=False)
     assert ck['scale']['tether'] == ['gauge', 'phase']
     assert ck['scale']['phase_classes']['translations'] == [T[0]]
@@ -123,7 +123,8 @@ def test_end_to_end(tmp_path, monkeypatch):
     steps = [r for r in steps if r.get('phase') == 'train']
     assert all(math.isfinite(r['tether_phase']) for r in steps)
     metrics = json.loads((run / 'merged.metrics.json').read_text())
-    merge_nn.main([str(run / 'best.pt'), 'x.stream', '-o', str(tmp_path / 'again.mtz'), '--device', 'cpu'])
+    merge_nn.main([str(run / 'best.pt'), 'x.stream', '-o', str(tmp_path / 'again.mtz'), '--device', 'cpu',
+                   '--tether-report'])
     again = json.loads((tmp_path / 'again.metrics.json').read_text())
     for name, rec in metrics.items():
         assert np.isclose(again[name]['tether']['phase']['rms'], rec['tether']['phase']['rms'],
