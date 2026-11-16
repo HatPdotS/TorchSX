@@ -17,6 +17,21 @@
 
 </div>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/HatPdotS/TorchSX/master/assets/readme-tubulin-overview.webp" alt="TorchSX overview: a fold transformer predicts a scale and a scatter law for every observation; tubulin azo-combretastatin difference maps from TorchSX and Partialator against the number of images per state" width="100%">
+</p>
+
+**Top:** a fold transformer reads one crystal's observations together:
+geometry, I, σ and I/Ī for most of them, geometry only for the fold whose
+observations it is predicting, and the crystal's cell, energy and resolution.
+For every observation it predicts a scale K and a scatter law, a mixture of
+Gaussians in log intensity whose components cover pooled, partial, outlier
+and sharp observations. **Bottom:** light-minus-dark difference maps of
+azo-combretastatin unbinding from tubulin, 1 ns after light activation, as a
+function of the number of images per state in the merge. TorchSX with 3,875
+images per state matches Partialator with 31,000 (8×) in correlation with the
+noise-free map. Open symbols: the full merge (A + B).
+
 In serial crystallography every reflection is seen once per crystal, with an
 unknown partiality, incident intensity and crystal volume. Established programs
 scale each crystal with a few parameters and average. TorchSX instead works
