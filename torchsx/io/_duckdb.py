@@ -220,6 +220,12 @@ def _measurement(conn, path: Path) -> MeasurementSpec:
 
 #: probixi's default for ``--enrich-alpha``, used when the database records no alpha
 DEFAULT_ENRICH_ALPHA = 1e-3
+#: under ``auto``, the largest ``enrich_p`` of a second or later lattice of a frame
+#: (probixi ``--max-lattices`` above one). Such a lattice is indexed on the peaks the
+#: earlier ones left over. Read at the first lattice's alpha, the further lattices of
+#: weakly diffracting crystals made the merge worse; at this bound the strong ones
+#: still add their signal.
+EXTRA_LATTICE_ENRICH_ALPHA = 1e-10
 
 
 def parse_enrich_alpha(value) -> float | str | None:
@@ -251,12 +257,15 @@ def parse_enrich_alpha(value) -> float | str | None:
 def _enrichment_gate(conn, enrich_alpha="auto") -> dict:
     """The enrichment gate on an open probixi database.
 
-    Returns ``predicate`` (SQL on ``crystals``, or None), ``alpha``, ``origin``
-    and the crystal counts ``n_total`` and ``n_kept`` before any other filter.
+    Returns ``predicate`` (SQL on ``crystals``, or None), ``alpha``,
+    ``alpha_extra`` (the bound on further lattices of a frame, or None),
+    ``origin`` and the crystal counts ``n_total`` and ``n_kept`` before any
+    other filter.
     """
     alpha = parse_enrich_alpha(enrich_alpha)
     tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
-    gate = {"predicate": None, "alpha": None, "origin": "off", "n_total": None, "n_kept": None}
+    gate = {"predicate": None, "alpha": None, "alpha_extra": None, "origin": "off",
+            "n_total": None, "n_kept": None}
     if "crystals" not in tables:
         gate["origin"] = "no crystals table"
         return gate
@@ -264,11 +273,12 @@ def _enrichment_gate(conn, enrich_alpha="auto") -> dict:
     gate["n_total"] = gate["n_kept"] = n_total
     if alpha is None:
         return gate
-    if "enrich_p" not in _columns(conn, "crystals") or not conn.execute(
+    crystal_cols = _columns(conn, "crystals")
+    if "enrich_p" not in crystal_cols or not conn.execute(
             "SELECT count(enrich_p) FROM crystals").fetchone()[0]:
         gate["origin"] = "no enrich_p recorded"
         return gate
-    origin = "requested"
+    origin, extra = "requested", None
     if alpha == "auto":
         recorded = None
         if "integration" in tables and "bg_model_var_alpha" in _columns(conn, "integration"):
@@ -277,9 +287,15 @@ def _enrichment_gate(conn, enrich_alpha="auto") -> dict:
             alpha, origin = float(recorded), "database, integration.bg_model_var_alpha"
         else:
             alpha, origin = DEFAULT_ENRICH_ALPHA, "torchsx default"
+        # further lattices of a frame: a given alpha gates every lattice alike
+        if alpha > EXTRA_LATTICE_ENRICH_ALPHA and "lattice_index" in crystal_cols and conn.execute(
+                "SELECT count(*) FROM crystals WHERE lattice_index > 0").fetchone()[0]:
+            extra = EXTRA_LATTICE_ENRICH_ALPHA
     predicate = f"enrich_p <= {alpha!r}"
+    if extra is not None:
+        predicate += f" AND (coalesce(lattice_index, 0) = 0 OR enrich_p <= {extra!r})"
     n_kept = int(conn.execute(f"SELECT count(*) FROM crystals WHERE {predicate}").fetchone()[0])
-    gate.update(predicate=predicate, alpha=alpha, origin=origin, n_kept=n_kept)
+    gate.update(predicate=predicate, alpha=alpha, alpha_extra=extra, origin=origin, n_kept=n_kept)
     return gate
 
 
@@ -289,20 +305,22 @@ def read_enrichment_gate(path: str | Path, enrich_alpha="auto") -> dict:
     probixi scores every lattice with ``enrich_p``, the probability that its
     predicted spots land on signal as often as they do by chance. A database
     keeps every lattice. The loader drops the lattices with
-    ``enrich_p > alpha``.
+    ``enrich_p > alpha``. Under ``"auto"`` a second or later lattice of a
+    frame must also reach :data:`EXTRA_LATTICE_ENRICH_ALPHA`.
 
     Parameters
     ----------
     path : the probixi database.
     enrich_alpha : ``"auto"`` (the alpha the database records in
-        ``integration.bg_model_var_alpha``, else :data:`DEFAULT_ENRICH_ALPHA`),
-        a probability in (0, 1], or None / ``"off"`` for no gate.
+        ``integration.bg_model_var_alpha``, else :data:`DEFAULT_ENRICH_ALPHA`,
+        and :data:`EXTRA_LATTICE_ENRICH_ALPHA` for further lattices of a frame),
+        a probability in (0, 1] for every lattice, or None / ``"off"`` for no gate.
 
     Returns
     -------
     dict
         ``predicate`` (SQL on ``crystals``, None without a gate), ``alpha``,
-        ``origin``, ``n_total`` and ``n_kept``.
+        ``alpha_extra``, ``origin``, ``n_total`` and ``n_kept``.
     """
     path = Path(path)
     if not path.exists():
@@ -359,8 +377,9 @@ def load_duckdb(
         on top of the enrichment gate.
     enrich_alpha : the enrichment gate, see :func:`read_enrichment_gate`.
         ``"auto"`` (default) drops the lattices whose ``enrich_p`` exceeds the
-        alpha the database records, else :data:`DEFAULT_ENRICH_ALPHA`. None or
-        ``"off"`` loads every lattice.
+        alpha the database records, else :data:`DEFAULT_ENRICH_ALPHA`, and the
+        further lattices of a frame above :data:`EXTRA_LATTICE_ENRICH_ALPHA`.
+        None or ``"off"`` loads every lattice.
 
     Returns
     -------

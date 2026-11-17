@@ -87,7 +87,8 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
                    help="probixi database only: the enrichment gate. Lattices whose "
                         "enrich_p (the chance probability of their spots landing on "
                         "signal) exceeds ALPHA are not read. auto takes the alpha the "
-                        "database records, else 1e-3; off reads every lattice. "
+                        "database records, else 1e-3, and 1e-10 for the second and "
+                        "later lattices of a frame; off reads every lattice. "
                         "Default: checkpoint recipe, then auto.")
     # With --background model: k on the model's background variance, auto (fitted on the
     # observations past their crystal's limit), off (k = 1) or a number.  Experimental.

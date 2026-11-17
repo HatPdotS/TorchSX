@@ -182,7 +182,8 @@ class SFXStream:
             crystals it accepts are loaded.
         enrich_alpha : the enrichment gate. ``"auto"`` (default) drops the
             lattices whose ``enrich_p`` exceeds the alpha the database records,
-            else 1e-3. None or ``"off"`` loads every lattice. See
+            else 1e-3, and the further lattices of a frame above 1e-10. None or
+            ``"off"`` loads every lattice. See
             :func:`torchsx.io._duckdb.read_enrichment_gate`.
         """
         import warnings

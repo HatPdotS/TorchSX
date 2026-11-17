@@ -180,6 +180,11 @@ default of probixi's own `--enrich-alpha`. `--enrich-alpha off` reads every
 lattice. The log prints the gate and the number of lattices it keeps, and the
 recipe records it.
 
+With probixi's `--max-lattices` above one, a frame can hold several lattices.
+The second and later ones are indexed on the peaks the first left over. Under
+`auto` they are read only with `enrich_p` at most 1e-10. A number given to
+`--enrich-alpha` applies to every lattice alike.
+
 Without `--dmin`, a probixi database is cut at the 10th percentile of its
 crystals' diffraction limits, so shells with no signal do not enter the merge
 or its statistics.

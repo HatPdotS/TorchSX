@@ -14,8 +14,8 @@ import duckdb
 import pytest
 import torch
 
-from torchsx.io._duckdb import (DEFAULT_ENRICH_ALPHA, load_duckdb, parse_enrich_alpha,
-                                read_enrichment_gate, read_measurement)
+from torchsx.io._duckdb import (DEFAULT_ENRICH_ALPHA, EXTRA_LATTICE_ENRICH_ALPHA, load_duckdb,
+                                parse_enrich_alpha, read_enrichment_gate, read_measurement)
 from torchsx.io.sources import inspect_source, read_source
 from torchsx.stream import SFXStream
 
@@ -202,7 +202,7 @@ _FRAMES = [
 # (filename, event, lattice, n_refl, profile, limit, astar_x, n_indexed, rmsd, mosaicity, enrichment, n_bright, enrich_p)
 _CRYSTALS = [
     ("run_b.h5", 8, 0, 3, 0.40, 3.0, 1.5, 60, 0.0004, 0.10, 8.0, 40, 1e-12),
-    ("run_b.h5", 8, 1, 2, 0.30, 2.0, 2.0, 20, 0.0009, 0.20, 3.0, 9, 1e-3),
+    ("run_b.h5", 8, 1, 2, 0.30, 2.0, 2.0, 20, 0.0009, 0.20, 3.0, 9, 1e-11),
     ("run_a.h5", 1, 0, 2, 0.20, 2.5, 0.5, 30, 0.0006, 0.15, 5.0, 20, 1e-6),
 ]
 
@@ -527,7 +527,7 @@ def test_crystal_feature_table_shape_and_dead_columns(db_path):
     assert dead.isdisjoint({"log_n_refl", "beam_energy", *PROBIXI_CRYSTAL_FEATURES})
     col = CRYSTAL_FEAT_COLUMNS.index
     torch.testing.assert_close(tbl[:, col("log_scale")], torch.tensor([0.8, 1.2, 1.2]).log())
-    torch.testing.assert_close(tbl[:, col("log_enrich_p")], torch.tensor([1e-6, 1e-12, 1e-3]).log10())
+    torch.testing.assert_close(tbl[:, col("log_enrich_p")], torch.tensor([1e-6, 1e-12, 1e-11]).log10())
     torch.testing.assert_close(tbl[:, col("log_n_indexed")], torch.log1p(torch.tensor([30.0, 60.0, 20.0])))
     torch.testing.assert_close(tbl[:, col("peak_resolution")], torch.tensor([10 / 2.8, 10 / 3.5, 10 / 3.5]))
 
@@ -1078,18 +1078,23 @@ def test_auto_gain_is_the_declared_gain_times_the_noise_scale_probixi_records(db
 
 
 def test_crystals_where_keeps_only_the_accepted_crystals(db_path):
-    core = load_duckdb(db_path, clipped=True, crystals_where="enrich_p <= 1e-5")
+    core = load_duckdb(db_path, clipped=True, crystals_where="lattice_index = 0")
     assert (core.n_images, core.n_crystals, core.n_observations) == (2, 2, 5)
     assert core.n_refl.tolist() == [2, 3]
     one = load_duckdb(db_path, clipped=True, crystals_where="num_reflections = 3")
     assert (one.n_images, one.n_crystals, one.n_observations) == (1, 1, 3)
     stream = read_source(db_path, spacegroup="P 43 21 2", clipped=True,
-                         crystals_where="enrich_p <= 1e-5")
+                         crystals_where="lattice_index = 0")
     assert stream._core.n_crystals == 2
     with pytest.raises(ValueError, match="nothing to load"):
         load_duckdb(db_path, crystals_where="enrich_p < 0")
     with pytest.raises(ValueError, match="one SQL predicate"):
         load_duckdb(db_path, crystals_where="true; DROP TABLE crystals")
+
+
+#: the gate ``auto`` builds for the fixture, whose run_b frame holds two lattices
+GATE = (f"enrich_p <= {DEFAULT_ENRICH_ALPHA!r} AND "
+        f"(coalesce(lattice_index, 0) = 0 OR enrich_p <= {EXTRA_LATTICE_ENRICH_ALPHA!r})")
 
 
 def _chance_lattice(db_path, enrich_p=0.5):
@@ -1101,7 +1106,8 @@ def _chance_lattice(db_path, enrich_p=0.5):
 def test_enrichment_gate_drops_chance_lattices_by_default(db_path):
     _chance_lattice(db_path)
     gate = read_enrichment_gate(db_path)
-    assert gate == {"predicate": f"enrich_p <= {DEFAULT_ENRICH_ALPHA!r}", "alpha": DEFAULT_ENRICH_ALPHA,
+    assert gate == {"predicate": GATE, "alpha": DEFAULT_ENRICH_ALPHA,
+                    "alpha_extra": EXTRA_LATTICE_ENRICH_ALPHA,
                     "origin": "torchsx default", "n_total": 3, "n_kept": 2}
     core = load_duckdb(db_path, clipped=True)
     assert (core.n_images, core.n_crystals, core.n_observations) == (2, 2, 5)
@@ -1120,7 +1126,8 @@ def test_enrichment_gate_drops_chance_lattices_by_default(db_path):
 
 
 def test_enrichment_gate_takes_the_alpha_the_database_records(db_path):
-    _chance_lattice(db_path, 0.01)
+    with duckdb.connect(str(db_path)) as conn:  # a first lattice between the default and the recorded alpha
+        conn.execute("UPDATE crystals SET enrich_p = 0.01 WHERE lattice_index = 0 AND num_reflections = 2")
     assert load_duckdb(db_path, clipped=True).n_crystals == 2          # 0.01 > the default 1e-3
     with duckdb.connect(str(db_path)) as conn:
         conn.execute("UPDATE integration SET bg_model_var_alpha = 0.05")
@@ -1129,6 +1136,23 @@ def test_enrichment_gate_takes_the_alpha_the_database_records(db_path):
         0.05, "database, integration.bg_model_var_alpha", 3)
     assert load_duckdb(db_path, clipped=True).n_crystals == 3
     assert load_duckdb(db_path, clipped=True, enrich_alpha=1e-3).n_crystals == 2
+
+
+def test_auto_gate_asks_more_of_the_further_lattices_of_a_frame(db_path):
+    """Under auto a second lattice of a frame needs enrich_p <= 1e-10; a given
+    alpha gates every lattice alike; one lattice per frame keeps the plain gate."""
+    _chance_lattice(db_path, 1e-6)  # passes the default alpha, not the bound on further lattices
+    gate = read_enrichment_gate(db_path)
+    assert (gate["predicate"], gate["alpha_extra"], gate["n_kept"]) == (GATE, EXTRA_LATTICE_ENRICH_ALPHA, 2)
+    assert load_duckdb(db_path, clipped=True).n_crystals == 2
+    assert load_duckdb(db_path, clipped=True, enrich_alpha=1e-3).n_crystals == 3
+    assert read_enrichment_gate(db_path, 1e-3)["alpha_extra"] is None
+    _chance_lattice(db_path, 1e-11)
+    assert load_duckdb(db_path, clipped=True).n_crystals == 3
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE crystals SET lattice_index = 0")
+    plain = read_enrichment_gate(db_path)
+    assert (plain["predicate"], plain["alpha_extra"]) == (f"enrich_p <= {DEFAULT_ENRICH_ALPHA!r}", None)
 
 
 def test_enrichment_gate_needs_recorded_enrichment(db_path):
@@ -1161,7 +1185,7 @@ def test_cli_enrich_alpha_reaches_the_store_and_the_recipe(db_path, tmp_path):
     gated = load()
     assert gated.prep.obs_info.n_crystals == 2
     assert gated.recipe["enrich_alpha"] == "auto"
-    assert gated.recipe["enrich_gate"] == [f"enrich_p <= {DEFAULT_ENRICH_ALPHA!r}"]
+    assert gated.recipe["enrich_gate"] == [GATE]
     every = load("--enrich-alpha", "off")
     assert every.prep.obs_info.n_crystals == 3
     assert (every.recipe["enrich_alpha"], every.recipe["enrich_gate"]) == ("off", ["off"])
