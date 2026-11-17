@@ -11,7 +11,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.7+-ee4c2c.svg)](https://pytorch.org/)
-[![TorchRef](https://img.shields.io/badge/TorchRef-0.7-f97316.svg)](https://github.com/HatPdotS/TorchRef)
+[![TorchRef](https://img.shields.io/badge/TorchRef-0.8-f97316.svg)](https://github.com/HatPdotS/TorchRef)
 [![CUDA](https://img.shields.io/badge/CUDA-supported-76b900.svg)](https://developer.nvidia.com/cuda-zone)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -76,7 +76,7 @@ maps in this repo were done with [TorchRef](https://github.com/HatPdotS/TorchRef
 pip install torchsx
 ```
 
-Python ≥ 3.10. This brings TorchRef 0.7, torch, triton, gemmi and
+Python ≥ 3.10. This brings TorchRef 0.8, torch, triton, gemmi and
 `torchsx-native`, the compiled `.stream` reader for your platform.
 
 - **GPU.** TorchSX is meant to run on a GPU: its core algorithms are Triton
