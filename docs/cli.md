@@ -42,7 +42,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--lr-schedule` | `constant` | Learning rate after the warm-up: `constant`, or `cosine` decay to zero at the last update. |
 | `--average-last N` | 5 | When the last N updates per state oscillate, validate, checkpoint and merge the mean of the network after each of them; 0 uses the last update alone. |
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
-| `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
+| `--prior` | `wilson` | Intensity prior: `wilson`, the only one (see [Intensity prior](#intensity-prior)). |
 | `--tether TERMS` | `gauge` | Directions the likelihood leaves to the model, held at the raw counts; `none` turns it off (see [Sum-of-spots tether](#sum-of-spots-tether)). |
 | `--pseudo-translation` | `auto` | Finds translational pseudo-symmetry in the data and, with a dominant translation, handles its classes of reflections; `off` skips the search (see [Pseudo-translation](#pseudo-translation)). |
 | `--seed N` | 0 | Network initialization and batch sampling. |
@@ -94,7 +94,7 @@ torchsx.merge RUN/best.pt --split dark=dark.stream --split light=light.stream -o
 
 Merges the given streams with a trained network. The checkpoint supplies the
 network, the Wilson surface, the measurement settings (radii, gain, detector
-noise) and the seed for the halves; `--int-radius`, `--gain`, `--prior` and
+noise) and the seed for the halves; `--int-radius`, `--gain` and
 `--merge-friedel` override them. `--tether-report` adds the tether's report. The streams can be the training data, more
 data from the same experiment, or other states. Merging the training data
 reproduces the merge written by `torchsx.train`.
@@ -239,18 +239,18 @@ refinements of different merges, give them the same free set with
 
 ## Intensity prior
 
-With `--prior wilson` each state has a Wilson prior whose mean intensity is a
+Each state has a Wilson prior whose mean intensity is a
 smooth surface over reciprocal space: Chebyshev polynomials in resolution plus
 the anisotropy terms of the space group. Its coefficients start from a Wilson
 fit to the data and are trained with the network on the same marginal
 likelihood.
 
-`--prior none` integrates the likelihood over positive intensity without a
-prior density. The result then depends on the bounds of the integration grid
-for weak reflections, and its validation loss is not comparable with that of
-a Wilson run.
-
-`torchsx.merge` uses the prior of the checkpoint unless `--prior` is given.
+`--prior wilson` is the only choice; the flag stays so existing scripts run.
+The flat prior, `--prior none`, was removed in 0.2.4: its posterior has no
+upper bound, and for weak reflections it ran off the top of the finite
+integration grid, leaving F at the grid ceiling with a near-zero sigma
+([#24](https://github.com/HatPdotS/TorchSX/issues/24)). `torchsx.merge` refuses
+a checkpoint trained with it; retrain, or merge it with torchsx 0.2.3.
 
 ## Sum-of-spots tether
 

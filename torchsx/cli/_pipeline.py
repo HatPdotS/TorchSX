@@ -858,10 +858,9 @@ class ResourceProbe:
 def add_model_args(p: argparse.ArgumentParser) -> None:
     """Flags shared by every command that builds the merge stack."""
     p.add_argument("--device", default=None, help="cuda | cpu")
-    p.add_argument("--prior", choices=("none", "wilson"), default=None,
-                   help="intensity prior: wilson (default; one surface per state, trained by the "
-                        "evidence) or none (flat in positive intensity); merge inherits the "
-                        "checkpoint unless set")
+    p.add_argument("--prior", choices=("wilson",), default=None,
+                   help="intensity prior: wilson, one surface per state, trained by the "
+                        "evidence (the only prior; the flag is kept for existing scripts)")
     p.add_argument("--tether-report", action="store_true",
                    help="report the sum-of-spots tether's terms over each state's merged observations "
                         "in merged.metrics.json; the fit holds all of a state's observations on the "
@@ -1053,11 +1052,21 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # The merge uses the DEFAULTS grid (n_sigma 24, k_coarse 63, m_fine 257),
     # and the checkpoint's training grid is reported, not applied.
     grid = dict(ck.get("posterior_grid") or {})
-    prior = getattr(args, "prior", None)
-    if prior is None:
-        prior = str(grid.get("prior", "wilson"))
-    if prior not in ("none", "wilson"):
-        raise ValueError(f"Invalid checkpoint prior {prior!r}; expected 'none' or 'wilson'")
+    # The flat prior (``--prior none``) was removed in 0.2.4: its posterior has
+    # no upper bound and runs off the top of the finite integration grid (#24).
+    # A network trained under it carries no Wilson surface, so it cannot be
+    # merged under the Wilson prior either.
+    ck_prior = str(grid.get("prior", "wilson"))
+    if ck_prior == "none":
+        raise SystemExit("this checkpoint was trained with --prior none, which torchsx 0.2.4 "
+                         "removed: the flat posterior runs off the top of the integration grid "
+                         "(https://github.com/HatPdotS/TorchSX/issues/24). Retrain with the "
+                         "Wilson prior, or merge it with torchsx 0.2.3.")
+    if ck_prior != "wilson":
+        raise ValueError(f"Invalid checkpoint prior {ck_prior!r}; expected 'wilson'")
+    prior = getattr(args, "prior", None) or "wilson"
+    if prior != "wilson":
+        raise ValueError(f"Invalid prior {prior!r}; expected 'wilson'")
     wilson_degree = int(grid.get("wilson_degree", DEFAULTS["wilson_degree"]))
     # One smooth reciprocal-space basis for the prior's Sigma(h) and the scale's
     # gauge pin, built from the prepared reflections, the median cell and the
@@ -1080,13 +1089,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         scatter_components=int(scale.heads.n_components),
     )
     if verbose:
-        print(f"intensity prior: {prior}"
-              + (" (overriding checkpoint prior " + str(grid.get("prior", "wilson")) + ")"
-                 if ck and getattr(args, "prior", None) is not None else ""), flush=True)
-        if prior == "none":
-            print("  none: integrate likelihood with dI on the finite intensity grid; "
-                  "the missed-spot component prevents an unbounded flat posterior. "
-                  "Check edge mass and integration-range sensitivity.", flush=True)
+        print(f"intensity prior: {prior}", flush=True)
         print(f"stack: amortised scale, "
               f"{scale.heads.n_components}-component Gaussian mixture scatter, "
               f"miss {miss:.3f}, " + (f"outlier {outlier:.4f}, " if outlier else "")

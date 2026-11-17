@@ -292,8 +292,18 @@ def test_per_condition_targets_keep_the_difference(tmp_path):
     tr.close()
 
 
-@pytest.mark.parametrize("prior", ["wilson", "none"])
-def test_evaluation_changes_no_state(tmp_path, prior):
+def test_flat_prior_is_rejected(tmp_path):
+    """The flat prior was removed (#24): its posterior runs off the top of the grid."""
+    prep, params, *_ = _synthetic(n_hkl=12, n_xtal=24, per=12)
+    scale = AmortizedScale.from_prep(prep, d_model=8, context_folds=2)
+    with pytest.raises(ValueError, match="removed"):
+        AmortizedTrainer(
+            prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
+            config=TrainConfig(device="cpu", outdir=str(tmp_path), posterior_prior="none"),
+        )
+
+
+def test_evaluation_changes_no_state(tmp_path):
     """Scoring held-out data must not feed its intensities into later training."""
     prep, params, *_ = _synthetic(n_hkl=12, n_xtal=24, per=12, n_cond=2)
     scale = AmortizedScale.from_prep(
@@ -303,7 +313,7 @@ def test_evaluation_changes_no_state(tmp_path, prior):
         prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(
             max_obs_per_batch=24, heldout_frac=0.25, device="cpu", outdir=str(tmp_path),
-            posterior_prior=prior, posterior_k_coarse=5, posterior_m_fine=17,
+            posterior_prior="wilson", posterior_k_coarse=5, posterior_m_fine=17,
             ),
     )
 
