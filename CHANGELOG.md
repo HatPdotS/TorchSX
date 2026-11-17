@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- TorchRef 0.8 (`>=0.8.1,<0.9`). torchsx's use of it is unchanged: 0.8 drops the `verbose` arguments of its readers and of `ReflectionData`, which torchsx never passed, and reports through `logging` instead of `print` and `warnings`. The one visible difference is that writing the merged MTZ no longer prints TorchRef's "✓ Wrote … MTZ" summary; torchsx's own summary stays.
 - A state can come from several streams: `--split` names repeat, a `--split` path may be a glob pattern, and several unnamed streams are one data set.
 - `--split-file` labels the frames of any number of streams, and an event of `*` names every frame of a file.
 - Patterns a split file assigns to no state no longer stop the run: by default they train the network, with their share of the updates, and are merged into nothing; `--unassigned drop` or `error` chooses otherwise.
