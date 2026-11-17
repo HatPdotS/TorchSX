@@ -247,9 +247,9 @@ likelihood.
 
 `--prior wilson` is the only choice; the flag stays so existing scripts run.
 The flat prior, `--prior none`, was removed in 0.2.4: its posterior has no
-upper bound, and for weak reflections it ran off the top of the finite
-integration grid, leaving F at the grid ceiling with a near-zero sigma
-([#24](https://github.com/HatPdotS/TorchSX/issues/24)). `torchsx.merge` refuses
+upper bound, so for weak reflections it could run off the top of the finite
+integration grid ([#24](https://github.com/HatPdotS/TorchSX/issues/24)). The
+Wilson prior closes the posterior off and is not affected. `torchsx.merge` refuses
 a checkpoint trained with it; retrain, or merge it with torchsx 0.2.3.
 
 ## Sum-of-spots tether
