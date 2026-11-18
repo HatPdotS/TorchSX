@@ -4,11 +4,18 @@ The scale model and the sum-of-spots tether assume that every observation
 captures the same fraction of its spot at a given resolution.  A source that
 sums reflections over disks of different size breaks that: a larger disk
 captures more of the spot, by a factor that jumps wherever the disk changes.
-:class:`DiskCapture` holds that factor relative to the source's base disk,
-``flux(disk used) / flux(base disk)``, as a function of resolution for each
+:class:`DiskCapture` holds that factor relative to one reference disk,
+``flux(disk used) / flux(reference disk)``, as a function of resolution for each
 disk size, and returns its logarithm per observation.  The scale model adds it
 to ``log K``, so the network's own scale and the merged intensities stay on the
-base disk's scale.
+reference disk's scale.
+
+The reference is the table's choice.  With the source's smallest disk as the
+reference, only the larger disks carry a row and the smallest disk is left
+alone (``base_pixels`` is its pixel count).  With the largest disk as the
+reference, every disk carries a row of values at or below zero and
+``base_pixels`` is 0: the merged intensities then follow the flux in the
+largest disk at every resolution.
 """
 
 from __future__ import annotations
@@ -30,14 +37,15 @@ class DiskCapture:
     q
         ``(n_q,)`` knots in ``1/d`` (1/A), increasing.
     n_pixels
-        ``(n_disk,)`` pixel counts of the full disks larger than the base disk,
-        increasing.
+        ``(n_disk,)`` pixel counts of the full disks that carry a row,
+        increasing, all above ``base_pixels``.
     log_ratio
-        ``(n_disk, n_q)`` log of the captured flux relative to the base disk at
-        each knot; linear between knots and constant beyond them.
+        ``(n_disk, n_q)`` log of the captured flux relative to the reference
+        disk at each knot; linear between knots and constant beyond them.
     base_pixels
-        Pixel count of the base disk.  Observations with at most this many
-        pixels get no offset.
+        Observations with at most this many pixels get no offset: the pixel
+        count of the smallest disk when it is the reference, 0 when every disk
+        carries a row.
 
     An observation belongs to the smallest disk that holds its pixel count: a
     disk that lost pixels to a mask or to a neighbour counts as the next
@@ -54,7 +62,7 @@ class DiskCapture:
             raise ValueError("capture knots must be increasing")
         if bool((self.n_pixels[1:] <= self.n_pixels[:-1]).any()) or (
                 self.n_pixels.numel() and float(self.n_pixels[0]) <= self.base_pixels):
-            raise ValueError("capture disks must be increasing and larger than the base disk")
+            raise ValueError("capture disks must be increasing and above base_pixels")
 
     @classmethod
     def from_definition(cls, d: dict) -> "DiskCapture":

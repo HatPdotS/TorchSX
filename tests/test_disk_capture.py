@@ -33,6 +33,18 @@ def test_log_offset_follows_disk_and_resolution():
     assert got.tolist() == pytest.approx([1.0, 1.2, 1.2, 1.5, 1.5], rel=1e-5)
 
 
+def test_every_disk_can_carry_a_row():
+    # reference = the largest disk: base_pixels 0, values at or below zero
+    cap = DiskCapture(q=[0.2, 0.4], n_pixels=[9, 21, 37],
+                      log_ratio=[[math.log(0.6), math.log(0.3)], [math.log(0.8), math.log(0.6)], [0.0, 0.0]],
+                      base_pixels=0)
+    s_sq = torch.full((5,), (0.3 / 2.0) ** 2)
+    n_pix = torch.tensor([0.0, 7.0, 9.0, 21.0, 37.0])
+    got = cap.log_offset(s_sq, n_pix).exp()
+    # an observation without a recorded disk gets no offset
+    assert got.tolist() == pytest.approx([1.0, math.sqrt(0.18), math.sqrt(0.18), math.sqrt(0.48), 1.0], rel=1e-5)
+
+
 def test_definition_round_trip(tmp_path):
     cap = _capture()
     again = DiskCapture.from_definition(cap.definition())

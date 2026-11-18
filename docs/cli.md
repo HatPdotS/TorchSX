@@ -45,7 +45,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
 | `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
 | `--tether TERMS` | `gauge` | Directions the likelihood leaves to the model, held at the raw counts; `none` turns it off (see [Sum-of-spots tether](#sum-of-spots-tether)). |
-| `--capture-table JSON` | none | Capture ratio of the source's larger disks relative to its base disk, by resolution; its logarithm is added to each observation's log scale (see [Disk capture](#disk-capture)). |
+| `--capture-table JSON` | none | Captured flux of each of the source's disks relative to one reference disk, by resolution; its logarithm is added to each observation's log scale (see [Disk capture](#disk-capture)). |
 | `--pseudo-translation` | `auto` | Finds translational pseudo-symmetry in the data and, with a dominant translation, handles its classes of reflections; `off` skips the search (see [Pseudo-translation](#pseudo-translation)). |
 | `--seed N` | 0 | Network initialization and batch sampling. |
 | `--device` | `cuda` if available | `cuda` or `cpu`. |
@@ -264,16 +264,28 @@ larger disk captures more of the spot. Where the disk changes, the captured
 fraction jumps, and without a correction the jump goes into the merged
 intensities.
 
-`--capture-table JSON` gives the capture ratio of each larger disk relative to
-the base disk: `q` (knots in 1/d, per Å), `n_pixels` (pixel counts of the
-larger disks), `log_ratio` (one row per disk, the log ratio at each knot) and
-`base_pixels`. Each observation takes the row of the smallest disk that holds
-its recorded pixel count and the value at its own resolution, linear between
-knots. The value is added to the predicted log scale in the likelihood, the
-posterior and the merge. The gauge anchor and the tether act on the network's
-own scale, without the offset. Observations on the base disk are unchanged, so
-the merged intensities stay on the base disk's scale. The checkpoint records
-the table and `torchsx.merge` applies it.
+`--capture-table JSON` gives the captured flux of each disk relative to one
+reference disk: `q` (knots in 1/d, per Å), `n_pixels` (pixel counts of the
+disks that carry a row), `log_ratio` (one row per disk, the log ratio at each
+knot) and `base_pixels`. Each observation takes the row of the smallest disk
+that holds its recorded pixel count and the value at its own resolution, linear
+between knots. The value is added to the predicted log scale in the likelihood,
+the posterior and the merge. The gauge anchor and the tether act on the
+network's own scale, without the offset. The merged intensities stay on the
+reference disk's scale. The checkpoint records the table and `torchsx.merge`
+applies it.
+
+The table chooses the reference:
+
+- **Largest disk.** Every disk carries a row, the values are at or below zero
+  and `base_pixels` is 0. The merged intensities follow the flux in the largest
+  disk at every resolution. A small disk loses a growing share of the spot
+  towards high resolution, and this reference removes that fall-off together
+  with the jumps.
+- **Smallest disk.** Only the larger disks carry a row and `base_pixels` is the
+  smallest disk's pixel count. Observations with at most that many pixels are
+  unchanged. This reference removes the jumps and keeps the smallest disk's
+  fall-off.
 
 ## Sum-of-spots tether
 

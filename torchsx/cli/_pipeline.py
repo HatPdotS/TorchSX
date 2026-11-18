@@ -1136,10 +1136,10 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         scale.capture = DiskCapture.from_file(args.capture_table)
     if verbose and scale.capture is not None:
         c = scale.capture
-        print(f"  disk capture: base disk {c.base_pixels:g} px, larger disks "
-              f"{', '.join(f'{int(n)}' for n in c.n_pixels.tolist())} px, capture ratio up to "
-              f"{float(c.log_ratio.max().exp()):.2f} over 1/d {float(c.q[0]):.3f}-{float(c.q[-1]):.3f} 1/A",
-              flush=True)
+        print(f"  disk capture: disks {', '.join(f'{int(n)}' for n in c.n_pixels.tolist())} px "
+              f"(no offset up to {c.base_pixels:g} px), capture ratio "
+              f"{float(c.log_ratio.min().exp()):.2f}-{float(c.log_ratio.max().exp()):.2f} "
+              f"over 1/d {float(c.q[0]):.3f}-{float(c.q[-1]):.3f} 1/A", flush=True)
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
     # the +c mean correction applies to the annulus estimate only

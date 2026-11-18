@@ -96,11 +96,11 @@ def _build_parser():
                         "at every resolution), or none, which pins the scale's smooth gauge by projection "
                         "instead.  Default: gauge.  The merge inherits the checkpoint")
     p.add_argument("--capture-table", type=Path, default=None, metavar="JSON",
-                   help="capture ratio of the source's larger disks relative to its base disk, by "
+                   help="captured flux of each of the source's disks relative to one reference disk, by "
                         "resolution (keys q, n_pixels, log_ratio, base_pixels).  Its logarithm is added "
                         "to each observation's log scale, so that the scale model, the tether and the "
-                        "merged intensities stay on the base disk's scale where the disk changes with "
-                        "resolution.  Default: none.  The merge inherits the checkpoint")
+                        "merged intensities stay on the reference disk's scale where the disk changes "
+                        "with resolution.  Default: none.  The merge inherits the checkpoint")
     # Weight of the tether's penalty (nats^2 per observation, default 1).
     p.add_argument("--tether-weight", type=_positive, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--redundancy", type=_positive, default=100,
