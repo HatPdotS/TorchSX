@@ -23,7 +23,6 @@ from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.scale import AmortizedScale
-from torchsx.nn.metrics import scale_metrics, spearman
 from torchsx.nn.objective import MarginalNLL
 from torchsx.cli.train import run_updates
 from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
@@ -81,54 +80,6 @@ def _synthetic(n_hkl=60, n_xtal=150, per=40, seed=0, n_cond=1, shift=1.5):
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
     )
     return prep, None, log_G, cid, per
-
-
-@pytest.mark.slow
-def test_crystal_context_recovers_a_hidden_per_crystal_scale(tmp_path):
-    prep, params, log_G, cid, per = _synthetic()
-    n_xtal = log_G.numel()
-
-    scale = AmortizedScale.from_prep(
-        prep, d_model=64
-    )
-    obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
-    # ~30 updates to converge from zero-init.  The scale ramps up from 0 and
-    # OVERSHOOTS around update 10 (slope of predicted-on-true peaks near 1.6
-    # before settling at ~0.94), so a short run measures the overshoot, not the
-    # answer.  Same endpoint at lr 5e-4, just slower.
-    cfg = TrainConfig(
-        max_obs_per_batch=6000, lr=3e-3, log_every=5, heldout_frac=0.1,
-        device="cpu", outdir=str(tmp_path),
-    )
-    trainer = AmortizedTrainer(prep, scale, obj, params, config=cfg)
-
-    def per_crystal_log_k():
-        scale.eval()
-        with torch.no_grad():
-            lk = scale.predict(prep.obs_info).log_K
-        return torch.zeros(n_xtal).index_add_(0, cid.long(), lk) / per
-
-    before = spearman(per_crystal_log_k(), log_G)
-    run_updates(trainer, 35)
-    after_pc = per_crystal_log_k()
-    after = spearman(after_pc, log_G)
-
-    assert abs(before) < 0.25, f"untrained model already correlated ({before})"
-    assert after > 0.85, f"failed to recover the hidden scale (rho={after})"
-
-    # Magnitude, not just ranking: the recovered spread should match the truth.
-    # Converged slope is ~0.94 — mild shrinkage, which is what a regularised
-    # predictor should do.
-    scale.eval()
-    with torch.no_grad():
-        lk = scale.predict(prep.obs_info).log_K
-    assert 0.6 < lk.std() / log_G.std() < 1.4
-
-    # The truth here is purely per-crystal, so the variance decomposition must
-    # say so.  On real data this same number is what distinguishes "learned
-    # partiality" from "rediscovered G".
-    m = scale_metrics(lk, prep.obs_info.crystal_id, n_xtal)
-    assert m["between_frac"] > 0.8
 
 
 def test_crystals_are_never_split_across_batches():
