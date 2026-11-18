@@ -131,7 +131,7 @@ def test_out_of_range_training_options_fail_at_parsing(option, value, capsys):
 
 
 @pytest.mark.parametrize('module', [train,merge_nn])
-@pytest.mark.parametrize('option,value', [('--gain','garbage'),('--prior','flat'),('--scatter-family','mixture'),('--calib-degree','9,9')])
+@pytest.mark.parametrize('option,value', [('--gain','garbage'),('--prior','none'),('--scatter-family','mixture'),('--calib-degree','9,9')])
 def test_invalid_or_removed_options_fail_before_loading(module,option,value,capsys):
     prefix = [] if module is train else ['model.pt']
     with pytest.raises(SystemExit):
@@ -142,7 +142,7 @@ def test_invalid_or_removed_options_fail_before_loading(module,option,value,caps
         for valid in ('auto','trust_input','calibrate','positive finite'):
             assert valid in error
     if option == '--prior':
-        assert 'none' in error and 'wilson' in error
+        assert 'wilson' in error
 
 
 def test_custom_split_matches_source_images(stream_file,tmp_path):
@@ -190,9 +190,10 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
 
 
 @pytest.mark.parametrize('saved,requested,expected', [
-    ('none',None,'none'), ('wilson','none','none'), ('none','wilson','wilson'),
+    ('wilson',None,'wilson'), ('wilson','wilson','wilson'),
+    ('none',None,SystemExit), ('none','wilson',SystemExit),
 ])
-def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,requested,expected):
+def test_checkpoint_prior_wilson_and_removed_flat_prior(tmp_path,saved,requested,expected):
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10)
     bundle=P.PrepBundle(prep,{'spacegroup':'P 1'},[],0.125)
     argv=['model.pt','x.stream','-o',str(tmp_path/'merged.mtz'),'--device','cpu']
@@ -201,6 +202,11 @@ def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,reque
     args=merge_nn._build_parser().parse_args(argv)
     ck=_production_checkpoint(bundle,tmp_path)
     ck['posterior_grid']={'prior':saved}
+    if expected is SystemExit:
+        # A flat-prior checkpoint (#24) carries no Wilson surface: no override rescues it.
+        with pytest.raises(SystemExit, match='--prior none'):
+            P.build_stack(bundle,args,ckpt=ck,verbose=False)
+        return
     _,_,_,_,settings=P.build_stack(bundle,args,ckpt=ck,verbose=False)
     assert settings['prior']==expected
 
@@ -254,8 +260,8 @@ def test_small_batch_respects_holdout_and_original_redundancy(requested):
 
 
 @pytest.mark.parametrize("merge_friedel", [True, False])
-@pytest.mark.parametrize("prior", ["none", "wilson"])
-def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,prior):
+def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel):
+    prior='wilson'
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10,n_cond=2)
     bundle=P.PrepBundle(prep,{'spacegroup':'P 1','d_min':0.9,'gain':1.0,'radii':[7,9,11],'merge_friedel':merge_friedel},['dark','light'],0.1)
     monkeypatch.setattr(P,'load_prep',lambda *a,**k: bundle)

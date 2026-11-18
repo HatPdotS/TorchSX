@@ -117,14 +117,13 @@ class PosteriorMergeTarget(nn.Module):
         90th-percentile error is *width*-limited (flat in node count), so 8 is
         the safer default since width is free.
     prior
-        ``"none"`` integrates ``dI0`` (weight ``exp(v)``), with no Wilson
-        density; ``"flat_log"`` integrates ``d log I0``; ``"wilson"`` uses
-        ``p(I) = exp(-I/Sigma)/Sigma`` with ``Sigma(h)`` the smooth Wilson surface.  **Use wilson.**  Where the
-        likelihood is uninformative — and most serial observations are
-        noise-limited — the posterior is whatever the prior says, and a
-        flat-in-I0 prior on a log grid drags those reflections toward the *top
-        of the grid*: per-shell CC1/2 rises at low resolution and collapses at
-        high resolution, because exactly the weak reflections are inflated.
+        ``"wilson"`` uses ``p(I) = exp(-I/Sigma)/Sigma`` with ``Sigma(h)`` the
+        smooth Wilson surface; ``"flat_log"`` integrates ``d log I0``.  **Use
+        wilson.**  The flat-in-I0 prior ``"none"`` was removed in 0.2.4: where
+        the likelihood is uninformative -- and most serial observations are
+        noise-limited -- the posterior is whatever the prior says, and the
+        ``exp(v)`` measure drags those reflections onto the *top node of the
+        grid*, with F at the grid ceiling and its sigma near zero (#24).
     """
 
     def __init__(
@@ -141,8 +140,8 @@ class PosteriorMergeTarget(nn.Module):
         max_halfwidth: float = 12.0,
     ) -> None:
         super().__init__()
-        if prior not in ("none", "flat_log", "wilson"):
-            raise ValueError(f"prior must be 'none', 'flat_log' or 'wilson', got {prior!r}")
+        if prior not in ("flat_log", "wilson"):
+            raise ValueError(f"prior must be 'flat_log' or 'wilson', got {prior!r}")
         if k_coarse < 3 or m_fine < k_coarse:
             raise ValueError("need k_coarse >= 3 and m_fine >= k_coarse")
         self.n_hkl = int(I_start.shape[0])
@@ -511,9 +510,7 @@ class PosteriorMergeTarget(nn.Module):
         v = centre[:, None] + sig_h[:, None] * self.u_fine[None, :]
         du = float(2 * self.n_sigma / (self.m_fine - 1))
         log_w = (sig_h * du).log()[:, None].expand_as(v).clone()
-        if self.prior == "none":
-            log_w = log_w + v                       # dI0 = I0 dv
-        elif self.prior == "wilson":
+        if self.prior == "wilson":
             # the trained parameter while training; every no-grad pass
             # (evaluation, merge, readout) reads the mirrored buffers
             if self.wilson_coef_param is not None and torch.is_grad_enabled():

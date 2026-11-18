@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.2.4
 
+- `--prior none` is removed (#24). Runs with the default Wilson prior are unaffected. The flat prior was never a usable option: its posterior has no upper bound, so for weak reflections it could run off the top of the integration grid, with F at the grid ceiling and a standard deviation near zero. `--prior` accepts only `wilson` and stays for existing scripts. `torchsx.merge` refuses a checkpoint trained with `--prior none`.
 - TorchRef 0.8 (`>=0.8.1,<0.9`). torchsx's use of it is unchanged: 0.8 drops the `verbose` arguments of its readers and of `ReflectionData`, which torchsx never passed, and reports through `logging` instead of `print` and `warnings`. The one visible difference is that writing the merged MTZ no longer prints TorchRef's "✓ Wrote … MTZ" summary; torchsx's own summary stays.
 - A state can come from several streams: `--split` names repeat, a `--split` path may be a glob pattern, and several unnamed streams are one data set.
 - `--split-file` labels the frames of any number of streams, and an event of `*` names every frame of a file.

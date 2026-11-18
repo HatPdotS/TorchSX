@@ -284,7 +284,8 @@ class TrainConfig:
     #: ``log Sigma(h) = phi(h) @ c``, whose coefficients are trained with the
     #: network by the same evidence (type-II maximum likelihood) at
     #: ``wilson_lr_mult`` times the base rate, started at the Wilson fit to the
-    #: unity merge.  ``"none"``: integrate the likelihood in positive intensity.
+    #: unity merge.  The only prior: the flat ``"none"`` was removed in 0.2.4
+    #: (its posterior runs off the top of the integration grid, #24).
     posterior_prior: str = "wilson"
     wilson_lr_mult: float = 10.0
     wilson_degree: int = 4
@@ -431,8 +432,12 @@ class AmortizedTrainer:
                 oi.sigma if oi.sigma is not None
                 else (self.n_ph + prep.bg.clamp(min=0) + 1.0).sqrt()
             )
-        if self.cfg.posterior_prior not in ("none", "wilson"):
-            raise ValueError(f"posterior_prior must be 'none' or 'wilson', got "
+        if self.cfg.posterior_prior == "none":
+            raise ValueError("posterior_prior 'none' was removed in torchsx 0.2.4: the flat "
+                             "posterior runs off the top of the integration grid (#24); "
+                             "use 'wilson'")
+        if self.cfg.posterior_prior != "wilson":
+            raise ValueError(f"posterior_prior must be 'wilson', got "
                              f"{self.cfg.posterior_prior!r}")
         # One posterior target PER CONDITION: dark and light keep their own
         # merge and Wilson surface while the network is shared.  None carries
@@ -1225,9 +1230,8 @@ class AmortizedTrainer:
         ``estimator``:
 
         ``posterior``  Wilson-posterior mean of ``sqrt(I0)`` over the very
-                       weights the merge computed, or the flat-in-intensity
-                       mean when ``posterior_prior='none'``. The selected prior
-                       governs I, F, uncertainties and edge diagnostics alike.
+                       weights the merge computed. The prior governs I, F,
+                       uncertainties and edge diagnostics alike.
         ``flat``       the same moment under the measure alone (no Wilson
                        prior).
         ``ml``         ``sqrt(I0)`` at the likelihood maximum, prior-free;
