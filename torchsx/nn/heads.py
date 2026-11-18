@@ -44,6 +44,15 @@ class ScalePrediction:
     #: upper log widths and log shape (2 for every component) per component
     #: (see ``torchsx.merging.scatter.mixture.split_mix``)
     mix: Tensor
+    #: (n,) known part of ``log_K`` that the network did not predict (the disk
+    #: capture ratio, :class:`~torchsx.merging.scale.capture.DiskCapture`), or None
+    log_offset: Tensor | None = None
+
+    @property
+    def log_K_net(self) -> Tensor:
+        """``log_K`` without the known offset: the network's own scale, which the
+        gauge anchor and the tether act on."""
+        return self.log_K if self.log_offset is None else self.log_K - self.log_offset
 
     def detach(self) -> "ScalePrediction":
         return replace(self, log_K=self.log_K.detach(), log_w=self.log_w.detach(),

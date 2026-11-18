@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--capture-table JSON` adds a known log-scale offset per observation: the capture ratio of the disk the observation was summed over relative to the source's base disk, by resolution. The gauge anchor and the tether act on the network's own scale. Without the flag nothing changes.
 - `--enrich-alpha auto` reads the second and later lattices of a frame (probixi `--max-lattices` above one) only with `enrich_p` at most 1e-10. The first lattice keeps the alpha the database records. A number given to `--enrich-alpha` applies to every lattice.
 - `--gain auto` on a probixi database that records its noise scale (`integration.bg_model_var_scale`, probixi 0.10.3 and later) uses the declared gain times that scale instead of estimating the gain from the integrated sums. Prepared caches made under `auto` are rebuilt. `--gain calibrate` keeps the estimate.
 - The merge written to `merged.mtz` and its halves is the `wls` estimator, the inverse-variance mean of `(n - bg) / K` on the trained scales, with French-Wilson amplitudes. `--estimator posterior` writes the Wilson-posterior amplitudes as before.
