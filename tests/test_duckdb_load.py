@@ -20,7 +20,7 @@ from torchsx.io._duckdb import (DEFAULT_ENRICH_ALPHA, EXTRA_LATTICE_ENRICH_ALPHA
 from torchsx.io.sources import inspect_source, read_source
 from torchsx.stream import SFXStream
 
-# Verbatim from probixi.io.db._SCHEMA (v0.10.3, schema 2).
+# Verbatim from probixi.io.db._SCHEMA (v0.11.0, schema 2).
 _SCHEMA = """
 CREATE TABLE geometry (
     beam_center_row  DOUBLE,

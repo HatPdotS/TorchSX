@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0
 
 - TorchSX names the probixi it is paired with: `torchsx.SUPPORTED_DB_SCHEMA` (2, the newest probixi database schema the reader understands) and `torchsx.PROBIXI_VERSION` (the first probixi release that writes it). probixi holds the counterpart (`probixi.SCHEMA_VERSION`, `probixi.TORCHSX_VERSION`). Neither package depends on the other. Where probixi is installed, the reader warns if that probixi writes a newer schema. The error for a database with a newer schema names the writer and the probixi release this reader mirrors. Schema 1 databases read as before.
 - `--enrich-alpha auto` reads the second and later lattices of a frame (probixi `--max-lattices` above one) only with `enrich_p` at most 1e-10. The first lattice keeps the alpha the database records. A number given to `--enrich-alpha` applies to every lattice.

@@ -69,7 +69,7 @@ def test_newer_probixi_names_the_torchsx_it_asks_for(monkeypatch, db_path):  # n
     assert "Upgrade TorchSX to 9.9.9 or later." in message
     # the reader says so once it opens a database, and still reads one it understands
     with duckdb.connect(str(db_path)) as conn:
-        conn.execute("INSERT INTO calibration VALUES ('0.10.3', 2, 100, 1.5, 0.0, false, 1.0, 5.9, "
+        conn.execute("INSERT INTO calibration VALUES ('0.11.0', 2, 100, 1.5, 0.0, false, 1.0, 5.9, "
                      "6.0, 10.2, 0, 2.3, 0.03, 0.96, 'snr', 0.1, 79.0, 79.0, 38.0, 90.0, 90.0, 90.0, 0)")
     with pytest.warns(UserWarning, match="Upgrade TorchSX to 9.9.9 or later"):
         spec = read_measurement(db_path)

@@ -17,7 +17,7 @@ __all__ = ["PROBIXI_VERSION", "SUPPORTED_DB_SCHEMA", "installed_probixi", "probi
 #: newest probixi database schema the DuckDB reader understands; it reads older ones too
 SUPPORTED_DB_SCHEMA = 2
 #: first probixi release that writes that schema
-PROBIXI_VERSION = "0.10.3"
+PROBIXI_VERSION = "0.11.0"
 
 
 def version_tuple(version) -> tuple[int, ...]:
