@@ -760,8 +760,7 @@ class AmortizedTrainer:
         loss = nll / max(n_used, 1)
         tether_rec = {}
         if self.tether:
-            # the tether holds the network's own scale; a known capture offset is not its to undo
-            pen, tether_rec = self.tether.penalty(self._tether_batch(meta, pred.log_K_net))
+            pen, tether_rec = self.tether.penalty(self._tether_batch(meta, pred.log_K))
             loss = loss + self.cfg.lam_tether * pen.to(loss.dtype)
             pen = None
         self.opt.zero_grad(set_to_none=True)
@@ -1089,8 +1088,6 @@ class AmortizedTrainer:
                     "lam_tether": float(self.cfg.lam_tether),
                     "phase_classes": (None if getattr(self.scale.features, "phase_classes", None) is None
                                       else self.scale.features.phase_classes.definition()),
-                    "capture": (None if getattr(self.scale, "capture", None) is None
-                                else self.scale.capture.definition()),
                 },
                 "splits": list(self.split_names or []),
                 # scatter family and miss component, so a merge rebuilds the
@@ -1313,7 +1310,7 @@ class AmortizedTrainer:
                 meta, n_ph, bg, _ = self._batch(rows.to(dev))
                 pred = self.scale.prime(meta)
                 if readout:
-                    seen_obs.append((pred.log_K_net.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int()))
+                    seen_obs.append((pred.log_K.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int()))
                 K = pred.log_K.exp().double()
                 sig = (n_ph - bg).double()
                 h = meta.hkl_idx
@@ -1467,7 +1464,7 @@ class AmortizedTrainer:
                 if n_sweeps == 1:
                     n_meas.index_add_(0, meta.hkl_idx.long(), torch.ones_like(meta.hkl_idx, dtype=torch.long))
                 if readout and n_sweeps == 1:
-                    seen_obs.append((pred.log_K_net.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int()))
+                    seen_obs.append((pred.log_K.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int()))
                 self.scale.clear()
             return acc
 

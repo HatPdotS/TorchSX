@@ -1125,21 +1125,6 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         phase_classes = None
     kw.update(phase_classes=phase_classes)
     scale = AmortizedScale.from_prep(prep, **kw).to(dev)
-    # Disk capture: a checkpoint restores the table it was trained with; a new
-    # run reads --capture-table.
-    from torchsx.merging.scale.capture import DiskCapture
-    if ck:
-        scale.capture = (DiskCapture.from_definition(sc["capture"]) if sc.get("capture") else None)
-    elif getattr(args, "capture_table", None):
-        if bundle.recipe.get("disk_size") != "recorded":
-            raise SystemExit("--capture-table needs the source's recorded disks (--disk-size recorded)")
-        scale.capture = DiskCapture.from_file(args.capture_table)
-    if verbose and scale.capture is not None:
-        c = scale.capture
-        print(f"  disk capture: disks {', '.join(f'{int(n)}' for n in c.n_pixels.tolist())} px "
-              f"(no offset up to {c.base_pixels:g} px), capture ratio "
-              f"{float(c.log_ratio.min().exp()):.2f}-{float(c.log_ratio.max().exp()):.2f} "
-              f"over 1/d {float(c.q[0]):.3f}-{float(c.q[-1]):.3f} 1/A", flush=True)
 
     bvf = (ck.get("likelihood") or {}).get("bg_var_factor", bundle.bg_var_factor)
     # the +c mean correction applies to the annulus estimate only

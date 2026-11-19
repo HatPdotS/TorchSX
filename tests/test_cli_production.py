@@ -15,7 +15,7 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file
 
 
-@pytest.mark.parametrize('module,count', [(train,42), (merge_nn,20)])
+@pytest.mark.parametrize('module,count', [(train,41), (merge_nn,20)])
 def test_public_options_and_split_inputs(module, count):
     parser = module._build_parser()
     opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
@@ -31,8 +31,7 @@ def test_research_options_parse_but_stay_out_of_help():
     parser = train._build_parser()
     hidden = {'--noise-lr-mult': '10', '--context-folds': '3', '--d-model': '64',
               '--eval-every': '50', '--heldout-stream': 'h.stream', '--outlier-frac': '0.01',
-              '--ctx-layers': '4', '--query-layers': '0', '--tether-weight': '2',
-              '--capture-table': 'capture.json'}
+              '--ctx-layers': '4', '--query-layers': '0', '--tether-weight': '2'}
     flags = ['--refine-geometry']
     text = parser.format_help()
     assert not [o for o in hidden if o in text]
@@ -42,7 +41,6 @@ def test_research_options_parse_but_stay_out_of_help():
             a.outlier_frac) == (10.0, 3, 64, 50, Path('h.stream'), 0.01)
     assert (a.ctx_layers, a.query_layers, a.refine_geometry) == (4, 0, True)
     assert a.tether_weight == 2.0 and a.tether is None
-    assert a.capture_table == Path('capture.json')
     assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'gauge']).tether == ('gauge',)
     assert parser.parse_args(['x.stream', '-o', 'run', '--tether', 'none']).tether == ()
     assert parser.parse_args(['x.stream', '-o', 'run']).pseudo_translation == 'auto'

@@ -254,42 +254,6 @@ a Wilson run.
 
 `torchsx.merge` uses the prior of the checkpoint unless `--prior` is given.
 
-## Disk capture
-
-`--capture-table` is a research option: it parses and stays out of `--help`.
-On five datasets it improved the refinement R factors of one and left the
-others unchanged or slightly worse.
-
-The scale model and the tether assume that every observation captures the same
-fraction of its spot at a given resolution. probixi grows the disk with
-resolution for reflections it integrates at their predicted position, and a
-larger disk captures more of the spot. Where the disk changes, the captured
-fraction jumps, and without a correction the jump goes into the merged
-intensities.
-
-`--capture-table JSON` gives the captured flux of each disk relative to one
-reference disk: `q` (knots in 1/d, per Å), `n_pixels` (pixel counts of the
-disks that carry a row), `log_ratio` (one row per disk, the log ratio at each
-knot) and `base_pixels`. Each observation takes the row of the smallest disk
-that holds its recorded pixel count and the value at its own resolution, linear
-between knots. The value is added to the predicted log scale in the likelihood,
-the posterior and the merge. The gauge anchor and the tether act on the
-network's own scale, without the offset. The merged intensities stay on the
-reference disk's scale. The checkpoint records the table and `torchsx.merge`
-applies it.
-
-The table chooses the reference:
-
-- **Largest disk.** Every disk carries a row, the values are at or below zero
-  and `base_pixels` is 0. The merged intensities follow the flux in the largest
-  disk at every resolution. A small disk loses a growing share of the spot
-  towards high resolution, and this reference removes that fall-off together
-  with the jumps.
-- **Smallest disk.** Only the larger disks carry a row and `base_pixels` is the
-  smallest disk's pixel count. Observations with at most that many pixels are
-  unchanged. This reference removes the jumps and keeps the smallest disk's
-  fall-off.
-
 ## Sum-of-spots tether
 
 The likelihood sees an observation through the product of its scale and the

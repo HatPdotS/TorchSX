@@ -95,10 +95,6 @@ def _build_parser():
                         "each reflection's spots: gauge (the rocking-curve integral of the scale is the same "
                         "at every resolution), or none, which pins the scale's smooth gauge by projection "
                         "instead.  Default: gauge.  The merge inherits the checkpoint")
-    # Captured flux of each of the source's disks relative to one reference disk, by
-    # resolution (JSON: q, n_pixels, log_ratio, base_pixels); its logarithm is added to
-    # each observation's log scale.  Research option, see docs/cli.md "Disk capture".
-    p.add_argument("--capture-table", type=Path, default=None, metavar="JSON", help=argparse.SUPPRESS)
     # Weight of the tether's penalty (nats^2 per observation, default 1).
     p.add_argument("--tether-weight", type=_positive, default=1.0, help=argparse.SUPPRESS)
     p.add_argument("--redundancy", type=_positive, default=100,

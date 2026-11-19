@@ -94,10 +94,6 @@ class AmortizedScale(nn.Module):
                 f"anchor_stat must be 'median', 'mean' or 'basis', got {anchor_stat!r}"
             )
         self.anchor_stat = anchor_stat
-        #: known log scale of each observation from its disk
-        #: (:class:`~torchsx.merging.scale.capture.DiskCapture`), added to the
-        #: anchored ``log K``; None leaves the prediction as the network gives it
-        self.capture = None
         self.scatter = PredictedMixtureScatter(heads.n_components, fixed_gaussian=True)
 
     # ── construction ───────────────────────────────────────────────────
@@ -226,14 +222,7 @@ class AmortizedScale(nn.Module):
             rows = [r.requires_grad_() for r in rows]
             self._deferred = (run, meta, blocks, rows)
         pred = ScalePrediction(**dict(zip(self._prediction_names(), rows)))
-        return self._with_capture(self._anchor(pred, meta), meta)
-
-    def _with_capture(self, pred: ScalePrediction, meta: ObsInfo) -> ScalePrediction:
-        """Add the disk capture ratio to the anchored ``log K`` and record it."""
-        if self.capture is None or getattr(meta, "n_pix", None) is None:
-            return pred
-        offset = self.capture.log_offset(meta.s_sq, meta.n_pix).to(pred.log_K)
-        return dataclasses.replace(pred, log_K=pred.log_K + offset, log_offset=offset)
+        return self._anchor(pred, meta)
 
     def encoder_backward(self) -> None:
         """The encoder's share of a deferred backward pass (:meth:`predict`):
