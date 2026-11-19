@@ -506,9 +506,11 @@ class AmortizedTrainer:
                 continue
             (no_decay if prm.ndim <= 1 else decay).append(prm)
         # the objective may carry its own scalars (the miss fraction); they are
-        # fitted with the network, undecayed.  The detector noise gets its own rate.
-        noise_ids = {id(p) for p in (self.objective.detector_noise.parameters()
-                                     if getattr(self.objective, "detector_noise", None) is not None else [])}
+        # fitted with the network, undecayed.  The detector noise and the real-space
+        # error model get their own rate.
+        noise_ids = {id(p) for m in ("detector_noise", "error_model")
+                     if getattr(self.objective, m, None) is not None
+                     for p in getattr(self.objective, m).parameters()}
         noise = []
         for prm in self.objective.parameters():
             if prm.requires_grad:
@@ -1034,6 +1036,17 @@ class AmortizedTrainer:
                  for k, v in dn.state_dict().items()}
         return {"config": dn.config(), "state": state}
 
+    def _observation_record(self) -> dict:
+        """The observation model and, in real space, its fitted (best-state) error terms."""
+        em = getattr(self.objective, "error_model", None)
+        if em is None:
+            return {"model": "counts"}
+        best = getattr(self, "_best_obj_state", None) or {}
+        dof = self.objective.dof
+        return {"model": "normal" if dof is None else "student-t", "dof": dof,
+                "state": {k: float(best.get(f"error_model.{k}", v).detach().cpu())
+                          for k, v in em.items()}}
+
     def save_best(self, path=None) -> "Path | None":
         """Persist the best held-out parameters so a finished run can be
         re-analysed (merge statistics, a different split, per-shell
@@ -1056,16 +1069,20 @@ class AmortizedTrainer:
                     # that makes a build without bg_mean_offset REFUSE this
                     # checkpoint (see _pipeline's kind check) instead of merging
                     # it at the uncorrected background convention.
-                    "kind": type(getattr(self.objective, "quadrature", None)).__name__
-                            + ("+bgmean" if _bg_mean_offset(self.objective) else ""),
+                    "kind": (None if getattr(self.objective, "quadrature", None) is None
+                             else type(self.objective.quadrature).__name__
+                             + ("+bgmean" if _bg_mean_offset(self.objective) else "")),
                     "n_points": getattr(getattr(self.objective, "quadrature", None),
                                         "n_points", None),
                 },
+                # the observation model: counts (scatter integral) or real space
+                "observation": self._observation_record(),
                 # so a later merge builds the SAME forward, not the default one
                 "encoder": {
                     k: getattr(self.scale.encoder, k, None)
                     for k in ("kind", "context_folds", "d_model", "n_crystal_features",
-                              "ctx_layers", "query_layers", "refine_geometry", "n_heads")
+                              "ctx_layers", "query_layers", "refine_geometry", "n_heads",
+                              "see_own_fold")
                 },
                 # everything a merge must not have to guess: the likelihood it
                 # was fitted under, the data recipe, and the scale geometry.  A

@@ -448,7 +448,7 @@ class PosteriorMergeTarget(nn.Module):
         reimplementing an estimator.  Accumulate ``S`` across batches, then call
         :meth:`integrate` once.
         """
-        base = pred.log_K - pred.log_e_s
+        base = pred.log_K if getattr(objective, "scatter_free", False) else pred.log_K - pred.log_e_s
         # Learned detector noise: per-panel (A, B, C), gathered once per batch and
         # grad mode by the objective (the node loop below reads the same terms).
         noise = objective.noise_terms(meta) if hasattr(objective, "noise_terms") else None

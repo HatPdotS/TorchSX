@@ -883,6 +883,9 @@ def bg_mean_offset_from_ckpt(ck: dict) -> float:
     qkind = (ck.get("quadrature") or {}).get("kind")
     lkind = (ck.get("likelihood") or {}).get("kind")
     corrected = (qkind == _BG_MEAN_QUAD_KIND, lkind == _BG_MEAN_LIK_KIND)
+    if (ck.get("observation") or {}).get("model", "counts") != "counts":
+        # the real-space model has no quadrature: the likelihood's marker alone
+        corrected = corrected[1:]
     if any(corrected) and not all(corrected):
         raise SystemExit(
             f"checkpoint markers disagree: quadrature {qkind!r} vs likelihood "
@@ -942,6 +945,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             **{k: int(rec(enc, k)) for k in ("context_folds", "ctx_layers", "query_layers",
                                              "n_heads")},
             refine_geometry=bool(rec(enc, "refine_geometry")),
+            see_own_fold=bool(enc.get("see_own_fold", False)),
             n_components=int(rec(scat, "n_components")),
             anchor_log_k=bool(rec(sc, "anchor_log_k")), anchor_stat=rec(sc, "anchor_stat"),
             self_features=tuple(rec(sc, "self_features")),
@@ -959,6 +963,9 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             d_model=flag("d_model"), context_folds=flag("context_folds"),
             ctx_layers=flag("ctx_layers"), query_layers=flag("query_layers"),
             n_heads=DEFAULTS["n_heads"], refine_geometry=_refine_geometry(args),
+            see_own_fold=bool(getattr(args, "see_own_fold", False)),
+            **({"n_components": int(args.scatter_components)}
+               if getattr(args, "scatter_components", None) is not None else {}),
             anchor_stat="median" if "gauge" in tether_terms(args) else DEFAULTS["gauge_anchor"],
             self_features=SELF_FEATURES + ((DISK_FEATURE,) if recorded else ()),
             crystal_features=(DEFAULT_CRYSTAL_FEATURES + PROBIXI_CRYSTAL_FEATURES
@@ -996,10 +1003,27 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     else:
         outlier = (getattr(args, "outlier_frac", None) if getattr(args, "outlier_frac", None) is not None
                    else DEFAULTS["outlier"])
-    obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev),
-                      Poisson(bg_var_factor=float(bvf),
-                              bg_mean_offset=bg_mean_offset),
-                      miss_frac=float(miss), outlier_frac=float(outlier)).to(dev)
+    # The observation model: the counts with the scatter integrated out, or the
+    # real-space error model (a Student-t or a Normal about K I0), which has no
+    # miss or outlier component.
+    obs = dict(ck.get("observation") or {"model": "counts"}) if ck else {
+        "model": getattr(args, "observation_model", None) or "counts",
+        "dof": getattr(args, "t_dof", None)}
+    lik = Poisson(bg_var_factor=float(bvf), bg_mean_offset=bg_mean_offset)
+    if obs["model"] == "counts":
+        obj = MarginalNLL(SplitLogGrid(n_points=int(n_points)).to(dev), lik,
+                          miss_frac=float(miss), outlier_frac=float(outlier)).to(dev)
+    elif obs["model"] in ("student-t", "normal"):
+        from torchsx.nn.objective import RealSpaceNLL
+        miss = outlier = 0.0
+        dof = None if obs["model"] == "normal" else float(obs.get("dof") or 32.0)
+        obj = RealSpaceNLL(lik, dof=dof).to(dev)
+        if obs.get("state"):
+            with torch.no_grad():
+                for k, v in obs["state"].items():
+                    obj.error_model[k].fill_(float(v))
+    else:
+        raise SystemExit(f"unknown observation model {obs['model']!r}")
     if scat.get("miss_logit") is not None and obj.miss_logit is not None:
         with torch.no_grad():
             obj.miss_logit.fill_(float(scat["miss_logit"]))
@@ -1021,6 +1045,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         if verbose:
             print(f"detector noise auto: {noise_mode} (gain from "
                   f"{'calibration' if noise_mode == 'global_B' else 'input'})", flush=True)
+    if (noise_rec or noise_mode in ("global_B", "panel")) and obs["model"] != "counts":
+        raise SystemExit("the learned detector noise needs the counts observation model")
     if noise_rec or noise_mode in ("global_B", "panel"):
         from torchsx.merging.likelihood.detector_noise import DetectorNoise
         if noise_rec:
@@ -1087,9 +1113,19 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         miss=float(miss), outlier=float(outlier), detector_noise=noise_mode or "off",
         wilson_degree=wilson_degree, basis=basis,
         scatter_components=int(scale.heads.n_components),
+        observation_model=obs["model"],
     )
     if verbose:
         print(f"intensity prior: {prior}", flush=True)
+        if obs["model"] != "counts":
+            print(f"observation model: real space, {obs['model']}"
+                  + (f" (dof {obj.dof:g})" if obj.dof is not None else "")
+                  + ", variance SdFac^2 (sigma_y^2 + SdB mu + (SdAdd mu)^2): "
+                  + ", ".join(f"{k} {v:.4g}" for k, v in obj.terms().items())
+                  + "; no scatter integral, miss or outlier component", flush=True)
+        if scale.encoder.see_own_fold:
+            print("encoder: no fold masked; every observation's embedding reads its own "
+                  "measurement", flush=True)
         print(f"stack: amortised scale, "
               f"{scale.heads.n_components}-component Gaussian mixture scatter, "
               f"miss {miss:.3f}, " + (f"outlier {outlier:.4f}, " if outlier else "")

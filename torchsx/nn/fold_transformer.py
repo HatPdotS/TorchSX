@@ -344,6 +344,10 @@ class FoldTransformerEncoder(nn.Module):
     checkpoint
         Recompute each packed block in the backward pass instead of storing
         its activations.
+    see_own_fold
+        Ablation: no fold is masked, so every run shows every observation's
+        measurement, its own included, and an observation's embedding depends
+        on its own count.
     """
 
     kind = "fold"
@@ -369,6 +373,7 @@ class FoldTransformerEncoder(nn.Module):
         bf16: bool | None = None,
         flex: bool | None = None,
         checkpoint: bool = True,
+        see_own_fold: bool = False,
     ) -> None:
         super().__init__()
         if int(folds) < 2:
@@ -392,6 +397,7 @@ class FoldTransformerEncoder(nn.Module):
         self.n_heads = int(n_heads)
         self.tokens = int(os.environ.get("TORCHSX_FOLD_TOKENS", 1 << 18) if tokens is None else tokens)
         self.checkpoint = bool(checkpoint)
+        self.see_own_fold = bool(see_own_fold)
         self.register_buffer("meas_idx", torch.tensor(meas, dtype=torch.long), persistent=False)
 
         self.input_geometry = nn.Linear(n_self_features, d_model)
@@ -599,6 +605,8 @@ class FoldTransformerEncoder(nn.Module):
         slots, valid = valid, valid.flatten(1)
         runs = torch.arange(K, device=g.device)
         masked = (torch.arange(L, device=g.device) % K)[None, :] == runs[:, None]    # (K, L)
+        if self.see_own_fold:
+            masked = torch.zeros_like(masked)
         tok = g[None] + torch.where(masked[:, None, :, None], self.mask_embedding, m[None])
         tok = tok.masked_fill(~valid[None, :, :, None], 0.0)                          # (K, B, L, D)
         n_vis = (valid[None] & ~masked[:, None]).sum(-1).clamp(min=1)                 # (K, B)

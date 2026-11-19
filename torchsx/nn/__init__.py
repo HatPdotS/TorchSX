@@ -19,7 +19,7 @@ from torchsx.nn.metrics import (
     condition_auc,
     scale_metrics,
 )
-from torchsx.nn.objective import MarginalNLL
+from torchsx.nn.objective import MarginalNLL, RealSpaceNLL
 from torchsx.nn.obs_features import ObsFeatureSpec
 from torchsx.nn.train_amortized import AmortizedTrainer, CrystalIndex, TrainConfig
 
@@ -30,6 +30,7 @@ __all__ = [
     "ObsFeatureSpec",
     "MergeTargetOut",
     "MarginalNLL",
+    "RealSpaceNLL",
     "MetricLogger", "calibration_metrics", "scale_metrics",
     "condition_auc",
     "AmortizedTrainer", "TrainConfig", "CrystalIndex",

@@ -82,6 +82,17 @@ def _build_parser():
     # on; off with --no-refine-geometry).
     p.add_argument("--refine-geometry", action=argparse.BooleanOptionalAction, default=None,
                    help=argparse.SUPPRESS)
+    # Ablations.  No fold masked: each observation's embedding reads its own
+    # measurement.
+    p.add_argument("--see-own-fold", action="store_true", help=argparse.SUPPRESS)
+    # Components of the scatter mixture (default 4; 1 is a lognormal scatter).
+    p.add_argument("--scatter-components", type=int, default=None, help=argparse.SUPPRESS)
+    # The observation model: counts (the scatter integrated out of the Poisson,
+    # default), or the real-space error model of Careless about K I0, a Student-t
+    # (--t-dof, default 32) or a Normal.
+    p.add_argument("--observation-model", choices=("counts", "student-t", "normal"),
+                   default="counts", help=argparse.SUPPRESS)
+    p.add_argument("--t-dof", type=_positive, default=32.0, help=argparse.SUPPRESS)
     p.add_argument("--pseudo-translation", choices=("off", "auto"), default="auto",
                    help="translational NCS or a lattice translocation defect: auto (default) finds the "
                         "structure's translations in the Patterson function of the data's plain means.  With "

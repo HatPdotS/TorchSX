@@ -9,6 +9,10 @@ evaluated by the quadrature stack.  On CUDA the quadrature dispatches to Triton
 kernels that take the per-observation scatter parameters, never materialise the
 ``(M, K)`` integrand and return analytic gradients, so the marginal costs tens
 of MB per million observations against several GB of network activations.
+
+:class:`RealSpaceNLL` is the real-space error model of Careless and Aimless in
+its place: the background-subtracted count about ``K I0``, with no scatter
+integral.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from torch import Tensor
 from torchsx.merging.likelihood.poisson import poisson_log_prob_at_zero_signal
 from torchsx.merging.scatter.mixture import PredictedMixtureScatter
 
-__all__ = ["MarginalNLL"]
+__all__ = ["MarginalNLL", "RealSpaceNLL"]
 
 
 class MarginalNLL(nn.Module):
@@ -206,6 +210,81 @@ class MarginalNLL(nn.Module):
                 lp = _chunk(*args)
             parts.append(lp)
         return torch.cat(parts)
+
+    def forward(
+        self, scatter, params, log_mean: Tensor, n_ph: Tensor, bg: Tensor, meta,
+        *, mask: Tensor | None = None,
+    ) -> Tensor:
+        lp = self.log_prob(scatter, params, log_mean, n_ph, bg, meta)
+        if mask is not None:
+            lp = lp[mask]
+        return -lp.sum()
+
+
+class RealSpaceNLL(nn.Module):
+    """Per-observation ``-log p`` of the background-subtracted count, in real space.
+
+    The error model of Careless (Ev11, after Aimless): the measurement
+    ``y = n - bg`` is a Student-t with ``dof`` degrees of freedom (a Normal with
+    ``dof = None``) about the predicted intensity ``mu = K I0``, with variance::
+
+        sigma^2 = SdFac^2 (sigma_y^2 + SdB mu + (SdAdd mu)^2)
+
+    ``sigma_y^2 = n + sigma_b^2`` is the counting variance of the measurement,
+    floored at one photon squared; ``SdFac``, ``SdB`` and ``SdAdd`` are three
+    global scalars fitted with the network.  There is no scatter integral: the
+    multiplicative errors enter through ``SdAdd`` alone, and the scale is ``K``
+    itself (``scatter_free``), so the scatter heads of the scale model go unused.
+
+    ``likelihood`` (a :class:`~torchsx.merging.likelihood.Poisson`) supplies the
+    detection background, its mean offset and the variance of the annulus
+    estimate, so this model and :class:`MarginalNLL` read the same background.
+    """
+
+    #: the scale is ``K``, with no scatter mean shift
+    scatter_free = True
+    quadrature = None
+    miss_logit = None
+    outlier_logit = None
+    detector_noise = None
+
+    def __init__(self, likelihood, *, dof: float | None = 32.0,
+                 sd_fac: float = 1.0, sd_b: float = 0.01, sd_add: float = 0.3) -> None:
+        super().__init__()
+        if dof is not None and not dof > 0:
+            raise ValueError(f"dof must be positive or None, got {dof}")
+        if min(sd_fac, sd_b, sd_add) <= 0:
+            raise ValueError("the error-model terms must be positive")
+        self.likelihood = likelihood
+        self.dof = None if dof is None else float(dof)
+        #: log SdFac, log SdB, log SdAdd
+        self.error_model = nn.ParameterDict({
+            "log_sd_fac": nn.Parameter(torch.tensor(math.log(sd_fac))),
+            "log_sd_b": nn.Parameter(torch.tensor(math.log(sd_b))),
+            "log_sd_add": nn.Parameter(torch.tensor(math.log(sd_add))),
+        })
+
+    def terms(self) -> dict[str, float]:
+        """``{"sd_fac", "sd_b", "sd_add"}``."""
+        return {k[4:]: float(v.detach().exp()) for k, v in self.error_model.items()}
+
+    def log_prob(
+        self, scatter, params, log_mean: Tensor, n_ph: Tensor, bg: Tensor, meta
+    ) -> Tensor:
+        bg_mean, sig_b2 = self.likelihood.detection_params(bg)
+        n = n_ph.to(log_mean.dtype)
+        y = n - bg_mean
+        var_y = n.clamp(min=0.0) + (sig_b2 if sig_b2 is not None else 0.0)
+        mu = log_mean.exp()
+        e = self.error_model
+        var = (2.0 * e["log_sd_fac"]).exp() * (
+            var_y.clamp(min=1.0) + e["log_sd_b"].exp() * mu + (e["log_sd_add"].exp() * mu) ** 2)
+        z2 = (y - mu) ** 2 / var
+        if self.dof is None:
+            return -0.5 * (z2 + var.log() + math.log(2.0 * math.pi))
+        nu = self.dof
+        const = math.lgamma(0.5 * (nu + 1.0)) - math.lgamma(0.5 * nu) - 0.5 * math.log(nu * math.pi)
+        return const - 0.5 * var.log() - 0.5 * (nu + 1.0) * torch.log1p(z2 / nu)
 
     def forward(
         self, scatter, params, log_mean: Tensor, n_ph: Tensor, bg: Tensor, meta,

@@ -110,6 +110,7 @@ class AmortizedScale(nn.Module):
         query_layers: int = 1,
         n_heads: int = 8,
         refine_geometry: bool = False,
+        see_own_fold: bool = False,
         w_init: float = 1.65,
         n_components: int = 4,
         anchor_log_k: bool = True,
@@ -122,7 +123,7 @@ class AmortizedScale(nn.Module):
         """The fold transformer
         (:class:`~torchsx.nn.fold_transformer.FoldTransformerEncoder`: ``context_folds``
         runs per crystal, ``ctx_layers`` / ``query_layers`` blocks of ``n_heads``
-        heads, ``refine_geometry``) and the heads, on ``prep``'s features.
+        heads, ``refine_geometry``, ``see_own_fold``) and the heads, on ``prep``'s features.
         ``phase_classes``
         (:class:`~torchsx.merging.scale.pseudo_translation.PhaseClasses`) adds the
         reflections' phase cosines to the self features."""
@@ -139,7 +140,7 @@ class AmortizedScale(nn.Module):
             features.n_self, features.n_context, meas,
             d_model=d_model, n_heads=n_heads, folds=context_folds,
             ctx_layers=ctx_layers, query_layers=query_layers,
-            refine_geometry=refine_geometry,
+            refine_geometry=refine_geometry, see_own_fold=see_own_fold,
             geometry=features.geometry_columns() if refine_geometry else None,
             d_hidden=d_hidden,
             n_crystal_features=features.n_crystal,
