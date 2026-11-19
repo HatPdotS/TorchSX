@@ -45,7 +45,6 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
 | `--prior` | `wilson` | Intensity prior: `wilson`, or `none` (see [Intensity prior](#intensity-prior)). |
 | `--tether TERMS` | `gauge` | Directions the likelihood leaves to the model, held at the raw counts; `none` turns it off (see [Sum-of-spots tether](#sum-of-spots-tether)). |
-| `--capture-table JSON` | none | Captured flux of each of the source's disks relative to one reference disk, by resolution; its logarithm is added to each observation's log scale (see [Disk capture](#disk-capture)). |
 | `--pseudo-translation` | `auto` | Finds translational pseudo-symmetry in the data and, with a dominant translation, handles its classes of reflections; `off` skips the search (see [Pseudo-translation](#pseudo-translation)). |
 | `--seed N` | 0 | Network initialization and batch sampling. |
 | `--device` | `cuda` if available | `cuda` or `cpu`. |
@@ -256,6 +255,10 @@ a Wilson run.
 `torchsx.merge` uses the prior of the checkpoint unless `--prior` is given.
 
 ## Disk capture
+
+`--capture-table` is a research option: it parses and stays out of `--help`.
+On five datasets it improved the refinement R factors of one and left the
+others unchanged or slightly worse.
 
 The scale model and the tether assume that every observation captures the same
 fraction of its spot at a given resolution. probixi grows the disk with
