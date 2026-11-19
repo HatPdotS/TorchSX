@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- TorchSX names the probixi it is paired with: `torchsx.SUPPORTED_DB_SCHEMA` (2, the newest probixi database schema the reader understands) and `torchsx.PROBIXI_VERSION` (the first probixi release that writes it). probixi holds the counterpart (`probixi.SCHEMA_VERSION`, `probixi.TORCHSX_VERSION`). Neither package depends on the other. Where probixi is installed, the reader warns if that probixi writes a newer schema. The error for a database with a newer schema names the writer and the probixi release this reader mirrors. Schema 1 databases read as before.
 - `--enrich-alpha auto` reads the second and later lattices of a frame (probixi `--max-lattices` above one) only with `enrich_p` at most 1e-10. The first lattice keeps the alpha the database records. A number given to `--enrich-alpha` applies to every lattice.
 - `--gain auto` on a probixi database that records its noise scale (`integration.bg_model_var_scale`, probixi 0.10.3 and later) uses the declared gain times that scale instead of estimating the gain from the integrated sums. Prepared caches made under `auto` are rebuilt. `--gain calibrate` keeps the estimate.
 - The merge written to `merged.mtz` and its halves is the `wls` estimator, the inverse-variance mean of `(n - bg) / K` on the trained scales, with French-Wilson amplitudes. `--estimator posterior` writes the Wilson-posterior amplitudes as before.

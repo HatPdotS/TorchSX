@@ -11,6 +11,7 @@ import hashlib
 from pathlib import Path
 
 import duckdb
+import re
 import pytest
 import torch
 
@@ -19,7 +20,7 @@ from torchsx.io._duckdb import (DEFAULT_ENRICH_ALPHA, EXTRA_LATTICE_ENRICH_ALPHA
 from torchsx.io.sources import inspect_source, read_source
 from torchsx.stream import SFXStream
 
-# Verbatim from probixi.io.db._SCHEMA (v0.10.3, schema 1).
+# Verbatim from probixi.io.db._SCHEMA (v0.10.3, schema 2).
 _SCHEMA = """
 CREATE TABLE geometry (
     beam_center_row  DOUBLE,
@@ -696,6 +697,19 @@ def test_schema_matches_probixi():
             src = Path(_db.__file__)
         except ImportError:
             pytest.skip("probixi source neither alongside torchsx nor installed")
+    from torchsx._compat import PROBIXI_VERSION, SUPPORTED_DB_SCHEMA
+
+    # the schema number sits in probixi/_compat.py, and in db.py before the pairing
+    compat = src.parent.parent / "_compat.py"
+    number = re.search(r"^SCHEMA_VERSION = (\d+)", (compat if compat.exists() else src).read_text(), re.M)
+    assert number, f"could not find SCHEMA_VERSION next to {src}"
+    theirs = int(number.group(1))
+    if theirs < SUPPORTED_DB_SCHEMA:
+        pytest.skip(f"the probixi at {src} writes schema {theirs}; this TorchSX mirrors schema "
+                    f"{SUPPORTED_DB_SCHEMA} (probixi {PROBIXI_VERSION})")
+    assert theirs == SUPPORTED_DB_SCHEMA, (
+        f"probixi writes schema {theirs}; raise SUPPORTED_DB_SCHEMA and PROBIXI_VERSION in "
+        "torchsx/_compat.py and update _SCHEMA and the _duckdb.py mapping")
     m = re.search(r'_SCHEMA = """(.*?)"""', src.read_text(), re.S)
     assert m, "could not find _SCHEMA in probixi/io/db.py"
 
@@ -704,7 +718,7 @@ def test_schema_matches_probixi():
 
     assert norm(m.group(1)) == norm(
         _SCHEMA
-    ), "probixi's DuckDB schema changed; update _SCHEMA and the _duckdb.py mapping"
+    ), "probixi's DuckDB schema changed under the same SCHEMA_VERSION; probixi must raise it"
 
 
 @pytest.mark.parametrize("embedded", [False, True])
@@ -750,6 +764,11 @@ def test_calibration_provenance_and_schema_gate(db_path):
         read_measurement(db_path)
     with pytest.raises(ValueError, match="newer"):
         load_duckdb(db_path)
+    # the message names the writer and the probixi release this reader mirrors
+    from torchsx._compat import PROBIXI_VERSION, SUPPORTED_DB_SCHEMA
+    with pytest.raises(ValueError, match=rf"schema 99 \(probixi 0\.10\.0\).*schema {SUPPORTED_DB_SCHEMA}, "
+                                         rf"the layout of probixi {re.escape(PROBIXI_VERSION)}"):
+        read_measurement(db_path)
 
 
 def test_varying_frame_energies_switch_on_per_image_k0(db_path, tmp_path):

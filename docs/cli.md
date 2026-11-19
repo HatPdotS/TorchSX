@@ -191,6 +191,14 @@ or its statistics.
 
 A custom-split file names a database's frames as CrystFEL does, `filename //event`.
 
+TorchSX and probixi name each other's version. `torchsx.SUPPORTED_DB_SCHEMA` is
+the newest database schema the reader understands, and `torchsx.PROBIXI_VERSION`
+is the first probixi release that writes it. probixi holds
+`probixi.SCHEMA_VERSION` and `probixi.TORCHSX_VERSION`, the first TorchSX
+release that reads its schema. Neither package depends on the other. Where
+probixi is installed, TorchSX warns when that probixi writes a newer schema.
+Older schemas read as before.
+
 ## Gain
 
 TorchSX models the data in photons, so the gain matters: a wrong gain

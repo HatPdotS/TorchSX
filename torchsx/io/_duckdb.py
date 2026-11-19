@@ -38,6 +38,7 @@ from pathlib import Path
 import duckdb
 import torch
 
+from torchsx._compat import PROBIXI_VERSION, SUPPORTED_DB_SCHEMA, probixi_mismatch
 from torchsx._core import SFXStreamCore
 from torchsx.geometry import Geometry
 from torchsx.io._metadata import StreamMetadata
@@ -49,8 +50,6 @@ _NM_INV_PER_A_INV = 10.0
 #: ``resolution`` fallback (Å) when a frame has no diffraction limit, matching
 #: the stream parser's sentinel.
 _NO_RESOLUTION = 999.0
-#: newest probixi database schema this reader understands
-SUPPORTED_DB_SCHEMA = 1
 
 # Per-crystal columns, in the order the reciprocal/cell tensors are built.
 _RECIP_COLS = (
@@ -189,8 +188,15 @@ def _measurement(conn, path: Path) -> MeasurementSpec:
     cal = cals[0] if cals else {}
     for row in cals:
         if (row.get("schema_version") or 0) > SUPPORTED_DB_SCHEMA:
-            raise ValueError(f"{path}: probixi database schema {row['schema_version']} is newer "
-                             f"than this TorchSX supports ({SUPPORTED_DB_SCHEMA})")
+            writer = f" (probixi {row['probixi_version']})" if row.get("probixi_version") else ""
+            raise ValueError(f"{path}: probixi database schema {row['schema_version']}{writer} is "
+                             f"newer than this TorchSX supports (schema {SUPPORTED_DB_SCHEMA}, the "
+                             f"layout of probixi {PROBIXI_VERSION}); upgrade TorchSX")
+    mismatch = probixi_mismatch()
+    if mismatch:
+        import warnings
+
+        warnings.warn(mismatch, stacklevel=3)
     if cal:
         for k in ("probixi_version", "schema_version", "flux_variance", "mf_threshold", "tail_ratio"):
             if cal.get(k) is not None:
