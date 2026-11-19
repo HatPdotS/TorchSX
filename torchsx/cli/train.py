@@ -315,7 +315,8 @@ def run_updates(tr, steps, *, eval_every: int = 100, probe=None):
                                           shuffle=False), None)
             if first is not None:
                 tr.prefetch(first[1])
-        rec = tr.step(rows.to(tr.device), state=k if tr.n_conditions > 1 else None)
+        with tr.in_state(k if tr.n_conditions > 1 else None):
+            rec = tr.step(rows.to(tr.device))
         if rec.get("step_skipped") or not rec.get("n_used"):
             raise FloatingPointError(f"Update {tr.step_i} for state {k} was unusable; see metrics.jsonl")
         updates[k] += 1
