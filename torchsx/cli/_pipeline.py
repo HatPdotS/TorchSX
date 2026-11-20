@@ -19,6 +19,8 @@ import numpy as np
 
 
 READOUT_MAX_OBS = 1_500_000
+#: resolution bins of ``--detector-noise resolution``, of equal reflection count
+NOISE_RESOLUTION_BINS = 10
 
 # ── data ───────────────────────────────────────────────────────────────
 
@@ -1166,7 +1168,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # builds it from --detector-noise.  auto: one global B when preparation
     # replaced the declared gain by its calibration, whose estimate is biased
     # (a global B is exactly a gain correction on the integrated sums), else none;
-    # panel: A and/or B per panel (--noise-terms, panels from the stream's panel ids).
+    # panel: A and/or B per panel (--noise-terms, panels from the stream's panel ids);
+    # resolution: the same per resolution bin of the prepared reflections.
     noise_rec = ck.get("detector_noise") if ck else None
     noise_mode = None if ck else getattr(args, "detector_noise", None)
     if noise_mode == "auto":
@@ -1175,7 +1178,7 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         if verbose:
             print(f"detector noise auto: {noise_mode} (gain from "
                   f"{'calibration' if noise_mode == 'global_B' else selection.get('selected') or 'input'})", flush=True)
-    if noise_rec or noise_mode in ("global_B", "panel"):
+    if noise_rec or noise_mode in ("global_B", "panel", "resolution"):
         from torchsx.merging.likelihood.detector_noise import DetectorNoise
         if noise_rec:
             dn = DetectorNoise.from_config(noise_rec["config"])
@@ -1184,6 +1187,13 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             noise_mode = "checkpoint"
         elif noise_mode == "global_B":
             dn = DetectorNoise(1, terms="B")
+        elif noise_mode == "resolution":
+            from torchref.base.reciprocal.hkl import get_d_spacing
+            d = get_d_spacing(prep.hkl_valid.float(), prep.median_cell).double().cpu()
+            s_sq = 1.0 / (4.0 * d.clamp(min=0.1) ** 2)
+            q = torch.linspace(0.0, 1.0, NOISE_RESOLUTION_BINS + 1, dtype=torch.float64)[1:-1]
+            edges = torch.unique(torch.quantile(s_sq, q).float())      # equal reflection count per bin
+            dn = DetectorNoise(int(edges.numel()) + 1, terms=str(getattr(args, "noise_terms", "AB") or "AB"), edges=edges)
         else:
             if hasattr(prep, "n_panels"):
                 n_groups = max(1, prep.n_panels)
@@ -1193,10 +1203,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             dn = DetectorNoise(n_groups, terms=str(getattr(args, "noise_terms", "AB") or "AB"))
         obj.detector_noise = dn.to(dev)
         if verbose:
-            print(f"detector noise: {noise_mode}, {dn.n_groups} panel(s), "
+            print(f"detector noise: {noise_mode}, {dn.n_groups} "
+                  f"{'panel(s)' if dn.edges is None else 'resolution bin(s)'}, "
                   f"V = A + B (lam + sig_b2), fitted terms {dn.terms}")
     elif noise_mode not in (None, "off"):
-        raise ValueError(f"Unknown detector noise mode {noise_mode!r}; expected auto, off or panel")
+        raise ValueError(f"Unknown detector noise mode {noise_mode!r}; expected auto, off, panel or resolution")
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at a

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `--detector-noise resolution` fits the detector variance terms per resolution bin (ten bins of equal reflection count) instead of per panel; `--noise-terms B` makes it a scale of the counting variance that changes with resolution. The merge inherits the bins from the checkpoint.
+
 ## v0.3.0
 
 - TorchSX names the probixi it is paired with: `torchsx.SUPPORTED_DB_SCHEMA` (2, the newest probixi database schema the reader understands) and `torchsx.PROBIXI_VERSION` (the first probixi release that writes it). probixi holds the counterpart (`probixi.SCHEMA_VERSION`, `probixi.TORCHSX_VERSION`). Neither package depends on the other. Where probixi is installed, the reader warns if that probixi writes a newer schema. The error for a database with a newer schema names the writer and the probixi release this reader mirrors. Schema 1 databases read as before.

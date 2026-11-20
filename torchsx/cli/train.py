@@ -60,15 +60,16 @@ def _build_parser():
     # Initial fraction of the learnable detector-outlier component (default 0 = off;
     # the merge inherits the checkpoint).
     p.add_argument("--outlier-frac", type=_fraction, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--detector-noise", choices=("off", "auto", "panel"), default="off",
+    p.add_argument("--detector-noise", choices=("off", "auto", "panel", "resolution"), default="off",
                    help="learned detector variance A + B (lam + sig_b2), fitted with the network. "
                         "off (default): none; auto: one global B (a gain correction on the integrated "
                         "sums) when preparation replaced the declared gain by its calibration, none "
-                        "otherwise; panel: per detector panel, terms from --noise-terms. The merge "
+                        "otherwise; panel: per detector panel; resolution: per resolution bin (ten bins of "
+                        "equal reflection count); the terms of both from --noise-terms. The merge "
                         "inherits the checkpoint")
     p.add_argument("--noise-terms", default="AB", choices=("AB", "A", "B"),
-                   help="--detector-noise panel: which of the terms A, B are fitted (default AB; "
-                        "B alone is a per-panel gain correction)")
+                   help="--detector-noise panel or resolution: which of the terms A, B are fitted "
+                        "(default AB; B alone is a gain correction per panel or bin)")
     # Research controls: they work, but --help does not list them.
     p.add_argument("--noise-lr-mult", type=float, default=30.0, help=argparse.SUPPRESS)
     # Fold transformer: K >= 2 masked runs per crystal (default 5); the merge

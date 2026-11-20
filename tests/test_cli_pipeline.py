@@ -611,7 +611,8 @@ def _gain_bundle(prep, selected):
 
 @pytest.mark.parametrize("mode,selected,expected", [
     (None, "calibration", "off"), ("auto", "calibration", "global_B"),
-    ("auto", "input", "off"), ("off", "calibration", "off"), ("panel", "input", "panel")])
+    ("auto", "input", "off"), ("off", "calibration", "off"), ("panel", "input", "panel"),
+    ("resolution", "input", "resolution")])
 def test_detector_noise_auto_fits_global_B_only_for_a_calibrated_gain(tmp_path, mode, selected, expected):
     from torchsx.cli import _pipeline as P
     from torchsx.cli.train import _build_parser as train_parser
@@ -626,10 +627,36 @@ def test_detector_noise_auto_fits_global_B_only_for_a_calibrated_gain(tmp_path, 
     if expected == "off":
         assert dn is None
     elif expected == "panel":
-        assert dn.terms == "AB"
+        assert dn.terms == "AB" and dn.edges is None
+    elif expected == "resolution":
+        assert dn.n_groups == dn.edges.numel() + 1 >= 2 and bool((dn.edges[1:] > dn.edges[:-1]).all())
     else:
         assert (dn.n_groups, dn.terms) == (1, "B")
         assert dn.log_B.requires_grad and not dn.log_A.requires_grad
+
+
+def test_detector_noise_resolution_bins_come_back_from_the_checkpoint(tmp_path):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.merge_nn import _build_parser as merge_parser
+    from torchsx.cli.train import _build_parser as train_parser
+    prep, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    bundle = _gain_bundle(prep, "input")
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu",
+                                       "--detector-noise", "resolution", "--noise-terms", "B"])
+    prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
+    dn = obj.detector_noise
+    assert S["detector_noise"] == "resolution" and dn.terms == "B"
+    with torch.no_grad():
+        dn.log_B.copy_(torch.linspace(-0.1, 0.1, dn.n_groups))
+    tr = _trainer_from_stack(prep_, params_, scale, obj, S)
+    tr.data_recipe = dict(bundle.recipe)
+    ck = torch.load(tr.save_best(tmp_path / "b.pt"), weights_only=False)
+    assert ck["detector_noise"]["config"]["edges"] == pytest.approx(dn.edges.tolist())
+    margs = merge_parser().parse_args(["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
+    _p, _q, _r, restored, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
+    assert S2["detector_noise"] == "checkpoint"
+    torch.testing.assert_close(restored.detector_noise.edges.cpu(), dn.edges.cpu())
+    torch.testing.assert_close(restored.detector_noise.log_B.cpu(), dn.log_B.detach().cpu())
 
 
 def test_detector_noise_checkpoint_record_wins_over_the_gain_selection(tmp_path):

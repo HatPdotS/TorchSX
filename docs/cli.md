@@ -30,8 +30,8 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 |---|---|---|
 | `--int-radius R_PEAK,R_GAP,R_BG` | from the stream | The integration radii in pixels, as given to indexamajig. |
 | `--gain` | `auto` | Detector gain in ADU per photon (see [Gain](#gain)). |
-| `--detector-noise` | `off` | Learned detector variance A + B (λ + σ<sub>b</sub>²): `auto` fits one global B when the gain was estimated from the data, `panel` fits it per detector panel. |
-| `--noise-terms` | `AB` | With `--detector-noise panel`: which of A and B are fitted. B alone is a per-panel gain correction. |
+| `--detector-noise` | `off` | Learned detector variance A + B (λ + σ<sub>b</sub>²): `auto` fits one global B when the gain was estimated from the data, `panel` fits it per detector panel, `resolution` per resolution bin (ten bins of equal reflection count). |
+| `--noise-terms` | `AB` | With `--detector-noise panel` or `resolution`: which of A and B are fitted. B alone is a gain correction per panel or bin. |
 
 ### Training
 

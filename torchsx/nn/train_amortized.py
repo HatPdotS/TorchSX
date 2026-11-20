@@ -998,7 +998,7 @@ class AmortizedTrainer:
         }
         dn = getattr(self.objective, "detector_noise", None)
         if dn is not None:
-            # the fitted variance terms per panel
+            # the fitted variance terms per panel or resolution bin
             for t, v in dn.values().items():
                 rec[f"noise_{t}"] = v
         if (

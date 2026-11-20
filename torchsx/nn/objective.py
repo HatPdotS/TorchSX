@@ -93,14 +93,14 @@ class MarginalNLL(nn.Module):
                 raise ValueError(f"outlier_frac must be in (0, 1), got {outlier_frac}")
             self.outlier_logit = nn.Parameter(torch.tensor(math.log(outlier_frac / (1.0 - outlier_frac))))
         #: Learned detector noise (:class:`~torchsx.merging.likelihood.detector_noise.DetectorNoise`):
-        #: the counting variance becomes ``A + B (lam + sig_b2)`` per panel,
+        #: the counting variance becomes ``A + B (lam + sig_b2)`` per panel or resolution bin,
         #: fitted with the network.  ``None`` is the plain detection model.
         #: The outlier Cauchy keeps the noise-free detector SD as its scale.
         self.detector_noise = detector_noise
         self._noise_cache: tuple | None = None
 
     def noise_terms(self, meta) -> tuple[Tensor, Tensor] | None:
-        """``(A, B)`` per observation of ``meta`` (gathered by panel), or ``None``.
+        """``(A, B)`` per observation of ``meta`` (gathered by panel or resolution bin), or ``None``.
 
         Cached on the batch object (held, so its id cannot be reused), the grad
         mode and the parameters' versions: the locate scans and outer nodes of one
@@ -115,10 +115,7 @@ class MarginalNLL(nn.Module):
         if (c is not None and c[0] is meta and c[1] == torch.is_grad_enabled()
                 and c[2] == versions):
             return c[3]
-        group = getattr(meta, "panel_id", None)
-        if group is not None and dn.n_groups == 1:
-            group = None
-        terms = dn.terms_obs(group, meta.hkl_idx.numel(), meta.hkl_idx.device)
+        terms = dn.terms_obs(dn.groups(meta), meta.hkl_idx.numel(), meta.hkl_idx.device)
         self._noise_cache = (meta, torch.is_grad_enabled(), versions, terms)
         return terms
 
