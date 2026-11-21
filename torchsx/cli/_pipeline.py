@@ -835,6 +835,9 @@ def report_merge(res: dict, *, hkl=None, verbose: bool = True) -> None:
         print(f"  estimator {res['estimator']}: {int(seen.sum()):,} reflections, "
               f"median I/sig {float(ratio.median()):.2f}, "
               f"negative {100 * float((I < 0).float().mean()):.1f} %", flush=True)
+        if res.get("n_pooled"):
+            print(f"  pooled      {res['n_pooled']:,} reflections with most observations at the "
+                  f"scatter limit of the network", flush=True)
         return
     if res.get("n_nonfinite_rows"):
         print(f"  NOTE {res['n_nonfinite_rows']:,} reflection-batch rows were "

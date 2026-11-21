@@ -1256,6 +1256,9 @@ class AmortizedTrainer:
                        moment estimators and belong on the same French-Wilson
                        path partialator's own output takes.
 
+        ``wls`` takes the pooled merge for a reflection with more than half of
+        its observations at the scatter limit, and counts them in ``n_pooled``.
+
         Returns a dict with ``F``/``F_sd`` (or ``I``/``I_sd``/``n_meas``),
         ``I0``, ``seen``, ``n_meas`` (observations per reflection) and the grid
         diagnostics ``edge_mass``, ``loc_sd``, ``w_max`` (the largest posterior
@@ -1303,7 +1306,7 @@ class AmortizedTrainer:
             bvf = float(getattr(self.objective.likelihood, "bg_var_factor", 0.0) or 0.0)
             S = {k: torch.zeros(n_hkl, device=dev, dtype=torch.float64)
                  for k in ("cnt", "r", "r2", "sig", "K", "var", "sig2", "sigK", "K2",
-                           "num", "den", "A", "B", "C")}
+                           "num", "den", "A", "B", "C", "lim")}
             readout = tether_readout and self._tether_phi is not None
             seen_obs = []                 # (log K, reflection, crystal) of every observation
             for _, rows in batches():
@@ -1326,7 +1329,11 @@ class AmortizedTrainer:
                 # unity merge of a weak reflection can be zero or negative) and the
                 # counting term at one count, so no single zero-background
                 # observation can dominate a reflection.
-                w2 = (pred.log_w.exp().double() ** 2).clamp(max=20.0)
+                # The scatter term is limited at w^2 = 20; an observation at the
+                # limit weighs nothing next to one below it.
+                w2 = pred.log_w.exp().double() ** 2
+                at_limit = (w2 >= 20.0).double()
+                w2 = w2.clamp(max=20.0)
                 mu = K * I0_ref[h].double().clamp(min=floor)
                 V = ((mu + bg.double() * (1.0 + bvf)).clamp(min=1.0)
                      + mu * mu * torch.expm1(w2))
@@ -1337,23 +1344,13 @@ class AmortizedTrainer:
                              ("sigK", sig * K), ("K2", K * K),
                              ("num", g * sig), ("den", g * K),
                              ("A", g * g * sig * sig), ("B", g * g * sig * K),
-                             ("C", g * g * K * K)):
+                             ("C", g * g * K * K), ("lim", at_limit)):
                     S[k].index_add_(0, h, v)
                 self.scale.clear()
             cnt = S["cnt"].clamp(min=1)
-            if estimator == "wls":
-                den = S["den"].clamp(min=1e-300)
-                I = S["num"] / den
-                # model variance 1 / sum(K^2 / V), and the sandwich variance of
-                # the same weighted mean; report the larger (see ``pooled``).
-                var_model = 1.0 / den
-                ss = (S["A"] - 2.0 * I * S["B"] + I * I * S["C"]).clamp(min=0)
-                bessel = cnt / (cnt - 1).clamp(min=1)
-                I_sd = torch.maximum(var_model, ss * bessel / (den * den)).sqrt()
-            elif estimator == "mean":
-                I = S["r"] / cnt
-                I_sd = ((S["r2"] / cnt - I * I).clamp(min=0) / cnt).sqrt()
-            else:
+            bessel = cnt / (cnt - 1).clamp(min=1)
+
+            def pooled():
                 sumK = S["K"].clamp(min=1e-12)
                 I = S["sig"] / sumK
                 # Counting variance alone understates the error of a merge whose
@@ -1365,9 +1362,35 @@ class AmortizedTrainer:
                 # term is a floor.
                 var_pois = S["var"] / (sumK * sumK)
                 ss = (S["sig2"] - 2.0 * I * S["sigK"] + I * I * S["K2"]).clamp(min=0)
-                bessel = cnt / (cnt - 1).clamp(min=1)
                 var_emp = ss * bessel / (sumK * sumK)
-                I_sd = torch.maximum(var_pois, var_emp).sqrt()
+                return I, torch.maximum(var_pois, var_emp).sqrt()
+
+            n_pooled = None
+            if estimator == "wls":
+                den = S["den"].clamp(min=1e-300)
+                I = S["num"] / den
+                # model variance 1 / sum(K^2 / V), and the sandwich variance of
+                # the same weighted mean; report the larger (see ``pooled``).
+                var_model = 1.0 / den
+                ss = (S["A"] - 2.0 * I * S["B"] + I * I * S["C"]).clamp(min=0)
+                I_sd = torch.maximum(var_model, ss * bessel / (den * den)).sqrt()
+                # A reflection with most of its observations at the scatter limit
+                # has no usable weights.  V is the scatter term alone there, K / V
+                # is 1 / K up to a constant, and the weighted mean is the plain
+                # mean of (n - bg) / K with an error far above the counting error;
+                # French-Wilson then returns the prior mean of the shell.  Such a
+                # reflection takes the pooled merge, which needs no weights from
+                # the network.
+                limited = S["lim"] > 0.5 * S["cnt"]
+                I_p, sd_p = pooled()
+                I = torch.where(limited, I_p, I)
+                I_sd = torch.where(limited, sd_p, I_sd)
+                n_pooled = int((limited & (S["cnt"] >= 2)).sum())
+            elif estimator == "mean":
+                I = S["r"] / cnt
+                I_sd = ((S["r2"] / cnt - I * I).clamp(min=0) / cnt).sqrt()
+            else:
+                I, I_sd = pooled()
             result = {
                 "estimator": estimator,
                 "I": I.float(), "I_sd": I_sd.float(),
@@ -1376,6 +1399,8 @@ class AmortizedTrainer:
                 "n_crystals": int(crystals.numel()),
                 "condition": self._cond,
             }
+            if n_pooled is not None:
+                result["n_pooled"] = n_pooled
             if readout:
                 result["tether"] = self._tether_readout(seen_obs)
             return result

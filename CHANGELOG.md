@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The `wls` merge takes the pooled merge, `sum(n - bg) / sum(K)`, for a reflection with more than half of its observations at the scatter limit of the network (a log-scatter variance of 20). The weights of such a reflection gave the plain mean of `(n - bg) / K` with an error far above the counting error, and French-Wilson returned the prior mean of the shell. The log counts these reflections and `merged.metrics.json` records `wls_pooled`.
 - `--detector-noise resolution` fits the detector variance terms per resolution bin (ten bins of equal reflection count) instead of per panel; `--noise-terms B` makes it a scale of the counting variance that changes with resolution. The merge inherits the bins from the checkpoint.
 
 ## v0.3.0

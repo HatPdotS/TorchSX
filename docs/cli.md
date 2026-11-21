@@ -89,6 +89,12 @@ intensities, which can be negative, become amplitudes by French-Wilson. The
 halves are the same estimator on each half of the crystals, and
 `merged.metrics.json` records their agreement as `split_half_wls`.
 
+The network limits the scatter it predicts for an observation at a log-scatter
+variance of 20. A reflection with more than half of its observations at that
+limit takes the pooled merge, `sum(n - bg) / sum(K)`, with the pooled sigma.
+The log counts these reflections and `merged.metrics.json` records the count as
+`wls_pooled`.
+
 `--estimator posterior` writes the Wilson-posterior amplitudes of the shape
 likelihood instead. Two posterior halves share the Wilson prior, and where the
 data are weak their agreement measures the prior. The half files then hold the

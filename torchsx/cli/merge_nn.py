@@ -308,6 +308,8 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
             write(out.stem if half == 0 else f"{out.stem}_half{half}", po, verbose and half == 0)
         rec = {"split": label, "products": [product], "estimator": product,
                "prior": full.get("prior", tr.cfg.posterior_prior)}
+        if full.get("n_pooled") is not None:
+            rec["wls_pooled"] = full["n_pooled"]
         tether = full.get("tether")
         if tether and tether.get("n_obs"):
             rec["tether"] = tether

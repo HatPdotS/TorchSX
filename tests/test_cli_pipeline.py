@@ -153,6 +153,43 @@ def test_merge_estimators(tmp_path):
     assert torch.allclose(pooled["I_sd"][~both], mean["I_sd"][~both] * (n[~both] / (n[~both] - 1)).sqrt().float(), rtol=1e-3, atol=1e-5)
 
 
+def test_wls_takes_the_pooled_merge_at_the_scatter_limit(tmp_path):
+    """A reflection with more than half of its observations at the scatter limit
+    gets the pooled intensity and sigma; the others keep the weighted mean."""
+    from dataclasses import replace
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, _obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    wls, pooled = tr.merge(estimator="wls"), tr.merge(estimator="pooled")
+    assert wls["n_pooled"] == 0 and "n_pooled" not in pooled
+    wide = torch.zeros(prep.n_valid, dtype=torch.bool)
+    wide[:10] = True
+    total, limited = torch.zeros(prep.n_valid), torch.zeros(prep.n_valid)
+    prime = tr.scale.prime
+
+    def widen(meta):
+        # every other crystal reports an unbounded scatter for the chosen reflections
+        pred = prime(meta)
+        h = meta.hkl_idx.cpu()
+        hit = wide[h] & (meta.crystal_id.cpu() % 2 == 0)
+        total.index_add_(0, h, torch.ones(len(h)))
+        limited.index_add_(0, h, hit.float())
+        return replace(pred, log_w=torch.where(hit.to(pred.log_w.device), torch.full_like(pred.log_w, 3.0), pred.log_w))
+
+    tr.scale.prime = widen
+    try:
+        res = tr.merge(estimator="wls")
+    finally:
+        tr.scale.prime = prime
+    falls = limited > 0.5 * total
+    assert falls.any() and (wide & ~falls).any()          # both sides of the rule occur
+    assert res["n_pooled"] == int((falls & res["seen"].cpu()).sum())
+    for key in ("I", "I_sd"):
+        assert torch.allclose(res[key][falls], pooled[key][falls])
+        assert torch.allclose(res[key][~wide], wls[key][~wide])
+    assert not torch.allclose(res["I"][wide & ~falls], pooled["I"][wide & ~falls])
+
+
 def test_merge_refuses_to_pool_splits_and_honours_one(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=20, n_cond=2)
     scale, _obj, tr = _stack(prep, params, tmp_path)
