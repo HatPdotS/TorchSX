@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Training and merging read their batches into a few host buffers that the store reuses (`torchsx.merging.store.RecordBuffers`). A buffer returns to the store when the last tensor on it is released, in the thread that releases it. Before, a read-ahead thread allocated each batch buffer and the consumer released it; the mimalloc allocator inside torch (2.13 on aarch64) kept such a buffer resident, so host memory grew by one batch per update (1.5 GB per update at 28 million observations per batch). On hosts with `zone_reclaim_mode` set, an update then took minutes instead of seconds once the NUMA node of the process was full. The merged values do not change.
 - The `wls` merge takes the pooled merge, `sum(n - bg) / sum(K)`, for a reflection with more than half of its observations at the scatter limit of the network (a log-scatter variance of 20). The weights of such a reflection gave the plain mean of `(n - bg) / K` with an error far above the counting error, and French-Wilson returned the prior mean of the shell. The log counts these reflections and `merged.metrics.json` records `wls_pooled`.
 - `--detector-noise resolution` fits the detector variance terms per resolution bin (ten bins of equal reflection count) instead of per panel; `--noise-terms B` makes it a scale of the counting variance that changes with resolution. The merge inherits the bins from the checkpoint.
 
