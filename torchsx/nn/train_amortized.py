@@ -1528,6 +1528,7 @@ class AmortizedTrainer:
         def sweep(v_nodes: Tensor) -> Tensor:
             nonlocal n_bad_acc, n_sweeps
             n_sweeps += 1
+            n_bad_acc = 0                 # of this sweep: the last one gives the curve that is read
             acc = torch.zeros(n_hkl, v_nodes.shape[1], device=dev)
             for _, rows in batches():
                 meta, n_ph, bg, _ = self._batch(rows.to(dev))

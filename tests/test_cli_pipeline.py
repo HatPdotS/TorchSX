@@ -680,6 +680,41 @@ def test_merge_survives_a_non_finite_batch(tmp_path):
     assert int(res["seen"].sum()) > 0           # and the split survives
 
 
+def test_non_finite_rows_are_counted_once_however_often_the_grid_is_re_placed(tmp_path, monkeypatch):
+    """The count is of the accumulation the merge reads, not the sum over the re-placement sweeps."""
+    from torchsx.nn import train_amortized
+
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    real, state = tr.target.accumulate, {"sweep": False, "first": False}
+
+    def poisoned(*a, **kw):
+        out = real(*a, **kw)
+        if state["sweep"] and state["first"]:      # the first batch of every sweep
+            state["first"] = False
+            return out * float("nan")
+        return out
+
+    def sweeps(n):
+        def refine(tgt, sweep, centre, sd, passes=4):
+            state["sweep"] = True
+            for _ in range(n):
+                state["first"] = True
+                acc = sweep(centre[:, None] + sd[:, None] * tgt.u_coarse[None, :])
+            state["sweep"] = False
+            return centre, sd, acc, 0
+        return refine
+
+    tr.target.accumulate = poisoned
+    counts = []
+    for n in (1, 3):
+        monkeypatch.setattr(train_amortized, "refine_grid", sweeps(n))
+        counts.append(tr.merge()["n_nonfinite_rows"])
+    tr.target.accumulate = real
+    assert counts[0] > 0 and counts[1] == counts[0]
+
+
 # ── smooth Wilson basis / gauge anchor round trip ──────────────────────
 
 

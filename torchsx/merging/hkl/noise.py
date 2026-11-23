@@ -182,10 +182,10 @@ class PoissonNoiseModel:
         CrystFEL streams do not carry.
 
         The estimate is biased: the integrated negatives are not a clean
-        zero-signal sample.  So ``auto``
-        uses it only to detect a wrong declaration (tolerance 50 %); a gain it
-        replaces can be refined in training by one global B
-        (``--detector-noise auto``).
+        zero-signal sample.  ``auto`` still takes it over a declared gain
+        whenever it is valid (``DEFAULT_GAIN_TOLERANCE`` is 0) and no off-Bragg
+        calibration is available; the gain can then be refined in training by
+        one global B (``--detector-noise auto``).
 
         Returns
         -------
