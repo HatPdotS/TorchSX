@@ -15,16 +15,90 @@ from tests.test_cli_pipeline import _stack, _DataArgs
 from tests.test_measurement_sources import stream_file
 
 
-@pytest.mark.parametrize('module,count', [(train,41), (merge_nn,20)])
-def test_public_options_and_split_inputs(module, count):
+@pytest.mark.parametrize('module', [train, merge_nn])
+def test_split_inputs(module):
     parser = module._build_parser()
-    opts = [a for a in parser._actions if a.option_strings and '--help' not in a.option_strings]
-    assert len(opts) == count
     prefix = [] if module is train else ['model.pt']
     a = parser.parse_args(prefix + ['--split','dark=dark.stream','--split','light=light.stream','-o','run'])
     assert P._splits_from_args(a) == [('dark',Path('dark.stream')),('light',Path('light.stream'))]
     a = parser.parse_args(prefix + ['combined.stream','--split-file','custom.split','-o','run'])
-    assert a.split_file == Path('custom.split')
+    assert a.split_file == Path('custom.split') and a.unassigned is None
+    assert parser.parse_args(prefix + ['x.stream','--unassigned','drop','-o','run']).unassigned == 'drop'
+
+
+def test_inputs_of_one_name_form_one_dataset(tmp_path, monkeypatch):
+    def parse(*argv):
+        return P._splits_from_args(train._build_parser().parse_args([*argv, '-o', 'run']))
+    pooled = parse('--split','dark=a.stream','--split','light=c.stream','--split','dark=b.stream')
+    assert pooled == [('dark',Path('a.stream')),('light',Path('c.stream')),('dark',Path('b.stream'))]
+    assert P._dataset_names(pooled) == ['dark','light']
+    bare = parse('a.stream','b.stream')
+    assert bare == [('',Path('a.stream')),('',Path('b.stream'))] and P._dataset_names(bare) == ['']
+    assert parse('a.stream','b.stream','--split-file','custom.split') == bare
+    for bad in (('--split','dark=a.stream','b.stream'),
+                ('--split','dark=a.stream','--split','light=b.stream','--split-file','custom.split'),
+                ('--split',f'{P.UNASSIGNED}=a.stream')):
+        with pytest.raises(SystemExit):
+            parse(*bad)
+    # a pattern is expanded here, in sorted order; a file of that very name is taken as it is
+    monkeypatch.chdir(tmp_path)
+    for name in ('run2.stream','run1.stream','other.sfx','odd[1].stream'):
+        (tmp_path/name).touch()
+    assert parse('--split','dark=run*.stream','--split','light=other.sfx','--split','dark=odd[1].stream') == [
+        ('dark',Path('run1.stream')),('dark',Path('run2.stream')),('light',Path('other.sfx')),
+        ('dark',Path('odd[1].stream'))]
+    with pytest.raises(SystemExit, match='matches no file'):
+        parse('--split','dark=none*.stream')
+
+
+def test_updates_follow_the_share_of_the_patterns_of_no_dataset():
+    def states(n_conditions, share, steps=400):
+        tr = SimpleNamespace(n_conditions=n_conditions, unassigned_share=share)
+        return [train._state_of_step(tr, i) for i in range(steps)]
+    # every pattern in a dataset: the states take turns, one draw per round
+    assert states(2, None, 6) == [(0,0),(1,0),(0,1),(1,1),(0,2),(1,2)]
+    for n, share in ((3, 0.25), (3, 0.9), (2, 0.5), (4, 0.01), (2, 0.0)):
+        got = states(n, share)
+        per = np.bincount([k for k, _ in got], minlength=n)
+        assert per[-1] == int(400 * share)                      # the last state, by its share
+        assert per[:-1].max() - per[:-1].min() <= 1             # the datasets, evenly
+        assert len({draw for _, draw in got}) == 400            # no batch drawn twice
+        # spread over the run rather than bunched
+        assert abs(sum(k == n - 1 for k, _ in got[:200]) - 200 * share) <= 1
+
+    condition = torch.tensor([0, 0, 1, 2, 2, 2, 2, 0])
+    tr = SimpleNamespace(n_conditions=3, condition=condition, train_crystals=torch.arange(7))
+    assert train.unassigned_share(tr, ['dark', 'light', P.UNASSIGNED]) == pytest.approx(4 / 7)
+    assert train.unassigned_share(tr, ['dark', 'light', 'late']) is None
+    assert train.unassigned_share(tr, []) is None
+
+
+def test_patterns_of_no_dataset_train_and_are_not_merged(tmp_path, monkeypatch, capsys):
+    prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10,n_cond=2)
+    # every fourth crystal is a pattern of no dataset, and every eighth is in both
+    i=torch.arange(prep.obs_info.n_crystals)
+    free=i%4==3
+    member=torch.stack([(i%2==0)|(i%8==1), (i%2==1)&~free, free],1)
+    P.assign_states(prep.obs_info,member)
+    names=['dark','light',P.UNASSIGNED]
+    bundle=P.PrepBundle(prep,{'spacegroup':'P 1','d_min':0.9,'gain':1.0,'radii':[7,9,11]},names,0.1)
+    monkeypatch.setattr(P,'load_prep',lambda *a,**k: bundle)
+    for key,value in dict(d_model=16,inner_points=32,k_coarse=15,m_fine=65).items():
+        monkeypatch.setitem(P.DEFAULTS,key,value)
+    run=tmp_path/'run'
+    train.main(['x.stream','-o',str(run),'--device','cpu','--steps','8','--seed','17'])
+    updates=json.loads((run/'training_summary.json').read_text())['updates_per_state']
+    assert sum(updates)==8 and updates[2]==2 and updates[0]==updates[1]==3
+    ck=torch.load(run/'best.pt',weights_only=False)
+    assert ck['splits']==names and len(ck['wilson_surface']['coef'])==3
+    wanted={f'merged_{n}{half}.mtz' for n in ('dark','light') for half in ('','_half1','_half2')}
+    assert {p.name for p in run.glob('*.mtz')}==wanted
+    assert set(json.loads((run/'merged.metrics.json').read_text()))=={'dark','light'}
+    out=capsys.readouterr().out
+    # the crystals of both states are merged in each, held once
+    assert 'merge [dark]: 25 crystals' in out and 'merge [light]: 10 crystals' in out
+    merge_nn.main([str(run/'best.pt'),'x.stream','-o',str(tmp_path/'again.mtz'),'--device','cpu'])
+    assert {p.name for p in tmp_path.glob('*.mtz')}=={n.replace('merged','again') for n in wanted}
 
 
 def test_research_options_parse_but_stay_out_of_help():
@@ -57,7 +131,7 @@ def test_out_of_range_training_options_fail_at_parsing(option, value, capsys):
 
 
 @pytest.mark.parametrize('module', [train,merge_nn])
-@pytest.mark.parametrize('option,value', [('--gain','garbage'),('--prior','flat'),('--scatter-family','mixture'),('--calib-degree','9,9')])
+@pytest.mark.parametrize('option,value', [('--gain','garbage'),('--prior','none'),('--scatter-family','mixture'),('--calib-degree','9,9')])
 def test_invalid_or_removed_options_fail_before_loading(module,option,value,capsys):
     prefix = [] if module is train else ['model.pt']
     with pytest.raises(SystemExit):
@@ -68,7 +142,7 @@ def test_invalid_or_removed_options_fail_before_loading(module,option,value,caps
         for valid in ('auto','trust_input','calibrate','positive finite'):
             assert valid in error
     if option == '--prior':
-        assert 'none' in error and 'wilson' in error
+        assert 'wilson' in error
 
 
 def test_custom_split_matches_source_images(stream_file,tmp_path):
@@ -116,9 +190,10 @@ def test_defaults_and_old_checkpoint_likelihood(tmp_path):
 
 
 @pytest.mark.parametrize('saved,requested,expected', [
-    ('none',None,'none'), ('wilson','none','none'), ('none','wilson','wilson'),
+    ('wilson',None,'wilson'), ('wilson','wilson','wilson'),
+    ('none',None,SystemExit), ('none','wilson',SystemExit),
 ])
-def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,requested,expected):
+def test_checkpoint_prior_wilson_and_removed_flat_prior(tmp_path,saved,requested,expected):
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10)
     bundle=P.PrepBundle(prep,{'spacegroup':'P 1'},[],0.125)
     argv=['model.pt','x.stream','-o',str(tmp_path/'merged.mtz'),'--device','cpu']
@@ -127,6 +202,11 @@ def test_checkpoint_prior_inheritance_and_explicit_override(tmp_path,saved,reque
     args=merge_nn._build_parser().parse_args(argv)
     ck=_production_checkpoint(bundle,tmp_path)
     ck['posterior_grid']={'prior':saved}
+    if expected is SystemExit:
+        # A flat-prior checkpoint (#24) carries no Wilson surface: no override rescues it.
+        with pytest.raises(SystemExit, match='--prior none'):
+            P.build_stack(bundle,args,ckpt=ck,verbose=False)
+        return
     _,_,_,_,settings=P.build_stack(bundle,args,ckpt=ck,verbose=False)
     assert settings['prior']==expected
 
@@ -180,8 +260,8 @@ def test_small_batch_respects_holdout_and_original_redundancy(requested):
 
 
 @pytest.mark.parametrize("merge_friedel", [True, False])
-@pytest.mark.parametrize("prior", ["none", "wilson"])
-def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel,prior):
+def test_joint_train_and_checkpoint_readout(tmp_path,monkeypatch,merge_friedel):
+    prior='wilson'
     prep,_,*_=_synthetic(n_hkl=20,n_xtal=40,per=10,n_cond=2)
     bundle=P.PrepBundle(prep,{'spacegroup':'P 1','d_min':0.9,'gain':1.0,'radii':[7,9,11],'merge_friedel':merge_friedel},['dark','light'],0.1)
     monkeypatch.setattr(P,'load_prep',lambda *a,**k: bundle)

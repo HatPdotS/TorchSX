@@ -163,6 +163,10 @@ def assign_timepoints_to_images(
     )
 
 
+#: Event of a split-file row that names every frame of its file.
+ANY_EVENT = "*"
+
+
 def load_split_labels(
     path: str | Path,
 ) -> dict[tuple[str, str], set[str]]:
@@ -171,10 +175,11 @@ def load_split_labels(
     Each line is ``filename event dataset``, whitespace separated; ``#``
     starts a comment, and fields after the third are ignored. The unit is a
     frame, and a frame listed under several dataset names belongs to each of
-    them; a repeated identical row counts once.
+    them; a repeated identical row counts once. An event of ``*``
+    (:data:`ANY_EVENT`) names every frame of the file.
 
     Returns ``(filename, event) → {dataset, ...}``. Match a stream's frames
-    with ``(filename, event_key(event))``.
+    with ``(filename, event_key(event))`` and ``(filename, ANY_EVENT)``.
     """
     lookup: dict[tuple[str, str], set[str]] = {}
     with open(path) as f:

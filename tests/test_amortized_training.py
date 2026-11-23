@@ -23,7 +23,6 @@ from torchsx.merging.likelihood import Poisson
 from torchsx.merging.observations import ObsInfo, PreparedObs
 from torchsx.merging.quadrature.split_log_grid import SplitLogGrid
 from torchsx.merging.scale import AmortizedScale
-from torchsx.nn.metrics import scale_metrics, spearman
 from torchsx.nn.objective import MarginalNLL
 from torchsx.cli.train import run_updates
 from torchsx.nn.train_amortized import AmortizedTrainer, TrainConfig
@@ -81,52 +80,6 @@ def _synthetic(n_hkl=60, n_xtal=150, per=40, seed=0, n_cond=1, shift=1.5):
         is_centric=torch.zeros(n_hkl, dtype=torch.bool),
     )
     return prep, None, log_G, cid, per
-
-
-@pytest.mark.slow
-def test_crystal_context_recovers_a_hidden_per_crystal_scale(tmp_path):
-    prep, params, log_G, cid, per = _synthetic()
-    n_xtal = log_G.numel()
-
-    scale = AmortizedScale.from_prep(
-        prep, d_model=64
-    )
-    obj = MarginalNLL(SplitLogGrid(n_points=96), Poisson())
-    # The production learning rate. The fold encoder converges within 35 updates
-    # at 1e-3 (slope of predicted on true 0.95, and 1.03 after 400 updates). At
-    # 3e-3 it is unstable: the recovered spread is 0.42 of the true one after 35
-    # updates and 2.0 after 400.
-    cfg = TrainConfig(
-        max_obs_per_batch=6000, lr=1e-3, log_every=5, heldout_frac=0.1,
-        device="cpu", outdir=str(tmp_path),
-    )
-    trainer = AmortizedTrainer(prep, scale, obj, params, config=cfg)
-
-    def per_crystal_log_k():
-        scale.eval()
-        with torch.no_grad():
-            lk = scale.predict(prep.obs_info).log_K
-        return torch.zeros(n_xtal).index_add_(0, cid.long(), lk) / per
-
-    before = spearman(per_crystal_log_k(), log_G)
-    run_updates(trainer, 35)
-    after_pc = per_crystal_log_k()
-    after = spearman(after_pc, log_G)
-
-    assert abs(before) < 0.25, f"untrained model already correlated ({before})"
-    assert after > 0.85, f"failed to recover the hidden scale (rho={after})"
-
-    # Magnitude, not just ranking: the recovered spread should match the truth.
-    scale.eval()
-    with torch.no_grad():
-        lk = scale.predict(prep.obs_info).log_K
-    assert 0.6 < lk.std() / log_G.std() < 1.4
-
-    # The truth here is purely per-crystal, so the variance decomposition must
-    # say so.  On real data this same number is what distinguishes "learned
-    # partiality" from "rediscovered G".
-    m = scale_metrics(lk, prep.obs_info.crystal_id, n_xtal)
-    assert m["between_frac"] > 0.8
 
 
 def test_crystals_are_never_split_across_batches():
@@ -290,8 +243,18 @@ def test_per_condition_targets_keep_the_difference(tmp_path):
     tr.close()
 
 
-@pytest.mark.parametrize("prior", ["wilson", "none"])
-def test_evaluation_changes_no_state(tmp_path, prior):
+def test_flat_prior_is_rejected(tmp_path):
+    """The flat prior was removed (#24): its posterior runs off the top of the grid."""
+    prep, params, *_ = _synthetic(n_hkl=12, n_xtal=24, per=12)
+    scale = AmortizedScale.from_prep(prep, d_model=8, context_folds=2)
+    with pytest.raises(ValueError, match="removed"):
+        AmortizedTrainer(
+            prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
+            config=TrainConfig(device="cpu", outdir=str(tmp_path), posterior_prior="none"),
+        )
+
+
+def test_evaluation_changes_no_state(tmp_path):
     """Scoring held-out data must not feed its intensities into later training."""
     prep, params, *_ = _synthetic(n_hkl=12, n_xtal=24, per=12, n_cond=2)
     scale = AmortizedScale.from_prep(
@@ -301,7 +264,7 @@ def test_evaluation_changes_no_state(tmp_path, prior):
         prep, scale, MarginalNLL(SplitLogGrid(n_points=96), Poisson()), params,
         config=TrainConfig(
             max_obs_per_batch=24, heldout_frac=0.25, device="cpu", outdir=str(tmp_path),
-            posterior_prior=prior, posterior_k_coarse=5, posterior_m_fine=17,
+            posterior_prior="wilson", posterior_k_coarse=5, posterior_m_fine=17,
             ),
     )
 

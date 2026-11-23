@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The `wls` product reports the sum-of-spots tether only with `--tether-report`, like the posterior product.
 - Training and merging read their batches into a few host buffers that the store reuses (`torchsx.merging.store.RecordBuffers`). A buffer returns to the store when the last tensor on it is released, in the thread that releases it. Before, a read-ahead thread allocated each batch buffer and the consumer released it; the mimalloc allocator inside torch (2.13 on aarch64) kept such a buffer resident, so host memory grew by one batch per update (1.5 GB per update at 28 million observations per batch). On hosts with `zone_reclaim_mode` set, an update then took minutes instead of seconds once the NUMA node of the process was full. The merged values do not change.
 - The `wls` merge takes the pooled merge, `sum(n - bg) / sum(K)`, for a reflection with more than half of its observations at the scatter limit of the network (a log-scatter variance of 20). The weights of such a reflection gave the plain mean of `(n - bg) / K` with an error far above the counting error, and French-Wilson returned the prior mean of the shell. The log counts these reflections and `merged.metrics.json` records `wls_pooled`.
 - `--detector-noise resolution` fits the detector variance terms per resolution bin (ten bins of equal reflection count) instead of per panel; `--noise-terms B` makes it a scale of the counting variance that changes with resolution. The merge inherits the bins from the checkpoint.
@@ -22,6 +23,19 @@
 - The merge report lists the multiplicity of the reflections whose posterior reaches the top grid edge.
 - `torchsx.merge-stats` reports the cross-correlation with a reference dataset per shell, against the value expected from the two CC1/2.
 - probixi databases with the `.db` suffix are accepted.
+
+## v0.2.4
+
+- `--prior none` is removed (#24). Runs with the default Wilson prior are unaffected. The flat prior was never a usable option: its posterior has no upper bound, so for weak reflections it could run off the top of the integration grid, with F at the grid ceiling and a standard deviation near zero. `--prior` accepts only `wilson` and stays for existing scripts. `torchsx.merge` refuses a checkpoint trained with `--prior none`.
+- TorchRef 0.8 (`>=0.8.1,<0.9`). torchsx's use of it is unchanged: 0.8 drops the `verbose` arguments of its readers and of `ReflectionData`, which torchsx never passed, and reports through `logging` instead of `print` and `warnings`. The one visible difference is that writing the merged MTZ no longer prints TorchRef's "✓ Wrote … MTZ" summary; torchsx's own summary stays.
+- A state can come from several streams: `--split` names repeat, a `--split` path may be a glob pattern, and several unnamed streams are one data set.
+- `--split-file` labels the frames of any number of streams, and an event of `*` names every frame of a file.
+- Patterns a split file assigns to no state no longer stop the run: by default they train the network, with their share of the updates, and are merged into nothing; `--unassigned drop` or `error` chooses otherwise.
+- The prepared store carries no states; they are assigned when it is opened. Other state names, another split file or another `--unassigned` reuse the store, so `torchsx.merge` can merge a run's data into new states without preparing it again. Prepared caches of earlier versions are rebuilt.
+- A frame in several states is stored once and is a member of each, instead of being prepared once per state.
+- The merge's report of the sum-of-spots tether is opt-in (`--tether-report`, off by default). It fits all of a state's observations at once, at about 100 bytes of device memory each, and set the GPU peak of large merges; the merged intensities never depended on it.
+- The compile dry run of the fold encoder holds one pass at a time, and an evaluation on flex attention dry-runs only the checkpointed pass it uses. Before, the dry run of the first evaluation held a plain pass with its autograd graph while it ran the checkpointed one, and set the device memory peak of training.
+- `SFXStream.completeness()` and `.multiplicity()` work again: they imported a TorchRef module that does not exist and failed on every call. Both now count unique reflections in the stream's space group with Friedel mates merged, whether or not the stream was symmetrized; completeness leaves out systematic absences, and the shells are equal in `1/d^3` over the observed resolution range in the median cell.
 
 ## v0.2.3
 

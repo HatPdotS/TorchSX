@@ -67,6 +67,16 @@ def test_attach_heldout_stream_folds_the_split_into_the_first():
     with pytest.raises(ValueError):
         attach_heldout_stream(bundle)
 
+    # with a membership table: the crystals join the first state, their own goes
+    member = torch.nn.functional.one_hot(lab, 3).bool()
+    member[1, 1] = True                               # a crystal of two states
+    oi = SimpleNamespace(delay_bin_idx=lab.clone(), unique_timepoints=None, membership=member)
+    bundle = SimpleNamespace(prep=SimpleNamespace(obs_info=oi), split_names=["dark", "light", "heldout"])
+    assert attach_heldout_stream(bundle).tolist() == [4, 5, 6]
+    assert bundle.split_names == ["dark", "light"]
+    assert oi.membership.tolist() == [[True, False], [True, True], [False, True], [False, True]] + [[True, False]] * 3
+    assert oi.delay_bin_idx.tolist() == [0, 0, 1, 1, 0, 0, 0] and oi.unique_timepoints.numel() == 2
+
 
 def test_width_flags_reach_the_encoder():
     from torchsx.cli import train

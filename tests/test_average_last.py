@@ -115,8 +115,8 @@ def test_without_averaging_the_latest_update_stays(tmp_path):
 def _recorded_run(tr, oscillating, steps=6):
     after, step = [], tr.step
 
-    def recorded(rows):
-        rec = step(rows)
+    def recorded(rows, **kwargs):
+        rec = step(rows, **kwargs)
         after.append(_params(tr))
         return rec
 

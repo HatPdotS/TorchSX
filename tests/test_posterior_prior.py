@@ -1,4 +1,4 @@
-"""Prior selection preserves the dI measure, evidence gradients and all moments."""
+"""Prior selection preserves the measure, evidence gradients and all moments."""
 import math
 
 import pytest
@@ -8,7 +8,7 @@ from torchsx.nn.posterior_target import PosteriorMergeTarget
 from torchsx.nn.train_amortized import TrainConfig
 
 
-@pytest.mark.parametrize('prior', ['none', 'wilson'])
+@pytest.mark.parametrize('prior', ['flat_log', 'wilson'])
 @pytest.mark.parametrize('centric', [False, True])
 def test_integrated_poisson_curve_matches_analytic_gamma(prior, centric):
     # L(I) = I**6 exp(-rate*I): a group of Poisson observations, omitting
@@ -23,7 +23,8 @@ def test_integrated_poisson_curve_matches_analytic_gamma(prior, centric):
     rate = torch.tensor(1.5, dtype=torch.float64, requires_grad=True)
     log_likelihood = 6 * nodes - rate * nodes.exp()
     log_z, mean_i, sd_i, weights, v, edge = target.integrate(log_likelihood)
-    shape, effective_rate, log_constant = 7., 1.5, 0.
+    # flat_log integrates d log I: the likelihood alone, a gamma of shape 6.
+    shape, effective_rate, log_constant = 6., 1.5, 0.
     if prior == 'wilson':
         shape = 6.5 if centric else 7.
         effective_rate += (0.5 if centric else 1.) / 4.
@@ -42,16 +43,9 @@ def test_integrated_poisson_curve_matches_analytic_gamma(prior, centric):
     assert edge.item() < 1e-8
 
 
-def test_none_is_not_flat_in_log_intensity():
-    targets = [PosteriorMergeTarget(torch.ones(1), prior=p, k_coarse=101,
-                                   m_fine=101, n_sigma=2).double()
-               for p in ['none', 'flat_log']]
-    means = []
-    for t in targets:
-        t._loc = (torch.zeros(1, dtype=torch.float64), torch.ones(1, dtype=torch.float64))
-        means.append(t.integrate(torch.zeros(1, t.k_coarse, dtype=torch.float64))[1].item())
-    # On finite [exp(-2), exp(2)], constant likelihood under dI is uniform I.
-    assert means[0] == pytest.approx((math.exp(2) + math.exp(-2)) / 2, rel=5e-4)
-    assert means[0] > means[1] * 1.5
+def test_flat_prior_was_removed():
+    # The flat-in-I0 prior's posterior runs off the top of the finite grid (#24).
+    with pytest.raises(ValueError, match="'none'"):
+        PosteriorMergeTarget(torch.ones(1), prior='none')
     assert TrainConfig().posterior_prior == 'wilson'
 
