@@ -96,7 +96,7 @@ model is one log scale plus six anisotropic terms on hkl/max|hkl|. It is fitted 
 | Column | Definition |
 | --- | --- |
 | `cc_half` | CC<sub>1/2</sub>: Pearson CC of I_A and I_B |
-| `cc_half_flat` | flat CC<sub>1/2</sub>: Pearson CC of the two halves, each standardised against its running mean and spread (below) |
+| `cc_half_flat` | flat CC<sub>1/2</sub>: Pearson CC of the two halves, each standardised against its local trend and spread (below) |
 | `r_split` | R<sub>split</sub> = √2 Σ\|I_A − I_B\| / Σ\|I_A + I_B\|; the magnitude of each pair, so negative measured intensities do not cancel positive ones |
 
 The headline adds them for the highest-resolution shell (`cc_half_outer`,
@@ -107,22 +107,30 @@ expected intensity at that resolution and direction. Both halves share the prior
 CC1/2 there measures how well they agree on it, and it turns back up at the weak end.
 The flat CC1/2 takes every smooth trend out first:
 
-1. Each reflection's neighbours are the 32 reflections nearest to it in direction,
-   within its fine resolution shell. The fine shells are equal-count: 80 of them, or
-   fewer so that each holds at least 64 reflections.
-2. Directions cover the full sphere, with every point-group copy and Friedel mate of each
-   reflection. A neighbour counts once for each of its copies among the nearest, and a
-   reflection's own copies are never its neighbours.
-3. In each half, the neighbours' intensities give a running mean m and standard
-   deviation s, and the reflection enters as z = (I − m) / s. Both halves use the
-   same neighbours, each with its own intensities.
+1. Each reflection's neighbours are the 32 reflections nearest to it in reciprocal
+   space, or all the others where the merge holds fewer.
+2. The points are every point-group copy and Friedel mate of each reflection. A
+   neighbour counts once for each of its copies among the nearest, and a reflection's
+   own copies are never its neighbours.
+3. In each half, a plane is fitted through the neighbours' intensities over their
+   positions. Its value at the reflection is the local trend m, the neighbours' spread
+   about it is s, and the reflection enters as z = (I − m) / s. Both halves use the same
+   neighbours, each with its own intensities.
 
-The running mean follows any smooth trend the halves share: falloff, anisotropy, or a
-prior of whatever form a merging program uses. Standardising weights every region of
-reciprocal space equally and takes negative intensities as they are, so the overall
-flat CC1/2 is close to the mean over shells. Where the data are strong the flat CC1/2
-lies a little below CC1/2, because the local trend of the signal itself is taken out
-too.
+The plane follows any smooth trend the halves share: falloff, anisotropy, or a
+prior of whatever form a merging program uses. A plane gives its value at the reflection
+whether the neighbours lie all round it or to one side, so the reflections at the
+resolution limits and next to missing ones are treated like the rest. Standardising
+weights every region of reciprocal space equally and takes negative intensities as
+they are, so the overall flat CC1/2 is close to the mean over shells. Where the data
+are strong the flat CC1/2 lies a little below CC1/2, because the local trend of the
+signal itself is taken out too.
+
+A step between neighbouring reflections is not a smooth trend and stays in. Where a
+merge returns prior amplitudes and the intensities are their squares, centric and
+acentric reflections differ by about a fifth, and the flat CC1/2 of halves that agree
+to a few percent stays above zero.
+
 R_split has this one definition throughout torchsx: the training log, the
 `STEM.metrics.json` of an export and this command.
 

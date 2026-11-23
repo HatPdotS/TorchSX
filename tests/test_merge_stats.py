@@ -11,7 +11,7 @@ from torchref.symmetry import SpaceGroup
 
 from torchsx.cli.merge_stats import discover, main
 from torchsx.merge_stats import (LOCAL_NEIGHBOURS, d_spacing, design, difference_stats, halves_stats, load_merge,
-                                 local_neighbours, merge_from_arrays, possible_reflections, resolution_shells,
+                                 local_neighbours, local_standardise, merge_from_arrays, possible_reflections,
                                  split_half_stats, summary_stats)
 
 CELL = (40.0, 50.0, 60.0, 90.0, 90.0, 90.0)
@@ -113,15 +113,37 @@ def wilson(rng, hkl):
     return Sigma, centric, Sigma * np.where(centric, rng.standard_normal(len(hkl))**2, rng.exponential(1.0, len(hkl)))
 
 
-def test_local_neighbours_share_the_fine_shell_and_leave_out_the_reflection():
+def test_local_neighbours_are_the_nearest_copies_and_leave_out_the_reflection():
     hkl = asu()
     m = merge(hkl, np.ones(len(hkl)), np.ones(len(hkl)))
-    near = local_neighbours(m)
-    assert near.shape == (len(m), LOCAL_NEIGHBOURS) and not (near == np.arange(len(m))[:, None]).any()
-    fine = np.empty(len(m), int)
-    for j, ix in enumerate(resolution_shells(m.d, min(80, len(m) // (2 * LOCAL_NEIGHBOURS)))):
-        fine[ix] = j
-    assert (fine[near] == fine[:, None]).all()
+    rows, offsets = local_neighbours(m)
+    assert rows.shape == (len(m), LOCAL_NEIGHBOURS) and not (rows == np.arange(len(m))[:, None]).any()
+    s = m.hkl / np.array(CELL[:3])
+    assert np.linalg.norm(s[:, None] + offsets, axis=2) == pytest.approx(1 / m.d[rows])
+    signs = np.array(np.meshgrid(*3 * [(1, -1)])).reshape(3, -1).T                   # the copies in mmm
+    for i in (0, len(m) // 2, int(np.argmin(m.d))):
+        copies = (s[np.arange(len(m)) != i][:, None] * signs).reshape(-1, 3)
+        nearest = np.sort(np.linalg.norm(np.unique(copies, axis=0) - s[i], axis=1))[:LOCAL_NEIGHBOURS]
+        assert np.sort(np.linalg.norm(offsets[i], axis=1)) == pytest.approx(nearest)
+
+
+def test_local_standardise_takes_a_plane_out_from_one_side():
+    """Values on a plane plus noise, the neighbours of the first half all on one side: both columns come back as
+    the standardised noise, whatever the plane and the scale."""
+    rng = np.random.default_rng(3)
+    x = rng.standard_normal((2000, 3))
+    x = x[np.argsort(x[:, 0])]
+    rows = np.array([rng.choice(np.arange(i + 1, 2000) if i < 1000 else np.delete(np.arange(2000), i), LOCAL_NEIGHBOURS,
+                                replace=False) for i in range(2000)])
+    offsets = x[rows] - x[:, None]
+    assert (offsets[:1000, :, 0] >= 0).all()
+    noise, plane = rng.standard_normal(2000), x @ np.array([40.0, -20.0, 70.0]) + 5
+    z = local_standardise(np.stack([noise, plane + noise, 3 * noise - plane], axis=1), rows, offsets)
+    assert z[:, 1] == pytest.approx(z[:, 0]) and z[:, 2] == pytest.approx(z[:, 0])
+    assert np.corrcoef(z[:, 0], noise)[0, 1] > 0.9
+    for half in (slice(0, 1000), slice(1000, 2000)):
+        assert abs(z[half, 0].mean()) < 0.1 and z[half, 0].std() == pytest.approx(1.1, abs=0.15)
+    assert np.isnan(local_standardise(plane[:, None], rows[:, :4], offsets[:, :4])).all()
 
 
 def test_flat_cc_half_removes_a_shared_prior():
@@ -134,6 +156,22 @@ def test_flat_cc_half_removes_a_shared_prior():
     noise = lambda: 1 + 0.2 * rng.standard_normal(len(hkl))                    # noqa: E731
     res = split_half_stats(merge(hkl, F * noise(), 0.2 * F), merge(hkl, 1.3 * F * noise(), 0.26 * F))
     assert all(s['cc_half'] > 0.5 for s in res['shells'][-5:])
+    assert all(abs(s['cc_half_flat']) < 0.15 for s in res['shells'])
+
+
+@pytest.mark.parametrize('missing', [0.0, 0.15])
+def test_flat_cc_half_removes_a_precise_prior_up_to_the_resolution_limits(missing):
+    """Halves that return the prior's mean intensity with independent 4 % errors, complete and with reflections
+    missing at random: CC1/2 is above 0.9 in every shell, the flat CC1/2 close to zero, the lowest and the
+    highest shell included."""
+    rng = np.random.default_rng(11)
+    hkl = asu()
+    hkl = hkl[rng.random(len(hkl)) >= missing]
+    Sigma, one = wilson(rng, hkl)[0], np.ones(len(hkl))
+    A, B = (merge(hkl, one, one, I=g * Sigma * (1 + 0.04 * rng.standard_normal(len(hkl))), SIGI=0.04 * g * Sigma)
+            for g in (1.0, 1.7))
+    res = split_half_stats(A, B)
+    assert all(s['cc_half'] > 0.9 for s in res['shells'])
     assert all(abs(s['cc_half_flat']) < 0.15 for s in res['shells'])
 
 
