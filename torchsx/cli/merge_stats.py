@@ -291,7 +291,12 @@ def main(argv=None):
         if d is ref or d.merge is None or ref.merge is None or (d.discovered and ref.discovered):
             continue
         pair = lambda x: None if x.halves is None else tuple(merges[f] for f in x.halves)  # noqa: E731
-        res = cross_stats(merges[d.merge], merges[ref.merge], pair(d), pair(ref), n_shells=args.shells)
+        try:
+            res = cross_stats(merges[d.merge], merges[ref.merge], pair(d), pair(ref), n_shells=args.shells)
+        except (ValueError, np.linalg.LinAlgError) as e:
+            # merges of different crystals share no reflections; their summaries still stand
+            print(f'{p.prog}: skipping cross-correlation {d.name} vs {reference}: {e}', file=sys.stderr)
+            continue
         results['cross'].append({'name': d.name, 'reference': reference,
                                  'files': [str(f) for f in d.files + ref.files], **res})
     for d in datasets:

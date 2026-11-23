@@ -530,3 +530,23 @@ def test_cli_cross_against_a_reference_with_merge_and_halves(tmp_path, capsys):
                                  'cc_half_residual_other'} <= set(shells[0])
     assert (out / 'cross.png').is_file()
     assert len(json.loads((out / 'stats.json').read_text())['cross']) == 1
+
+
+def test_cli_skips_a_cross_correlation_without_common_reflections(tmp_path, capsys):
+    """Two merges that share no reflection still get their summaries."""
+    rng = np.random.default_rng(15)
+    hkl = asu(2.0)
+    files = {}
+    for name, part in (('a', hkl[0::2]), ('b', hkl[1::2])):
+        F = 50.0 + 10.0 * rng.standard_normal(len(part))
+        files[name] = tmp_path / f'{name}.mtz'
+        write_mtz(files[name], part, {'F-obs': np.abs(F), 'SIGF-obs': np.full(len(part), 2.0)})
+    out = tmp_path / 'stats'
+    main([str(files['a']), '--name', 'a', '--dataset', 'b', str(files['b']), '--format', 'tsv', 'json',
+          '-o', str(out)])
+    assert 'skipping cross-correlation b vs a' in capsys.readouterr().err
+    summary = rows(out / 'summary.tsv')
+    assert sorted(r['name'] for r in summary if r['kind'] == 'summary') == ['a', 'b']
+    assert not [r for r in summary if r['kind'] == 'cross']
+    assert json.loads((out / 'stats.json').read_text())['cross'] == []
+
