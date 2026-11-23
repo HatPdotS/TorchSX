@@ -11,7 +11,7 @@ common to the merges involved, after scaling, in equal-count resolution shells:
   scaled onto half A (one log scale plus six anisotropic terms on normalised
   hkl, sigma-weighted robust least squares on amplitudes), then CC1/2 and
   R_split of the intensities, and CC1/2 with each half standardised against
-  its running mean and spread over neighbouring reflections.
+  its local trend and spread over neighbouring reflections.
 * ``halves_stats``: the same halves, scaled the same way, with CC and R on
   intensities and amplitudes, the sigma-normalised difference and the
   noise-to-signal ratio ``ln N/S``.
@@ -433,45 +433,60 @@ def _intensities(A: Merge, B: Merge, g):
 
 
 LOCAL_NEIGHBOURS = 32
-LOCAL_SHELLS = 80
+LOCAL_CHUNK = 50_000
 
 
-def local_neighbours(m: Merge, k=LOCAL_NEIGHBOURS, n_shells=LOCAL_SHELLS):
-    """Row indices ``(len(m), k)``: per reflection, the ``k`` nearest in direction
-    within its fine resolution shell.
+def local_neighbours(m: Merge, k=LOCAL_NEIGHBOURS):
+    """Per reflection, the ``k`` nearest reflections in reciprocal space: their
+    rows ``(len(m), k)`` and their scattering vectors less the reflection's own,
+    ``(len(m), k, 3)`` in 1/A.
 
-    Directions cover the full sphere, every point-group copy and Friedel mate of
-    each reflection, so a neighbour counts once per copy among the nearest; the
-    reflection's own copies are left out. The fine shells are equal-count,
-    ``n_shells`` of them or fewer so that each holds at least ``2 k`` reflections.
+    The points are every point-group copy and Friedel mate of each reflection,
+    so a neighbour counts once per copy among the nearest; the reflection's own
+    copies are left out.
     """
     import torch
     from scipy.spatial import cKDTree
     from torchref.base.reciprocal.basis import get_scattering_vectors
+    cell = torch.as_tensor(np.asarray(m.cell, dtype=np.float64))
     hkl, orig = _spacegroup(m.spacegroup).expand_hkl(_tensor(m.hkl), include_friedel=True, remove_absences=False)[:2]
-    s = get_scattering_vectors(hkl, torch.as_tensor(np.asarray(m.cell, dtype=np.float64))).cpu().numpy()
-    u, orig = s / np.linalg.norm(s, axis=1, keepdims=True), orig.cpu().numpy().astype(np.int64)
+    own, s = (get_scattering_vectors(h, cell).cpu().numpy() for h in (_tensor(m.hkl), hkl))
+    orig = orig.cpu().numpy().astype(np.int64)
     k = max(1, min(k, len(m) - 1))
-    shells = resolution_shells(m.d, max(1, min(n_shells, len(m) // (2 * k))))
-    fine = np.empty(len(m), np.int64)
-    for j, ix in enumerate(shells):
-        fine[ix] = j
-    out = np.empty((len(m), k), np.int64)
-    for j in range(len(shells)):
-        rows = np.flatnonzero(fine[orig] == j)
-        members, first, copies = np.unique(orig[rows], return_index=True, return_counts=True)
-        _, nearest = cKDTree(u[rows]).query(u[rows[first]], k=min(k + copies.max(), len(rows)))
-        nearest = orig[rows][nearest]
-        other = nearest != members[:, None]
-        out[members] = np.take_along_axis(nearest, np.argsort(~other, axis=1, kind='stable'), 1)[:, :k]
+    n_query = min(k + np.bincount(orig).max(), len(s))
+    tree = cKDTree(s)
+    rows, offsets = np.empty((len(m), k), np.int64), np.empty((len(m), k, 3))
+    for lo in range(0, len(m), LOCAL_CHUNK):
+        part = np.arange(lo, min(lo + LOCAL_CHUNK, len(m)))
+        near = tree.query(own[part], k=n_query)[1]
+        near = np.take_along_axis(near, np.argsort(orig[near] == part[:, None], axis=1, kind='stable')[:, :k], 1)
+        rows[part], offsets[part] = orig[near], s[near] - own[part, None]
+    return rows, offsets
+
+
+def local_standardise(v, rows, offsets):
+    """``(v - fit) / sd`` of each column of ``v``, per reflection: a plane is
+    fitted through its neighbours' values over their offsets; ``fit`` is the
+    plane at the reflection, ``sd`` the neighbours' spread about the plane. NaN
+    where the plane passes through every neighbour, as it does through four or
+    fewer.
+
+    A plane takes its value at the reflection from neighbours on one side as
+    well as from neighbours all round, so the reflections at the resolution
+    limits and next to missing ones are standardised like the rest.
+    """
+    k, scale = rows.shape[1], np.abs(offsets).max()
+    out = np.full(v.shape, np.nan)
+    if k <= 4:
+        return out
+    for lo in range(0, len(v), LOCAL_CHUNK):
+        part = slice(lo, lo + LOCAL_CHUNK)
+        X = np.concatenate([np.ones((len(rows[part]), k, 1)), offsets[part] / scale], axis=2)
+        y = v[rows[part]]
+        plane = np.linalg.pinv(X) @ y
+        sd = np.sqrt(((y - X @ plane) ** 2).sum(1) / (k - 4))
+        np.divide(v[part] - plane[:, 0], sd, out=out[part], where=sd > 0)
     return out
-
-
-def local_standardise(v, neighbours):
-    """``(v - mean) / sd`` of each row against its neighbours' values; NaN where they are all equal."""
-    near = v[neighbours]
-    mean, sd = near.mean(1), near.std(1)
-    return np.where(sd > 0, (v - mean) / np.where(sd > 0, sd, 1.0), np.nan)
 
 
 def split_half_stats(a: Merge, b: Merge, n_shells=20) -> dict:
@@ -482,12 +497,12 @@ def split_half_stats(a: Merge, b: Merge, n_shells=20) -> dict:
     sum|I_A + I_B|; intensities are the measured ones when both halves carry
     them, else F^2.
 
-    ``cc_half_flat`` standardises each half against its own running mean and
-    spread first: per reflection, ``(I - mean) / sd`` over its
-    ``LOCAL_NEIGHBOURS`` nearest reflections in direction within a fine
-    resolution shell (``local_neighbours``). A Bayesian merge returns its prior
-    where the data say nothing; both halves share it, so CC1/2 turns back up
-    at the weak end, while the flat CC1/2 falls to zero. The running mean
+    ``cc_half_flat`` standardises each half against its own local trend and
+    spread first: per reflection, ``(I - fit) / sd`` of a plane fitted through
+    its ``LOCAL_NEIGHBOURS`` nearest reflections in reciprocal space
+    (``local_neighbours``, ``local_standardise``). A Bayesian merge returns its
+    prior where the data say nothing; both halves share it, so CC1/2 turns
+    back up at the weak end, while the flat CC1/2 falls to zero. The plane
     follows any smooth trend the halves share, falloff, anisotropy or a prior
     of any form; standardising weights every region of reciprocal space
     equally, so the overall flat CC1/2 is close to the mean over shells, and
@@ -496,8 +511,7 @@ def split_half_stats(a: Merge, b: Merge, n_shells=20) -> dict:
     """
     a, b, A, B, g, c = _common_scaled(a, b)
     IA, IB, intensities = _intensities(A, B, g)
-    near = local_neighbours(A)
-    EA, EB = local_standardise(IA, near), local_standardise(IB, near)
+    EA, EB = local_standardise(np.stack([IA, IB], axis=1), *local_neighbours(A)).T
 
     def stats(ix):
         return {'n': len(ix), 'cc_half': pearson(IA[ix], IB[ix]), 'cc_half_flat': pearson(EA[ix], EB[ix]),
@@ -780,7 +794,7 @@ def render(results, folder):
         _wilson_panel(summaries, folder)
         written.append('summary.png')
     if halves:
-        _panels(halves, (('cc_half', 'CC1/2'), ('cc_half_flat', 'flat CC1/2 (running mean and spread taken out)'),
+        _panels(halves, (('cc_half', 'CC1/2'), ('cc_half_flat', 'flat CC1/2 (local trend and spread taken out)'),
                          ('r_split', 'R_split')),
                 'halves.png', folder, 'independent halves (B scaled onto A)', refs={'cc_half_flat': 0.0})
         written.append('halves.png')

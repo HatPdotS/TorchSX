@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The flat CC1/2 of `torchsx.merge-stats` takes each reflection's local trend from a plane fitted through its 32 nearest reflections in reciprocal space, instead of the mean of its 32 nearest in direction within a fine resolution shell. Values change. Halves that share a prior and agree to a few percent now read close to zero in every shell, the lowest and the highest included, and with reflections missing; before, they read 0.3 to 0.7. Where the halves carry signal the values move by a few hundredths.
+
 ## v0.2.4
 
 - `--prior none` is removed (#24). Runs with the default Wilson prior are unaffected. The flat prior was never a usable option: its posterior has no upper bound, so for weak reflections it could run off the top of the integration grid, with F at the grid ceiling and a standard deviation near zero. `--prior` accepts only `wilson` and stays for existing scripts. `torchsx.merge` refuses a checkpoint trained with `--prior none`.
