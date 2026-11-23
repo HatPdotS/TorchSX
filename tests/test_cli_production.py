@@ -421,7 +421,8 @@ def test_top_edge_reports_the_multiplicity_of_edge_piled_reflections():
 
 def test_estimator_selects_the_product(tmp_path, monkeypatch, capsys):
     """wls by default: French-Wilson amplitudes of the inverse-variance merge and its
-    halves. posterior: the posterior amplitudes, with pooled halves and both half statistics."""
+    halves. posterior: the posterior amplitudes, with posterior halves. Both record the plain
+    and the flat CC1/2 of the half files."""
     import gemmi
     prep, params, *_ = _synthetic(n_hkl=20, n_xtal=24, per=10, n_cond=1)
     _, _, trainer = _stack(prep, params, tmp_path)
@@ -437,13 +438,20 @@ def test_estimator_selects_the_product(tmp_path, monkeypatch, capsys):
     merge_nn.main(base + ['-o', str(tmp_path / 'w.mtz'), '--also', 'wls'])
     merge_nn.main(base + ['-o', str(tmp_path / 'p.mtz'), '--estimator', 'posterior'])
     out = capsys.readouterr().out
-    assert 'half-datasets  wls, no prior' in out and 'posterior, halves share the prior' in out
+    assert 'half-datasets  wls' in out and 'half-datasets  posterior' in out
+    assert out.count('flat CC1/2') == 2
     w = json.loads((tmp_path / 'w.metrics.json').read_text())['']
     p = json.loads((tmp_path / 'p.metrics.json').read_text())['']
     assert (w['estimator'], w['products']) == ('wls', ['wls'])
     assert 'split_half_wls' in w and 'split_half_pooled' not in w and 'sigF_collapsed' not in w
     assert (p['estimator'], p['products']) == ('posterior', ['posterior'])
-    assert {'split_half_pooled', 'split_half_posterior_shared_prior', 'sigF_collapsed'} <= set(p)
+    assert {'split_half_posterior', 'sigF_collapsed'} <= set(p) and 'split_half_pooled' not in p
+    from torchsx.merge_stats import load_merge, split_half_stats
+    for stem, rec in (('w', w), ('p', p)):
+        files = rec['split_half_files']
+        direct = split_half_stats(load_merge(tmp_path / f'{stem}_half1.mtz'), load_merge(tmp_path / f'{stem}_half2.mtz'))
+        assert files['cc_half_flat'] == pytest.approx(direct['headline']['cc_half_flat'], nan_ok=True)
+        assert len(files['by_shell']) == len(direct['shells'])
     for stem in ('w', 'w_half1', 'w_half2', 'p', 'p_half1', 'p_half2'):
         mtz = gemmi.read_mtz_file(str(tmp_path / f'{stem}.mtz'))
         F = np.asarray(mtz.column_with_label('F-obs'))

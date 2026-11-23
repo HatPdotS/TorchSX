@@ -190,6 +190,37 @@ def test_wls_takes_the_pooled_merge_at_the_scatter_limit(tmp_path):
     assert not torch.allclose(res["I"][wide & ~falls], pooled["I"][wide & ~falls])
 
 
+def test_wls_keeps_a_reflection_measured_once(tmp_path):
+    """One crystal measures each of its reflections once, and the merge writes them with a sigma."""
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, _obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    res = tr.merge(estimator="wls", crystals=torch.tensor([0]))
+    once = res["n_meas"] == 1
+    assert once.any() and torch.equal(res["seen"], res["n_meas"] >= 1)
+    assert torch.isfinite(res["I"][once]).all() and (res["I_sd"][once] > 0).all()
+
+
+def test_wls_weights_take_the_fitted_detector_noise(tmp_path):
+    """The model variance of the wls merge is A + B times the counting variance."""
+    import math
+    from torchsx.merging.likelihood.detector_noise import DetectorNoise
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    plain = tr.merge(estimator="wls")
+    obj.detector_noise = DetectorNoise(1)
+    with torch.no_grad():
+        obj.detector_noise.log_A.fill_(-30.0)
+    same = tr.merge(estimator="wls")
+    assert torch.allclose(same["I"], plain["I"]) and torch.allclose(same["I_sd"], plain["I_sd"])
+    with torch.no_grad():
+        obj.detector_noise.log_B.fill_(math.log(9.0))
+    noisy = tr.merge(estimator="wls")
+    assert (noisy["I_sd"] >= plain["I_sd"] * (1 - 1e-5)).all()
+    assert (noisy["I_sd"] > plain["I_sd"] * (1 + 1e-4)).any()
+
+
 def test_merge_refuses_to_pool_splits_and_honours_one(tmp_path):
     prep, params, *_ = _synthetic(n_hkl=30, n_xtal=24, per=20, n_cond=2)
     scale, _obj, tr = _stack(prep, params, tmp_path)

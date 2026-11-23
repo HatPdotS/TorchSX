@@ -86,10 +86,13 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 
 The merge is the `wls` estimator: for each reflection, the inverse-variance
 mean of `(n - bg) / K` over its observations, with the scales K and the
-per-observation variance from the trained network. It uses no prior. Its
+per-observation variance from the trained network. That variance is the
+counting variance, with the detector terms of `--detector-noise` where the
+checkpoint fitted them, plus the scatter the network predicts. A reflection
+measured once is merged with the sigma of its one observation. The
 intensities, which can be negative, become amplitudes by French-Wilson. The
-halves are the same estimator on each half of the crystals, and
-`merged.metrics.json` records their agreement as `split_half_wls`.
+merge rests on the trained scales, the error model and the French-Wilson
+prior.
 
 The network limits the scatter it predicts for an observation at a log-scatter
 variance of 20. A reflection with more than half of its observations at that
@@ -98,12 +101,18 @@ The log counts these reflections and `merged.metrics.json` records the count as
 `wls_pooled`.
 
 `--estimator posterior` writes the Wilson-posterior amplitudes of the shape
-likelihood instead. Two posterior halves share the Wilson prior, and where the
-data are weak their agreement measures the prior. The half files then hold the
-pooled merge, `sum(n - bg) / sum(K)`, and the log reports both
-`split_half_pooled` and `split_half_posterior_shared_prior`.
+likelihood instead.
 
-The halves share the network. For independent merges, train two runs on
+The half files hold the same estimator as `merged.mtz`, on each half of the
+crystals. `merged.metrics.json` records the agreement of the half intensities
+before any conversion to amplitudes as `split_half_wls` or
+`split_half_posterior`, and the statistics of the half files as
+`split_half_files`: CC<sub>1/2</sub> and the flat CC<sub>1/2</sub> of
+[`torchsx.merge-stats`](merge_stats.md), overall and per shell. The halves
+share the network and the form of the prior, French-Wilson fitted per half or
+Wilson. Where the data are weak a plain CC<sub>1/2</sub> then measures the
+prior. The flat CC<sub>1/2</sub> divides out the running mean and spread of
+each half and falls to zero there. For independent merges, train two runs on
 disjoint sets of patterns.
 
 `--also ESTIMATOR ...` merges all crystals with further estimators and writes
@@ -232,7 +241,8 @@ only the lattices with `enrich_p` at most alpha. `--enrich-alpha auto` takes the
 alpha the database records (`integration.bg_model_var_alpha`), else 1e-3, the
 default of probixi's own `--enrich-alpha`. `--enrich-alpha off` reads every
 lattice. The log prints the gate and the number of lattices it keeps, and the
-recipe records it.
+recipe records it. A lattice without `enrich_p` was not integrated by probixi
+and does not pass the gate. The log counts such lattices separately.
 
 With probixi's `--max-lattices` above one, a frame can hold several lattices.
 The second and later ones are indexed on the peaks the first left over. Under
@@ -286,6 +296,8 @@ against the Poisson law at the declared gain and records the ratio in
 `integration.bg_model_var_scale`. The declared gain times this ratio is the
 gain at which the photon counts carry Poisson noise, measured on the frames.
 `auto` uses it and makes no estimate of its own; `calibrate` still does.
+With several databases `auto` uses the ratio only where every input records
+the same one. Otherwise it says so in the log and estimates the gain.
 
 Both estimates divide the scatter of signal-free sums by the counting noise of
 the integration disk. A probixi database records the pixels of every disk, and

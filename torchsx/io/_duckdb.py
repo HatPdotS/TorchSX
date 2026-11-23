@@ -266,13 +266,13 @@ def _enrichment_gate(conn, enrich_alpha="auto") -> dict:
 
     Returns ``predicate`` (SQL on ``crystals``, or None), ``alpha``,
     ``alpha_extra`` (the bound on further lattices of a frame, or None),
-    ``origin`` and the crystal counts ``n_total`` and ``n_kept`` before any
-    other filter.
+    ``origin`` and the crystal counts ``n_total``, ``n_kept`` and ``n_unscored``
+    (lattices without ``enrich_p``, which no gate keeps) before any other filter.
     """
     alpha = parse_enrich_alpha(enrich_alpha)
     tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
     gate = {"predicate": None, "alpha": None, "alpha_extra": None, "origin": "off",
-            "n_total": None, "n_kept": None}
+            "n_total": None, "n_kept": None, "n_unscored": None}
     if "crystals" not in tables:
         gate["origin"] = "no crystals table"
         return gate
@@ -302,7 +302,9 @@ def _enrichment_gate(conn, enrich_alpha="auto") -> dict:
     if extra is not None:
         predicate += f" AND (coalesce(lattice_index, 0) = 0 OR enrich_p <= {extra!r})"
     n_kept = int(conn.execute(f"SELECT count(*) FROM crystals WHERE {predicate}").fetchone()[0])
-    gate.update(predicate=predicate, alpha=alpha, alpha_extra=extra, origin=origin, n_kept=n_kept)
+    n_unscored = int(conn.execute("SELECT count(*) FROM crystals WHERE enrich_p IS NULL").fetchone()[0])
+    gate.update(predicate=predicate, alpha=alpha, alpha_extra=extra, origin=origin, n_kept=n_kept,
+                n_unscored=n_unscored)
     return gate
 
 
@@ -327,7 +329,7 @@ def read_enrichment_gate(path: str | Path, enrich_alpha="auto") -> dict:
     -------
     dict
         ``predicate`` (SQL on ``crystals``, None without a gate), ``alpha``,
-        ``alpha_extra``, ``origin``, ``n_total`` and ``n_kept``.
+        ``alpha_extra``, ``origin``, ``n_total``, ``n_kept`` and ``n_unscored``.
     """
     path = Path(path)
     if not path.exists():

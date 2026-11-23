@@ -1129,7 +1129,7 @@ def test_enrichment_gate_drops_chance_lattices_by_default(db_path):
     gate = read_enrichment_gate(db_path)
     assert gate == {"predicate": GATE, "alpha": DEFAULT_ENRICH_ALPHA,
                     "alpha_extra": EXTRA_LATTICE_ENRICH_ALPHA,
-                    "origin": "torchsx default", "n_total": 3, "n_kept": 2}
+                    "origin": "torchsx default", "n_total": 3, "n_kept": 2, "n_unscored": 0}
     core = load_duckdb(db_path, clipped=True)
     assert (core.n_images, core.n_crystals, core.n_observations) == (2, 2, 5)
     stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
@@ -1183,6 +1183,37 @@ def test_enrichment_gate_needs_recorded_enrichment(db_path):
     gate = read_enrichment_gate(db_path)
     assert (gate["predicate"], gate["origin"], gate["n_kept"]) == (None, "no enrich_p recorded", 3)
     assert load_duckdb(db_path, clipped=True).n_crystals == 3
+
+
+def test_enrichment_gate_counts_the_lattices_without_a_score(db_path):
+    """A lattice probixi did not score fails the gate and is counted apart."""
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE crystals SET enrich_p = NULL WHERE lattice_index = 1")
+    gate = read_enrichment_gate(db_path)
+    assert (gate["n_total"], gate["n_kept"], gate["n_unscored"]) == (3, 2, 1)
+    assert load_duckdb(db_path, clipped=True).n_crystals == 2
+
+
+def test_inputs_with_different_noise_scales_leave_the_gain_to_the_estimate(db_path, capsys):
+    """One input's noise scale is never applied to another input."""
+    from dataclasses import replace
+    from torchsx.measurement import combine_measurements
+    from torchsx.merging.observations import source_noise_gain, source_var_scale
+
+    base = read_measurement(db_path)
+
+    def spec(*scales):
+        return combine_measurements(
+            replace(base, provenance=base.provenance + ((("bg_model_var_scale", s),) if s else ()))
+            for s in scales)
+
+    assert source_noise_gain(spec("0.8", "0.8"), 9000.0)[2] == 0.8
+    assert source_var_scale(spec("0.8", "0.8")) == 0.8
+    for mixed in (spec("0.8", "0.9"), spec("0.8", None)):
+        assert source_noise_gain(mixed, 9000.0) is None and source_var_scale(mixed) is None
+    assert capsys.readouterr().out.count("different noise scales") == 2
+    assert source_noise_gain(spec(None, None), 9000.0) is None
+    assert "noise scales" not in capsys.readouterr().out
 
 
 def test_parse_enrich_alpha():

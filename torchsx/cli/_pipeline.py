@@ -398,6 +398,8 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                 if g["predicate"]:
                     kept = (f" keeps {g['n_kept']:,} of {g['n_total']:,}"
                             if g["n_kept"] is not None else "")
+                    if g.get("n_unscored"):
+                        kept += f"; {g['n_unscored']:,} of the dropped have no enrich_p"
                     print(f"  crystals: enrichment gate {g['predicate']} [{g['origin']}]{kept}",
                           flush=True)
                 else:
@@ -647,7 +649,7 @@ def _memberships(args, splits, prep, *, unassigned: str = "train", verbose: bool
 ESTIMATORS = ("wls", "posterior")
 #: estimators ``--also`` can export beside the product
 ALSO_ESTIMATORS = ("posterior", "flat", "ml", "pooled", "mean", "wls")
-#: estimators that return intensities (``I``, ``I_sd``) on the trained scales, with no prior
+#: estimators that return intensities (``I``, ``I_sd``) on the trained scales
 MOMENT_ESTIMATORS = ("pooled", "mean", "wls")
 
 
@@ -655,8 +657,8 @@ def add_export_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--estimator", default=None, choices=ESTIMATORS,
                    help="the merge written to merged.mtz and its halves. wls (default): the "
                         "inverse-variance mean of (n - bg) / K on the trained scales, with "
-                        "French-Wilson amplitudes; it uses no prior. posterior: the Wilson-"
-                        "posterior amplitude of the shape likelihood, with pooled halves.")
+                        "French-Wilson amplitudes. posterior: the Wilson-posterior amplitude "
+                        "of the shape likelihood. The halves hold the same estimator.")
     p.add_argument("--also", nargs="+", default=None, choices=ALSO_ESTIMATORS, metavar="ESTIMATOR",
                    help="diagnostic: also merge every crystal with these estimators and write "
                         "merged_ESTIMATOR.mtz and merged_ESTIMATOR.tsv (h k l d, intensity or "

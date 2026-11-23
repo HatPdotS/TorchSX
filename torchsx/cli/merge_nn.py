@@ -2,7 +2,7 @@
 
 The product is the inverse-variance (wls) merge on the trained scales, for all
 crystals and for each half. ``--estimator posterior`` writes the Wilson-posterior
-amplitudes instead; its half files then hold pooled amplitudes, which share no prior.
+amplitudes instead. The half files hold the same estimator as the full merge.
 
 Model and likelihood settings come from the checkpoint.
 """
@@ -242,6 +242,19 @@ def _amplitudes(po: dict, hkl=None, d=None, spacegroup: str | None = None):
     return F, sd / (2 * F).clamp(min=sd.sqrt().clamp(min=1e-30)), usable
 
 
+def _flat_halves(path1, path2) -> dict | None:
+    """Plain and flat CC1/2 of two half files, as ``torchsx.merge-stats`` reports them."""
+    from torchsx.merge_stats import load_merge, split_half_stats
+    try:
+        stats = split_half_stats(load_merge(path1), load_merge(path2))
+    except Exception as exc:  # noqa: BLE001 - too few common reflections for the statistic
+        print(f"  half-datasets  flat CC1/2 unavailable ({exc})", flush=True)
+        return None
+    return {**stats["headline"],
+            "by_shell": [{k: s[k] for k in ("d_max", "d_min", "n", "cc_half", "cc_half_flat")}
+                         for s in stats["shells"]]}
+
+
 def _report_halves(rec: dict, key: str, name: str, stats: dict | None) -> None:
     if stats is None:
         return
@@ -259,10 +272,10 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
     """Write the merged amplitudes of each requested split and of its two halves.
 
     ``args.estimator`` selects the product. ``wls`` (default) is the
-    inverse-variance mean on the trained scales, for the full set and for each
-    half, turned into amplitudes by French-Wilson. ``posterior`` is the
-    Wilson-posterior amplitude; its half files hold the pooled merge, because
-    two posterior halves share the prior.
+    inverse-variance mean on the trained scales, turned into amplitudes by
+    French-Wilson. ``posterior`` is the Wilson-posterior amplitude. The halves
+    are the same estimator on each half of the crystals. They share the network
+    and the form of the prior, which the flat CC1/2 of the half files takes out.
     """
     product = getattr(args, "estimator", None) or P.ESTIMATORS[0]
     also = [e for e in (getattr(args, "also", None) or ()) if e != product]
@@ -275,15 +288,8 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
         everyone = _export_crystals(tr, k) if getattr(tr, "external_heldout", None) is not None else None
         h1, h2 = _split_halves(tr, k, args.seed + 1000000007)
         label = names[k] if k < len(names) else str(k)
-        if product == "posterior":
-            sets = [(0, everyone), (1, h1), (2, h2)]
-            merges = {half: tr.merge(crystals=crystals, condition=cond, estimator="posterior",
-                                     tether_readout=half == 0 and args.tether_report)
-                      for half, crystals in sets}
-            full = merges[0]
-        else:
-            full = tr.merge(crystals=everyone, condition=cond, estimator=product,
-                            tether_readout=args.tether_report)
+        full = tr.merge(crystals=everyone, condition=cond, estimator=product,
+                        tether_readout=args.tether_report)
         print(f"\nmerge [{label or 'all'}]: {full['n_crystals']:,} crystals", flush=True)
         P.report_merge(full, hkl=hkl, verbose=verbose)
         if not full["n_crystals"] or not int(full["seen"].sum()):
@@ -293,20 +299,18 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
         if len(wanted) > 1:
             out = out.with_name(f"{out.stem}_{label}{out.suffix}")
         work = P.work_mask(hkl, args, verbose=verbose)
-        if product == "posterior":
-            halves = [tr.merge(crystals=c, condition=cond, estimator="pooled") for c in (h1, h2)]
-        else:
-            halves = [tr.merge(crystals=c, condition=cond, estimator=product) for c in (h1, h2)]
+        halves = [tr.merge(crystals=c, condition=cond, estimator=product) for c in (h1, h2)]
 
-        def write(stem: str, res: dict, verbose_mtz: bool = False) -> None:
+        def write(stem: str, res: dict, verbose_mtz: bool = False) -> bool:
             F, F_sd, keep = _amplitudes(res, hkl, d, spacegroup)
             if keep.any():
                 P.write_mtz(out.with_name(f"{stem}{out.suffix}"), hkl, F, F_sd,
                             cell=cell, spacegroup=spacegroup, work=work, keep=keep,
                             merge_friedel=merge_friedel, verbose=verbose_mtz)
+            return bool(keep.any())
 
-        for half, po in enumerate((full, *halves)):
-            write(out.stem if half == 0 else f"{out.stem}_half{half}", po, verbose and half == 0)
+        written = [write(out.stem if half == 0 else f"{out.stem}_half{half}", po, verbose and half == 0)
+                   for half, po in enumerate((full, *halves))]
         rec = {"split": label, "products": [product], "estimator": product,
                "prior": full.get("prior", tr.cfg.posterior_prior)}
         if full.get("n_pooled") is not None:
@@ -318,13 +322,16 @@ def merge_products(tr, prep, args, names, wanted, *, spacegroup: str,
         if product == "posterior":
             rec["sigF_collapsed"] = P.collapsed_sigma(full, hkl)
             rec["top_edge"] = P.top_edge(full, hkl)
-            _report_halves(rec, "split_half_pooled", "pooled, no prior",
-                           _split_half_stats(*halves, d, key="I", rank=full["I0"]))
-            _report_halves(rec, "split_half_posterior_shared_prior", "posterior, halves share the prior",
-                           _split_half_stats(merges[1], merges[2], d, rank=full["I0"]))
-        else:
-            _report_halves(rec, f"split_half_{product}", f"{product}, no prior",
-                           _split_half_stats(*halves, d, key="I", rank=full["I"]))
+        key = "I0" if product == "posterior" else "I"
+        _report_halves(rec, f"split_half_{product}", product,
+                       _split_half_stats(*halves, d, key=key, rank=full[key]))
+        flat = _flat_halves(*(out.with_name(f"{out.stem}_half{h}{out.suffix}") for h in (1, 2))) \
+            if all(written[1:]) else None
+        if flat is not None:
+            rec["split_half_files"] = flat
+            print(f"  half files     CC1/2 {flat['cc_half']:.4f}  flat CC1/2 {flat['cc_half_flat']:.4f}  "
+                  f"(outer shell {flat['cc_half_flat_outer']:.3f}) on {flat['n_common']:,} reflections",
+                  flush=True)
         for est in also:
             # diagnostic readouts of the same crystals, to compare with the product
             res = tr.merge(crystals=everyone, condition=cond, estimator=est)

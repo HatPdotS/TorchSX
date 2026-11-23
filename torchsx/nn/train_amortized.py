@@ -1371,8 +1371,12 @@ class AmortizedTrainer:
                 sig = (n_ph - bg).double()
                 h = meta.hkl_idx
                 ratio = sig / K
-                var = ((K * I0_ref[h].double()).clamp(min=0)
-                       + bg.double() * (1.0 + bvf))
+                # the detector variance the checkpoint fitted, A + B (counting)
+                noise = (self.objective.noise_terms(meta)
+                         if hasattr(self.objective, "noise_terms") else None)
+                nA, nB = (t.detach().double() for t in noise) if noise is not None else (0.0, 1.0)
+                var = nA + nB * ((K * I0_ref[h].double()).clamp(min=0)
+                                 + bg.double() * (1.0 + bvf))
                 # per-observation variance of (n - bg) under the trained model:
                 # counting term plus the multiplicative log-scatter of width w.
                 # The counting term is the model's (K I0_ref + bg), not the
@@ -1388,7 +1392,7 @@ class AmortizedTrainer:
                 at_limit = (w2 >= 20.0).double()
                 w2 = w2.clamp(max=20.0)
                 mu = K * I0_ref[h].double().clamp(min=floor)
-                V = ((mu + bg.double() * (1.0 + bvf)).clamp(min=1.0)
+                V = ((nA + nB * (mu + bg.double() * (1.0 + bvf))).clamp(min=1.0)
                      + mu * mu * torch.expm1(w2))
                 g = K / V                     # weight on (n - bg) for the WLS mean
                 for k, v in (("cnt", torch.ones_like(sig)), ("r", ratio),
@@ -1438,7 +1442,7 @@ class AmortizedTrainer:
                 I_p, sd_p = pooled()
                 I = torch.where(limited, I_p, I)
                 I_sd = torch.where(limited, sd_p, I_sd)
-                n_pooled = int((limited & (S["cnt"] >= 2)).sum())
+                n_pooled = int((limited & (S["cnt"] >= 1)).sum())
             elif estimator == "mean":
                 I = S["r"] / cnt
                 I_sd = ((S["r2"] / cnt - I * I).clamp(min=0) / cnt).sqrt()
@@ -1448,7 +1452,7 @@ class AmortizedTrainer:
                 "estimator": estimator,
                 "I": I.float(), "I_sd": I_sd.float(),
                 "n_meas": S["cnt"].long(),
-                "seen": S["cnt"] >= 2,
+                "seen": S["cnt"] >= 1,
                 "n_crystals": int(crystals.numel()),
                 "condition": self._cond,
             }

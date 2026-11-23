@@ -184,9 +184,10 @@ def source_var_scale(spec) -> float | None:
     (``integration.bg_model_var_scale``, probixi >= 0.10.3), or None."""
     if spec is None:
         return None
+    scales = {value for key, value in spec.provenance if key == "bg_model_var_scale"}
     try:
-        return float(dict(spec.provenance)["bg_model_var_scale"])
-    except (KeyError, TypeError, ValueError):
+        return float(scales.pop()) if len(scales) == 1 else None
+    except (TypeError, ValueError):
         return None
 
 
@@ -204,6 +205,9 @@ def source_noise_gain(spec, beam_energy_eV: float) -> tuple[float, float, float]
     if spec is None:
         return None
     scales = {value for key, value in spec.provenance if key == "bg_model_var_scale"}
+    if len(scales) > 1:
+        print(f"  gain: the inputs record different noise scales ({', '.join(sorted(scales))}), "
+              f"so auto does not use them and estimates the gain from the integrated sums", flush=True)
     if len(scales) != 1:
         return None
     try:
@@ -664,10 +668,10 @@ def resolve_gain(core, spec, resolved_measurement, config: MergeConfig,
         mean_eV = float(core.beam_energy.float().mean().item())
         gain = gain_from_measurement(spec, mean_eV) if spec is not None else legacy_stream_gain(core)
         gain_src = "source measurement declaration" if spec is not None else "legacy geometry (unverified)"
-    elif gain_cfg == "auto" and source_noise_gain(spec, float(core.beam_energy.float().mean().item())):
+    elif gain_cfg == "auto" and (measured := source_noise_gain(spec, float(core.beam_energy.float().mean().item()))):
         # The source measured the noise scale on its own frames: take it.  The
         # calibration below reads the same scale off the integrated sums and is biased.
-        gain, declared, k = source_noise_gain(spec, float(core.beam_energy.float().mean().item()))
+        gain, declared, k = measured
         poisson_noise.gain_selection = dict(mode=gain_cfg, declared_gain=declared, source_noise_scale=k,
                                             selected="source_noise_scale", reason="source_measured_noise",
                                             selected_gain=gain)

@@ -76,9 +76,13 @@ def combine_measurements(specs) -> MeasurementSpec | None:
     specs = list(specs)
     if not specs or any(s is None for s in specs):
         return None
+    provenance = dict.fromkeys(item for spec in specs for item in spec.provenance)
+    # an input without a noise scale must not take the scale of another input
+    scaled = ["bg_model_var_scale" in dict(spec.provenance) for spec in specs]
+    if any(scaled) and not all(scaled):
+        provenance[("bg_model_var_scale", "unrecorded")] = None
     return replace(specs[0], source_files=tuple(dict.fromkeys(
-        path for spec in specs for path in spec.source_files)),
-        provenance=tuple(dict.fromkeys(item for spec in specs for item in spec.provenance)))
+        path for spec in specs for path in spec.source_files)), provenance=tuple(provenance))
 
 
 def parse_radii(value) -> tuple[float, float, float]:

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `merged_half1.mtz` and `merged_half2.mtz` always hold the same estimator as `merged.mtz`. With `--estimator posterior` they held the pooled merge. `merged.metrics.json` records `split_half_posterior` in place of `split_half_pooled` and `split_half_posterior_shared_prior`.
+- `merged.metrics.json` records the plain and the flat CC1/2 of the half files as `split_half_files`, overall and per shell, as `torchsx.merge-stats` computes them.
+- The moment estimators (`wls`, `pooled`, `mean`) keep a reflection measured once. They dropped reflections with fewer than two observations, so the `wls` product held fewer reflections than the posterior product. `mean` has no sigma for such a reflection and its amplitude is not written.
+- The `wls` and `pooled` variances take the detector variance terms the checkpoint fitted (`--detector-noise`), A + B times the counting variance. Before, only the posterior product used them.
+- `--gain auto` with several probixi databases uses the recorded noise scale only where every input records the same one. An input without a scale took the scale of another input. Where the scales differ the log says so before the gain is estimated.
+- The log of the enrichment gate counts the lattices without `enrich_p` separately. probixi leaves `enrich_p` empty for a lattice it did not integrate, and the gate drops it.
 - An `.sfx` saved from a probixi database is a training cache: it holds the crystals that passed the filter in force when the database was read, and its measurement provenance records that filter (`enrich_gate`, `crystals_where`). `torchsx.train` and `torchsx.merge` use such a file as saved and print the recorded filter. `--enrich-alpha` and `--crystals-where` are refused for it. An `.sfx` that records no filter is taken as unfiltered.
 - `torchsx.merge-stats` skips a cross-correlation it cannot compute (merges with no common reflections) with a message, and writes the other statistics.
 - The `wls` product reports the sum-of-spots tether only with `--tether-report`, like the posterior product.
