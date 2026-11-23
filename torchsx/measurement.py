@@ -13,8 +13,12 @@ import math
 MEASUREMENT_KEY = "_torchsx_measurement"
 # 3: off-Bragg calibration, else a truncated normal on the negative sums; a gain the
 # calibration replaced can be refined in training by one global B (--detector-noise auto).
-GAIN_POLICY_VERSION = 3
-DEFAULT_GAIN_TOLERANCE = 0.5
+# 4: auto takes the calibrated gain whenever a valid calibration exists (tolerance 0).
+# 5: both calibrations whiten each observation with its own recorded disk, where the source has one.
+# 6: auto takes declared gain x the noise scale a probixi database records, where it records one.
+GAIN_POLICY_VERSION = 6
+#: relative difference up to which ``auto`` keeps a declared gain; 0 takes every valid calibration
+DEFAULT_GAIN_TOLERANCE = 0.0
 _PLANE_WARNED: set[str] = set()
 
 
@@ -72,9 +76,13 @@ def combine_measurements(specs) -> MeasurementSpec | None:
     specs = list(specs)
     if not specs or any(s is None for s in specs):
         return None
+    provenance = dict.fromkeys(item for spec in specs for item in spec.provenance)
+    # an input without a noise scale must not take the scale of another input
+    scaled = ["bg_model_var_scale" in dict(spec.provenance) for spec in specs]
+    if any(scaled) and not all(scaled):
+        provenance[("bg_model_var_scale", "unrecorded")] = None
     return replace(specs[0], source_files=tuple(dict.fromkeys(
-        path for spec in specs for path in spec.source_files)),
-        provenance=tuple(dict.fromkeys(item for spec in specs for item in spec.provenance)))
+        path for spec in specs for path in spec.source_files)), provenance=tuple(provenance))
 
 
 def parse_radii(value) -> tuple[float, float, float]:

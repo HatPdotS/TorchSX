@@ -11,14 +11,16 @@ import hashlib
 from pathlib import Path
 
 import duckdb
+import re
 import pytest
 import torch
 
-from torchsx.io._duckdb import load_duckdb, read_measurement
+from torchsx.io._duckdb import (DEFAULT_ENRICH_ALPHA, EXTRA_LATTICE_ENRICH_ALPHA, load_duckdb,
+                                parse_enrich_alpha, read_enrichment_gate, read_measurement)
 from torchsx.io.sources import inspect_source, read_source
 from torchsx.stream import SFXStream
 
-# Verbatim from probixi.io.db._SCHEMA (v0.10.0, schema 1).
+# Verbatim from probixi.io.db._SCHEMA (v0.11.0, schema 2).
 _SCHEMA = """
 CREATE TABLE geometry (
     beam_center_row  DOUBLE,
@@ -75,7 +77,8 @@ CREATE TABLE calibration (
     cell_c_A               DOUBLE,
     cell_alpha_deg         DOUBLE,
     cell_beta_deg          DOUBLE,
-    cell_gamma_deg         DOUBLE
+    cell_gamma_deg         DOUBLE,
+    rank                   INTEGER
 );
 
 CREATE TABLE integration (
@@ -84,7 +87,12 @@ CREATE TABLE integration (
     r_bg              DOUBLE,
     adu_per_photon    DOUBLE,
     bg_annulus_pixels DOUBLE,
-    aperture          VARCHAR
+    aperture          VARCHAR,
+    bg_model_var_scale DOUBLE,
+    bg_model_var_dmin_A DOUBLE,
+    bg_model_var_ref VARCHAR,
+    bg_model_var_alpha DOUBLE,
+    bg_model_var_n_ref BIGINT
 );
 
 CREATE TABLE frames (
@@ -101,7 +109,8 @@ CREATE TABLE frames (
     num_reflections          INTEGER,
     adu_per_photon           DOUBLE,
     event_name               VARCHAR,
-    photon_energy_eV         DOUBLE
+    photon_energy_eV         DOUBLE,
+    rank                     INTEGER
 );
 
 CREATE TABLE crystals (
@@ -194,7 +203,7 @@ _FRAMES = [
 # (filename, event, lattice, n_refl, profile, limit, astar_x, n_indexed, rmsd, mosaicity, enrichment, n_bright, enrich_p)
 _CRYSTALS = [
     ("run_b.h5", 8, 0, 3, 0.40, 3.0, 1.5, 60, 0.0004, 0.10, 8.0, 40, 1e-12),
-    ("run_b.h5", 8, 1, 2, 0.30, 2.0, 2.0, 20, 0.0009, 0.20, 3.0, 9, 1e-3),
+    ("run_b.h5", 8, 1, 2, 0.30, 2.0, 2.0, 20, 0.0009, 0.20, 3.0, 9, 1e-11),
     ("run_a.h5", 1, 0, 2, 0.20, 2.5, 0.5, 30, 0.0006, 0.15, 5.0, 20, 1e-6),
 ]
 
@@ -226,13 +235,15 @@ def db_path(tmp_path):
         "INSERT INTO cell VALUES (79.0, 79.0, 38.0, 90.0, 90.0, 90.0, 237158.0, "
         "'tetragonal', 'P', 'c')"
     )
-    conn.execute("INSERT INTO integration VALUES (?, ?, ?, ?, 280.0, 'snr')", [*RADII, GAIN])
+    conn.execute("INSERT INTO integration VALUES (?, ?, ?, ?, 280.0, 'snr', NULL, NULL, NULL, NULL, NULL)",
+                 [*RADII, GAIN])
     for serial, (fn, ev, indexed, n_peaks, pres, scale, ssig) in enumerate(_FRAMES):
         n_refl = sum(c[3] for c in _CRYSTALS if c[:2] == (fn, ev)) or None
         conn.execute(
-            "INSERT INTO frames VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO frames VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [_frame_id(fn, ev), serial, fn, ev, indexed, serial, n_peaks, pres,
-             scale, ssig, n_refl, GAIN, f"//{ev}", PHOTON_EV],  # the run energy per frame
+             scale, ssig, n_refl, GAIN, f"//{ev}", PHOTON_EV,  # the run energy per frame
+             0 if fn == "run_a.h5" else 1],  # rank: run_a on 0, run_b on 1
         )
     for fn, ev, lat, n_refl, prof, limit, ax, n_idx, rmsd, mos, enr, nb, ep in _CRYSTALS:
         fid = _frame_id(fn, ev)
@@ -376,7 +387,9 @@ def test_measurement_spec_from_integration_table(db_path):
     assert spec.unresolved == ()
     assert inspect_source(db_path) == spec
     stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2")
-    assert stream.measurement == spec
+    # a stream that was read also records the filter its crystals passed
+    from dataclasses import replace
+    assert stream.measurement == replace(spec, provenance=spec.provenance + (("enrich_gate", GATE),))
 
 
 def test_read_source_dispatches_duckdb(db_path):
@@ -517,7 +530,7 @@ def test_crystal_feature_table_shape_and_dead_columns(db_path):
     assert dead.isdisjoint({"log_n_refl", "beam_energy", *PROBIXI_CRYSTAL_FEATURES})
     col = CRYSTAL_FEAT_COLUMNS.index
     torch.testing.assert_close(tbl[:, col("log_scale")], torch.tensor([0.8, 1.2, 1.2]).log())
-    torch.testing.assert_close(tbl[:, col("log_enrich_p")], torch.tensor([1e-6, 1e-12, 1e-3]).log10())
+    torch.testing.assert_close(tbl[:, col("log_enrich_p")], torch.tensor([1e-6, 1e-12, 1e-11]).log10())
     torch.testing.assert_close(tbl[:, col("log_n_indexed")], torch.log1p(torch.tensor([30.0, 60.0, 20.0])))
     torch.testing.assert_close(tbl[:, col("peak_resolution")], torch.tensor([10 / 2.8, 10 / 3.5, 10 / 3.5]))
 
@@ -686,6 +699,19 @@ def test_schema_matches_probixi():
             src = Path(_db.__file__)
         except ImportError:
             pytest.skip("probixi source neither alongside torchsx nor installed")
+    from torchsx._compat import PROBIXI_VERSION, SUPPORTED_DB_SCHEMA
+
+    # the schema number sits in probixi/_compat.py, and in db.py before the pairing
+    compat = src.parent.parent / "_compat.py"
+    number = re.search(r"^SCHEMA_VERSION = (\d+)", (compat if compat.exists() else src).read_text(), re.M)
+    assert number, f"could not find SCHEMA_VERSION next to {src}"
+    theirs = int(number.group(1))
+    if theirs < SUPPORTED_DB_SCHEMA:
+        pytest.skip(f"the probixi at {src} writes schema {theirs}; this TorchSX mirrors schema "
+                    f"{SUPPORTED_DB_SCHEMA} (probixi {PROBIXI_VERSION})")
+    assert theirs == SUPPORTED_DB_SCHEMA, (
+        f"probixi writes schema {theirs}; raise SUPPORTED_DB_SCHEMA and PROBIXI_VERSION in "
+        "torchsx/_compat.py and update _SCHEMA and the _duckdb.py mapping")
     m = re.search(r'_SCHEMA = """(.*?)"""', src.read_text(), re.S)
     assert m, "could not find _SCHEMA in probixi/io/db.py"
 
@@ -694,7 +720,7 @@ def test_schema_matches_probixi():
 
     assert norm(m.group(1)) == norm(
         _SCHEMA
-    ), "probixi's DuckDB schema changed; update _SCHEMA and the _duckdb.py mapping"
+    ), "probixi's DuckDB schema changed under the same SCHEMA_VERSION; probixi must raise it"
 
 
 @pytest.mark.parametrize("embedded", [False, True])
@@ -727,7 +753,7 @@ p0/corner_y = -256
 def test_calibration_provenance_and_schema_gate(db_path):
     with duckdb.connect(str(db_path)) as conn:
         conn.execute("INSERT INTO calibration VALUES ('0.10.0', 1, 100, 1.5, 0.0, false, 1.0, 5.9, "
-                     "6.0, 10.2, 0, 2.3, 0.03, 0.96, 'snr', 0.1, 79.0, 79.0, 38.0, 90.0, 90.0, 90.0)")
+                     "6.0, 10.2, 0, 2.3, 0.03, 0.96, 'snr', 0.1, 79.0, 79.0, 38.0, 90.0, 90.0, 90.0, 0)")
     spec = read_measurement(db_path)
     assert spec.producer_version == "0.10.0"
     assert {("probixi_version", "0.10.0"), ("schema_version", "1"), ("flux_variance", "False"),
@@ -740,6 +766,11 @@ def test_calibration_provenance_and_schema_gate(db_path):
         read_measurement(db_path)
     with pytest.raises(ValueError, match="newer"):
         load_duckdb(db_path)
+    # the message names the writer and the probixi release this reader mirrors
+    from torchsx._compat import PROBIXI_VERSION, SUPPORTED_DB_SCHEMA
+    with pytest.raises(ValueError, match=rf"schema 99 \(probixi 0\.10\.0\).*schema {SUPPORTED_DB_SCHEMA}, "
+                                         rf"the layout of probixi {re.escape(PROBIXI_VERSION)}"):
+        read_measurement(db_path)
 
 
 def test_varying_frame_energies_switch_on_per_image_k0(db_path, tmp_path):
@@ -798,3 +829,464 @@ def test_cache_survives_a_provenance_only_change(db_path, tmp_path, monkeypatch)
         original(conn, path), provenance=original(conn, path).provenance + (("new_entry", "1"),)))
     bundle = P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "b")]), verbose=False)
     assert bundle.prep.n_obs_total > 0
+
+
+_CAL = ("INSERT INTO calibration VALUES ('0.10.0', 1, 100, ?, 0.0, false, 1.0, 5.9, 6.0, 10.2, 0, "
+        "2.3, 0.03, 0.96, 'snr', 0.1, 79.0, 79.0, 38.0, 90.0, 90.0, 90.0, ?)")
+
+
+def test_per_rank_calibration_gain(db_path):
+    """A multi-GPU run writes one calibration row per rank; the gain is their
+    frame-weighted mean (rank 1 indexed one frame, rank 0 one), not rank 0's."""
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute(_CAL, [1.50, 0])
+        conn.execute(_CAL, [1.52, 1])
+    spec = read_measurement(db_path)
+    (src, key, gain), = spec.gain_declarations
+    assert (src, key) == ("calibration", "adu_per_photon")
+    assert gain == pytest.approx(1.51)
+    prov = dict(spec.provenance)
+    assert prov["calibration_ranks"] == "2"
+    assert float(prov["gain_rank_spread"]) == pytest.approx(0.02 / 1.51, rel=1e-3)
+    # a spread beyond tolerance warns but still loads
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE calibration SET gain = 2.0 WHERE rank = 1")
+    with pytest.warns(UserWarning, match="per-rank calibrated gains"):
+        spec = read_measurement(db_path)
+    assert spec.gain_declarations[0][2] == pytest.approx(1.75)
+    # every rank's schema is checked, not only the first row's
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE calibration SET schema_version = 99 WHERE rank = 1")
+    with pytest.raises(ValueError, match="newer"):
+        read_measurement(db_path)
+
+
+def test_model_background_sigma(db_path):
+    """With the model background the intensity carries the model's own sigma,
+    sigma^2 = V_model (1 + n_bg / n) + g max(I_model, 0) in ADU^2, and the count
+    I + n b keeps the disk the source summed even with nominal disks."""
+    from torchsx.merging import MergeConfig, prepare_observations
+
+    assert ("bg_annulus_pixels", "280") in read_measurement(db_path).provenance
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    core = stream._core
+    n = core.levels["obs"]["n_pixels"].float()
+    I_model = core.I + n * core.background - 40.0  # ADU
+    want = (4.0 * (1 + 280.0 / n) + GAIN * I_model.clamp(min=0)).sqrt() / GAIN  # photons
+    annulus = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded"))
+    for disks in ("recorded", "nominal"):
+        model = prepare_observations(
+            stream, MergeConfig(gain="trust_input", disk_size=disks, background="model"))
+        # same observation order: obs_info.sigma follows I_obs
+        got = dict(zip((model.I_obs * GAIN).round(decimals=3).tolist(), model.obs_info.sigma.tolist()))
+        for i, s in zip((I_model).round(decimals=3).tolist(), want.tolist()):
+            assert got[i] == pytest.approx(s, rel=1e-5)
+    torch.testing.assert_close(annulus.obs_info.sigma.sort().values,
+                               (core.sigma / GAIN).sort().values)
+
+
+def test_cli_background_override(db_path, tmp_path):
+    """--background annulus restores the ring estimate on a probixi database;
+    the store's model sigma matches the in-memory preparation."""
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging import MergeConfig, prepare_observations
+
+    base = [str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+            "--device", "cpu"]
+    ann = P.load_prep(_build_parser().parse_args(base + ["--background", "annulus",
+                                                         "-o", str(tmp_path / "a")]), verbose=False)
+    mod = P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "m")]), verbose=False)
+    assert ann.recipe["background"] == "annulus" and ann.recipe["disk_size"] == "recorded"
+    assert mod.recipe["background"] == "model"
+    rows = torch.arange(mod.prep.n_obs_total)
+    a, m = ann.prep.batch(rows, "cpu"), mod.prep.batch(rows, "cpu")
+    torch.testing.assert_close(a.bg, 5.0 / GAIN * a.n_pix)
+    torch.testing.assert_close(m.bg, torch.full_like(m.bg, 40.0 / GAIN))
+    # recorded disks keep the clipped ones, in the store as in memory
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    ref = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded",
+                                                   background="model"))
+    torch.testing.assert_close(m.sigma.sort().values, ref.obs_info.sigma.sort().values)
+    assert not torch.allclose(a.sigma.sort().values, m.sigma.sort().values)
+
+
+
+def test_gain_calibration_sees_the_recorded_disks(db_path, tmp_path, monkeypatch):
+    """The gain calibration whitens each observation with its own disk: in
+    memory and from the prepared store it receives the recorded pixel counts,
+    and none when the disks are taken as nominal."""
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging import MergeConfig, prepare_observations
+    from torchsx.merging.hkl.noise import PoissonNoiseModel
+
+    seen = []
+
+    def calibrate(self, I, background, ewald, **kw):
+        seen.append(kw.get("n_pix"))
+        self.gain_calibration_info = {"valid": True, "method": "fixture"}
+        return GAIN, 0.0, 0.0
+
+    monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", calibrate)
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    prepare_observations(stream, MergeConfig(gain="auto", disk_size="recorded"))
+    prepare_observations(stream, MergeConfig(gain="auto"))
+    assert sorted(seen[0].tolist()) == [6, 7, 9, 9, 9, 9, 9] and seen[1] is None
+    seen.clear()
+    P.load_prep(_build_parser().parse_args(
+        [str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "auto",
+         "--cache", str(tmp_path / "c"), "-o", str(tmp_path / "o")]), verbose=False)
+    assert seen and seen[0] is not None and set(seen[0].tolist()) <= {6.0, 7.0, 9.0}
+
+
+def test_fit_model_sigma_scale_recovers_a_known_factor():
+    """Pure background past the limit: the robust fit returns the factor by which
+    the recorded variance overstates the scatter, and ignores a few signal rows."""
+    from torchsx.merging.observations import fit_model_sigma_scale, sigma_scale_shells
+
+    from torchsx.merging.observations import robust_sd
+
+    g = torch.Generator().manual_seed(0)
+    n, k_true = 200_000, 0.4
+    # background-dominated (the Poisson term max(I, 0) is ~1 % of the variance): k itself
+    var_bg = 5e3 + 1e4 * torch.rand(n, generator=g)            # photons^2, as recorded
+    I = torch.randn(n, generator=g) * (k_true * var_bg).sqrt()   # true scatter: k var_bg
+    I[:500] += 1e6                                               # leftover signal / outliers
+    k, m = fit_model_sigma_scale(I, var_bg)
+    assert m == n
+    assert k == pytest.approx(k_true, rel=0.03)
+    shells = sigma_scale_shells(I, var_bg, torch.linspace(2.0, 4.0, n), k)
+    assert len(shells) == 8
+    assert all(s1 == pytest.approx(1.0, abs=0.05) and s0 == pytest.approx(k_true ** 0.5, abs=0.05)
+               for _, _, _, s0, s1 in shells)
+    # few photons: k is what makes I / sqrt(k var + max(I, 0)) unit-spread, below k_true
+    small = var_bg / 100.0
+    I_small = torch.randn(n, generator=g) * (k_true * small).sqrt()
+    k_small, _ = fit_model_sigma_scale(I_small, small)
+    assert robust_sd(I_small / (k_small * small + I_small.clamp(min=0)).sqrt()) == pytest.approx(1.0, abs=0.01)
+    assert 0.25 < k_small < k_true
+    assert fit_model_sigma_scale(I[:10], var_bg[:10]) == (None, 10)
+
+
+def test_model_sigma_scale_policies(db_path, tmp_path):
+    """A fixed k scales the background term only, identically in memory and in
+    the store; off is k = 1; the fit is recorded in the recipe."""
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging import MergeConfig, prepare_observations
+
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    core = stream._core
+    n = core.levels["obs"]["n_pixels"].float()
+    I_model = core.I + n * core.background - 40.0
+    for k in (1.0, 0.25):
+        want = (k * 4.0 * (1 + 280.0 / n) + GAIN * I_model.clamp(min=0)).sqrt() / GAIN
+        prep = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded",
+                                                        background="model", model_sigma_scale=k))
+        torch.testing.assert_close(prep.obs_info.sigma.sort().values, want.sort().values)
+    off = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded",
+                                                   background="model", model_sigma_scale="off"))
+    auto = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded",
+                                                    background="model"))
+    # seven rows, none past its crystal's limit: auto leaves k at 1
+    torch.testing.assert_close(auto.obs_info.sigma, off.obs_info.sigma)
+
+    base = [str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+            "--device", "cpu"]
+    fixed = P.load_prep(_build_parser().parse_args(base + ["--model-sigma-scale", "0.25",
+                                                           "-o", str(tmp_path / "k")]), verbose=False)
+    assert fixed.recipe["model_sigma_scale"] == 0.25
+    assert fixed.recipe["model_sigma_scale_fit"] == {"policy": "fixed", "k": 0.25}
+    rows = torch.arange(fixed.prep.n_obs_total)
+    ref = prepare_observations(stream, MergeConfig(gain="trust_input", disk_size="recorded",
+                                                   background="model", model_sigma_scale=0.25))
+    torch.testing.assert_close(fixed.prep.batch(rows, "cpu").sigma.sort().values,
+                               ref.obs_info.sigma.sort().values)
+    auto = P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "a")]), verbose=False)
+    assert auto.recipe["model_sigma_scale"] == "auto"
+    assert auto.recipe["model_sigma_scale_fit"]["fitted"] is False
+    with pytest.raises(SystemExit, match="model-sigma-scale"):
+        P.load_prep(_build_parser().parse_args(base + ["--model-sigma-scale", "-1",
+                                                       "-o", str(tmp_path / "bad")]), verbose=False)
+
+
+def test_model_sigma_scale_fit_in_the_store(db_path, tmp_path, monkeypatch):
+    """auto in the store: the reference rows are those past their crystal's
+    limit, and the fitted k reaches every model sigma."""
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging import observations as O
+
+    # every crystal's limit just above the data's d, so every row is a reference row
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE crystals SET diffraction_limit_nm_inv = 0.02")
+    monkeypatch.setattr(O, "SIGMA_SCALE_MIN_OBS", 3)
+    base = [str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+            "--device", "cpu"]
+    auto = P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "a")]), verbose=False)
+    fit = auto.recipe["model_sigma_scale_fit"]
+    assert fit["policy"] == "auto" and fit["fitted"] is True and fit["n_ref"] == 7
+    k = fit["k"]
+    fixed = P.load_prep(_build_parser().parse_args(base + ["--model-sigma-scale", str(k),
+                                                           "-o", str(tmp_path / "k")]), verbose=False)
+    rows = torch.arange(auto.prep.n_obs_total)
+    torch.testing.assert_close(auto.prep.batch(rows, "cpu").sigma, fixed.prep.batch(rows, "cpu").sigma)
+
+
+def test_model_sigma_scale_defers_to_probixi(db_path, tmp_path, monkeypatch):
+    """A database whose variance probixi already rescaled (0.10.3) keeps k = 1
+    under auto, in memory and in the store; a fixed k still applies."""
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging import MergeConfig, prepare_observations
+    from torchsx.merging import observations as O
+
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE integration SET bg_model_var_scale = 0.5")
+        conn.execute("UPDATE crystals SET diffraction_limit_nm_inv = 0.02")  # all rows past
+    monkeypatch.setattr(O, "SIGMA_SCALE_MIN_OBS", 3)
+    assert ("bg_model_var_scale", "0.5") in read_measurement(db_path).provenance
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    cfg = dict(gain="trust_input", disk_size="recorded", background="model")
+    auto = prepare_observations(stream, MergeConfig(**cfg))
+    off = prepare_observations(stream, MergeConfig(**cfg, model_sigma_scale="off"))
+    torch.testing.assert_close(auto.obs_info.sigma, off.obs_info.sigma)
+    base = [str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+            "--device", "cpu"]
+    bundle = P.load_prep(_build_parser().parse_args(base + ["-o", str(tmp_path / "a")]), verbose=False)
+    assert bundle.recipe["model_sigma_scale_fit"] == {"policy": "source", "k": 1.0,
+                                                      "source_scales": [0.5]}
+    fixed = P.load_prep(_build_parser().parse_args(base + ["--model-sigma-scale", "0.25",
+                                                           "-o", str(tmp_path / "k")]), verbose=False)
+    assert fixed.recipe["model_sigma_scale_fit"] == {"policy": "fixed", "k": 0.25}
+
+
+def test_auto_gain_is_the_declared_gain_times_the_noise_scale_probixi_records(db_path, tmp_path, monkeypatch):
+    """A database with ``bg_model_var_scale`` settles ``--gain auto`` without a
+    calibration, and ``--detector-noise auto`` then fits nothing; ``calibrate``
+    still estimates; without the scale ``auto`` estimates as before."""
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+    from torchsx.merging.hkl.noise import PoissonNoiseModel
+
+    calls = []
+
+    def calibrate(self, I, background, ewald, **kw):
+        calls.append(1)
+        self.gain_calibration_info = {"valid": True, "method": "fixture"}
+        return 3.0 * GAIN, 0.0, 0.0
+
+    monkeypatch.setattr(PoissonNoiseModel, "calibrate_sigma2_of_bg", calibrate)
+
+    def selection(name, gain):
+        args = _build_parser().parse_args([str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0",
+                                           "--gain", gain, "--device", "cpu", "-o", str(tmp_path / name)])
+        return P.load_prep(args, verbose=False).recipe["measurement"]
+
+    before = selection("before", "auto")
+    assert calls and before["gain_selection"]["selected"] == "calibration"
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE integration SET bg_model_var_scale = 0.8")
+    calls.clear()
+    m = selection("auto", "auto")
+    assert not calls
+    assert m["gain_selection"]["selected"] == "source_noise_scale"
+    assert m["gain_selection"]["declared_gain"] == pytest.approx(GAIN)
+    assert m["gain_adu_per_photon"] == pytest.approx(0.8 * GAIN)
+    forced = selection("calibrate", "calibrate")
+    assert calls and forced["gain_adu_per_photon"] == pytest.approx(3.0 * GAIN)
+
+
+def test_crystals_where_keeps_only_the_accepted_crystals(db_path):
+    core = load_duckdb(db_path, clipped=True, crystals_where="lattice_index = 0")
+    assert (core.n_images, core.n_crystals, core.n_observations) == (2, 2, 5)
+    assert core.n_refl.tolist() == [2, 3]
+    one = load_duckdb(db_path, clipped=True, crystals_where="num_reflections = 3")
+    assert (one.n_images, one.n_crystals, one.n_observations) == (1, 1, 3)
+    stream = read_source(db_path, spacegroup="P 43 21 2", clipped=True,
+                         crystals_where="lattice_index = 0")
+    assert stream._core.n_crystals == 2
+    with pytest.raises(ValueError, match="nothing to load"):
+        load_duckdb(db_path, crystals_where="enrich_p < 0")
+    with pytest.raises(ValueError, match="one SQL predicate"):
+        load_duckdb(db_path, crystals_where="true; DROP TABLE crystals")
+
+
+#: the gate ``auto`` builds for the fixture, whose run_b frame holds two lattices
+GATE = (f"enrich_p <= {DEFAULT_ENRICH_ALPHA!r} AND "
+        f"(coalesce(lattice_index, 0) = 0 OR enrich_p <= {EXTRA_LATTICE_ENRICH_ALPHA!r})")
+
+
+def _chance_lattice(db_path, enrich_p=0.5):
+    """Give the second lattice of run_b a chance-level enrichment."""
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE crystals SET enrich_p = ? WHERE lattice_index = 1", [enrich_p])
+
+
+def test_enrichment_gate_drops_chance_lattices_by_default(db_path):
+    _chance_lattice(db_path)
+    gate = read_enrichment_gate(db_path)
+    assert gate == {"predicate": GATE, "alpha": DEFAULT_ENRICH_ALPHA,
+                    "alpha_extra": EXTRA_LATTICE_ENRICH_ALPHA,
+                    "origin": "torchsx default", "n_total": 3, "n_kept": 2, "n_unscored": 0}
+    core = load_duckdb(db_path, clipped=True)
+    assert (core.n_images, core.n_crystals, core.n_observations) == (2, 2, 5)
+    stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True)
+    assert stream._core.n_crystals == 2
+    for off in (None, "off"):
+        assert load_duckdb(db_path, clipped=True, enrich_alpha=off).n_crystals == 3
+        assert read_enrichment_gate(db_path, off)["predicate"] is None
+    assert read_source(db_path, spacegroup="P 43 21 2", clipped=True, enrich_alpha="off")._core.n_crystals == 3
+    # a number replaces the default; crystals_where applies on top of the gate
+    assert load_duckdb(db_path, clipped=True, enrich_alpha=1e-9).n_crystals == 1
+    assert load_duckdb(db_path, clipped=True, enrich_alpha=0.9).n_crystals == 3
+    assert load_duckdb(db_path, clipped=True, crystals_where="num_reflections = 2").n_crystals == 1
+    with pytest.raises(ValueError, match="enrichment gate"):
+        load_duckdb(db_path, enrich_alpha=1e-20)
+
+
+def test_enrichment_gate_takes_the_alpha_the_database_records(db_path):
+    with duckdb.connect(str(db_path)) as conn:  # a first lattice between the default and the recorded alpha
+        conn.execute("UPDATE crystals SET enrich_p = 0.01 WHERE lattice_index = 0 AND num_reflections = 2")
+    assert load_duckdb(db_path, clipped=True).n_crystals == 2          # 0.01 > the default 1e-3
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE integration SET bg_model_var_alpha = 0.05")
+    gate = read_enrichment_gate(db_path)
+    assert (gate["alpha"], gate["origin"], gate["n_kept"]) == (
+        0.05, "database, integration.bg_model_var_alpha", 3)
+    assert load_duckdb(db_path, clipped=True).n_crystals == 3
+    assert load_duckdb(db_path, clipped=True, enrich_alpha=1e-3).n_crystals == 2
+
+
+def test_auto_gate_asks_more_of_the_further_lattices_of_a_frame(db_path):
+    """Under auto a second lattice of a frame needs enrich_p <= 1e-10; a given
+    alpha gates every lattice alike; one lattice per frame keeps the plain gate."""
+    _chance_lattice(db_path, 1e-6)  # passes the default alpha, not the bound on further lattices
+    gate = read_enrichment_gate(db_path)
+    assert (gate["predicate"], gate["alpha_extra"], gate["n_kept"]) == (GATE, EXTRA_LATTICE_ENRICH_ALPHA, 2)
+    assert load_duckdb(db_path, clipped=True).n_crystals == 2
+    assert load_duckdb(db_path, clipped=True, enrich_alpha=1e-3).n_crystals == 3
+    assert read_enrichment_gate(db_path, 1e-3)["alpha_extra"] is None
+    _chance_lattice(db_path, 1e-11)
+    assert load_duckdb(db_path, clipped=True).n_crystals == 3
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE crystals SET lattice_index = 0")
+    plain = read_enrichment_gate(db_path)
+    assert (plain["predicate"], plain["alpha_extra"]) == (f"enrich_p <= {DEFAULT_ENRICH_ALPHA!r}", None)
+
+
+def test_enrichment_gate_needs_recorded_enrichment(db_path):
+    """A database without enrich_p values loads every lattice."""
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE crystals SET enrich_p = NULL")
+    gate = read_enrichment_gate(db_path)
+    assert (gate["predicate"], gate["origin"], gate["n_kept"]) == (None, "no enrich_p recorded", 3)
+    assert load_duckdb(db_path, clipped=True).n_crystals == 3
+
+
+def test_enrichment_gate_counts_the_lattices_without_a_score(db_path):
+    """A lattice probixi did not score fails the gate and is counted apart."""
+    with duckdb.connect(str(db_path)) as conn:
+        conn.execute("UPDATE crystals SET enrich_p = NULL WHERE lattice_index = 1")
+    gate = read_enrichment_gate(db_path)
+    assert (gate["n_total"], gate["n_kept"], gate["n_unscored"]) == (3, 2, 1)
+    assert load_duckdb(db_path, clipped=True).n_crystals == 2
+
+
+def test_inputs_with_different_noise_scales_leave_the_gain_to_the_estimate(db_path, capsys):
+    """One input's noise scale is never applied to another input."""
+    from dataclasses import replace
+    from torchsx.measurement import combine_measurements
+    from torchsx.merging.observations import source_noise_gain, source_var_scale
+
+    base = read_measurement(db_path)
+
+    def spec(*scales):
+        return combine_measurements(
+            replace(base, provenance=base.provenance + ((("bg_model_var_scale", s),) if s else ()))
+            for s in scales)
+
+    assert source_noise_gain(spec("0.8", "0.8"), 9000.0)[2] == 0.8
+    assert source_var_scale(spec("0.8", "0.8")) == 0.8
+    for mixed in (spec("0.8", "0.9"), spec("0.8", None)):
+        assert source_noise_gain(mixed, 9000.0) is None and source_var_scale(mixed) is None
+    assert capsys.readouterr().out.count("different noise scales") == 2
+    assert source_noise_gain(spec(None, None), 9000.0) is None
+    assert "noise scales" not in capsys.readouterr().out
+
+
+def test_parse_enrich_alpha():
+    assert parse_enrich_alpha("auto") == "auto" and parse_enrich_alpha(" AUTO ") == "auto"
+    assert parse_enrich_alpha(None) is None and parse_enrich_alpha("off") is None
+    assert parse_enrich_alpha("1e-3") == 1e-3 and parse_enrich_alpha(0.05) == 0.05
+    for bad in ("0", "1.5", -1.0, "strict", True):
+        with pytest.raises(ValueError, match="enrich_alpha"):
+            parse_enrich_alpha(bad)
+
+
+def test_cli_enrich_alpha_reaches_the_store_and_the_recipe(db_path, tmp_path):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+
+    _chance_lattice(db_path)
+    base = [str(db_path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+            "--device", "cpu"]
+    load = lambda *extra: P.load_prep(_build_parser().parse_args(  # noqa: E731
+        base + list(extra) + ["-o", str(tmp_path / ("run" + "".join(extra)))]), verbose=False)
+    gated = load()
+    assert gated.prep.obs_info.n_crystals == 2
+    assert gated.recipe["enrich_alpha"] == "auto"
+    assert gated.recipe["enrich_gate"] == [GATE]
+    every = load("--enrich-alpha", "off")
+    assert every.prep.obs_info.n_crystals == 3
+    assert (every.recipe["enrich_alpha"], every.recipe["enrich_gate"]) == ("off", ["off"])
+    strict = load("--enrich-alpha", "1e-9")
+    assert strict.prep.obs_info.n_crystals == 1 and strict.recipe["enrich_alpha"] == 1e-9
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(base + ["--enrich-alpha", "2", "-o", str(tmp_path / "bad")])
+
+
+def test_sfx_saved_from_a_database_is_used_as_saved(db_path, tmp_path):
+    """An .sfx of a probixi run is a training cache: its crystals and the filter it records stand."""
+    pytest.importorskip("safetensors")
+    import json
+    import shutil
+
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+
+    _chance_lattice(db_path)
+    gated, every = tmp_path / "gated.sfx", tmp_path / "every.sfx"
+    SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True).save(gated)
+    SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True, enrich_alpha="off",
+                          crystals_where="lattice_index >= 0").save(every)
+    assert dict(SFXStream.load(gated).measurement.provenance)["enrich_gate"] == GATE
+    saved = dict(SFXStream.load(every).measurement.provenance)
+    assert (saved["enrich_gate"], saved["crystals_where"]) == ("off", "lattice_index >= 0")
+
+    # a cache from before the filter was recorded: taken as unfiltered
+    legacy = tmp_path / "legacy.sfx"
+    shutil.copy(every, legacy)
+    sidecar = json.loads(every.with_suffix(".sfx.json").read_text())
+    record = sidecar["metadata_schema"]["_torchsx_measurement/record"]["value"]
+    record["provenance"] = [kv for kv in record["provenance"]
+                            if kv[0] not in ("enrich_gate", "crystals_where")]
+    legacy.with_suffix(".sfx.json").write_text(json.dumps(sidecar))
+
+    def load(path, *extra):
+        args = _build_parser().parse_args([
+            str(path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+            "--device", "cpu", *extra, "-o", str(tmp_path / f"run_{path.stem}")])
+        return P.load_prep(args, verbose=False)
+
+    for path, n_crystals, gate in ((gated, 2, GATE), (every, 3, "off"), (legacy, 3, "off")):
+        bundle = load(path)
+        assert bundle.prep.obs_info.n_crystals == n_crystals, path.name
+        assert bundle.recipe["enrich_gate"] == [gate], path.name
+        assert bundle.recipe["background"] == "model", "still a probixi measurement"
+        bundle.prep.close()
+    # the filter is fixed when the cache is saved
+    for option in (("--enrich-alpha", "off"), ("--crystals-where", "lattice_index = 0")):
+        with pytest.raises(SystemExit, match="holds the crystals it was saved with"):
+            load(gated, *option)

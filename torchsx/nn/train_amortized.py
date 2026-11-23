@@ -41,6 +41,52 @@ from torchsx.nn.metrics import (
 __all__ = ["CrystalIndex", "TrainConfig", "AmortizedTrainer"]
 
 
+@torch.no_grad()
+def refine_grid(tgt, sweep, centre: Tensor, sd: Tensor, passes: int = 4) -> tuple[Tensor, Tensor, Tensor, int]:
+    """Accumulate the merge curve, re-placing each grid that does not resolve its posterior.
+
+    ``sweep(v_nodes)`` returns the accumulated coarse curve. A posterior with more
+    than half its mass on one fine node is re-centred on its mean with a grid of its
+    measured width, at least two old node spacings across each side. A posterior
+    with more than half its mass in one edge band has its grid moved to that edge.
+    Returns the final centre, width, curve and the number of reflections re-placed.
+    """
+    step = 2.0 * tgt.n_sigma / (tgt.k_coarse - 1)
+    n_edge = max(1, round(0.05 * tgt.m_fine))
+    moved = torch.zeros_like(sd, dtype=torch.bool)
+    for left in range(passes, -1, -1):
+        acc = sweep(centre[:, None] + sd[:, None] * tgt.u_coarse[None, :])
+        if not left:
+            break
+        w, v = tgt.integrate(acc, (centre, sd))[3:5]
+        mean = (w * v).sum(1)
+        width = (w * (v - mean[:, None]) ** 2).sum(1).clamp(min=0).sqrt()
+        seen = acc.abs().sum(1) > 0
+        low = seen & (w[:, :n_edge].sum(1) > 0.5)
+        high = seen & (w[:, -n_edge:].sum(1) > 0.5)
+        narrow = seen & ~low & ~high & (w.max(1).values > 0.5)
+        if not bool((low | high | narrow).any()):
+            break
+        moved |= low | high | narrow
+        centre = torch.where(low, v[:, 0], torch.where(high, v[:, -1], torch.where(narrow, mean, centre)))
+        # ponytail: float32 log-intensity nodes stop resolving below a width of about 1e-4.
+        sd = torch.where(narrow, width.clamp(min=2.0 * step * sd / tgt.n_sigma), sd).clamp(min=1e-4)
+    return centre, sd, acc, int(moved.sum())
+
+
+def drop_nonfinite_rows(c: Tensor) -> tuple[Tensor, int]:
+    """Zero every row of ``c`` that holds a non-finite node, and count those rows.
+
+    Zeroing only the non-finite nodes leaves them above their neighbours by the
+    contribution the other nodes kept, and the posterior then concentrates on
+    them with a width near zero.
+    """
+    bad = ~torch.isfinite(c).all(dim=1)
+    if not bool(bad.any()):
+        return c, 0
+    return c.masked_fill(bad[:, None], 0.0), int(bad.sum())
+
+
 def _bg_mean_offset(objective) -> float:
     """The detection background-mean offset the objective's likelihood carries."""
     return float(getattr(getattr(objective, "likelihood", None),
@@ -1000,7 +1046,7 @@ class AmortizedTrainer:
         }
         dn = getattr(self.objective, "detector_noise", None)
         if dn is not None:
-            # the fitted variance terms per panel
+            # the fitted variance terms per panel or resolution bin
             for t, v in dn.values().items():
                 rec[f"noise_{t}"] = v
         if (
@@ -1202,6 +1248,21 @@ class AmortizedTrainer:
         return True
 
     @torch.no_grad()
+    def _tether_readout(self, seen_obs: list) -> dict:
+        """Every term of the sum-of-spots tether over the observations of one merge,
+        given their ``(log K, reflection, crystal)`` batches."""
+        from torchsx.merging.tether import TERMS, Tether, TetherBatch
+
+        if seen_obs:
+            lk, h, cid = (torch.cat(c) for c in zip(*seen_obs))
+        else:
+            lk = torch.zeros(0, device=self.device)
+            h = cid = torch.zeros(0, dtype=torch.int32, device=self.device)
+        return Tether(TERMS).readout(
+            TetherBatch(lk, h, cid, self.index.n_crystals, self._tether_phi, phase=self._tether_phase),
+            d_spacing=self.prep.d_spacing)
+
+    @torch.no_grad()
     def merge(self, *, crystals: Tensor | None = None, condition: int | None = None, **kwargs) -> dict:
         """:meth:`_merge`, every batch read as one of ``condition``'s when it is given."""
         with self.in_state(condition if condition is not None else self._state):
@@ -1252,9 +1313,14 @@ class AmortizedTrainer:
                        moment estimators and belong on the same French-Wilson
                        path partialator's own output takes.
 
+        ``wls`` takes the pooled merge for a reflection with more than half of
+        its observations at the scatter limit, and counts them in ``n_pooled``.
+
         Returns a dict with ``F``/``F_sd`` (or ``I``/``I_sd``/``n_meas``),
-        ``I0``, ``seen`` and the grid diagnostics ``edge_mass``, ``loc_sd``.
-        With ``tether_readout`` (posterior estimators, a reciprocal basis) it
+        ``I0``, ``seen``, ``n_meas`` (observations per reflection) and the grid
+        diagnostics ``edge_mass``, ``loc_sd``, ``w_max`` (the largest posterior
+        weight on one node).
+        With ``tether_readout`` (and a reciprocal basis) it
         also carries ``tether``: every term of the sum-of-spots tether over all
         the merged observations (:meth:`~torchsx.merging.tether.Tether.readout`),
         whichever terms the network was trained with.
@@ -1293,16 +1359,24 @@ class AmortizedTrainer:
             bvf = float(getattr(self.objective.likelihood, "bg_var_factor", 0.0) or 0.0)
             S = {k: torch.zeros(n_hkl, device=dev, dtype=torch.float64)
                  for k in ("cnt", "r", "r2", "sig", "K", "var", "sig2", "sigK", "K2",
-                           "num", "den", "A", "B", "C")}
+                           "num", "den", "A", "B", "C", "lim")}
+            readout = tether_readout and self._tether_phi is not None
+            seen_obs = []                 # (log K, reflection, crystal) of every observation
             for _, rows in batches():
                 meta, n_ph, bg, _ = self._batch(rows.to(dev))
                 pred = self.scale.prime(meta)
+                if readout:
+                    seen_obs.append((pred.log_K.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int()))
                 K = pred.log_K.exp().double()
                 sig = (n_ph - bg).double()
                 h = meta.hkl_idx
                 ratio = sig / K
-                var = ((K * I0_ref[h].double()).clamp(min=0)
-                       + bg.double() * (1.0 + bvf))
+                # the detector variance the checkpoint fitted, A + B (counting)
+                noise = (self.objective.noise_terms(meta)
+                         if hasattr(self.objective, "noise_terms") else None)
+                nA, nB = (t.detach().double() for t in noise) if noise is not None else (0.0, 1.0)
+                var = nA + nB * ((K * I0_ref[h].double()).clamp(min=0)
+                                 + bg.double() * (1.0 + bvf))
                 # per-observation variance of (n - bg) under the trained model:
                 # counting term plus the multiplicative log-scatter of width w.
                 # The counting term is the model's (K I0_ref + bg), not the
@@ -1312,9 +1386,13 @@ class AmortizedTrainer:
                 # unity merge of a weak reflection can be zero or negative) and the
                 # counting term at one count, so no single zero-background
                 # observation can dominate a reflection.
-                w2 = (pred.log_w.exp().double() ** 2).clamp(max=20.0)
+                # The scatter term is limited at w^2 = 20; an observation at the
+                # limit weighs nothing next to one below it.
+                w2 = pred.log_w.exp().double() ** 2
+                at_limit = (w2 >= 20.0).double()
+                w2 = w2.clamp(max=20.0)
                 mu = K * I0_ref[h].double().clamp(min=floor)
-                V = ((mu + bg.double() * (1.0 + bvf)).clamp(min=1.0)
+                V = ((nA + nB * (mu + bg.double() * (1.0 + bvf))).clamp(min=1.0)
                      + mu * mu * torch.expm1(w2))
                 g = K / V                     # weight on (n - bg) for the WLS mean
                 for k, v in (("cnt", torch.ones_like(sig)), ("r", ratio),
@@ -1323,23 +1401,13 @@ class AmortizedTrainer:
                              ("sigK", sig * K), ("K2", K * K),
                              ("num", g * sig), ("den", g * K),
                              ("A", g * g * sig * sig), ("B", g * g * sig * K),
-                             ("C", g * g * K * K)):
+                             ("C", g * g * K * K), ("lim", at_limit)):
                     S[k].index_add_(0, h, v)
                 self.scale.clear()
             cnt = S["cnt"].clamp(min=1)
-            if estimator == "wls":
-                den = S["den"].clamp(min=1e-300)
-                I = S["num"] / den
-                # model variance 1 / sum(K^2 / V), and the sandwich variance of
-                # the same weighted mean; report the larger (see ``pooled``).
-                var_model = 1.0 / den
-                ss = (S["A"] - 2.0 * I * S["B"] + I * I * S["C"]).clamp(min=0)
-                bessel = cnt / (cnt - 1).clamp(min=1)
-                I_sd = torch.maximum(var_model, ss * bessel / (den * den)).sqrt()
-            elif estimator == "mean":
-                I = S["r"] / cnt
-                I_sd = ((S["r2"] / cnt - I * I).clamp(min=0) / cnt).sqrt()
-            else:
+            bessel = cnt / (cnt - 1).clamp(min=1)
+
+            def pooled():
                 sumK = S["K"].clamp(min=1e-12)
                 I = S["sig"] / sumK
                 # Counting variance alone understates the error of a merge whose
@@ -1351,17 +1419,48 @@ class AmortizedTrainer:
                 # term is a floor.
                 var_pois = S["var"] / (sumK * sumK)
                 ss = (S["sig2"] - 2.0 * I * S["sigK"] + I * I * S["K2"]).clamp(min=0)
-                bessel = cnt / (cnt - 1).clamp(min=1)
                 var_emp = ss * bessel / (sumK * sumK)
-                I_sd = torch.maximum(var_pois, var_emp).sqrt()
-            return {
+                return I, torch.maximum(var_pois, var_emp).sqrt()
+
+            n_pooled = None
+            if estimator == "wls":
+                den = S["den"].clamp(min=1e-300)
+                I = S["num"] / den
+                # model variance 1 / sum(K^2 / V), and the sandwich variance of
+                # the same weighted mean; report the larger (see ``pooled``).
+                var_model = 1.0 / den
+                ss = (S["A"] - 2.0 * I * S["B"] + I * I * S["C"]).clamp(min=0)
+                I_sd = torch.maximum(var_model, ss * bessel / (den * den)).sqrt()
+                # A reflection with most of its observations at the scatter limit
+                # has no usable weights.  V is the scatter term alone there, K / V
+                # is 1 / K up to a constant, and the weighted mean is the plain
+                # mean of (n - bg) / K with an error far above the counting error;
+                # French-Wilson then returns the prior mean of the shell.  Such a
+                # reflection takes the pooled merge, which needs no weights from
+                # the network.
+                limited = S["lim"] > 0.5 * S["cnt"]
+                I_p, sd_p = pooled()
+                I = torch.where(limited, I_p, I)
+                I_sd = torch.where(limited, sd_p, I_sd)
+                n_pooled = int((limited & (S["cnt"] >= 1)).sum())
+            elif estimator == "mean":
+                I = S["r"] / cnt
+                I_sd = ((S["r2"] / cnt - I * I).clamp(min=0) / cnt).sqrt()
+            else:
+                I, I_sd = pooled()
+            result = {
                 "estimator": estimator,
                 "I": I.float(), "I_sd": I_sd.float(),
                 "n_meas": S["cnt"].long(),
-                "seen": S["cnt"] >= 2,
+                "seen": S["cnt"] >= 1,
                 "n_crystals": int(crystals.numel()),
                 "condition": self._cond,
             }
+            if n_pooled is not None:
+                result["n_pooled"] = n_pooled
+            if readout:
+                result["tether"] = self._tether_readout(seen_obs)
+            return result
 
         # Locate the peak on THIS crystal set, then accumulate the same coarse
         # curve the loss uses -- additive over observations, hence over batches.
@@ -1398,10 +1497,8 @@ class AmortizedTrainer:
                         self.objective, self.scale.scatter, self.params, pred,
                         n_ph, bg, meta.hkl_idx, meta, scan,
                     )
-                    bad = ~torch.isfinite(c)
-                    if bool(bad.any()):
-                        n_bad_loc += int(bad.any(1).sum())
-                        c = c.masked_fill(bad, 0.0)
+                    c, n_bad = drop_nonfinite_rows(c)
+                    n_bad_loc += n_bad
                     acc_s = acc_s + c
                     self.scale.clear()
                 centre, sd_r = tgt.peak_from_scan(acc_s, centre)
@@ -1418,49 +1515,48 @@ class AmortizedTrainer:
                     loc_sd = sd_r
         finally:
             tgt.scan_halfwidth = hw0
-        tgt._loc = (centre, loc_sd)
-        v_nodes = centre[:, None] + loc_sd[:, None] * tgt.u_coarse[None, :]
-
-        # A non-finite contribution is dropped where it is non-finite, not
-        # summed in.  ``accumulate`` is additive over observations, so a NaN
+        # A reflection's contribution from one batch is dropped whole when
+        # any of its nodes is non-finite (``drop_nonfinite_rows``).
+        # ``accumulate`` is additive over observations, so a NaN
         # from one batch otherwise propagates to every reflection that batch
         # touched -- and since ``seen`` is ``acc.abs().sum(1) > 0`` and
         # ``NaN > 0`` is False, the whole split comes back empty.  Losing
         # those reflections' share of one batch is worth far less than the
         # split.
-        acc = torch.zeros(n_hkl, v_nodes.shape[1], device=dev)
         n_bad_acc = 0
         readout = tether_readout and self._tether_phi is not None
         seen_obs = []                     # (log K, reflection, crystal) of every observation
-        for _, rows in batches():
-            meta, n_ph, bg, _ = self._batch(rows.to(dev))
-            pred = self.scale.prime(meta)
-            c = tgt.accumulate(
-                self.objective, self.scale.scatter, self.params, pred,
-                n_ph, bg, meta.hkl_idx, meta, v_nodes,
-            )
-            bad = ~torch.isfinite(c)
-            if bool(bad.any()):
-                n_bad_acc += int(bad.any(1).sum())
-                c = c.masked_fill(bad, 0.0)
-            acc = acc + c
-            if readout:
-                seen_obs.append((pred.log_K.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int()))
-            self.scale.clear()
+        n_sweeps = 0
+        n_meas = torch.zeros(n_hkl, device=dev, dtype=torch.long)   # observations per reflection
+
+        def sweep(v_nodes: Tensor) -> Tensor:
+            nonlocal n_bad_acc, n_sweeps
+            n_sweeps += 1
+            n_bad_acc = 0                 # of this sweep: the last one gives the curve that is read
+            acc = torch.zeros(n_hkl, v_nodes.shape[1], device=dev)
+            for _, rows in batches():
+                meta, n_ph, bg, _ = self._batch(rows.to(dev))
+                pred = self.scale.prime(meta)
+                c = tgt.accumulate(
+                    self.objective, self.scale.scatter, self.params, pred,
+                    n_ph, bg, meta.hkl_idx, meta, v_nodes,
+                )
+                c, n_bad = drop_nonfinite_rows(c)
+                n_bad_acc += n_bad
+                acc = acc + c
+                if n_sweeps == 1:
+                    n_meas.index_add_(0, meta.hkl_idx.long(), torch.ones_like(meta.hkl_idx, dtype=torch.long))
+                if readout and n_sweeps == 1:
+                    seen_obs.append((pred.log_K.detach().float(), meta.hkl_idx.int(), meta.crystal_id.int()))
+                self.scale.clear()
+            return acc
+
+        centre, loc_sd, acc, n_refined = refine_grid(tgt, sweep, centre, loc_sd)
+        tgt._loc = (centre, loc_sd)
         tether_rec = None
         if readout:
-            from torchsx.merging.tether import TERMS, Tether, TetherBatch
-
-            if seen_obs:
-                lk, h, cid = (torch.cat(c) for c in zip(*seen_obs))
-            else:
-                lk = torch.zeros(0, device=dev)
-                h = cid = torch.zeros(0, dtype=torch.int32, device=dev)
+            tether_rec = self._tether_readout(seen_obs)
             del seen_obs
-            tether_rec = Tether(TERMS).readout(
-                TetherBatch(lk, h, cid, self.index.n_crystals, self._tether_phi, phase=self._tether_phase),
-                d_spacing=self.prep.d_spacing)
-            del lk, h, cid
         _, I0, I0_sd, w_post, v, edge = tgt.integrate(acc)
 
         # F as a posterior moment of sqrt(I0) on the same weights, not the
@@ -1469,6 +1565,7 @@ class AmortizedTrainer:
         rootI = v.exp().clamp(min=0).sqrt()
         F = (w_post * rootI).sum(1)
         F_sd = ((w_post * (rootI - F[:, None]) ** 2).sum(1)).clamp(min=0).sqrt()
+        w_max = w_post.max(1).values
         if estimator in ("flat", "ml"):
             # Same nodes, same accumulated curve, weighted by the measure alone
             # (dI0 = I0 dv): the prior-free estimate and a sigma that carries no
@@ -1482,6 +1579,7 @@ class AmortizedTrainer:
             w_flat = torch.softmax(S_fine + lw, dim=1)
             F_flat = (w_flat * rootI).sum(1)
             F_sd = ((w_flat * (rootI - F_flat[:, None]) ** 2).sum(1)).clamp(min=0).sqrt()
+            w_max = w_flat.max(1).values
             F = (F_flat if estimator == "flat"
                  else rootI.gather(1, S_fine.argmax(1, keepdim=True)).squeeze(1))
         result = {
@@ -1490,7 +1588,10 @@ class AmortizedTrainer:
             "seen": acc.abs().sum(1) > 0,
             "edge_mass": edge,
             "edge_low": w_post[:, 0], "edge_high": w_post[:, -1],
+            "w_max": w_max,
+            "n_meas": n_meas,
             "loc_sd": loc_sd,
+            "n_refined": n_refined,
             "scan_halfwidth": tgt.scan_halfwidth,
             "n_nonfinite_rows": n_bad_loc + n_bad_acc,
             "n_crystals": int(crystals.numel()),

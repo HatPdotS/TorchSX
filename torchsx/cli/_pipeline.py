@@ -19,6 +19,8 @@ import numpy as np
 
 
 READOUT_MAX_OBS = 1_500_000
+#: resolution bins of ``--detector-noise resolution``, of equal reflection count
+NOISE_RESOLUTION_BINS = 10
 
 # ── data ───────────────────────────────────────────────────────────────
 
@@ -86,8 +88,27 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
                         "Required if neither records a usable ring recipe.")
     p.add_argument("--gain", default=None, type=_gain_arg,
                    help="ADU/photon: auto (default), trust_input, calibrate, or a "
-                        "positive number. Auto replaces the input gain when "
-                        "calibration differs by more than 50%%.")
+                        "positive number. Auto takes the gain calibrated on the data "
+                        "whenever a calibration exists, else the input gain.")
+    p.add_argument("--background", default=None, choices=("annulus", "model"),
+                   help="background under each disk: annulus (ring mean times disk "
+                        "pixels) or model (the source's background model, probixi's "
+                        "background_model, with its own sigma). Default: checkpoint "
+                        "recipe, then model for a probixi database, else annulus.")
+    p.add_argument("--crystals-where", default=None, metavar="SQL",
+                   help="probixi database only: SQL predicate on its crystals table; only "
+                        "the crystals it accepts are read, e.g. \"enrich_p <= 0.05\". "
+                        "It applies on top of --enrich-alpha. Default: checkpoint recipe.")
+    p.add_argument("--enrich-alpha", default=None, type=_enrich_alpha_arg, metavar="ALPHA",
+                   help="probixi database only: the enrichment gate. Lattices whose "
+                        "enrich_p (the chance probability of their spots landing on "
+                        "signal) exceeds ALPHA are not read. auto takes the alpha the "
+                        "database records, else 1e-3, and 1e-10 for the second and "
+                        "later lattices of a frame; off reads every lattice. "
+                        "Default: checkpoint recipe, then auto.")
+    # With --background model: k on the model's background variance, auto (fitted on the
+    # observations past their crystal's limit), off (k = 1) or a number.  Experimental.
+    p.add_argument("--model-sigma-scale", default=None, help=argparse.SUPPRESS)
     p.add_argument("--dmin", type=float, default=None, help="high-resolution cut (A)")
     p.add_argument("--dmax", type=float, default=None, help="low-resolution cut (A)")
     p.add_argument("--cache", dest="cache_prep", type=Path, default=None,
@@ -109,6 +130,15 @@ def _gain_arg(value):
         return parse_gain(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+def _enrich_alpha_arg(value):
+    from torchsx.io._duckdb import parse_enrich_alpha
+    try:
+        alpha = parse_enrich_alpha(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return "off" if alpha is None else alpha
+
 
 def _workers():
     available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
@@ -203,7 +233,7 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
     """
     from torchsx.merging.config import MergeConfig
     from torchsx.merging.hkl.noise import PoissonNoiseModel
-    from torchsx.merging.observations import OBSERVATION_FILTER_VERSION
+    from torchsx.merging.observations import MODEL_BACKGROUND_VERSION, OBSERVATION_FILTER_VERSION
     from torchsx.io.sources import inspect_source
     from torchsx.measurement import combine_measurements, resolve_measurement, validate_measurement
     import torch
@@ -287,7 +317,53 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         # a probixi database switches on what it records; a checkpoint keeps its recipe
         auto = bool(measurement is not None and measurement.producer == "probixi" and not d)
         disk_size = d.get("disk_size") or ("recorded" if auto else "nominal")
-        background = d.get("background") or ("model" if auto else "annulus")
+        background = (getattr(args, "background", None) or d.get("background")
+                      or ("model" if auto else "annulus"))
+        if getattr(args, "background", None) == "model" and not (
+                measurement is not None and measurement.producer == "probixi"):
+            raise SystemExit("--background model needs a source with a background model "
+                             "(a probixi database)")
+        crystals_where = getattr(args, "crystals_where", None) or d.get("crystals_where")
+        probixi = measurement is not None and measurement.producer == "probixi"
+        # The crystal filters are applied where a probixi database is read.  An .sfx
+        # saved from one is a training cache: it holds the crystals that passed the
+        # filter it was saved under, and is used as saved.
+        from torchsx.io.sources import source_input
+        of_probixi = [(path, spec, source_input(path).kind == "probixi")
+                      for path, spec in zip(sources, specs)
+                      if spec is not None and spec.producer == "probixi"]
+        caches = [path for path, _, database in of_probixi if not database]
+        if crystals_where and (not probixi or caches):
+            raise SystemExit("--crystals-where needs a probixi database"
+                             + (f"; {caches[0]} holds the crystals it was saved with" if caches else ""))
+        # the enrichment gate: "auto", a probability or "off"; resolved per database
+        enrich_alpha = getattr(args, "enrich_alpha", None)
+        if enrich_alpha is not None and len(caches) == len(of_probixi):
+            raise SystemExit("--enrich-alpha needs a probixi database"
+                             + (f"; {caches[0]} holds the crystals it was saved with" if caches else ""))
+        if enrich_alpha is None:
+            # a checkpoint that predates the gate was trained on every lattice
+            enrich_alpha = d.get("enrich_alpha", "off") if d else "auto"
+        gates = []
+        for path, spec, database in of_probixi:
+            if database:
+                from torchsx.io._duckdb import read_enrichment_gate
+                gates.append(read_enrichment_gate(path, enrich_alpha))
+                continue
+            # the filter the cache records; one that records none is taken as unfiltered
+            saved = dict(spec.provenance)
+            gate = saved.get("enrich_gate")
+            gates.append({"predicate": None if gate in (None, "off") else gate,
+                          "origin": (f"as saved in {Path(path).name}" if gate is not None else
+                                     f"{Path(path).name} records no filter, taken as unfiltered"),
+                          "saved_where": saved.get("crystals_where"),
+                          "n_total": None, "n_kept": None})
+        from torchsx.merging.observations import parse_sigma_scale
+        try:
+            sigma_scale = parse_sigma_scale(getattr(args, "model_sigma_scale", None)
+                                            or d.get("model_sigma_scale"))
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
         per_frame = auto and dict(measurement.provenance).get("photon_energy") == "per-frame"
         per_image_k0 = bool(d.get("per_image_k0") if d else per_frame)
         resolved = resolve_measurement(measurement, radii=args.int_radius,
@@ -305,11 +381,33 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                          measurement={"source": measurement.to_dict() if measurement else None,
                                       "resolved": resolved.to_dict()},
                          source_files=[_stamp(path) for _, path in splits])
+        if crystals_where:
+            signature["crystals_where"] = crystals_where
+        if probixi:  # the resolved gate of every database, so a changed alpha rebuilds the cache
+            signature["enrich_gate"] = [g["predicate"] or "off" for g in gates]
+        if background == "model":
+            # the model's own sigma and the recorded disk in the count (v1)
+            signature["model_background_version"] = MODEL_BACKGROUND_VERSION
+            signature["model_sigma_scale"] = sigma_scale
         if verbose:
             origins = dict(resolved.provenance)
             print(f"  measurement: radii={radii} [{origins['radii']}], "
                   f"gain={gain} [{origins['gain']}], disks={disk_size}, "
                   f"background={background}", flush=True)
+            for g in gates:
+                if g["predicate"]:
+                    kept = (f" keeps {g['n_kept']:,} of {g['n_total']:,}"
+                            if g["n_kept"] is not None else "")
+                    if g.get("n_unscored"):
+                        kept += f"; {g['n_unscored']:,} of the dropped have no enrich_p"
+                    print(f"  crystals: enrichment gate {g['predicate']} [{g['origin']}]{kept}",
+                          flush=True)
+                else:
+                    print(f"  crystals: no enrichment gate [{g['origin']}]", flush=True)
+                if g.get("saved_where"):
+                    print(f"  crystals: WHERE {g['saved_where']} [{g['origin']}]", flush=True)
+            if crystals_where:
+                print(f"  crystals: WHERE {crystals_where}", flush=True)
             for override in resolved.overrides:
                 print(f"    override: {override}", flush=True)
             if measurement and measurement.unresolved:
@@ -356,7 +454,9 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
         raise SystemExit(f"--cache {cache}: {exc}") from None
     builder = StoreBuilder(staging_paths(cache)[0], spacegroup=spacegroup,
                            merge_friedel=merge_friedel, n_workers=_workers(),
-                           disk_size=disk_size, background=background)
+                           disk_size=disk_size, background=background,
+                           crystals_where=crystals_where,
+                           enrich_alpha=None if enrich_alpha == "off" else enrich_alpha)
     try:
         # --spacegroup reaches the .sfx loader too, and is applied before
         # canonicalization: an .sfx cache carries whatever group it was parsed
@@ -382,18 +482,41 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
             recipe.update(_recipe(args, d, splits, d_min, builder.spacegroup or spacegroup,
                                   merge_friedel, gain, radii, noise, resolved, measurement,
                                   disk_size, background, per_image_k0))
+            if crystals_where:
+                recipe["crystals_where"] = crystals_where
+            if probixi:
+                recipe["enrich_alpha"] = enrich_alpha
+                recipe["enrich_gate"] = [g["predicate"] or "off" for g in gates]
+            if background == "model":
+                recipe["model_sigma_scale"] = sigma_scale
+                recipe["model_sigma_scale_fit"] = builder.model_sigma_scale
             meta_out.update({"signature": signature, "recipe": recipe, "bg_var_factor": bvf})
             return meta_out
 
         prep = builder.finish(
             cache, config=MergeConfig(gain=gain, disk_size=disk_size, background=background,
-                                      per_image_k0=per_image_k0),
+                                      per_image_k0=per_image_k0, model_sigma_scale=sigma_scale),
             noise=noise, resolved_measurement=resolved, meta=store_meta)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     finally:
         builder.close()
     bvf = meta_out["bg_var_factor"]
+    fit = builder.model_sigma_scale
+    if verbose and fit:
+        if fit.get("policy") == "auto":
+            print(f"  model sigma scale: k = {fit['k']:.4g} "
+                  f"({'fitted on' if fit.get('fitted') else 'too few,'} {fit.get('n_ref', 0):,} "
+                  f"observations past their crystal's limit)", flush=True)
+            for d_hi, d_lo, m, s0, s1 in fit.get("shells", []):
+                print(f"    d {d_hi:6.2f}-{d_lo:6.2f} A  n={m:>9,}  robust sd(I/sigma) "
+                      f"{s0:.3f} -> {s1:.3f}", flush=True)
+        elif fit.get("policy") == "source":
+            print("  model sigma scale: k = 1, background_model_var already rescaled by "
+                  f"probixi (k = {', '.join(f'{k:.3g}' for k in fit['source_scales'])})",
+                  flush=True)
+        else:
+            print(f"  model sigma scale: k = {fit['k']:.4g} ({fit['policy']})", flush=True)
     if verbose:
         print(f"prepared: {prep.n_valid:,} reflections, {prep.n_obs_total:,} obs, "
               f"{prep.obs_info.n_crystals:,} crystals, n_peak/n_bg={bvf:.4f}, "
@@ -520,6 +643,49 @@ def _memberships(args, splits, prep, *, unassigned: str = "train", verbose: bool
 
 
 # ── free flags ─────────────────────────────────────────────────────────
+
+
+#: estimators the merge can write as its product, the first being the default
+ESTIMATORS = ("wls", "posterior")
+#: estimators ``--also`` can export beside the product
+ALSO_ESTIMATORS = ("posterior", "flat", "ml", "pooled", "mean", "wls")
+#: estimators that return intensities (``I``, ``I_sd``) on the trained scales
+MOMENT_ESTIMATORS = ("pooled", "mean", "wls")
+
+
+def add_export_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--estimator", default=None, choices=ESTIMATORS,
+                   help="the merge written to merged.mtz and its halves. wls (default): the "
+                        "inverse-variance mean of (n - bg) / K on the trained scales, with "
+                        "French-Wilson amplitudes. posterior: the Wilson-posterior amplitude "
+                        "of the shape likelihood. The halves hold the same estimator.")
+    p.add_argument("--also", nargs="+", default=None, choices=ALSO_ESTIMATORS, metavar="ESTIMATOR",
+                   help="diagnostic: also merge every crystal with these estimators and write "
+                        "merged_ESTIMATOR.mtz and merged_ESTIMATOR.tsv (h k l d, intensity or "
+                        "amplitude with its sigma, multiplicity). flat and ml read the posterior "
+                        "curve without the prior; pooled, mean and wls are moment estimators "
+                        "on the trained scales, and their table keeps negative intensities. "
+                        f"Choices: {', '.join(ALSO_ESTIMATORS)}.")
+
+
+def write_merge_table(path: Path, hkl: np.ndarray, d: np.ndarray, res: dict) -> None:
+    """One merge as a tab-separated table: ``h k l d`` then ``I sigI`` (moment
+    estimators, negative intensities kept) or ``F sigF I0 sigI0``, and ``n_meas``."""
+    seen = res["seen"].cpu().numpy()
+    cols = (("I", "I"), ("sigI", "I_sd")) if "I" in res else (
+        ("F", "F"), ("sigF", "F_sd"), ("I0", "I0"), ("sigI0", "I0_sd"))
+    data = [(name, res[key].detach().cpu().numpy()[seen]) for name, key in cols if res.get(key) is not None]
+    n_meas = res.get("n_meas")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("\t".join(["h", "k", "l", "d_A", *(n for n, _ in data)]
+                           + (["n_meas"] if n_meas is not None else [])) + "\n")
+        counts = None if n_meas is None else n_meas.cpu().numpy()[seen]
+        for i, (h, dd) in enumerate(zip(hkl[seen], d[seen])):
+            row = [str(int(x)) for x in h] + [f"{float(dd):.4f}"] + [f"{float(v[i]):.6g}" for _, v in data]
+            if counts is not None:
+                row.append(str(int(counts[i])))
+            fh.write("\t".join(row) + "\n")
 
 
 def add_free_args(p: argparse.ArgumentParser) -> None:
@@ -674,7 +840,62 @@ def tether_summary(rec: dict) -> str:
     return f"sum-of-spots tether over {rec['n_obs']:,} observations: " + "; ".join(parts)
 
 
-def report_merge(res: dict, *, verbose: bool = True) -> None:
+#: sigF below this fraction of the median sigF counts as collapsed
+SIGF_FLOOR_FRACTION = 1e-3
+
+
+def collapsed_sigma(res: dict, hkl=None, n_worst: int = 5) -> dict:
+    """Reflections whose posterior sigF is below ``SIGF_FLOOR_FRACTION`` of the median.
+
+    Returns ``n``, the ``floor`` and the ``n_worst`` smallest, each with its
+    grid diagnostics: a posterior on one node has ``w_max`` near one, and one
+    cut by the grid has ``edge_low`` or ``edge_high`` near one.
+    """
+    import torch
+
+    seen = res["seen"]
+    S = res["F_sd"]
+    floor = SIGF_FLOOR_FRACTION * float(S[seen].median())
+    low = (seen & (S < floor)).nonzero(as_tuple=True)[0]
+    worst = low[torch.argsort(S[low])[:n_worst]]
+    pick = lambda key, i: None if res.get(key) is None else float(res[key][i])  # noqa: E731
+    rows = [{"index": int(i), "hkl": None if hkl is None else [int(x) for x in hkl[int(i)]],
+             "F": float(res["F"][i]), "F_sd": float(S[i]), "loc_sd": pick("loc_sd", i),
+             "edge_low": pick("edge_low", i), "edge_high": pick("edge_high", i),
+             "w_max": pick("w_max", i)} for i in worst]
+    return {"n": int(low.numel()), "floor": floor, "worst": rows}
+
+
+#: posterior mass at the top grid edge above which a reflection is listed by ``top_edge``
+TOP_EDGE_MASS = 0.01
+
+
+def top_edge(res: dict, hkl=None, n_worst: int = 5) -> dict:
+    """Reflections with more than ``TOP_EDGE_MASS`` of their posterior at the top grid edge.
+
+    Returns ``n``, the quantiles of their multiplicity, the median multiplicity
+    of every merged reflection and the ``n_worst`` with the most edge mass.
+    """
+    import torch
+
+    seen, high, n_meas = res["seen"], res.get("edge_high"), res.get("n_meas")
+    if high is None or n_meas is None:
+        return {"n": 0, "worst": []}
+    at = (seen & (high > TOP_EDGE_MASS)).nonzero(as_tuple=True)[0]
+    if not at.numel():
+        return {"n": 0, "worst": []}
+    m = n_meas[at].double()
+    quant = lambda p: float(m.quantile(torch.tensor(p, dtype=m.dtype, device=m.device)))  # noqa: E731
+    worst = at[torch.argsort(high[at], descending=True)[:n_worst]]
+    rows = [{"index": int(i), "hkl": None if hkl is None else [int(x) for x in hkl[int(i)]],
+             "n_meas": int(n_meas[i]), "F": float(res["F"][i]), "F_sd": float(res["F_sd"][i]),
+             "edge_high": float(high[i])} for i in worst]
+    return {"n": int(at.numel()), "n_meas_median": float(m.median()),
+            "n_meas_q10": quant(0.1), "n_meas_q90": quant(0.9),
+            "n_meas_median_all": float(n_meas[seen].double().median()), "worst": rows}
+
+
+def report_merge(res: dict, *, hkl=None, verbose: bool = True) -> None:
     """The diagnostics that have actually caught bugs in this pipeline."""
     if not verbose:
         return
@@ -690,16 +911,21 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
               f"({res['n_crystals']:,} crystals) -- the outer grid found no "
               f"support; check edge_mass and the locating rounds", flush=True)
         return
-    if res["estimator"] in ("pooled", "mean"):
+    if res["estimator"] in MOMENT_ESTIMATORS:
         I, sd = res["I"][seen], res["I_sd"][seen]
         ratio = I / sd.clamp(min=1e-12)
         print(f"  estimator {res['estimator']}: {int(seen.sum()):,} reflections, "
               f"median I/sig {float(ratio.median()):.2f}, "
               f"negative {100 * float((I < 0).float().mean()):.1f} %", flush=True)
+        if res.get("n_pooled"):
+            print(f"  pooled      {res['n_pooled']:,} reflections with most observations at the "
+                  f"scatter limit of the network", flush=True)
         return
     if res.get("n_nonfinite_rows"):
         print(f"  NOTE {res['n_nonfinite_rows']:,} reflection-batch rows were "
               f"non-finite and were dropped from the accumulation", flush=True)
+    if res.get("n_refined"):
+        print(f"  grid        {res['n_refined']:,} reflections re-placed on a narrower or shifted grid", flush=True)
     F, S, E = res["F"][seen], res["F_sd"][seen], res["edge_mass"][seen]
     ratio = F / S.clamp(min=1e-12)
     # MEDIAN of the per-reflection ratio: F is heavily right-skewed, so
@@ -707,6 +933,14 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
     print(f"  F           median {float(F.median()):.3f}   <F> {float(F.mean()):.3f}")
     print(f"  F/sigF      median {float(ratio.median()):.2f}  "
           f"q10 {q(ratio, 0.1):.2f}  q90 {q(ratio, 0.9):.2f}")
+    low = collapsed_sigma(res, hkl)
+    print(f"  sigF floor  {low['n']:,} reflections with sigF < {low['floor']:.2e} "
+          f"({SIGF_FLOOR_FRACTION:g} x median)" + ("  <-- COLLAPSED POSTERIORS" if low["n"] else ""))
+    fmt = lambda v: "-" if v is None else f"{v:.3g}"  # noqa: E731
+    for r in low["worst"]:
+        print(f"    hkl {r['hkl'] if r['hkl'] is not None else r['index']}  F {r['F']:.4g}  "
+              f"sigF {r['F_sd']:.3g}  grid sd {fmt(r['loc_sd'])}  edge low {fmt(r['edge_low'])}  "
+              f"high {fmt(r['edge_high'])}  max node weight {fmt(r['w_max'])}")
     if res.get("loc_sd") is not None:
         sd = res["loc_sd"]
         print(f"  outer grid  sd med {float(sd.median()):.3f}  "
@@ -722,6 +956,16 @@ def report_merge(res: dict, *, verbose: bool = True) -> None:
     print(f"  edge_mass   median {float(E.median()):.2e}  q99 {q(E, 0.99):.2e}  "
           f"max {float(E.max()):.2e}  | frac>0.01 "
           f"{100 * float((E > 0.01).double().mean()):.3f} %", flush=True)
+    top = top_edge(res, hkl)
+    if top["n"]:
+        # a posterior that runs to the top edge at low multiplicity is improper
+        # (too few observations to bound it), at high multiplicity the grid is misplaced
+        print(f"  top edge    {top['n']:,} reflections with > {TOP_EDGE_MASS:g} of their mass at the top "
+              f"edge: multiplicity median {top['n_meas_median']:g} (q10 {top['n_meas_q10']:g}, "
+              f"q90 {top['n_meas_q90']:g}); all reflections median {top['n_meas_median_all']:g}")
+        for r in top["worst"]:
+            print(f"    hkl {r['hkl'] if r['hkl'] is not None else r['index']}  multiplicity {r['n_meas']}  "
+                  f"F {r['F']:.4g}  sigF {r['F_sd']:.3g}  edge high {r['edge_high']:.3g}", flush=True)
 
 
 # ── model stack ────────────────────────────────────────────────────────
@@ -1012,7 +1256,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
     # builds it from --detector-noise.  auto: one global B when preparation
     # replaced the declared gain by its calibration, whose estimate is biased
     # (a global B is exactly a gain correction on the integrated sums), else none;
-    # panel: A and/or B per panel (--noise-terms, panels from the stream's panel ids).
+    # panel: A and/or B per panel (--noise-terms, panels from the stream's panel ids);
+    # resolution: the same per resolution bin of the prepared reflections.
     noise_rec = ck.get("detector_noise") if ck else None
     noise_mode = None if ck else getattr(args, "detector_noise", None)
     if noise_mode == "auto":
@@ -1020,8 +1265,8 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
         noise_mode = "global_B" if selection.get("selected") == "calibration" else "off"
         if verbose:
             print(f"detector noise auto: {noise_mode} (gain from "
-                  f"{'calibration' if noise_mode == 'global_B' else 'input'})", flush=True)
-    if noise_rec or noise_mode in ("global_B", "panel"):
+                  f"{'calibration' if noise_mode == 'global_B' else selection.get('selected') or 'input'})", flush=True)
+    if noise_rec or noise_mode in ("global_B", "panel", "resolution"):
         from torchsx.merging.likelihood.detector_noise import DetectorNoise
         if noise_rec:
             dn = DetectorNoise.from_config(noise_rec["config"])
@@ -1030,6 +1275,13 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             noise_mode = "checkpoint"
         elif noise_mode == "global_B":
             dn = DetectorNoise(1, terms="B")
+        elif noise_mode == "resolution":
+            from torchref.base.reciprocal.hkl import get_d_spacing
+            d = get_d_spacing(prep.hkl_valid.float(), prep.median_cell).double().cpu()
+            s_sq = 1.0 / (4.0 * d.clamp(min=0.1) ** 2)
+            q = torch.linspace(0.0, 1.0, NOISE_RESOLUTION_BINS + 1, dtype=torch.float64)[1:-1]
+            edges = torch.unique(torch.quantile(s_sq, q).float())      # equal reflection count per bin
+            dn = DetectorNoise(int(edges.numel()) + 1, terms=str(getattr(args, "noise_terms", "AB") or "AB"), edges=edges)
         else:
             if hasattr(prep, "n_panels"):
                 n_groups = max(1, prep.n_panels)
@@ -1039,10 +1291,11 @@ def build_stack(bundle: PrepBundle, args, *, ckpt: dict | None = None,
             dn = DetectorNoise(n_groups, terms=str(getattr(args, "noise_terms", "AB") or "AB"))
         obj.detector_noise = dn.to(dev)
         if verbose:
-            print(f"detector noise: {noise_mode}, {dn.n_groups} panel(s), "
+            print(f"detector noise: {noise_mode}, {dn.n_groups} "
+                  f"{'panel(s)' if dn.edges is None else 'resolution bin(s)'}, "
                   f"V = A + B (lam + sig_b2), fitted terms {dn.terms}")
     elif noise_mode not in (None, "off"):
-        raise ValueError(f"Unknown detector noise mode {noise_mode!r}; expected auto, off or panel")
+        raise ValueError(f"Unknown detector noise mode {noise_mode!r}; expected auto, off, panel or resolution")
 
     # The outer grid is deliberately NOT inherited from the checkpoint.  A
     # training run may integrate on a cheaper grid than a merge should: at a

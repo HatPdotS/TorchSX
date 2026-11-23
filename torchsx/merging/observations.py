@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -19,6 +21,215 @@ from torchsx.merging.hkl import PoissonNoiseModel, compute_hkl_index
 # 2: the per-HKL initial parameters (mu/alpha/beta) and the Miller adjacency are
 # no longer prepared -- the predicted scatter never read them.
 OBSERVATION_FILTER_VERSION = 2
+
+# Prepared caches built with ``background="model"`` must match this definition.
+# 1: the count I + n b keeps the recorded disk n, and sigma is the model's own,
+# ``model_background_sigma``, instead of the source's annulus sigma.
+MODEL_BACKGROUND_VERSION = 1
+
+
+def model_background_sigma(I_model: Tensor, var_model: Tensor, n_pix: Tensor,
+                           n_bg: float | None, fallback: Tensor, scale: float = 1.0) -> Tensor:
+    """Uncertainty of a model-subtracted intensity, all in photons.
+
+    probixi stores ``background_model_var`` = (n / n_bg) sum_p V_p over the n
+    disk pixels, with n_bg the local annulus behind the model, so
+
+        sigma^2 = k V_model (1 + n_bg / n) + max(I_model, 0).
+
+    ``var_model`` is ``background_model_var`` divided by gain^2 and ``I_model``
+    is in photons (the Poisson term g max(I, 0) in ADU^2 becomes max(I, 0)).
+    ``scale`` is k, the factor on the background term only
+    (:func:`fit_model_sigma_scale`); 1 takes probixi's variance as it is.
+    Rows without a finite variance, a recorded disk or a known n_bg keep
+    ``fallback``.
+    """
+    if n_bg is None or not n_bg > 0:
+        return fallback
+    var_bg, ok = model_background_var(var_model, n_pix, n_bg)
+    var = float(scale) * var_bg + I_model.clamp(min=0)
+    return torch.where(ok, var.clamp(min=1e-12).sqrt(), fallback)
+
+
+def model_background_var(var_model: Tensor, n_pix: Tensor, n_bg: float) -> tuple[Tensor, Tensor]:
+    """``(V_model (1 + n_bg / n), usable)``: the background term of the model's
+    variance, and where it is defined (finite, non-negative, recorded disk)."""
+    n = n_pix.float()
+    ok = torch.isfinite(var_model) & (var_model >= 0) & (n > 0)
+    return var_model * (1.0 + float(n_bg) / n.clamp(min=1.0)), ok
+
+
+#: observations at most in the sample :func:`fit_model_sigma_scale` sees
+SIGMA_SCALE_SAMPLE = 2_000_000
+#: fewer reference observations than this leave the scale at 1
+SIGMA_SCALE_MIN_OBS = 1000
+#: the fitted scale is clamped to this range
+SIGMA_SCALE_RANGE = (0.05, 20.0)
+
+
+def robust_sd(z: Tensor) -> float:
+    """1.4826 x the median absolute deviation: the sd of a normal sample, and
+    insensitive to the weak signal and outliers a sample past the limit keeps."""
+    z = z.double()
+    return float(1.4826 * (z - z.median()).abs().median())
+
+
+def fit_model_sigma_scale(I_model: Tensor, var_bg: Tensor, *, n_iter: int = 8,
+                          min_obs: int | None = None) -> tuple[float | None, int]:
+    """``(k, n)``: the factor on the model's background variance that makes the
+    robust spread of ``I_model / sigma`` one, with
+    sigma^2 = k var_bg + max(I_model, 0) (photons).
+
+    The sample should be observations with no signal to speak of: probixi's
+    reflections past their own crystal's diffraction limit
+    (:func:`sigma_scale_reference`).  The Poisson term is kept, so k is
+    found by a fixed-point iteration rather than as one ratio.  ``None`` when
+    fewer than ``min_obs`` usable observations remain.
+    """
+    ok = torch.isfinite(I_model) & torch.isfinite(var_bg) & (var_bg > 0)
+    I, v = I_model[ok].double(), var_bg[ok].double()
+    n = int(I.numel())
+    if n < (SIGMA_SCALE_MIN_OBS if min_obs is None else min_obs):
+        return None, n
+    poisson = I.clamp(min=0)
+    k = 1.0
+    for _ in range(n_iter):
+        s = robust_sd(I / (k * v + poisson).sqrt())
+        if not s > 0:
+            return None, n
+        # sigma^2 ~ k v for background-dominated rows: k s^2 is the next estimate
+        k_new = min(max(k * s * s, SIGMA_SCALE_RANGE[0]), SIGMA_SCALE_RANGE[1])
+        if abs(k_new - k) < 1e-4 * k:
+            k = k_new
+            break
+        k = k_new
+    return k, n
+
+
+def sigma_scale_reference(d_obs: Tensor, d_limit: Tensor) -> Tensor:
+    """Observations past their own crystal's diffraction limit (both d in A;
+    the 999 A no-limit sentinel never counts)."""
+    return torch.isfinite(d_obs) & (d_limit > 0) & (d_limit < 900.0) & (d_obs < d_limit)
+
+
+def sigma_scale_shells(I_model: Tensor, var_bg: Tensor, d_obs: Tensor, k: float,
+                       n_shells: int = 8) -> list[tuple[float, float, int, float, float]]:
+    """Diagnostic: ``(d_hi, d_lo, n, robust sd at k = 1, robust sd at k)`` in
+    equal-population resolution shells of the reference sample."""
+    ok = torch.isfinite(I_model) & torch.isfinite(var_bg) & (var_bg > 0) & torch.isfinite(d_obs)
+    I, v, d = I_model[ok].double(), var_bg[ok].double(), d_obs[ok].double()
+    if I.numel() < n_shells:
+        return []
+    order = torch.argsort(d)
+    out = []
+    for part in torch.tensor_split(order, n_shells):
+        Ip, vp, dp = I[part], v[part], d[part]
+        p = Ip.clamp(min=0)
+        out.append((float(dp.min()), float(dp.max()), int(part.numel()),
+                    robust_sd(Ip / (vp + p).sqrt()), robust_sd(Ip / (k * vp + p).sqrt())))
+    return out
+
+
+def parse_sigma_scale(value) -> str | float:
+    """``auto``, ``off`` or a positive number (the ``--model-sigma-scale`` values)."""
+    if value is None:
+        return "auto"
+    if str(value) in ("auto", "off"):
+        return str(value)
+    try:
+        k = float(value)
+    except (TypeError, ValueError):
+        k = float("nan")
+    if not (k > 0 and k < float("inf")):
+        raise ValueError(f"--model-sigma-scale wants auto, off or a positive number, got {value!r}")
+    return k
+
+
+def _model_sigma_scale(core, config, I_model, var_model, n_pix, n_bg, use, spec=None) -> float:
+    """k for :func:`model_background_sigma` under ``config.model_sigma_scale``;
+    1 under ``auto`` when probixi already rescaled the variance (``spec``)."""
+    policy = parse_sigma_scale(getattr(config, "model_sigma_scale", "auto"))
+    if policy == "off" or n_bg is None:
+        return 1.0
+    if not isinstance(policy, str):
+        return float(policy)
+    if source_var_scale(spec) is not None:
+        print("  model sigma scale: k = 1, the database's variance is already "
+              "calibrated by probixi", flush=True)
+        return 1.0
+    var_bg, ok = model_background_var(var_model, n_pix, n_bg)
+    cid = core.crystal_id.long()
+    observed = getattr(core, "observed_hkl", None)
+    hkl = (observed if observed is not None else core.hkl).float()
+    d = obs_d_spacing(hkl, core.astar[cid], core.bstar[cid], core.cstar[cid])
+    ref = ok & use & sigma_scale_reference(d, core.resolution[cid].float())
+    k, n = fit_model_sigma_scale(I_model[ref], var_bg[ref])
+    if k is None:
+        print(f"  model sigma scale: {n:,} observations past their crystal's limit, "
+              f"too few; k = 1", flush=True)
+        return 1.0
+    print(f"  model sigma scale: k = {k:.4g} from {n:,} observations past their "
+          f"crystal's limit", flush=True)
+    return k
+
+
+def obs_d_spacing(hkl: Tensor, astar: Tensor, bstar: Tensor, cstar: Tensor) -> Tensor:
+    """d (A) of measured indices against per-row reciprocal axes (A^-1)."""
+    q = hkl[:, 0:1] * astar + hkl[:, 1:2] * bstar + hkl[:, 2:3] * cstar
+    return 1.0 / q.norm(dim=1).clamp(min=1e-12)
+
+
+def source_var_scale(spec) -> float | None:
+    """The scale probixi already applied to ``background_model_var``
+    (``integration.bg_model_var_scale``, probixi >= 0.10.3), or None."""
+    if spec is None:
+        return None
+    scales = {value for key, value in spec.provenance if key == "bg_model_var_scale"}
+    try:
+        return float(scales.pop()) if len(scales) == 1 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def source_noise_gain(spec, beam_energy_eV: float) -> tuple[float, float, float] | None:
+    """``(gain, declared gain, k)`` for a source that measured its own noise scale, else None.
+
+    probixi (>= 0.10.3) fits the variance of the background under its disks against
+    the Poisson law at the declared gain and records the ratio k
+    (``integration.bg_model_var_scale``).  ``k * gain`` is then the variance of the
+    detector signal per unit mean, in ADU: the gain at which the photon counts carry
+    Poisson noise.  Inputs that record different k have no single such gain.
+    """
+    from torchsx.measurement import gain_from_measurement
+
+    if spec is None:
+        return None
+    scales = {value for key, value in spec.provenance if key == "bg_model_var_scale"}
+    if len(scales) > 1:
+        print(f"  gain: the inputs record different noise scales ({', '.join(sorted(scales))}), "
+              f"so auto does not use them and estimates the gain from the integrated sums", flush=True)
+    if len(scales) != 1:
+        return None
+    try:
+        k = float(next(iter(scales)))
+        declared = gain_from_measurement(spec, beam_energy_eV)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(k) and k > 0):
+        return None
+    return declared * k, declared, k
+
+
+def source_n_bg(spec) -> float | None:
+    """Pixels behind the source's background model (probixi ``bg_annulus_pixels``)."""
+    if spec is None:
+        return None
+    value = dict(spec.provenance).get("bg_annulus_pixels")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 # ── Per-observation metadata ───────────────────────────────────────────
@@ -441,7 +652,8 @@ def resolve_gain(core, spec, resolved_measurement, config: MergeConfig,
 
     ``core`` supplies the images' ``beam_energy`` (and, for legacy inputs, the
     ``geometry``).  ``calibration_sample()`` returns ``(I, background,
-    ewald_offset)`` in ADU over the observations, or over a subset holding at
+    ewald_offset)`` in ADU, optionally followed by ``n_pix`` (the recorded
+    pixels of each observation's disk, 0 where unrecorded), over the observations, or over a subset holding at
     least every observation a calibration selects
     (:func:`~torchsx.merging.hkl.noise.calibration_candidates`); it is called only
     when the gain is calibrated.
@@ -456,6 +668,14 @@ def resolve_gain(core, spec, resolved_measurement, config: MergeConfig,
         mean_eV = float(core.beam_energy.float().mean().item())
         gain = gain_from_measurement(spec, mean_eV) if spec is not None else legacy_stream_gain(core)
         gain_src = "source measurement declaration" if spec is not None else "legacy geometry (unverified)"
+    elif gain_cfg == "auto" and (measured := source_noise_gain(spec, float(core.beam_energy.float().mean().item()))):
+        # The source measured the noise scale on its own frames: take it.  The
+        # calibration below reads the same scale off the integrated sums and is biased.
+        gain, declared, k = measured
+        poisson_noise.gain_selection = dict(mode=gain_cfg, declared_gain=declared, source_noise_scale=k,
+                                            selected="source_noise_scale", reason="source_measured_noise",
+                                            selected_gain=gain)
+        gain_src = f"auto: declared {declared:.4g} x noise scale {k:.4g} measured by the source"
     elif gain_cfg in ("auto", "calibrate"):
         import math
         tolerance = float(config.gain_tolerance)
@@ -468,17 +688,20 @@ def resolve_gain(core, spec, resolved_measurement, config: MergeConfig,
             declaration_error = str(exc)
         if declared is not None:
             poisson_noise.gain = declared
-        cal_I, cal_background, cal_ewald = calibration_sample()
+        cal_I, cal_background, cal_ewald, *cal_rest = calibration_sample()
+        # the disk each observation was integrated with, where the source records it
+        disk = {"n_pix": cal_rest[0]} if cal_rest and cal_rest[0] is not None else {}
         g, mu_bias, read_var_adu_sq = poisson_noise.calibrate_sigma2_of_bg(
-            cal_I, cal_background, cal_ewald,
+            cal_I, cal_background, cal_ewald, **disk,
         )
         if not (poisson_noise.gain_calibration_info.get("valid", True)
                 and g is not None and math.isfinite(g) and g > 0):
             # No off-Bragg sample (CrystFEL streams predict only near the Ewald
             # sphere): the truncated normal on the negative sums.  Biased (see its
-            # docstring), so it decides a wrong declaration only past the tolerance.
+            # docstring), yet closer than a wrong declaration: a noise variance
+            # understated by a third already turns into intensity at high multiplicity.
             off_bragg = poisson_noise.gain_calibration_info
-            g, mu_bias = poisson_noise.calibrate_gain_truncnorm(cal_I, cal_background)
+            g, mu_bias = poisson_noise.calibrate_gain_truncnorm(cal_I, cal_background, **disk)
             read_var_adu_sq = 0.0
             poisson_noise.gain_calibration_info = {
                 **poisson_noise.gain_calibration_info,
@@ -493,7 +716,8 @@ def resolve_gain(core, spec, resolved_measurement, config: MergeConfig,
         if valid_calibration and (gain_cfg == "calibrate" or declared is None or difference > tolerance):
             gain = calibrated
             reason = ("calibration_requested" if gain_cfg == "calibrate" else
-                      "declaration_unavailable" if declared is None else "disagreement_exceeds_tolerance")
+                      "declaration_unavailable" if declared is None else
+                      "calibration_available" if tolerance == 0 else "disagreement_exceeds_tolerance")
             selected = "calibration"
         elif declared is not None:
             gain = declared
@@ -624,25 +848,38 @@ def prepare_observations(
     _lap("ewald offset")
 
     # ── Detector gain (ADU / photon) ──
+    obs_cols = core.levels["obs"] if hasattr(core, "levels") else {}
+    recorded_disk = obs_cols.get("n_pixels") if config.disk_size == "recorded" else None
     gain = resolve_gain(core, spec, resolved_measurement, config, poisson_noise,
-                        lambda: (core_I, core_background, ewald_offset_core))
+                        lambda: (core_I, core_background, ewald_offset_core, recorded_disk))
 
     # ADU → photon counts for the Poisson likelihood.
     core_I = core_I / gain
     core_background = core_background / gain
-    obs_cols = core.levels["obs"] if hasattr(core, "levels") else {}
     n_pix_core = torch.full_like(core_I, float(poisson_noise.n_peak))
     recorded = obs_cols.get("n_pixels")
     if config.disk_size == "recorded" and recorded is not None:
         n_pix_core = torch.where(recorded > 0, recorded.float(), n_pix_core)
     bg_core = core_background * n_pix_core
+    sigma_core = (core.sigma / gain) if getattr(core, "sigma", None) is not None else None
     model = obs_cols.get("background_model")
     if config.background == "model" and model is not None:
-        # keep the measured count I + bg; move only its background estimate
+        # keep the measured count I + n b over the disk the source summed;
+        # move only its background estimate
         model = model.float() / gain
         use = torch.isfinite(model)
-        core_I = torch.where(use, core_I + bg_core - model, core_I)
+        n_rec = (torch.where(recorded > 0, recorded.float(), n_pix_core)
+                 if recorded is not None else n_pix_core)
+        core_I = torch.where(use, core_I + core_background * n_rec - model, core_I)
         bg_core = torch.where(use, model, bg_core)
+        var_model = obs_cols.get("background_model_var")
+        n_bg = source_n_bg(spec)
+        if sigma_core is not None and var_model is not None and recorded is not None:
+            k = _model_sigma_scale(core, config, core_I, var_model.float() / gain**2,
+                                   recorded, n_bg, use, spec)
+            own = model_background_sigma(core_I, var_model.float() / gain**2, recorded,
+                                         n_bg, sigma_core, scale=k)
+            sigma_core = torch.where(use, own, sigma_core)
     hkl_idx = compute_hkl_index(core.hkl)
     _lap("hkl index")
     hkl_id_raw = hkl_idx.hkl_id
@@ -721,8 +958,8 @@ def prepare_observations(
         # divided by the detector gain above).  Consumed by the agreement /
         # marginal objective and by a supplied-σ likelihood.
         sigma=(
-            (core.sigma / gain)[keep_all][sort_all].float()
-            if getattr(core, "sigma", None) is not None else None
+            sigma_core[keep_all][sort_all].float()
+            if sigma_core is not None else None
         ),
         q_dir=q_dir_core[keep_all][sort_all].float(),
         beam_energy=(

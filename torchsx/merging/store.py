@@ -20,8 +20,8 @@ Directory layout::
 Every record field is four bytes, so a batch of records is one contiguous
 ``(n, RECORD_WIDTH)`` float32/int32 block: it crosses the bus as one copy and
 is split into columns on the compute device.  Batches are read into ordinary
-host memory of their exact size; a page-locked pool would round every buffer
-up to a power of two and hold it.
+host memory, a few buffers that the store reuses (:class:`RecordBuffers`); a
+page-locked pool would round every buffer up to a power of two and hold it.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ import json
 import os
 import threading
 import time
+import weakref
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +68,9 @@ READ_THREADS = 16
 #: Batches read ahead at most (read-ahead of a training step plus that of an
 #: evaluation pass running between steps).
 MAX_PENDING = 3
+#: Released record buffers kept for the next batches at most.  A training step
+#: has two in use, its own batch and the one read ahead.
+MAX_SPARE = 2
 
 _POOLS: dict[str, ThreadPoolExecutor] = {}
 _POOL_LOCK = threading.Lock()
@@ -166,8 +171,59 @@ def row_runs(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return starts.astype(np.int64), ends.astype(np.int64)
 
 
-def _empty_records(n: int) -> Tensor:
-    return torch.empty((n, RECORD.itemsize), dtype=torch.uint8)
+class RecordBuffers:
+    """Host buffers for batches of records, reused from batch to batch.
+
+    :meth:`take` hands out a tensor on a spare buffer, or on a new one when no
+    spare is large enough.  The buffer comes back when the last tensor that
+    shares its memory is released, in whichever thread releases it, so a batch
+    still in use is never overwritten.  Buffers are allocated and dropped only
+    in the threads that call :meth:`take`.  A buffer allocated in a read-ahead
+    thread and released by the consumer stays resident under allocators that
+    leave a block to its owner thread (mimalloc inside torch): host memory then
+    grows by one batch per update.
+    """
+
+    def __init__(self, itemsize: int, max_spare: int = MAX_SPARE):
+        self.itemsize = int(itemsize)
+        self.max_spare = int(max_spare)
+        #: Buffers allocated so far.
+        self.n_allocated = 0
+        self._spare: list[np.ndarray] = []
+        self._returned: deque[np.ndarray] = deque()
+        self._lock = threading.Lock()
+        self._open = True
+
+    def take(self, n: int) -> Tensor:
+        """An uninitialised ``(n, itemsize)`` uint8 tensor."""
+        n = int(n)
+        with self._lock:
+            while self._returned:
+                self._spare.append(self._returned.popleft())
+            # keep the largest spares; the smallest fitting one serves this batch
+            self._spare.sort(key=len)
+            del self._spare[:max(0, len(self._spare) - self.max_spare)]
+            fit = next((j for j, b in enumerate(self._spare) if len(b) >= n), None)
+            buf = None if fit is None else self._spare.pop(fit)
+        if buf is None:
+            # batches of whole crystals differ a little in size: leave room for the next
+            buf = np.empty((n + n // 64 + 1, self.itemsize), dtype=np.uint8)
+            self.n_allocated += 1
+        part = buf[:n]
+        # torch keeps `part` alive for as long as any tensor shares its memory
+        weakref.finalize(part, self._give_back, buf).atexit = False
+        return torch.from_numpy(part)
+
+    def _give_back(self, buf: np.ndarray) -> None:
+        # runs in the releasing thread, possibly inside a garbage collection: no lock
+        if self._open:
+            self._returned.append(buf)
+
+    def close(self) -> None:
+        self._open = False
+        with self._lock:
+            self._spare.clear()
+            self._returned.clear()
 
 
 class ObservationStore:
@@ -177,6 +233,7 @@ class ObservationStore:
         self.path = Path(path)
         self.file = RecordFile(self.path / "obs.bin", RECORD.itemsize, n_obs)
         self.n_obs = int(n_obs)
+        self.buffers = RecordBuffers(RECORD.itemsize)
         self._pending: list[tuple[Tensor, object]] = []
         self._last: tuple[Tensor, Tensor] | None = None
         #: Seconds callers spent blocked in :meth:`read`, and bytes read.
@@ -185,12 +242,12 @@ class ObservationStore:
 
     def close(self) -> None:
         self._pending, self._last = [], None
+        self.buffers.close()
         self.file.close()
 
-    def _read(self, rows: Tensor) -> Tensor:
-        r = rows.numpy()
-        out = _empty_records(r.size)
-        starts, ends = row_runs(r)
+    def _read(self, rows: Tensor, out: Tensor) -> Tensor:
+        """Fill ``out``, a buffer of the caller, with the records of ``rows``."""
+        starts, ends = row_runs(rows.numpy())
         self.file.read_ranges(starts, ends, memoryview(out.numpy()).cast("B"))
         return out
 
@@ -199,7 +256,8 @@ class ObservationStore:
         rows = rows.detach().to("cpu", torch.int64)
         if any(_same(r, rows) for r, _ in self._pending):
             return
-        self._pending.append((rows, _pool("ahead").submit(self._read, rows)))
+        out = self.buffers.take(rows.numel())     # in this thread; the pool thread only fills it
+        self._pending.append((rows, _pool("ahead").submit(self._read, rows, out)))
         del self._pending[:-MAX_PENDING]
 
     def read(self, rows: Tensor) -> Tensor:
@@ -217,7 +275,7 @@ class ObservationStore:
         if hit is not None:
             rec = self._pending.pop(hit)[1].result()
         else:
-            rec = self._read(rows)
+            rec = self._read(rows, self.buffers.take(rows.numel()))
         self.wait_s += time.perf_counter() - t0
         self.bytes_read += rec.numel()
         self._last = (rows, rec)

@@ -137,12 +137,88 @@ def test_merge_estimators(tmp_path):
     # Same reflections, finite, positive sigma at least the model variance,
     # and every estimate inside the range of its own observations.
     wls = tr.merge(estimator="wls")
+    # merge is a readout: every estimator calls the scale model with autograd
+    # off (a graph kept across the batches of a full dataset exhausts the GPU)
+    grad_modes, prime = [], tr.scale.prime
+    tr.scale.prime = lambda meta: (grad_modes.append(torch.is_grad_enabled()), prime(meta))[1]
+    for est in ("posterior", "pooled", "wls"):
+        tr.merge(estimator=est)
+    tr.scale.prime = prime
+    assert grad_modes and not any(grad_modes)
     assert torch.equal(wls["n_meas"], pooled["n_meas"]) and torch.isfinite(wls["I"]).all()
     assert (wls["I_sd"] > 0).all()
     lo = torch.full((prep.n_valid,), float("inf")).scatter_reduce(0, prep.obs_info.hkl_idx, prep.I_obs, "amin")
     hi = torch.full((prep.n_valid,), -float("inf")).scatter_reduce(0, prep.obs_info.hkl_idx, prep.I_obs, "amax")
     assert ((wls["I"] >= lo - 1e-4) & (wls["I"] <= hi + 1e-4)).all()
     assert torch.allclose(pooled["I_sd"][~both], mean["I_sd"][~both] * (n[~both] / (n[~both] - 1)).sqrt().float(), rtol=1e-3, atol=1e-5)
+
+
+def test_wls_takes_the_pooled_merge_at_the_scatter_limit(tmp_path):
+    """A reflection with more than half of its observations at the scatter limit
+    gets the pooled intensity and sigma; the others keep the weighted mean."""
+    from dataclasses import replace
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, _obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    wls, pooled = tr.merge(estimator="wls"), tr.merge(estimator="pooled")
+    assert wls["n_pooled"] == 0 and "n_pooled" not in pooled
+    wide = torch.zeros(prep.n_valid, dtype=torch.bool)
+    wide[:10] = True
+    total, limited = torch.zeros(prep.n_valid), torch.zeros(prep.n_valid)
+    prime = tr.scale.prime
+
+    def widen(meta):
+        # every other crystal reports an unbounded scatter for the chosen reflections
+        pred = prime(meta)
+        h = meta.hkl_idx.cpu()
+        hit = wide[h] & (meta.crystal_id.cpu() % 2 == 0)
+        total.index_add_(0, h, torch.ones(len(h)))
+        limited.index_add_(0, h, hit.float())
+        return replace(pred, log_w=torch.where(hit.to(pred.log_w.device), torch.full_like(pred.log_w, 3.0), pred.log_w))
+
+    tr.scale.prime = widen
+    try:
+        res = tr.merge(estimator="wls")
+    finally:
+        tr.scale.prime = prime
+    falls = limited > 0.5 * total
+    assert falls.any() and (wide & ~falls).any()          # both sides of the rule occur
+    assert res["n_pooled"] == int((falls & res["seen"].cpu()).sum())
+    for key in ("I", "I_sd"):
+        assert torch.allclose(res[key][falls], pooled[key][falls])
+        assert torch.allclose(res[key][~wide], wls[key][~wide])
+    assert not torch.allclose(res["I"][wide & ~falls], pooled["I"][wide & ~falls])
+
+
+def test_wls_keeps_a_reflection_measured_once(tmp_path):
+    """One crystal measures each of its reflections once, and the merge writes them with a sigma."""
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, _obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    res = tr.merge(estimator="wls", crystals=torch.tensor([0]))
+    once = res["n_meas"] == 1
+    assert once.any() and torch.equal(res["seen"], res["n_meas"] >= 1)
+    assert torch.isfinite(res["I"][once]).all() and (res["I_sd"][once] > 0).all()
+
+
+def test_wls_weights_take_the_fitted_detector_noise(tmp_path):
+    """The model variance of the wls merge is A + B times the counting variance."""
+    import math
+    from torchsx.merging.likelihood.detector_noise import DetectorNoise
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    plain = tr.merge(estimator="wls")
+    obj.detector_noise = DetectorNoise(1)
+    with torch.no_grad():
+        obj.detector_noise.log_A.fill_(-30.0)
+    same = tr.merge(estimator="wls")
+    assert torch.allclose(same["I"], plain["I"]) and torch.allclose(same["I_sd"], plain["I_sd"])
+    with torch.no_grad():
+        obj.detector_noise.log_B.fill_(math.log(9.0))
+    noisy = tr.merge(estimator="wls")
+    assert (noisy["I_sd"] >= plain["I_sd"] * (1 - 1e-5)).all()
+    assert (noisy["I_sd"] > plain["I_sd"] * (1 + 1e-4)).any()
 
 
 def test_merge_refuses_to_pool_splits_and_honours_one(tmp_path):
@@ -635,6 +711,41 @@ def test_merge_survives_a_non_finite_batch(tmp_path):
     assert int(res["seen"].sum()) > 0           # and the split survives
 
 
+def test_non_finite_rows_are_counted_once_however_often_the_grid_is_re_placed(tmp_path, monkeypatch):
+    """The count is of the accumulation the merge reads, not the sum over the re-placement sweeps."""
+    from torchsx.nn import train_amortized
+
+    prep, params, *_ = _synthetic(n_hkl=30, n_xtal=25, per=20)
+    scale, obj, tr = _stack(prep, params, tmp_path)
+    scale.eval()
+    real, state = tr.target.accumulate, {"sweep": False, "first": False}
+
+    def poisoned(*a, **kw):
+        out = real(*a, **kw)
+        if state["sweep"] and state["first"]:      # the first batch of every sweep
+            state["first"] = False
+            return out * float("nan")
+        return out
+
+    def sweeps(n):
+        def refine(tgt, sweep, centre, sd, passes=4):
+            state["sweep"] = True
+            for _ in range(n):
+                state["first"] = True
+                acc = sweep(centre[:, None] + sd[:, None] * tgt.u_coarse[None, :])
+            state["sweep"] = False
+            return centre, sd, acc, 0
+        return refine
+
+    tr.target.accumulate = poisoned
+    counts = []
+    for n in (1, 3):
+        monkeypatch.setattr(train_amortized, "refine_grid", sweeps(n))
+        counts.append(tr.merge()["n_nonfinite_rows"])
+    tr.target.accumulate = real
+    assert counts[0] > 0 and counts[1] == counts[0]
+
+
 # ── smooth Wilson basis / gauge anchor round trip ──────────────────────
 
 
@@ -733,7 +844,8 @@ def _gain_bundle(prep, selected):
 
 @pytest.mark.parametrize("mode,selected,expected", [
     (None, "calibration", "off"), ("auto", "calibration", "global_B"),
-    ("auto", "input", "off"), ("off", "calibration", "off"), ("panel", "input", "panel")])
+    ("auto", "input", "off"), ("off", "calibration", "off"), ("panel", "input", "panel"),
+    ("resolution", "input", "resolution")])
 def test_detector_noise_auto_fits_global_B_only_for_a_calibrated_gain(tmp_path, mode, selected, expected):
     from torchsx.cli import _pipeline as P
     from torchsx.cli.train import _build_parser as train_parser
@@ -748,10 +860,36 @@ def test_detector_noise_auto_fits_global_B_only_for_a_calibrated_gain(tmp_path, 
     if expected == "off":
         assert dn is None
     elif expected == "panel":
-        assert dn.terms == "AB"
+        assert dn.terms == "AB" and dn.edges is None
+    elif expected == "resolution":
+        assert dn.n_groups == dn.edges.numel() + 1 >= 2 and bool((dn.edges[1:] > dn.edges[:-1]).all())
     else:
         assert (dn.n_groups, dn.terms) == (1, "B")
         assert dn.log_B.requires_grad and not dn.log_A.requires_grad
+
+
+def test_detector_noise_resolution_bins_come_back_from_the_checkpoint(tmp_path):
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.merge_nn import _build_parser as merge_parser
+    from torchsx.cli.train import _build_parser as train_parser
+    prep, *_ = _synthetic(n_hkl=20, n_xtal=12, per=10)
+    bundle = _gain_bundle(prep, "input")
+    targs = train_parser().parse_args(["x.sfx", "-o", str(tmp_path), "--device", "cpu",
+                                       "--detector-noise", "resolution", "--noise-terms", "B"])
+    prep_, params_, scale, obj, S = P.build_stack(bundle, targs, verbose=False)
+    dn = obj.detector_noise
+    assert S["detector_noise"] == "resolution" and dn.terms == "B"
+    with torch.no_grad():
+        dn.log_B.copy_(torch.linspace(-0.1, 0.1, dn.n_groups))
+    tr = _trainer_from_stack(prep_, params_, scale, obj, S)
+    tr.data_recipe = dict(bundle.recipe)
+    ck = torch.load(tr.save_best(tmp_path / "b.pt"), weights_only=False)
+    assert ck["detector_noise"]["config"]["edges"] == pytest.approx(dn.edges.tolist())
+    margs = merge_parser().parse_args(["ck.pt", "x.sfx", "-o", str(tmp_path / "o.mtz"), "--device", "cpu"])
+    _p, _q, _r, restored, S2 = P.build_stack(bundle, margs, ckpt=ck, verbose=False)
+    assert S2["detector_noise"] == "checkpoint"
+    torch.testing.assert_close(restored.detector_noise.edges.cpu(), dn.edges.cpu())
+    torch.testing.assert_close(restored.detector_noise.log_B.cpu(), dn.log_B.detach().cpu())
 
 
 def test_detector_noise_checkpoint_record_wins_over_the_gain_selection(tmp_path):

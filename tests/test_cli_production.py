@@ -370,3 +370,94 @@ def test_split_half_stats_report_shells_and_quintiles():
     # the weakest quintile has the largest relative disagreement
     assert stats["by_quintile"][0]["r_split"] > stats["by_quintile"][-1]["r_split"]
     assert stats["cc_half"] > 0.99
+
+
+def test_also_exports_the_requested_estimators(tmp_path, monkeypatch, capsys):
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=24, per=10, n_cond=1)
+    _, _, trainer = _stack(prep, params, tmp_path)
+    try:
+        checkpoint = trainer.save_best(tmp_path / 'model.pt')
+    finally:
+        trainer.close()
+    bundle = P.PrepBundle(prep, {'spacegroup': 'P 1'}, [''], 0.1)
+    monkeypatch.setattr(P, 'load_prep', lambda *a, **kw: bundle)
+    monkeypatch.setitem(P.DEFAULTS, 'k_coarse', 15)
+    monkeypatch.setitem(P.DEFAULTS, 'm_fine', 65)
+    merge_nn.main([str(checkpoint), 'x.stream', '-o', str(tmp_path / 'm.mtz'), '--device', 'cpu',
+                   '--also', 'posterior', 'pooled', 'flat', 'wls'])
+    assert {p.name for p in tmp_path.glob('m*.mtz')} == {
+        'm.mtz', 'm_half1.mtz', 'm_half2.mtz', 'm_posterior.mtz', 'm_pooled.mtz', 'm_flat.mtz'}
+    rec = json.loads((tmp_path / 'm.metrics.json').read_text())['']
+    assert rec['estimator'] == 'wls'                      # the default product; not exported twice
+    assert rec['products'] == ['wls', 'posterior', 'pooled', 'flat']
+    assert 'n' in rec['top_edge'] and 'split_half_wls' in rec
+    tables = {name: np.genfromtxt(tmp_path / f'm_{name}.tsv', names=True, delimiter='\t')
+              for name in ('posterior', 'pooled', 'flat', 'wls')}
+    assert tables['pooled'].dtype.names == tables['wls'].dtype.names == ('h', 'k', 'l', 'd_A', 'I', 'sigI', 'n_meas')
+    assert tables['posterior'].dtype.names == ('h', 'k', 'l', 'd_A', 'F', 'sigF', 'I0', 'sigI0', 'n_meas')
+    # every observation is counted once, by the moment and the posterior readouts alike
+    assert tables['pooled']['n_meas'].sum() == prep.n_obs_total == tables['posterior']['n_meas'].sum()
+    assert np.isfinite(tables['flat']['F']).all() and (tables['flat']['sigF'] > 0).all()
+    assert 'also        pooled' in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        merge_nn._build_parser().parse_args(['model.pt', 'x.stream', '-o', 'm.mtz', '--also', 'median'])
+
+
+def test_top_edge_reports_the_multiplicity_of_edge_piled_reflections():
+    seen = torch.tensor([True, True, True, True, False])
+    res = {'seen': seen, 'F': torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]),
+           'F_sd': torch.full((5,), 0.1),
+           'edge_high': torch.tensor([0.0, 0.5, 0.02, 0.001, 0.9]),
+           'n_meas': torch.tensor([100, 2, 4, 50, 1])}
+    top = P.top_edge(res, np.arange(15).reshape(5, 3))
+    assert top['n'] == 2                                  # the unseen reflection is not counted
+    assert [r['hkl'] for r in top['worst']] == [[3, 4, 5], [6, 7, 8]]
+    assert [r['n_meas'] for r in top['worst']] == [2, 4]
+    assert top['n_meas_median'] == 2.0 and top['n_meas_median_all'] == 4.0
+    assert P.top_edge({**res, 'edge_high': torch.zeros(5)})['n'] == 0
+    assert P.top_edge({'seen': seen, 'F': res['F'], 'F_sd': res['F_sd']})['n'] == 0
+
+
+
+def test_estimator_selects_the_product(tmp_path, monkeypatch, capsys):
+    """wls by default: French-Wilson amplitudes of the inverse-variance merge and its
+    halves. posterior: the posterior amplitudes, with posterior halves. Both record the plain
+    and the flat CC1/2 of the half files."""
+    import gemmi
+    prep, params, *_ = _synthetic(n_hkl=20, n_xtal=24, per=10, n_cond=1)
+    _, _, trainer = _stack(prep, params, tmp_path)
+    try:
+        checkpoint = trainer.save_best(tmp_path / 'model.pt')
+    finally:
+        trainer.close()
+    bundle = P.PrepBundle(prep, {'spacegroup': 'P 1'}, [''], 0.1)
+    monkeypatch.setattr(P, 'load_prep', lambda *a, **kw: bundle)
+    monkeypatch.setitem(P.DEFAULTS, 'k_coarse', 15)
+    monkeypatch.setitem(P.DEFAULTS, 'm_fine', 65)
+    base = [str(checkpoint), 'x.stream', '--device', 'cpu']
+    merge_nn.main(base + ['-o', str(tmp_path / 'w.mtz'), '--also', 'wls'])
+    merge_nn.main(base + ['-o', str(tmp_path / 'p.mtz'), '--estimator', 'posterior'])
+    out = capsys.readouterr().out
+    assert 'half-datasets  wls' in out and 'half-datasets  posterior' in out
+    assert out.count('flat CC1/2') == 2
+    w = json.loads((tmp_path / 'w.metrics.json').read_text())['']
+    p = json.loads((tmp_path / 'p.metrics.json').read_text())['']
+    assert (w['estimator'], w['products']) == ('wls', ['wls'])
+    assert 'split_half_wls' in w and 'split_half_pooled' not in w and 'sigF_collapsed' not in w
+    assert (p['estimator'], p['products']) == ('posterior', ['posterior'])
+    assert {'split_half_posterior', 'sigF_collapsed'} <= set(p) and 'split_half_pooled' not in p
+    from torchsx.merge_stats import load_merge, split_half_stats
+    for stem, rec in (('w', w), ('p', p)):
+        files = rec['split_half_files']
+        direct = split_half_stats(load_merge(tmp_path / f'{stem}_half1.mtz'), load_merge(tmp_path / f'{stem}_half2.mtz'))
+        assert files['cc_half_flat'] == pytest.approx(direct['headline']['cc_half_flat'], nan_ok=True)
+        assert len(files['by_shell']) == len(direct['shells'])
+    for stem in ('w', 'w_half1', 'w_half2', 'p', 'p_half1', 'p_half2'):
+        mtz = gemmi.read_mtz_file(str(tmp_path / f'{stem}.mtz'))
+        F = np.asarray(mtz.column_with_label('F-obs'))
+        assert np.isfinite(F).all() and (F > 0).all()
+    # every wls intensity gets a French-Wilson amplitude, and the amplitudes follow the intensities
+    table = np.genfromtxt(tmp_path / 'w_wls.tsv', names=True, delimiter='\t')
+    F = np.asarray(gemmi.read_mtz_file(str(tmp_path / 'w.mtz')).column_with_label('F-obs'))
+    assert len(F) == len(table)
+    assert np.corrcoef(np.sort(F), np.sort(np.sqrt(np.clip(table['I'], 0, None))))[0, 1] > 0.9

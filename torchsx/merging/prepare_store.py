@@ -199,6 +199,7 @@ class _Input:
     on_device: tuple = None              # (keys, to_valid) on the builder's device
     n_crystals: int = 0                  # after the resolution cut
     n_obs: int = 0                       # after the resolution cut
+    n_bg: float | None = None            # pixels behind the source's background model
 
 
 @dataclass
@@ -239,7 +240,9 @@ class StoreBuilder:
 
     def __init__(self, workdir: str | Path, *, spacegroup: str | None, merge_friedel: bool = True,
                  n_workers: int = 1, block_obs: int | None = None, verbose: bool = True,
-                 disk_size: str = "nominal", background: str = "annulus"):
+                 disk_size: str = "nominal", background: str = "annulus",
+                 crystals_where: str | None = None,
+                 enrich_alpha: float | str | None = "auto"):
         self.workdir = _fresh_staging(Path(workdir))
         self.spacegroup = spacegroup
         self.merge_friedel = bool(merge_friedel)
@@ -251,8 +254,14 @@ class StoreBuilder:
             raise ValueError(f"background must be 'annulus' or 'model', got {background!r}")
         #: see :attr:`MergeConfig.background`
         self.background = background
+        #: SQL predicate on a probixi database's crystals table
+        self.crystals_where = crystals_where
+        #: enrichment gate on a probixi database: "auto", a probability or None
+        self.enrich_alpha = enrich_alpha
         #: Var[bg]/bg of a modelled background, set by finish
         self.bg_var_factor: float | None = None
+        #: the fitted or fixed k on the model background variance, once finished
+        self.model_sigma_scale: dict | None = None
         self.n_workers = max(1, int(n_workers))
         self.block_obs = int(BLOCK_OBS if block_obs is None else block_obs)
         self.verbose = verbose
@@ -305,7 +314,10 @@ class StoreBuilder:
         # A cache written by torchsx is read whole, then cut into blocks of crystals.
         from torchsx.merging.hkl.filter import filter_crystals
         s = SFXStream.read(path, spacegroup=self.spacegroup, merge_friedel=self.merge_friedel,
-                           clipped=self.disk_size == "recorded")._core
+                           clipped=self.disk_size == "recorded",
+                           enrich_alpha=self.enrich_alpha,
+                           **({"crystals_where": self.crystals_where}
+                              if self.crystals_where else {}))._core
         self.spacegroup = self.spacegroup or s.spacegroup
         if bool((s.crystal_id[1:] < s.crystal_id[:-1]).any()):
             raise ValueError(f"{path}: observations are not ordered by crystal")
@@ -399,8 +411,9 @@ class StoreBuilder:
         if first:
             raise ValueError(f"{path}: no observations")
         self._specs.append(spec)
+        from torchsx.merging.observations import source_n_bg
         self.inputs.append(_Input(name, path, (c0, self._n_crystals()), (i0, len(self.filenames)),
-                                  refl=refl.to("cpu")))
+                                  refl=refl.to("cpu"), n_bg=source_n_bg(spec)))
         self.clock.report(f"parse {path.name}")
 
     def _n_crystals(self) -> int:
@@ -594,8 +607,52 @@ class StoreBuilder:
             I = _field(raw, "I")[rows]
             background = _field(raw, "background")[rows]
             take = calibration_candidates(I, background, off)
-            parts.append((I[take], background[take], off[take]))
+            # the recorded disk of each observation (0 where unrecorded)
+            n_pix = (_field(raw, "n_pix")[rows][take] if self.disk_size == "recorded"
+                     else torch.zeros(int(take.sum())))
+            parts.append((I[take], background[take], off[take], n_pix))
             self.clock.lap("calibration sample")
+        sample = tuple(torch.cat([p[i] for p in parts]) for i in range(4))
+        return sample if self.disk_size == "recorded" else sample[:3]
+
+    def _model_sigma_sample(self, gain: float, cap: int):
+        """``(I_model, var_bg, d)`` in photons for the observations past their own
+        crystal's diffraction limit, within the cut, at most about ``cap`` of
+        them (an even stride over the raw rows): the sample
+        :func:`~torchsx.merging.observations.fit_model_sigma_scale` fits k on."""
+        from torchsx.merging.observations import (
+            model_background_var, obs_d_spacing, sigma_scale_reference,
+        )
+
+        stride = max(1, -(-self.n_raw // max(cap, 1)))
+        parts, seen = [], 0
+        for _, sel, inp, hkl, raw in self._logical_blocks():
+            n_blk = len(raw)
+            take = torch.arange((-seen) % stride, n_blk, stride)
+            seen += n_blk
+            if inp.n_bg is None or not len(take):
+                continue
+            h = inp.in_range[torch.searchsorted(inp.refl.keys, hkl_key(hkl))]
+            _, valid = _validity(_field(raw, "I"), _field(raw, "background"),
+                                 _field(raw, "sigma") if self.has_sigma else None)
+            rows = take[(h & valid)[take]]
+            if not len(rows):
+                continue
+            rc = sel[self._local(sel)[rows]]
+            recorded = _field(raw, "n_pix")[rows]
+            model = _field(raw, "bg_model")[rows] / gain
+            I_model = (_field(raw, "I")[rows] + _field(raw, "background")[rows] * recorded) / gain - model
+            var_bg, ok = model_background_var(_field(raw, "bg_model_var")[rows] / gain**2,
+                                              recorded, inp.n_bg)
+            d = obs_d_spacing(torch.from_numpy(raw["observed"])[rows].float(),
+                              self.crystal["astar"][rc], self.crystal["bstar"][rc],
+                              self.crystal["cstar"][rc])
+            ref = ok & torch.isfinite(model) & sigma_scale_reference(
+                d, self.crystal["resolution"][rc].float())
+            parts.append((I_model[ref], var_bg[ref], d[ref]))
+            self.clock.lap("sigma-scale sample")
+        if not parts:
+            return (torch.zeros(0),) * 3
         return tuple(torch.cat([p[i] for p in parts]) for i in range(3))
 
     def finish(self, out: str | Path, *, config: MergeConfig, noise: PoissonNoiseModel,
@@ -607,6 +664,10 @@ class StoreBuilder:
         is recorded in the store's ``meta.json``.
         """
         from torchsx.measurement import combine_measurements, validate_measurement
+        from torchsx.merging.observations import (
+            SIGMA_SCALE_SAMPLE, fit_model_sigma_scale, model_background_sigma,
+            parse_sigma_scale, sigma_scale_shells, source_var_scale,
+        )
         from torchsx.merging.observations import (
             _crystal_feature_table, centric_flags, ewald_k0, ewald_rows, fw_shell_ids,
             resolve_gain, unit_rows,
@@ -650,6 +711,32 @@ class StoreBuilder:
         gain = resolve_gain(sk, spec, resolved_measurement, config, noise,
                             lambda: self._calibration_sample(k0, config.per_image_k0))
         self.clock.report("gain")
+        # k on the model's background variance (MergeConfig.model_sigma_scale)
+        sigma_scale = 1.0
+        self.model_sigma_scale = None
+        if self.background == "model" and self.has_sigma:
+            policy = parse_sigma_scale(getattr(config, "model_sigma_scale", "auto"))
+            scales = [source_var_scale(s) for s in self._specs]
+            if policy == "auto" and scales and all(k is not None for k in scales):
+                # probixi >= 0.10.3 rescaled background_model_var already
+                self.model_sigma_scale = {"policy": "source", "k": 1.0,
+                                          "source_scales": scales}
+            elif policy == "auto":
+                I_s, v_s, d_s = self._model_sigma_sample(gain, SIGMA_SCALE_SAMPLE)
+                k, n = fit_model_sigma_scale(I_s, v_s)
+                sigma_scale = 1.0 if k is None else k
+                self.model_sigma_scale = {"policy": "auto", "k": sigma_scale, "n_ref": n,
+                                          "fitted": k is not None}
+                if k is not None:
+                    self.model_sigma_scale["shells"] = [
+                        [round(a, 4), round(b, 4), m, round(s0, 4), round(s1, 4)]
+                        for a, b, m, s0, s1 in sigma_scale_shells(I_s, v_s, d_s, k)]
+                self.clock.report("sigma scale")
+            elif policy != "off":
+                sigma_scale = float(policy)
+                self.model_sigma_scale = {"policy": "fixed", "k": sigma_scale}
+            else:
+                self.model_sigma_scale = {"policy": "off", "k": 1.0}
 
         unique_hkl = key_hkl(keys)
         median_cell = sk.cell.median(dim=0).values
@@ -689,18 +776,27 @@ class StoreBuilder:
                 recorded = _field(raw, "n_pix")[rows]
                 n_pix = torch.where(recorded > 0, recorded, n_pix)
             bg = _field(raw, "background")[rows] / gain * n_pix
+            if self.has_sigma:
+                sigma = _field(raw, "sigma")[rows] / gain
             if self.background == "model":
-                # keep the measured count I + bg; move only its background estimate
+                # keep the measured count I + n b over the disk the source summed;
+                # move only its background estimate
+                recorded = _field(raw, "n_pix")[rows]
+                n_rec = torch.where(recorded > 0, recorded, n_pix)
                 model_adu = _field(raw, "bg_model")[rows]
                 model = model_adu / gain
                 use = torch.isfinite(model)
-                I_obs = torch.where(use, I_obs + bg - model, I_obs)
+                I_obs = torch.where(use, I_obs + _field(raw, "background")[rows] / gain * n_rec
+                                    - model, I_obs)
                 bg = torch.where(use, model, bg)
-                var_sum += float(_field(raw, "bg_model_var")[rows][use].double().sum())
+                var_adu = _field(raw, "bg_model_var")[rows]
+                var_sum += float(var_adu[use].double().sum())
                 model_sum += float(model_adu[use].double().sum())
-            if self.has_sigma:
-                sigma = _field(raw, "sigma")[rows] / gain
-            else:
+                if self.has_sigma:  # the model's own sigma, not the annulus one
+                    own = model_background_sigma(I_obs, var_adu / gain**2, recorded,
+                                                 inp.n_bg, sigma, scale=sigma_scale)
+                    sigma = torch.where(use, own, sigma)
+            if not self.has_sigma:
                 sigma = ((I_obs + bg).clamp(min=0) + bg.clamp(min=0) + 1.0).sqrt()
             panel = _field(raw, "panel_id")[rows]
             off, q = ewald_rows(torch.from_numpy(raw["observed"])[rows].float(),

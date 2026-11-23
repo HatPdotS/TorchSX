@@ -5,7 +5,7 @@ parse their arguments (and answer ``--help``) without importing torch.
 """
 import importlib
 
-__version__ = "0.2.4"
+__version__ = "0.3.0"
 
 _EXPORTS = {
     "SFXStream": "torchsx.stream",
@@ -16,6 +16,8 @@ _EXPORTS = {
     "compute_hkl_index": "torchsx.merging.hkl",
     "merge_intensities": "torchsx.merging.hkl",
     "HKLIndex": "torchsx.merging.hkl",
+    "PROBIXI_VERSION": "torchsx._compat",
+    "SUPPORTED_DB_SCHEMA": "torchsx._compat",
 }
 
 __all__ = [*_EXPORTS, "__version__"]

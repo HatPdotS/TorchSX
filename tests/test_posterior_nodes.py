@@ -221,6 +221,25 @@ def test_detector_noise_terms_without_grad_are_not_reused_with_grad():
     assert obj.noise_terms(meta) is not b
 
 
+def test_detector_noise_groups_by_resolution_bin():
+    from torchsx.merging.likelihood.detector_noise import DetectorNoise
+    dn = DetectorNoise(3, terms="B", edges=[0.01, 0.04])
+    with torch.no_grad():
+        dn.log_B.copy_(torch.log(torch.tensor([1.1, 1.0, 0.9])))
+    obj = MarginalNLL(SplitLogGrid(n_points=192), Poisson(), detector_noise=dn)
+    meta = Meta(torch.arange(5), torch.zeros(5, dtype=torch.long))
+    meta.panel_id = torch.tensor([2, 2, 2, 2, 2])            # not used: the groups are resolution bins
+    meta.s_sq = torch.tensor([0.001, 0.01, 0.02, 0.04, 0.3])
+    _a, b = obj.noise_terms(meta)
+    torch.testing.assert_close(b, torch.tensor([1.1, 1.0, 1.0, 0.9, 0.9]))
+    again = DetectorNoise.from_config(dn.config())
+    assert again.edges.tolist() == pytest.approx([0.01, 0.04]) and again.terms == "B"
+    assert "edges" not in dn.state_dict()                     # configuration, not a fitted value
+    for bad in ([0.01], [0.04, 0.01]):
+        with pytest.raises(ValueError):
+            DetectorNoise(3, edges=bad)
+
+
 def test_detector_noise_projection_bounds_the_terms():
     from torchsx.merging.likelihood.detector_noise import BOUNDS, DetectorNoise
     dn = DetectorNoise(3)

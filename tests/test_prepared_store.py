@@ -1,5 +1,6 @@
 """The on-disk prepared store against the in-memory preparation it replaces."""
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -15,7 +16,7 @@ from torchsx.merging.config import MergeConfig
 from torchsx.merging.hkl.filter import filter_resolution
 from torchsx.merging.hkl.noise import PoissonNoiseModel
 from torchsx.merging.observations import prepare_observations
-from torchsx.merging.store import RECORD, ObservationStore, PreparedStore
+from torchsx.merging.store import MAX_PENDING, MAX_SPARE, RECORD, ObservationStore, PreparedStore
 from torchsx.nn.merge_target import plain_mean, unity_merge
 from tests import python_parser
 
@@ -218,6 +219,74 @@ def test_reader_returns_the_requested_rows(streams, tmp_path, parser):
     for chunk in (7, 1 << 20):
         rows = np.concatenate([rec for _, rec in reader.scan(chunk)])
         assert np.array_equal(rows, raw)
+
+
+def _reader(streams, tmp_path):
+    _build(streams, tmp_path / "store", spacegroup="P 1", merge_friedel=True, d_min=2.0, gain=1.0)
+    raw = np.fromfile(tmp_path / "store" / "obs.bin", dtype=RECORD)
+    return ObservationStore(tmp_path / "store", len(raw)), raw
+
+
+def test_reader_reuses_buffers_without_overwriting_a_batch_in_use(streams, tmp_path, parser):
+    reader, raw = _reader(streams, tmp_path)
+    g = torch.Generator().manual_seed(2)
+
+    def batch(n=60):
+        rows = torch.randperm(len(raw), generator=g)[:n]
+        reader.prefetch(rows)
+        got = reader.read(rows)
+        assert np.array_equal(got.numpy().view(RECORD).reshape(-1), raw[rows.numpy()])
+        return got
+
+    # a batch still in use, and then a view of it alone, keep their bytes
+    kept = batch()
+    part, want = kept[:, :8], kept.clone()
+    for _ in range(8):
+        batch()
+    assert torch.equal(kept, want) and torch.equal(part, want[:, :8])
+    del kept
+    for _ in range(4):
+        batch()
+    assert torch.equal(part, want[:, :8])
+    # once released, the buffers serve the next batches: nothing new is allocated
+    del part
+    for _ in range(2):
+        batch()
+    n = reader.buffers.n_allocated
+    for _ in range(25):
+        batch()
+    assert reader.buffers.n_allocated == n
+    assert len(reader.buffers._spare) <= MAX_SPARE
+    # a larger batch gets a new buffer, a smaller one fits a spare
+    batch(90)
+    assert reader.buffers.n_allocated == n + 1
+    for _ in range(6):
+        batch(30)
+    assert reader.buffers.n_allocated == n + 1
+    reader.close()
+    assert not reader.buffers._spare and not reader.buffers._returned
+
+
+def test_buffers_return_from_another_thread_and_from_dropped_read_ahead(streams, tmp_path, parser):
+    reader, raw = _reader(streams, tmp_path)
+    g = torch.Generator().manual_seed(3)
+    rows = [torch.randperm(len(raw), generator=g)[:n] for n in (80, 40, 80)]
+    # a batch released in another thread: its buffer comes back and serves a later batch
+    held = [reader.read(rows[0])]
+    reader.read(rows[1])
+    address = held[0].data_ptr()
+    worker = threading.Thread(target=held.clear)
+    worker.start()
+    worker.join()
+    again = reader.read(rows[2])
+    assert again.data_ptr() == address
+    assert np.array_equal(again.numpy().view(RECORD).reshape(-1), raw[rows[2].numpy()])
+    # read-ahead that nobody collects gives its buffers back as well
+    n = reader.buffers.n_allocated
+    for _ in range(30):
+        reader.prefetch(torch.randperm(len(raw), generator=g)[:40])
+        reader._pending[-1][1].result()
+    assert reader.buffers.n_allocated <= n + MAX_PENDING + 1
 
 
 def _train_and_merge(prep, tmp_path):

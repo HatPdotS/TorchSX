@@ -20,6 +20,12 @@ common to the merges involved, after scaling, in equal-count resolution shells:
   the reference merges; the arms' Delta F = F_X - F_R are compared per shell
   (CC, ``ln N/S``) and summed into information in bits over resolution shells x
   quantiles of sigma(Delta F).
+* ``cross_stats``: one merge against a reference merge of the same crystal
+  form. Per shell: the correlation of the two merges' intensities, the value
+  ``CC* x CC*`` that their own half-dataset CC1/2 predict for it, and the share
+  of each merge's variance that a smooth function of direction explains. A
+  correlation far below the prediction means a CC1/2 that the data do not
+  support.
 """
 from __future__ import annotations
 
@@ -623,6 +629,117 @@ def difference_stats(ref: tuple[Merge, Merge], other: tuple[Merge, Merge], n_she
     }
 
 
+def cc_star(cc) -> float:
+    """``sqrt(2 CC / (1 + CC))``: the correlation with the true signal that a
+    half-dataset CC1/2 implies. Zero for a CC at or below zero."""
+    if not np.isfinite(cc):
+        return float('nan')
+    return math.sqrt(2 * cc / (1 + cc)) if cc > 0 else 0.0
+
+
+def unit_scattering_vectors(hkl, cell):
+    """Cartesian unit vector along each reflection's scattering vector."""
+    a, b, c, al, be, ga = np.asarray(cell, dtype=np.float64)
+    al, be, ga = np.radians([al, be, ga])
+    cx = c * math.cos(be)
+    cy = c * (math.cos(al) - math.cos(be) * math.cos(ga)) / math.sin(ga)
+    A = np.array([[a, b * math.cos(ga), cx],
+                  [0.0, b * math.sin(ga), cy],
+                  [0.0, 0.0, math.sqrt(max(c * c - cx * cx - cy * cy, 0.0))]])
+    s = np.asarray(hkl, dtype=np.float64) @ np.linalg.inv(A)
+    return s / np.linalg.norm(s, axis=1, keepdims=True).clip(min=1e-30)
+
+
+def direction_design(hkl, cell, counts=None):
+    """Design of the smooth-direction fit: a constant, the six quadratic terms
+    of the unit scattering vector and, where given, log multiplicity."""
+    x, y, z = unit_scattering_vectors(hkl, cell).T
+    cols = [np.ones_like(x), x * x, y * y, z * z, x * y, x * z, y * z]
+    if counts is not None and np.all(np.isfinite(counts)) and np.all(counts > 0):
+        cols.append(np.log(counts))
+    return np.stack(cols, 1)
+
+
+def _direction_residual(X, y):
+    """``(R^2, residuals)`` of the least-squares fit of ``y`` on ``X``."""
+    if len(y) <= X.shape[1] + 2 or np.ptp(y) == 0:
+        return float('nan'), y - y.mean() if len(y) else y
+    res = y - X @ np.linalg.lstsq(X, y, rcond=None)[0]
+    return float(1.0 - res.var() / y.var()), res
+
+
+def _measured_or_squared(m: Merge, g=1.0):
+    return (m.I if m.I is not None else m.F**2) * g**2
+
+
+def cross_stats(other: Merge, ref: Merge, other_halves: tuple[Merge, Merge] | None = None,
+                ref_halves: tuple[Merge, Merge] | None = None, n_shells=20) -> dict:
+    """One merge against a reference merge, per resolution shell and overall.
+
+    On the reflections common to every merge given, with ``other`` scaled onto
+    ``ref``: ``cc_cross`` is the Pearson correlation of the two merges'
+    intensities (measured where the file carries them, else F^2). With both
+    pairs of halves, ``cc_expected = CC*(other) x CC*(ref)`` is the value
+    ``cc_cross`` takes when each CC1/2 measures agreement with the true
+    intensities, and ``cc_ratio`` is ``cc_cross / cc_expected``.
+
+    ``direction_r2`` is the share of a merge's variance in the shell that a
+    quadratic form of the unit scattering vector explains (with log
+    multiplicity where the file carries counts). It is taken on the merge's own
+    intensities, before the anisotropic scale onto the reference, which would
+    absorb part of such a surface. ``cc_half_residual`` is CC1/2
+    after that fit is removed from each half. A large ``direction_r2`` with a
+    small ``cc_half_residual`` marks half-dataset agreement that comes from a
+    smooth surface shared by the halves.
+    """
+    sets = {'other': other, 'ref': ref}
+    for name, halves in (('other', other_halves), ('ref', ref_halves)):
+        if halves is not None:
+            sets[f'{name}_A'], sets[f'{name}_B'] = halves
+    sets = {k: m.with_amplitudes() for k, m in sets.items()}
+    rows = dict(zip(sets, (m.take(i) for m, i in zip(sets.values(), common_indices(*sets.values())))))
+    O, R = rows['other'], rows['ref']
+    g, c = scale_onto(R, O)
+    d = R.d
+    I = {'other': _measured_or_squared(O, g), 'ref': _measured_or_squared(R)}
+    own = {'other': _measured_or_squared(O), 'ref': I['ref']}
+    halves = {}
+    for name in ('other', 'ref'):
+        if f'{name}_A' in rows:
+            A, B = rows[f'{name}_A'], rows[f'{name}_B']
+            gb, _ = scale_onto(A, B)
+            halves[name] = _intensities(A, B, gb)[:2]
+    X = {name: direction_design(m.hkl, m.cell, m.counts) for name, m in (('other', O), ('ref', R))}
+
+    def stats(ix):
+        out = {'n': len(ix), 'cc_cross': pearson(I['other'][ix], I['ref'][ix])}
+        for name in ('other', 'ref'):
+            out[f'direction_r2_{name}'] = _direction_residual(X[name][ix], own[name][ix])[0]
+            if name in halves:
+                IA, IB = (h[ix] for h in halves[name])
+                out[f'cc_half_{name}'] = pearson(IA, IB)
+                out[f'cc_half_residual_{name}'] = pearson(_direction_residual(X[name][ix], IA)[1],
+                                                          _direction_residual(X[name][ix], IB)[1])
+        if len(halves) == 2:
+            out['cc_expected'] = cc_star(out['cc_half_other']) * cc_star(out['cc_half_ref'])
+            out['cc_ratio'] = (out['cc_cross'] / out['cc_expected'] if out['cc_expected'] > 0
+                               else float('nan'))
+        return out
+    shells = [{**_shell(j, d, ix), **stats(ix)} for j, ix in enumerate(resolution_shells(d, n_shells))]
+    overall = stats(np.arange(len(d)))
+    ratios = [s['cc_ratio'] for s in shells if np.isfinite(s.get('cc_ratio', float('nan')))]
+    return {
+        'n_common': len(d),
+        'scale': {'model': SCALE_MODEL, 'c': [float(v) for v in c]},
+        'overall': overall,
+        'shells': shells,
+        'headline': {'n_common': len(d), 'cc_cross': overall['cc_cross'],
+                     'cc_cross_outer': shells[-1]['cc_cross'],
+                     'cc_expected_outer': shells[-1].get('cc_expected', float('nan')),
+                     'cc_ratio_min': min(ratios) if ratios else float('nan')},
+    }
+
+
 def summary_stats(m: Merge, n_shells=20, dmax=None) -> dict:
     """One merge on its own, per equal-count resolution shell and overall.
 
@@ -770,7 +887,7 @@ def _wilson_panel(series, folder):
 
 
 def render(results, folder):
-    """PNG figures, one per kind present: ``summary.png``, ``halves.png``, ``difference.png``."""
+    """PNG figures, one per kind present: ``summary.png``, ``halves.png``, ``cross.png``, ``difference.png``."""
     folder = Path(folder)
     summaries = {r['name']: r for r in results['datasets'] if r['kind'] == 'summary'}
     halves = {r['name']: r['shells'] for r in results['datasets'] if r['kind'] == 'halves'}
@@ -784,6 +901,14 @@ def render(results, folder):
                          ('r_split', 'R_split')),
                 'halves.png', folder, 'independent halves (B scaled onto A)', refs={'cc_half_flat': 0.0})
         written.append('halves.png')
+    cross = {f"{r['name']} vs {r['reference']}": r['shells'] for r in results.get('cross', [])}
+    if cross:
+        metrics = [('cc_cross', 'CC against the reference')]
+        if all('cc_expected' in s for shells in cross.values() for s in shells):
+            metrics += [('cc_expected', 'expected CC* × CC*')]
+        metrics += [('direction_r2_other', 'smooth-direction R²')]
+        _panels(cross, tuple(metrics), 'cross.png', folder, 'merges against the reference')
+        written.append('cross.png')
     if diffs:
         _panels(diffs, (('cc_dF', 'CC(ΔF), arm A vs arm B'), ('lnsr_dF', 'ln N/S of ΔF'), ('bits', 'information (bits)')),
                 'difference.png', folder, 'differences against the reference', refs={'cc_dF': 0.0, 'bits': 0.0})

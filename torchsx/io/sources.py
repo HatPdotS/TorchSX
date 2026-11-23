@@ -20,6 +20,15 @@ class SourceInput:
         object.__setattr__(self, "files", MappingProxyType({k: Path(v) for k, v in self.files.items()}))
 
 
+def _is_duckdb(path: Path) -> bool:
+    """True when the file carries the DuckDB magic bytes at offset 8."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(12)[8:] == b"DUCK"
+    except OSError:
+        return False
+
+
 def source_input(source: str | Path | SourceInput) -> SourceInput:
     if isinstance(source, SourceInput):
         return source
@@ -28,7 +37,7 @@ def source_input(source: str | Path | SourceInput) -> SourceInput:
         return SourceInput("crystfel", {"stream": path})
     if path.suffix == ".sfx":
         return SourceInput("sfx", {"cache": path})
-    if path.suffix == ".duckdb":
+    if path.suffix == ".duckdb" or (path.suffix == ".db" and _is_duckdb(path)):
         return SourceInput("probixi", {"database": path})
     raise ValueError(f"Cannot infer datasource from {path}; use SourceInput(kind, files).")
 
@@ -47,6 +56,10 @@ def read_source(source, **kwargs):
     source = source_input(source)
     path = _path(source)
     clipped = kwargs.pop("clipped", False)  # probixi only: keep clipped disks
+    crystals_where = kwargs.pop("crystals_where", None)
+    if crystals_where and source.kind != "probixi":
+        raise ValueError("crystals_where needs a probixi database")
+    enrich_alpha = kwargs.pop("enrich_alpha", "auto")  # probixi only: the enrichment gate
     if source.kind == "crystfel":
         return SFXStream.from_stream(path, **kwargs)
     # Parser-only controls have no meaning for an already parsed .sfx, but the
@@ -59,7 +72,8 @@ def read_source(source, **kwargs):
         raise TypeError(f"Unexpected read options: {', '.join(kwargs)}")
     if source.kind == "probixi":
         return SFXStream.from_duckdb(path, spacegroup=spacegroup, merge_friedel=merge_friedel,
-                                     clipped=clipped)
+                                     clipped=clipped, crystals_where=crystals_where,
+                                     enrich_alpha=enrich_alpha)
     return SFXStream.load(path, merge_friedel=merge_friedel, spacegroup=spacegroup)
 
 
