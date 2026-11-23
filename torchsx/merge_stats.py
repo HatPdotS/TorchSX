@@ -433,7 +433,7 @@ def _intensities(A: Merge, B: Merge, g):
 
 
 LOCAL_NEIGHBOURS = 32
-LOCAL_CHUNK = 50_000
+LOCAL_BLOCK = 2_000_000        # reflections x neighbours handled at a time
 
 
 def local_neighbours(m: Merge, k=LOCAL_NEIGHBOURS):
@@ -443,24 +443,49 @@ def local_neighbours(m: Merge, k=LOCAL_NEIGHBOURS):
 
     The points are every point-group copy and Friedel mate of each reflection,
     so a neighbour counts once per copy among the nearest; the reflection's own
-    copies are left out.
+    copies are left out. The points lie on a lattice, so the nearest to any of
+    them are the same lattice vectors away: the shortest ones are looked up in
+    a table of the points, shell by shell, until every reflection has ``k``.
     """
     import torch
-    from scipy.spatial import cKDTree
     from torchref.base.reciprocal.basis import get_scattering_vectors
     cell = torch.as_tensor(np.asarray(m.cell, dtype=np.float64))
-    hkl, orig = _spacegroup(m.spacegroup).expand_hkl(_tensor(m.hkl), include_friedel=True, remove_absences=False)[:2]
-    own, s = (get_scattering_vectors(h, cell).cpu().numpy() for h in (_tensor(m.hkl), hkl))
-    orig = orig.cpu().numpy().astype(np.int64)
-    k = max(1, min(k, len(m) - 1))
-    n_query = min(k + np.bincount(orig).max(), len(s))
-    tree = cKDTree(s)
-    rows, offsets = np.empty((len(m), k), np.int64), np.empty((len(m), k, 3))
-    for lo in range(0, len(m), LOCAL_CHUNK):
-        part = np.arange(lo, min(lo + LOCAL_CHUNK, len(m)))
-        near = tree.query(own[part], k=n_query)[1]
-        near = np.take_along_axis(near, np.argsort(orig[near] == part[:, None], axis=1, kind='stable')[:, :k], 1)
-        rows[part], offsets[part] = orig[near], s[near] - own[part, None]
+    vectors = lambda h: get_scattering_vectors(_tensor(h), cell).cpu().numpy()   # noqa: E731
+    copies = _spacegroup(m.spacegroup).expand_reciprocal(_tensor(m.hkl)).cpu().numpy().astype(np.int64)
+    copies = np.concatenate([copies, -copies])                     # (copies, reflections, 3)
+    low = copies.min(axis=(0, 1))
+    points = np.full(copies.max(axis=(0, 1)) - low + 1, -1, np.int32)   # lattice point -> row of its reflection
+    points[tuple(np.moveaxis(copies - low, 2, 0))] = np.arange(len(m))
+    k = min(k, len(m) - 1)
+    volume = 1 / abs(np.linalg.det(vectors(np.eye(3, dtype=np.int64))))
+
+    def shell(j):
+        """The lattice vectors between the spheres that hold ``k 2^j`` and ``k 2^(j+1)`` points, shortest first."""
+        r_in, r_out = (0 if i == 0 else (3 * k * 2**i / (4 * np.pi * volume)) ** (1 / 3) for i in (j, j + 1))
+        n = np.floor(r_out * np.asarray(m.cell[:3])).astype(np.int64)
+        d = np.stack(np.meshgrid(*(np.arange(-i, i + 1) for i in n), indexing='ij'), axis=-1).reshape(-1, 3)
+        s = vectors(d)
+        r = np.linalg.norm(s, axis=1)
+        keep = np.flatnonzero((r > r_in) & (r <= r_out))
+        keep = keep[np.argsort(r[keep], kind='stable')]
+        return d[keep], s[keep]
+
+    rows, offsets, filled = np.empty((len(m), k), np.int64), np.empty((len(m), k, 3)), np.zeros(len(m), np.int64)
+    todo, j = np.flatnonzero(filled < k), 0
+    while len(todo):
+        d, s = shell(j)
+        pad = np.abs(d).max(axis=0, initial=0)                     # the table reaches as far as the vectors do
+        table = np.pad(points, [(i, i) for i in pad], constant_values=-1)
+        stride = np.array([table.shape[1] * table.shape[2], table.shape[2], 1])
+        at, hop, table = (m.hkl - low + pad) @ stride, d @ stride, table.ravel()
+        for part in np.array_split(todo, len(todo) * len(d) // LOCAL_BLOCK + 1):
+            found = table[at[part, None] + hop]
+            new = (found >= 0) & (found != part[:, None])
+            slot = filled[part, None] + np.cumsum(new, axis=1) - 1
+            i, c = np.nonzero(new & (slot < k))
+            rows[part[i], slot[i, c]], offsets[part[i], slot[i, c]] = found[i, c], s[c]
+            filled[part] = np.minimum(k, filled[part] + new.sum(axis=1))
+        todo, j = todo[filled[todo] < k], j + 1
     return rows, offsets
 
 
@@ -475,12 +500,12 @@ def local_standardise(v, rows, offsets):
     well as from neighbours all round, so the reflections at the resolution
     limits and next to missing ones are standardised like the rest.
     """
-    k, scale = rows.shape[1], np.abs(offsets).max()
-    out = np.full(v.shape, np.nan)
+    k, out = rows.shape[1], np.full(v.shape, np.nan)
     if k <= 4:
         return out
-    for lo in range(0, len(v), LOCAL_CHUNK):
-        part = slice(lo, lo + LOCAL_CHUNK)
+    scale = np.abs(offsets).max()
+    for lo in range(0, len(v), LOCAL_BLOCK // k):
+        part = slice(lo, lo + LOCAL_BLOCK // k)
         X = np.concatenate([np.ones((len(rows[part]), k, 1)), offsets[part] / scale], axis=2)
         y = v[rows[part]]
         plane = np.linalg.pinv(X) @ y
