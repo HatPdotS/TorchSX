@@ -387,7 +387,9 @@ def test_measurement_spec_from_integration_table(db_path):
     assert spec.unresolved == ()
     assert inspect_source(db_path) == spec
     stream = SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2")
-    assert stream.measurement == spec
+    # a stream that was read also records the filter its crystals passed
+    from dataclasses import replace
+    assert stream.measurement == replace(spec, provenance=spec.provenance + (("enrich_gate", GATE),))
 
 
 def test_read_source_dispatches_duckdb(db_path):
@@ -1213,3 +1215,47 @@ def test_cli_enrich_alpha_reaches_the_store_and_the_recipe(db_path, tmp_path):
     with pytest.raises(SystemExit):
         _build_parser().parse_args(base + ["--enrich-alpha", "2", "-o", str(tmp_path / "bad")])
 
+
+def test_sfx_saved_from_a_database_is_used_as_saved(db_path, tmp_path):
+    """An .sfx of a probixi run is a training cache: its crystals and the filter it records stand."""
+    pytest.importorskip("safetensors")
+    import json
+    import shutil
+
+    from torchsx.cli import _pipeline as P
+    from torchsx.cli.train import _build_parser
+
+    _chance_lattice(db_path)
+    gated, every = tmp_path / "gated.sfx", tmp_path / "every.sfx"
+    SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True).save(gated)
+    SFXStream.from_duckdb(db_path, spacegroup="P 43 21 2", clipped=True, enrich_alpha="off",
+                          crystals_where="lattice_index >= 0").save(every)
+    assert dict(SFXStream.load(gated).measurement.provenance)["enrich_gate"] == GATE
+    saved = dict(SFXStream.load(every).measurement.provenance)
+    assert (saved["enrich_gate"], saved["crystals_where"]) == ("off", "lattice_index >= 0")
+
+    # a cache from before the filter was recorded: taken as unfiltered
+    legacy = tmp_path / "legacy.sfx"
+    shutil.copy(every, legacy)
+    sidecar = json.loads(every.with_suffix(".sfx.json").read_text())
+    record = sidecar["metadata_schema"]["_torchsx_measurement/record"]["value"]
+    record["provenance"] = [kv for kv in record["provenance"]
+                            if kv[0] not in ("enrich_gate", "crystals_where")]
+    legacy.with_suffix(".sfx.json").write_text(json.dumps(sidecar))
+
+    def load(path, *extra):
+        args = _build_parser().parse_args([
+            str(path), "--spacegroup", "P 43 21 2", "--dmin", "1.0", "--gain", "trust_input",
+            "--device", "cpu", *extra, "-o", str(tmp_path / f"run_{path.stem}")])
+        return P.load_prep(args, verbose=False)
+
+    for path, n_crystals, gate in ((gated, 2, GATE), (every, 3, "off"), (legacy, 3, "off")):
+        bundle = load(path)
+        assert bundle.prep.obs_info.n_crystals == n_crystals, path.name
+        assert bundle.recipe["enrich_gate"] == [gate], path.name
+        assert bundle.recipe["background"] == "model", "still a probixi measurement"
+        bundle.prep.close()
+    # the filter is fixed when the cache is saved
+    for option in (("--enrich-alpha", "off"), ("--crystals-where", "lattice_index = 0")):
+        with pytest.raises(SystemExit, match="holds the crystals it was saved with"):
+            load(gated, *option)

@@ -205,7 +205,15 @@ class SFXStream:
         return stream.symmetrize(separate_friedel=not merge_friedel)
 
     def save(self, path: str | Path):
-        """Save to .sfx (safetensors) format."""
+        """Save to .sfx (safetensors) format.
+
+        The file is a training cache: it holds the crystals of this stream as
+        they are.  For a stream read from a probixi database those are the
+        crystals that passed ``enrich_alpha`` and ``crystals_where``, and the
+        measurement provenance in the sidecar records that filter
+        (``enrich_gate``, ``crystals_where``).  The filter cannot be changed
+        on the file; read the database again instead.
+        """
         from torchsx.io._safetensors import save_sfx
         save_sfx(self._core, path)
 

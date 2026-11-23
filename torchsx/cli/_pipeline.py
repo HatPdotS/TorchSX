@@ -325,20 +325,39 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                              "(a probixi database)")
         crystals_where = getattr(args, "crystals_where", None) or d.get("crystals_where")
         probixi = measurement is not None and measurement.producer == "probixi"
-        if crystals_where and not probixi:
-            raise SystemExit("--crystals-where needs a probixi database")
+        # The crystal filters are applied where a probixi database is read.  An .sfx
+        # saved from one is a training cache: it holds the crystals that passed the
+        # filter it was saved under, and is used as saved.
+        from torchsx.io.sources import source_input
+        of_probixi = [(path, spec, source_input(path).kind == "probixi")
+                      for path, spec in zip(sources, specs)
+                      if spec is not None and spec.producer == "probixi"]
+        caches = [path for path, _, database in of_probixi if not database]
+        if crystals_where and (not probixi or caches):
+            raise SystemExit("--crystals-where needs a probixi database"
+                             + (f"; {caches[0]} holds the crystals it was saved with" if caches else ""))
         # the enrichment gate: "auto", a probability or "off"; resolved per database
         enrich_alpha = getattr(args, "enrich_alpha", None)
-        if enrich_alpha is not None and not probixi:
-            raise SystemExit("--enrich-alpha needs a probixi database")
+        if enrich_alpha is not None and len(caches) == len(of_probixi):
+            raise SystemExit("--enrich-alpha needs a probixi database"
+                             + (f"; {caches[0]} holds the crystals it was saved with" if caches else ""))
         if enrich_alpha is None:
             # a checkpoint that predates the gate was trained on every lattice
             enrich_alpha = d.get("enrich_alpha", "off") if d else "auto"
         gates = []
-        if probixi:
-            from torchsx.io._duckdb import read_enrichment_gate
-            gates = [read_enrichment_gate(path, enrich_alpha) for path, spec in zip(sources, specs)
-                     if spec is not None and spec.producer == "probixi"]
+        for path, spec, database in of_probixi:
+            if database:
+                from torchsx.io._duckdb import read_enrichment_gate
+                gates.append(read_enrichment_gate(path, enrich_alpha))
+                continue
+            # the filter the cache records; one that records none is taken as unfiltered
+            saved = dict(spec.provenance)
+            gate = saved.get("enrich_gate")
+            gates.append({"predicate": None if gate in (None, "off") else gate,
+                          "origin": (f"as saved in {Path(path).name}" if gate is not None else
+                                     f"{Path(path).name} records no filter, taken as unfiltered"),
+                          "saved_where": saved.get("crystals_where"),
+                          "n_total": None, "n_kept": None})
         from torchsx.merging.observations import parse_sigma_scale
         try:
             sigma_scale = parse_sigma_scale(getattr(args, "model_sigma_scale", None)
@@ -377,10 +396,14 @@ def load_prep(args, *, recipe_defaults: dict | None = None, verbose: bool = True
                   f"background={background}", flush=True)
             for g in gates:
                 if g["predicate"]:
-                    print(f"  crystals: enrichment gate {g['predicate']} [{g['origin']}] keeps "
-                          f"{g['n_kept']:,} of {g['n_total']:,}", flush=True)
+                    kept = (f" keeps {g['n_kept']:,} of {g['n_total']:,}"
+                            if g["n_kept"] is not None else "")
+                    print(f"  crystals: enrichment gate {g['predicate']} [{g['origin']}]{kept}",
+                          flush=True)
                 else:
                     print(f"  crystals: no enrichment gate [{g['origin']}]", flush=True)
+                if g.get("saved_where"):
+                    print(f"  crystals: WHERE {g['saved_where']} [{g['origin']}]", flush=True)
             if crystals_where:
                 print(f"  crystals: WHERE {crystals_where}", flush=True)
             for override in resolved.overrides:

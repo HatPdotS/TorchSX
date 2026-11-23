@@ -22,7 +22,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 | `--spacegroup SG` | | Space group, e.g. `'P 63'`. Required for `.stream` input. |
 | `--dmin`, `--dmax` | all | High- and low-resolution cut in Å. |
 | `--merge-friedel` / `--no-merge-friedel` | merge | Keep Friedel mates apart with `--no-merge-friedel`; the MTZs then carry (+) and (−) columns. |
-| `--enrich-alpha ALPHA` | `auto` | probixi database only: the enrichment gate (see [probixi input](#probixi-input)). `off` reads every lattice. |
+| `--enrich-alpha ALPHA` | `auto` | probixi database only: the enrichment gate (see [probixi input](#probixi-input)). `off` reads every lattice. An `.sfx` saved from a database is used as saved. |
 | `--crystals-where SQL` | | probixi database only: an SQL predicate on its `crystals` table. Only the crystals it accepts are read. It applies on top of the gate. |
 
 ### Measurement
@@ -238,6 +238,15 @@ With probixi's `--max-lattices` above one, a frame can hold several lattices.
 The second and later ones are indexed on the peaks the first left over. Under
 `auto` they are read only with `enrich_p` at most 1e-10. A number given to
 `--enrich-alpha` applies to every lattice alike.
+
+An `.sfx` saved from a probixi database is a training cache. It holds the
+crystals that passed the filter in force when the database was read
+(`enrich_alpha` and `crystals_where` of `SFXStream.from_duckdb` or
+`SFXStream.read`), and its sidecar records that filter. Training and merging
+use the file as saved: the log prints the recorded filter, the recipe keeps it,
+and `--enrich-alpha` and `--crystals-where` are refused, since they apply only
+where a database is read. An `.sfx` that records no filter is taken as
+unfiltered. To change the filter, read the database again.
 
 Without `--dmin`, a probixi database is cut at the 10th percentile of its
 crystals' diffraction limits, so shells with no signal do not enter the merge

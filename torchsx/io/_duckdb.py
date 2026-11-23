@@ -33,6 +33,7 @@ unavailable and are emitted as zero-valued image columns.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import duckdb
@@ -407,6 +408,11 @@ def load_duckdb(
         multi = "crystals" in tables
         source = "crystals" if multi else "frames"
         gate = _enrichment_gate(conn, enrich_alpha)["predicate"]
+        # The filter in force goes into the provenance: a stream saved from this
+        # read (.sfx) then says which crystals it holds.
+        spec = replace(spec, provenance=spec.provenance + (
+            ("enrich_gate", gate or "off"),
+            *((("crystals_where", str(crystals_where)),) if crystals_where else ())))
         if crystals_where:
             if not multi:
                 raise ValueError(f"{path}: crystals_where needs a database with a crystals table")
