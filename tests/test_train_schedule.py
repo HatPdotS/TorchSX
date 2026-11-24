@@ -33,3 +33,19 @@ def test_train_cli_accepts_the_schedule_flags():
     a = train._build_parser().parse_args(["x.stream", "-o", "run"])
     assert a.warmup is None and a.lr_schedule == "constant"
     assert math.isfinite(lr_factor(0, warmup=0, total=0, schedule="cosine"))
+
+
+def test_warmup_does_not_grow_with_the_number_of_states():
+    from torchsx.cli import train
+    parse = train._build_parser().parse_args
+    default = parse(["x.stream", "-o", "run"])
+    for n_states in (1, 2, 16):
+        assert train.schedule(default, n_states)["warmup_steps"] == 25
+        assert train.schedule(parse(["x.stream", "-o", "run", "--warmup", "40"]), n_states)["warmup_steps"] == 40
+    # 16 states reach the full learning rate within the default budget
+    s = train.schedule(default, 16)
+    assert s["total_steps"] == 400
+    assert lr_factor(24, warmup=s["warmup_steps"], total=s["total_steps"]) == 1.0
+    assert train.schedule(parse(["x.stream", "-o", "run", "--warmup", "0"]), 3)["warmup_steps"] == 0
+    # the averaging window stays one update of each state
+    assert train.schedule(default, 3)["average_last"] == 15

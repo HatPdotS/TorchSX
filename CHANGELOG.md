@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--warmup` counts updates of the run, not updates per state: the default is 25 updates however many states there are. Before, the warm-up was 25 updates times the number of states while `--steps` is the total over all states, so it took a growing share of the run, and all of the default 400 updates from 16 states on, where the learning rate never reached its full value. Runs with one state are unchanged; with several states the warm-up is shorter, and `--warmup N` gives the old length with N = 25 × states.
 - The flat CC1/2 of `torchsx.merge-stats` takes each reflection's local trend from a plane fitted through its 32 nearest reflections in reciprocal space, instead of the mean of its 32 nearest in direction within a fine resolution shell. Values change. Halves that share a prior and agree to a few percent now read close to zero in every shell, the lowest and the highest included, and with reflections missing; before, they read 0.3 to 0.7. Where the halves carry signal the values move by a few hundredths.
 
 ## v0.2.4

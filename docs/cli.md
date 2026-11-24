@@ -38,7 +38,7 @@ torchsx.train --split NAME=PATH --split NAME=PATH --spacegroup SG -o RUN [option
 |---|---|---|
 | `--steps N` | 400 | Optimizer updates in total, divided evenly over the states (see [States](#states) for patterns of no state). |
 | `--redundancy N` | 100 | Target observations per reflection in a batch. |
-| `--warmup N` | 25 | Learning-rate warm-up, in updates per state. |
+| `--warmup N` | 25 | Learning-rate warm-up, in updates: the first N of `--steps`, whatever the number of states. |
 | `--lr-schedule` | `constant` | Learning rate after the warm-up: `constant`, or `cosine` decay to zero at the last update. |
 | `--average-last N` | 5 | When the last N updates per state oscillate, validate, checkpoint and merge the mean of the network after each of them; 0 uses the last update alone. |
 | `--miss-frac F` | 0.03 | Initial weight of the miss component, a predicted reflection that recorded no signal; 0 turns it off. |
