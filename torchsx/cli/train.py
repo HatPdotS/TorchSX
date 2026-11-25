@@ -108,7 +108,7 @@ def _build_parser():
     # same crystals.
     p.add_argument("--heldout-stream", type=Path, default=None, help=argparse.SUPPRESS)
     p.add_argument("--warmup", type=int, default=None,
-                   help="learning-rate warm-up in updates per state (default 25)")
+                   help="learning-rate warm-up in updates, whatever the number of states (default 25)")
     p.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant",
                    help="learning rate after the warm-up: constant (default) or a cosine "
                         "decay to zero at the last update")
@@ -117,6 +117,18 @@ def _build_parser():
                         "the step before it), validate, checkpoint and merge the mean of the network after "
                         "each of them (default 5; 0 = the last update alone)")
     return p
+
+
+def schedule(args, n_states: int) -> dict:
+    """The learning-rate schedule and the averaging window of a run, as
+    :class:`~torchsx.nn.train_amortized.TrainConfig` fields.  The warm-up is in
+    updates of the one network every state trains, so it does not grow with the
+    number of states: ``--steps`` is the total over all of them, and a warm-up
+    per state would take a share of the run that grows with every state added.
+    The averaging window stays per state, ``--average-last`` updates of each."""
+    return dict(warmup_steps=25 if args.warmup is None else max(0, args.warmup),
+                lr_schedule=args.lr_schedule, total_steps=args.steps,
+                average_last=max(0, args.average_last) * n_states)
 
 
 def unassigned_share(tr, names) -> float | None:
@@ -373,9 +385,7 @@ def main(argv=None):
     n_states = max(1, len(bundle.split_names))
     cfg = TrainConfig(
         target_redundancy=args.redundancy, lr=1e-3,
-        warmup_steps=(25 if args.warmup is None else args.warmup) * n_states,
-        lr_schedule=args.lr_schedule, total_steps=args.steps,
-        average_last=max(0, args.average_last) * n_states,
+        **schedule(args, n_states),
         grad_clip=20.0, log_every=25,
         posterior_k_coarse=31, posterior_m_fine=129, posterior_n_sigma=6.0,
         posterior_max_halfwidth=settings["max_halfwidth"],
